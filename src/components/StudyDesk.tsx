@@ -42,7 +42,7 @@ export default function StudyDesk({
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }),
       link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = 'it-basic-study.json';
+    link.download = 'av-lore-study.json';
     link.click();
     URL.revokeObjectURL(link.href);
     setStatus('Đã xuất dữ liệu học tập.');

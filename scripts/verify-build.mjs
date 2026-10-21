@@ -25,6 +25,21 @@ for (const file of htmlFiles) {
   pages.set(file, { $, ids });
   assert.equal($('h1').length, 1, `One h1: ${file}`);
   assert.equal($('html').attr('lang'), path.relative(dist, file).startsWith('en/') ? 'en' : 'vi');
+  const rendered = $.root().clone();
+  rendered.find('script,style').remove();
+  assert.ok(
+    !/\b(?:IT[\s-]?BASIC|IT[\s-]?Basic|It[\s-]?Basic|it-basic|itbasic)\b/.test(rendered.text()),
+    `Old branding in page text: ${file}`,
+  );
+  $('[title],[aria-label],[placeholder],[alt],meta[name="description"]').each((_, element) => {
+    for (const attribute of ['title', 'aria-label', 'placeholder', 'alt', 'content'])
+      assert.ok(
+        !/\b(?:IT[\s-]?BASIC|IT[\s-]?Basic|It[\s-]?Basic|it-basic|itbasic)\b/.test(
+          $(element).attr(attribute) || '',
+        ),
+        `Old branding in ${attribute}: ${file}`,
+      );
+  });
 }
 let checked = 0;
 for (const [file, { $ }] of pages) {
@@ -111,8 +126,9 @@ assert.ok(
   'English search index missing',
 );
 assert.ok(pages.has(path.join(dist, 'case-studies/index.html')), 'Case Studies index missing');
-assert.equal(htmlFiles.length, 558, 'Both languages must contain all 279 pages');
-assert.equal(htmlFiles.filter((f) => path.relative(dist, f).startsWith('en/')).length, 279);
+assert.ok(pages.has(path.join(dist, 'themes/index.html')), 'Theme preview page missing');
+assert.equal(htmlFiles.length, 560, 'Both languages must contain all 280 pages');
+assert.equal(htmlFiles.filter((f) => path.relative(dist, f).startsWith('en/')).length, 280);
 for (const [file, { $ }] of pages) {
   if (!path.relative(dist, file).startsWith('en/')) continue;
   const original = pages.get(path.join(dist, path.relative(path.join(dist, 'en'), file)));

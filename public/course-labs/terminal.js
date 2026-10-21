@@ -15,9 +15,9 @@
     },
     '/Users/you/Documents': { type: 'dir', children: ['note.txt', 'todo.md'] },
     '/Users/you/Downloads': { type: 'dir', children: ['app.dmg'] },
-    '/Users/you/Developer': { type: 'dir', children: ['IT Basic', 'projects'] },
-    '/Users/you/Developer/IT Basic': { type: 'dir', children: ['CLI', 'JS', 'Python'] },
-    '/Users/you/Developer/IT Basic/CLI': {
+    '/Users/you/Developer': { type: 'dir', children: ['AV Lore', 'projects'] },
+    '/Users/you/Developer/AV Lore': { type: 'dir', children: ['CLI', 'JS', 'Python'] },
+    '/Users/you/Developer/AV Lore/CLI': {
       type: 'dir',
       children: ['index.html', 'css', 'js', 'chuong']
     },

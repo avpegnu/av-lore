@@ -1,6 +1,9 @@
 import { chromium, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import fs from 'node:fs';
+const themeIds = JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8')).map(
+  (theme) => theme.id,
+);
 fs.mkdirSync('artifacts', { recursive: true });
 const origin = process.env.PREVIEW_URL || 'http://127.0.0.1:4322/av-lore';
 const browser = await chromium.launch({
@@ -49,7 +52,7 @@ try {
   report.checks.push(
     'Top-level case navigation, dedicated bilingual catalog, breadcrumb and fold persistence',
   );
-  for (const theme of ['dark', 'latte', 'github-dimmed', 'midnight', 'light']) {
+  for (const theme of themeIds) {
     await page.locator('#theme-toggle').click();
     await page.locator(`[data-theme-choice=${theme}]`).click();
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
@@ -78,7 +81,7 @@ try {
   await expect(page.locator('#menu-toggle')).toHaveAttribute('aria-expanded', 'false');
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
   report.checks.push(
-    'Five persisted themes, removed homepage counters, mobile drawer and overflow',
+    'All selected themes persist, removed homepage counters, mobile drawer and overflow',
   );
   expect(
     report.themes.filter((r) => r.violations.length),

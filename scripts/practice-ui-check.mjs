@@ -1,6 +1,9 @@
 import { chromium, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import fs from 'node:fs';
+const themeIds = JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8')).map(
+  (theme) => theme.id,
+);
 
 const origin = process.env.PREVIEW_URL || 'http://127.0.0.1:4322/av-lore';
 const browser = await chromium.launch({
@@ -18,7 +21,7 @@ try {
   const page = await context.newPage();
   page.on('pageerror', (e) => report.errors.push(e.message));
   await page.goto(origin + '/practice/', { waitUntil: 'networkidle' });
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'github-dimmed');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'github-dark');
   const select = page.getByRole('combobox');
   await expect(select).toHaveValue('Tất cả');
   await select.focus();
@@ -34,10 +37,10 @@ try {
   await page.keyboard.press('Tab');
   await expect(page.getByRole('checkbox')).toBeFocused();
   report.checks.push(
-    'Default Slate Dark; keyboard selection, Escape cancellation, filtering and Tab',
+    'Default GitHub Dark; keyboard selection, Escape cancellation, filtering and Tab',
   );
 
-  for (const theme of ['github-dimmed', 'dark', 'latte', 'midnight', 'light']) {
+  for (const theme of themeIds) {
     await page.locator('#theme-toggle').click();
     await page.locator(`[data-theme-choice="${theme}"]`).click();
     await select.click();
@@ -58,7 +61,7 @@ try {
   await select.click();
   await page.locator('main h1').click();
   expect(await select.evaluate((el) => el.matches(':open'))).toBe(false);
-  report.checks.push('Five themed pickers align below the trigger and dismiss on outside click');
+  report.checks.push('All themed pickers align below the trigger and dismiss on outside click');
 
   await page.goto(origin + '/en/practice/', { waitUntil: 'networkidle' });
   await expect(page.locator('html')).toHaveAttribute('data-language-ready', 'true');
@@ -97,18 +100,20 @@ try {
   const noJS = await browser.newContext({ javaScriptEnabled: false });
   const noJSPage = await noJS.newPage();
   await noJSPage.goto(origin + '/');
-  await expect(noJSPage.locator('html')).toHaveAttribute('data-theme', 'github-dimmed');
+  await expect(noJSPage.locator('html')).toHaveAttribute('data-theme', 'github-dark');
   expect(await noJSPage.evaluate(() => getComputedStyle(document.body).backgroundColor)).toBe(
-    'rgb(33, 40, 48)',
+    'rgb(13, 17, 23)',
   );
   await noJS.close();
-  report.checks.push('Saved theme preference preserved; no-JavaScript default uses Slate Dark');
+  report.checks.push('Saved theme preference preserved; no-JavaScript default uses GitHub Dark');
   expect(
     report.themes.filter((t) => t.violations.length),
     JSON.stringify(report.themes),
   ).toEqual([]);
   expect(report.errors).toEqual([]);
-  console.log(`Practice UI checks passed: ${report.checks.length} groups, five themes.`);
+  console.log(
+    `Practice UI checks passed: ${report.checks.length} groups, ${themeIds.length} themes.`,
+  );
 } finally {
   fs.writeFileSync('artifacts/practice-ui-report.json', JSON.stringify(report, null, 2));
   await browser.close();

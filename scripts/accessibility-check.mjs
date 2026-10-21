@@ -1,6 +1,9 @@
 import { chromium, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import fs from 'node:fs';
+const themeIds = JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8')).map(
+  (theme) => theme.id,
+);
 fs.mkdirSync('artifacts', { recursive: true });
 const browser = await chromium.launch({
   executablePath:
@@ -9,7 +12,7 @@ const browser = await chromium.launch({
 });
 const report = [];
 try {
-  for (const theme of ['dark', 'latte', 'github-dimmed', 'midnight', 'light'])
+  for (const theme of themeIds)
     for (const route of [
       '/',
       '/handbook/sql/',

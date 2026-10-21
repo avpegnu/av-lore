@@ -1,4 +1,4 @@
--- IT Basic / Notes & Interview / PostgreSQL lab
+-- AV Lore / Notes & Interview / PostgreSQL lab
 -- Chạy toàn bộ script trong một session thử nghiệm.
 -- Chỉ dùng TEMP TABLE, cuối script ROLLBACK. Không sửa bảng hiện có.
 BEGIN;

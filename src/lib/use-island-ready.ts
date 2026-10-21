@@ -6,7 +6,7 @@ export function useIslandReady<T extends HTMLElement = HTMLDivElement>() {
     const island = ref.current?.closest('astro-island');
     if (island) {
       island.setAttribute('data-ui-ready', 'true');
-      island.dispatchEvent(new CustomEvent('it-basic:island-ready', { bubbles: true }));
+      island.dispatchEvent(new CustomEvent('av-lore:island-ready', { bubbles: true }));
     }
   }, []);
   return ref;

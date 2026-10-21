@@ -2,6 +2,14 @@
 
 Website độc lập dùng Astro + React + TypeScript. Chạy lệnh npm ở repo root; không cần checkout IT Basic để build hoặc deploy. Nội dung gốc là tiếng Việt, bản English sinh từ dictionary đã commit.
 
+Theo yêu cầu của chủ sở hữu, không thêm lại file acknowledgements hoặc mục giới thiệu nguồn tham khảo vào README hay giao diện khi chưa được yêu cầu.
+
+Thương hiệu hiển thị của repo này luôn là AV Lore, gồm giao diện, nội dung bài học, ví dụ, file tải xuống và cả hai ngôn ngữ. Các key lưu trữ `it-basic-*` hiện có được giữ để tương thích dữ liệu học tập; không dùng chúng làm tên hiển thị. Tên IT Basic chỉ dùng trong hướng dẫn kỹ thuật về repo đối ứng bên dưới.
+
+## Giao diện
+
+Bộ giao diện đã chốt 9 theme: 4 tối (GitHub Dark, Tối hiện đại, Dracula, Ayu Mirage) và 5 sáng (Sáng pastel, Sáng giấy, GitHub Light, Solarized Light, Rosé Pine Dawn). Mặc định là GitHub Dark; giữ các lựa chọn còn hợp lệ đã lưu của người dùng. Không thêm lại các theme bị loại. Trang `/themes/` vẫn dùng để xem và so sánh.
+
 ## Đồng bộ nội dung giữa IT Basic và AV Lore
 
 Chủ sở hữu muốn duy trì kiến thức tương ứng ở hai repo. IT Basic giữ website HTML/CSS/JavaScript; AV Lore là website Astro độc lập. IT Basic không có thư mục `website/`: không tạo lại bản Astro bên trong repo này.

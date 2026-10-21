@@ -100,7 +100,7 @@ export function initLanguage() {
         attributeFilter: ['aria-label', 'placeholder', 'title', 'alt'],
       });
       for (const island of document.querySelectorAll('astro-island'))
-        island.addEventListener('it-basic:island-ready', () => visit(island));
+        island.addEventListener('av-lore:island-ready', () => visit(island));
       // Existing canvas lessons draw labels rather than DOM text.
       if (typeof CanvasRenderingContext2D !== 'undefined') {
         const original = CanvasRenderingContext2D.prototype.fillText;
