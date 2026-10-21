@@ -1,0 +1,240 @@
+{
+  "id": "system-design--chapter-05",
+  "track": "system-design",
+  "trackTitle": "System Design",
+  "slug": "chapter-05",
+  "order": 5,
+  "title": "Message Queue & Async Communication",
+  "description": "Sync vs Async, Queue vs Pub/Sub, Kafka/RabbitMQ/SQS, delivery guarantees, idempotency, dead letter queue, backpressure, event-driven architecture.",
+  "html": "\n\n      <section id=\"why\">\n        <h2 id=\"section-1\">1. Vì sao Async Communication?</h2>\n\n        <h3 id=\"section-2\">1.1. Sync (synchronous) communication</h3>\n        <p>Client gọi service A → A gọi B → A chờ B response → A trả client. Nếu B chậm, client cũng chậm.</p>\n\n        <div class=\"ascii\">  Client ──► A ──► B ──► C\n   (blocking through)\n   Tổng latency = sum của mọi hop\n   Bất kỳ service nào fail → toàn chuỗi fail</div>\n\n        <h3 id=\"section-3\">1.2. Async communication</h3>\n        <p>A push message vào queue → trả client ngay. B/C lấy message từ queue và xử lý sau.</p>\n\n        <div class=\"ascii\">  Client ──► A ──► [QUEUE]\n                       │\n                       ▼ (B lấy khi rảnh)\n                       B ──► [QUEUE]\n                                │\n                                ▼\n                                C\n   Client không chờ\n   B chậm/chết → message vẫn an toàn trong queue\n   Có thể replay khi B recover</div>\n\n        <h3 id=\"section-4\">1.3. Khi nào dùng async?</h3>\n        <ul>\n          <li><strong>Background work</strong>: gửi email, generate PDF, thumbnail image, video transcode.</li>\n          <li><strong>Decouple service</strong>: A không cần biết B exist, chỉ publish event.</li>\n          <li><strong>Buffer spike</strong>: queue hấp thụ burst, consumer xử lý đều đặn.</li>\n          <li><strong>Retry/replay</strong>: persistent queue cho phép replay khi consumer fix bug.</li>\n          <li><strong>Fan-out</strong>: 1 event → nhiều consumer độc lập.</li>\n        </ul>\n\n        <h3 id=\"section-5\">1.4. Khi KHÔNG dùng async?</h3>\n        <ul>\n          <li>User cần response ngay (login, search, get profile).</li>\n          <li>Logic transaction strict (chuyển tiền phải atomic).</li>\n          <li>Latency-sensitive real-time (game, stock trading).</li>\n        </ul>\n\n        <h3 id=\"section-6\">1.5. Trade-off</h3>\n        <ul>\n          <li>(+) Resilience: 1 service chết không kéo cả hệ.</li>\n          <li>(+) Decouple: thêm consumer mới không động producer.</li>\n          <li>(+) Burst handling: queue làm buffer.</li>\n          <li>(−) Eventual consistency: kết quả không có ngay.</li>\n          <li>(−) Complexity: queue, consumer, monitoring, error handling.</li>\n          <li>(−) Debug: stack trace cross-service khó.</li>\n        </ul>\n      </section>\n\n      <section id=\"queue-vs-pubsub\">\n        <h2 id=\"section-7\">2. Queue vs Pub/Sub</h2>\n\n        <h3 id=\"section-8\">2.1. Queue (point-to-point)</h3>\n        <p>1 message → 1 consumer xử lý. Sau khi consumer ack, message bị xóa.</p>\n\n        <div class=\"ascii\">  Producer ──► [Queue: msg1, msg2, msg3, msg4] ──► Consumer A\n                                                  ──► Consumer B\n                                                  ──► Consumer C\n\n  msg1 → A\n  msg2 → B    (mỗi msg đến đúng 1 consumer)\n  msg3 → C\n  msg4 → A</div>\n\n        <p>Use case: job queue (gửi email, video transcode). Mỗi job xử lý 1 lần.</p>\n\n        <h3 id=\"section-9\">2.2. Pub/Sub (broadcast)</h3>\n        <p>1 message → mọi subscriber nhận. Mỗi subscriber có queue riêng.</p>\n\n        <div class=\"ascii\">  Publisher ──► [Topic: msg1] ──► Subscriber A nhận msg1\n                              ──► Subscriber B nhận msg1\n                              ──► Subscriber C nhận msg1\n\n  Mỗi sub độc lập, có offset riêng, có thể replay riêng</div>\n\n        <p>Use case: event-driven — order.created → email service + analytics + warehouse + audit log đều cần biết.</p>\n\n        <h3 id=\"section-10\">2.3. Consumer Group — best of both</h3>\n        <p>Kafka concept: trong cùng topic, multiple \"consumer group\", mỗi group có nhiều consumer. Trong 1 group, message được phân chia (queue behavior). Giữa các group, message được broadcast (pub/sub behavior).</p>\n\n        <div class=\"ascii\">              [Topic: order.created]\n                       │\n        ┌──────────────┴──────────────┐\n        ▼                              ▼\n   ┌─ Group: email-service ─┐   ┌─ Group: analytics ─┐\n   │ ▶ consumer-1 (msg1)    │   │ ▶ consumer-1 (msg1) │\n   │ ▶ consumer-2 (msg2)    │   │ ▶ consumer-2 (msg2) │\n   └────────────────────────┘   └─────────────────────┘\n   (1 group: queue chia tải)    (giữa groups: broadcast)</div>\n\n        <p>Hệ quả: <strong>cùng topic phục vụ cả 2 pattern</strong>. Đó là sức mạnh Kafka.</p>\n      </section>\n\n      <section id=\"kafka\">\n        <h2 id=\"section-11\">3. Kafka Deep Dive</h2>\n\n        <h3 id=\"section-12\">3.1. Architecture</h3>\n        <p>Kafka khác queue truyền thống: là <strong>distributed commit log</strong>. Producer append, consumer đọc theo offset.</p>\n\n        <ul>\n          <li><strong>Topic</strong> — logical category (user.events, order.events).</li>\n          <li><strong>Partition</strong> — chia 1 topic thành N partition để parallelize.</li>\n          <li><strong>Broker</strong> — Kafka server, lưu các partition.</li>\n          <li><strong>Producer</strong> — publish message vào topic.</li>\n          <li><strong>Consumer</strong> — đọc từ topic, track offset.</li>\n          <li><strong>Consumer Group</strong> — consumer cùng group share work.</li>\n        </ul>\n\n        <div class=\"ascii\">  TOPIC: order.events (3 partitions)\n\n   Partition 0:  [m1] [m4] [m7] [m10] ...   ← messages append-only\n   Partition 1:  [m2] [m5] [m8] [m11] ...\n   Partition 2:  [m3] [m6] [m9] [m12] ...\n\n   Consumer group \"billing\":\n     Consumer-1 → Partition 0\n     Consumer-2 → Partition 1\n     Consumer-3 → Partition 2\n   (Mỗi partition đọc bởi 1 consumer trong group)</div>\n\n        <h3 id=\"section-13\">3.2. Partition key</h3>\n        <p>Producer chọn partition: <code>partitionId = hash(key) % numPartitions</code>. Cùng key → cùng partition → preserve order.</p>\n\n<pre><code class=\"language-typescript\">// Order events theo user_id để cùng user cùng partition\nproducer.send({\n  topic: 'order.events',\n  messages: [{\n    key: String(userId),\n    value: JSON.stringify(orderData),\n  }],\n});</code></pre>\n\n        <p>Quy tắc: <strong>Kafka guarantee order trong partition, KHÔNG cross partition</strong>. Cần order theo user → partition theo user_id.</p>\n\n        <h3 id=\"section-14\">3.3. Offset &amp; retention</h3>\n        <p>Consumer track offset của mình. Có thể \"rewind\" để replay event.</p>\n\n<pre><code class=\"language-bash\"># Kafka retention: giữ message bao lâu\nlog.retention.hours=168    # 7 ngày\nlog.retention.bytes=1073741824   # hoặc 1GB</code></pre>\n\n        <p>Khác queue truyền thống xóa khi ack — Kafka giữ message theo retention. Producer-consumer hoàn toàn decouple.</p>\n\n        <h3 id=\"section-15\">3.4. Replication</h3>\n        <p>Mỗi partition có replica trên broker khác. Leader handle read/write, followers replicate. Leader chết → follower promote.</p>\n\n        <p>Configure: <code>replication.factor=3</code>, <code>min.insync.replicas=2</code> — phổ biến nhất cho prod.</p>\n\n        <h3 id=\"section-16\">3.5. Producer reliability</h3>\n<pre><code class=\"language-typescript\">await producer.send({\n  topic: 'order.events',\n  messages: [...],\n  acks: 'all',        // chờ all replicas ack (most durable)\n  // acks: 1         — chỉ leader ack (faster)\n  // acks: 0         — fire and forget (no guarantee)\n});</code></pre>\n\n        <h3 id=\"section-17\">3.6. Use cases</h3>\n        <ul>\n          <li>Event streaming (LinkedIn-original use case).</li>\n          <li>Activity log (Twitter, Uber click stream).</li>\n          <li>Metrics aggregation.</li>\n          <li>CDC (Debezium → Kafka).</li>\n          <li>Decouple microservice.</li>\n          <li>Real-time analytics.</li>\n        </ul>\n      </section>\n\n      <section id=\"tools\">\n        <h2 id=\"section-18\">4. Kafka vs RabbitMQ vs SQS — chọn cái nào?</h2>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th></th><th>Kafka</th><th>RabbitMQ</th><th>AWS SQS</th></tr></thead>\n          <tbody>\n            <tr><td>Model</td><td>Commit log, persistent</td><td>Traditional queue + topic</td><td>Managed queue</td></tr>\n            <tr><td>Throughput</td><td>1M+ msg/s/broker</td><td>50k msg/s</td><td>~3000 msg/s/queue (FIFO)</td></tr>\n            <tr><td>Latency</td><td>2-10ms</td><td>&lt; 1ms</td><td>10-100ms</td></tr>\n            <tr><td>Retention</td><td>Days/weeks/months</td><td>Cho đến khi consumer ack</td><td>14 ngày max</td></tr>\n            <tr><td>Replay</td><td>Có (rewind offset)</td><td>Không native</td><td>Không</td></tr>\n            <tr><td>Routing</td><td>Đơn giản (partition key)</td><td>Mạnh (exchange, binding, headers)</td><td>Cơ bản</td></tr>\n            <tr><td>Operational complexity</td><td>Cao (Zookeeper/KRaft, JVM tuning)</td><td>Trung bình</td><td>Zero (managed)</td></tr>\n            <tr><td>Use case</td><td>Event streaming, log, analytics, high throughput</td><td>Task queue, RPC, complex routing</td><td>AWS-native, simple queue, low ops</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-19\">4.1. Quy tắc chọn</h3>\n        <ul>\n          <li><strong>Kafka</strong>: event sourcing, &gt; 100k msg/s, multiple consumer groups, replay history.</li>\n          <li><strong>RabbitMQ</strong>: complex routing (priority queue, fanout, topic exchange), task queue điển hình, low latency.</li>\n          <li><strong>SQS</strong>: trên AWS, đơn giản, không muốn manage broker.</li>\n          <li><strong>Redis Streams / Pub-Sub</strong>: cực đơn giản, đã có Redis sẵn, không cần broker mới.</li>\n          <li><strong>NATS</strong>: cloud-native, lightweight, &lt; 1ms latency.</li>\n          <li><strong>Postgres LISTEN/NOTIFY</strong> hoặc bảng outbox: nhỏ, đã có DB, không cần broker mới.</li>\n        </ul>\n\n        <h3 id=\"section-20\">4.2. RabbitMQ exchange types</h3>\n<pre><code class=\"language-bash\"># Direct: route theo exact routing key\nqueue.bind(exchange='direct', binding_key='order.created')\n\n# Topic: pattern routing key (* = 1 word, # = nhiều)\nqueue.bind(exchange='topic', binding_key='order.*')      # match order.created, order.cancelled\nqueue.bind(exchange='topic', binding_key='*.payment.*')\n\n# Fanout: broadcast tất cả binding queue\nqueue.bind(exchange='fanout')\n\n# Headers: route theo message header</code></pre>\n      </section>\n\n      <section id=\"delivery\">\n        <h2 id=\"section-21\">5. Delivery Guarantees</h2>\n\n        <h3 id=\"section-22\">5.1. Ba mức đảm bảo</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Guarantee</th><th>Mô tả</th><th>Trade-off</th></tr></thead>\n          <tbody>\n            <tr><td><strong>At-most-once</strong></td><td>Message delivered 0 hoặc 1 lần. Có thể mất.</td><td>Nhanh nhất, không retry. Cho metrics, log không quan trọng từng message.</td></tr>\n            <tr><td><strong>At-least-once</strong></td><td>Message delivered ≥ 1 lần. Có thể duplicate.</td><td>Mặc định nhiều system. Consumer phải idempotent.</td></tr>\n            <tr><td><strong>Exactly-once</strong></td><td>Message delivered đúng 1 lần.</td><td>Khó nhất. Yêu cầu transactional producer + consumer.</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-23\">5.2. Vì sao \"Exactly-once\" khó?</h3>\n        <p>Producer send → broker chết trước ack → producer retry → 2 lần message. Network không có \"exactly-once\" guarantee thuần — chỉ có \"at-least-once + dedup\".</p>\n\n        <p>Kafka có \"exactly-once semantics\" (EOS) bằng:</p>\n        <ul>\n          <li><strong>Idempotent producer</strong> — producer ID + sequence number, broker dedup.</li>\n          <li><strong>Transactional producer</strong> — atomic across multiple partition.</li>\n          <li><strong>Read-process-write</strong> trong cùng Kafka transaction.</li>\n        </ul>\n\n        <p>Nhưng: EOS chỉ trong Kafka. Cross-system (Kafka → DB) vẫn cần idempotency.</p>\n\n        <h3 id=\"section-24\">5.3. Pattern thực tế: At-least-once + Idempotent consumer</h3>\n        <p>Đa số production dùng pattern này. Consumer tự đảm bảo dedup.</p>\n\n<pre><code class=\"language-typescript\">async function processOrderEvent(event: OrderEvent) {\n  // Idempotency key\n  const exists = await db.query(\n    'SELECT 1 FROM processed_events WHERE event_id = $1',\n    [event.id]\n  );\n  if (exists.rowCount &gt; 0) {\n    logger.info('Already processed', event.id);\n    return;\n  }\n\n  // Process trong transaction\n  await db.transaction(async (tx) =&gt; {\n    await processBusiness(tx, event);\n    await tx.query(\n      'INSERT INTO processed_events (event_id, processed_at) VALUES ($1, NOW())',\n      [event.id]\n    );\n  });\n}</code></pre>\n      </section>\n\n      <section id=\"idempotent\">\n        <h2 id=\"section-25\">6. Idempotency — bắt buộc cho async</h2>\n\n        <p>Idempotent: gọi nhiều lần kết quả như gọi 1 lần. <code>f(f(x)) = f(x)</code>.</p>\n\n        <h3 id=\"section-26\">6.1. Vì sao quan trọng?</h3>\n        <ul>\n          <li>Consumer crash giữa \"process xong\" và \"ack\" → message redeliver → process 2 lần.</li>\n          <li>Network timeout → producer retry → 2 message.</li>\n          <li>User click \"submit\" 3 lần → 3 request.</li>\n        </ul>\n\n        <h3 id=\"section-27\">6.2. Cách thiết kế idempotent</h3>\n\n        <h4>6.2.a. Idempotency key</h4>\n<pre><code class=\"language-typescript\">// Request có header Idempotency-Key\napp.post('/charge', async (req, res) =&gt; {\n  const idemKey = req.header('Idempotency-Key');\n  if (!idemKey) return res.status(400).send('idempotency key required');\n\n  const result = await db.query(\n    `INSERT INTO charges (idem_key, amount, status)\n     VALUES ($1, $2, 'pending')\n     ON CONFLICT (idem_key) DO NOTHING\n     RETURNING *`,\n    [idemKey, req.body.amount]\n  );\n\n  if (result.rowCount === 0) {\n    // Đã tồn tại — trả response cũ\n    const existing = await db.query('SELECT * FROM charges WHERE idem_key=$1', [idemKey]);\n    return res.json(existing.rows[0]);\n  }\n\n  // Mới — process\n  await processCharge(result.rows[0]);\n  res.json(result.rows[0]);\n});</code></pre>\n\n        <h4>6.2.b. Conditional update</h4>\n<pre><code class=\"language-sql\">-- ❌ Không idempotent\nUPDATE accounts SET balance = balance + 100 WHERE id = 5;\n\n-- ✓ Với version\nUPDATE accounts SET balance = balance + 100, version = version + 1\nWHERE id = 5 AND version = $expectedVersion;\n-- Retry không tăng nhiều lần vì version đổi</code></pre>\n\n        <h4>6.2.c. Upsert</h4>\n<pre><code class=\"language-sql\">INSERT INTO orders (id, ...) VALUES ($1, ...)\nON CONFLICT (id) DO NOTHING;\n-- Hoặc DO UPDATE SET ... WHERE excluded.updated_at &gt; orders.updated_at;</code></pre>\n\n        <h4>6.2.d. Natural idempotency</h4>\n        <p>Một số operation tự idempotent:</p>\n        <ul>\n          <li><code>SET</code>, <code>DELETE</code> (chứ không <code>INCR</code>).</li>\n          <li>\"Set status = 'paid'\" (chứ không \"increment paid count\").</li>\n          <li>HTTP PUT (chứ không POST).</li>\n        </ul>\n\n        <h3 id=\"section-28\">6.3. Idempotency key storage</h3>\n        <p>Lưu key trong DB hoặc Redis với TTL (1-7 ngày). Tránh table phình mãi.</p>\n      </section>\n\n      <section id=\"dlq\">\n        <h2 id=\"section-29\">7. Dead Letter Queue (DLQ)</h2>\n\n        <p>Message fail nhiều lần (poison message) — không retry vô tận, đẩy sang queue riêng để debug.</p>\n\n        <div class=\"ascii\">  Main Queue ──► Consumer ──► Process\n                    ▲             │\n                    │             ▼ Error\n                    └─── Retry (3 times)\n                                  │\n                                  ▼ Sau 3 retry\n                              [DLQ] ─► Manual investigation</div>\n\n        <h3 id=\"section-30\">7.1. Setup pattern</h3>\n<pre><code class=\"language-typescript\">async function processWithRetry(msg: Message) {\n  const retryCount = msg.headers['retry-count'] || 0;\n\n  try {\n    await process(msg);\n    await ack(msg);\n  } catch (err) {\n    if (retryCount &gt;= 3) {\n      // Đẩy sang DLQ\n      await publishToDLQ({\n        ...msg,\n        headers: { ...msg.headers, error: err.message, original_topic: msg.topic },\n      });\n      await ack(msg);\n    } else {\n      // Retry với backoff\n      await publishWithDelay({\n        ...msg,\n        headers: { ...msg.headers, 'retry-count': retryCount + 1 },\n      }, exponentialBackoff(retryCount));\n      await ack(msg);\n    }\n  }\n}</code></pre>\n\n        <h3 id=\"section-31\">7.2. DLQ best practices</h3>\n        <ul>\n          <li><strong>Alert</strong>: DLQ &gt; 0 → ping on-call.</li>\n          <li><strong>Investigate</strong>: error type, frequency, root cause.</li>\n          <li><strong>Replay</strong>: sau khi fix, có tool replay DLQ về main queue.</li>\n          <li><strong>Retention dài</strong>: giữ DLQ ≥ 14 ngày để debug.</li>\n        </ul>\n\n        <h3 id=\"section-32\">7.3. Exponential backoff</h3>\n<pre><code class=\"language-typescript\">function exponentialBackoff(attempt: number, base = 1000) {\n  const exp = Math.pow(2, attempt) * base;       // 1s, 2s, 4s, 8s, 16s\n  const jitter = Math.random() * exp * 0.3;      // ±30% jitter\n  return Math.min(exp + jitter, 60_000);         // cap 60s\n}</code></pre>\n\n        <p>Jitter quan trọng — tránh \"retry storm\" khi nhiều consumer cùng retry sau cùng thời điểm.</p>\n      </section>\n\n      <section id=\"backpressure\">\n        <h2 id=\"section-33\">8. Backpressure — controlling flow</h2>\n\n        <p>Khi producer phát nhanh hơn consumer xử lý → queue phình → memory/disk full → crash.</p>\n\n        <h3 id=\"section-34\">8.1. Strategies</h3>\n\n        <ul>\n          <li><strong>Bounded queue</strong> — set max size. Producer block khi queue đầy.</li>\n          <li><strong>Reject new messages</strong> — return 503 cho client. Họ retry sau.</li>\n          <li><strong>Drop oldest</strong> — discard message cũ (cho metrics, log không critical).</li>\n          <li><strong>Sample</strong> — chỉ ghi 10% message khi rate cao.</li>\n          <li><strong>Scale consumer</strong> — autoscale theo queue depth.</li>\n        </ul>\n\n        <h3 id=\"section-35\">8.2. Reactive Streams</h3>\n        <p>Backpressure protocol — consumer \"pull\" số lượng message họ sẵn sàng xử lý:</p>\n\n<pre><code class=\"language-typescript\">// Pseudocode reactive stream\nconsumer.request(10);   // tôi xử lý được 10 message\nproducer.send(10);\n// consumer xử lý xong\nconsumer.request(20);   // request thêm</code></pre>\n\n        <p>Implemented trong: RxJS, Project Reactor, Akka Streams. Native trong gRPC streaming.</p>\n\n        <h3 id=\"section-36\">8.3. Monitor lag</h3>\n        <ul>\n          <li><strong>Queue depth</strong> — số message chưa xử lý.</li>\n          <li><strong>Consumer lag</strong> — offset cuối producer - offset cuối consumer.</li>\n          <li><strong>Processing rate</strong> — msg/s consumer xử lý.</li>\n          <li><strong>Producer rate</strong> — msg/s producer phát.</li>\n        </ul>\n\n        <p>Khi lag tăng dần → consumer không kịp. Scale up hoặc fix bottleneck.</p>\n      </section>\n\n      <section id=\"eda\">\n        <h2 id=\"section-37\">9. Event-Driven Architecture (EDA)</h2>\n\n        <h3 id=\"section-38\">9.1. Khái niệm</h3>\n        <p>Service không gọi trực tiếp nhau — communicate qua event. Service A publish event \"order.created\" — bất cứ service nào quan tâm đều subscribe.</p>\n\n        <div class=\"ascii\">  Order Service publish \"order.created\"\n              │\n              ▼\n   ┌──────── [Event bus / Kafka] ────────┐\n   │                                      │\n   ▼          ▼          ▼          ▼     ▼\n Email   Inventory   Shipping  Analytics  Audit\n  svc      svc         svc       svc     svc\n  (each subscribe và xử lý độc lập)</div>\n\n        <h3 id=\"section-39\">9.2. Lợi ích</h3>\n        <ul>\n          <li><strong>Loose coupling</strong> — Order không biết Email/Inventory exist.</li>\n          <li><strong>Easy add consumer</strong> — service mới subscribe topic, không động producer.</li>\n          <li><strong>Scalable</strong> — mỗi service scale độc lập.</li>\n          <li><strong>Resilient</strong> — 1 service chết, queue hold message.</li>\n          <li><strong>Auditable</strong> — event stream là audit log tự nhiên.</li>\n        </ul>\n\n        <h3 id=\"section-40\">9.3. Trade-off</h3>\n        <ul>\n          <li><strong>Eventual consistency</strong> — kết quả không có ngay.</li>\n          <li><strong>Debug khó</strong> — flow distributed, stack trace cross-service.</li>\n          <li><strong>Schema evolution</strong> — đổi event schema = đụng tất cả consumer.</li>\n          <li><strong>Operational complexity</strong> — Kafka, monitoring, alerting.</li>\n        </ul>\n\n        <h3 id=\"section-41\">9.4. Schema registry</h3>\n        <p>Confluent Schema Registry quản lý schema (Avro/JSON Schema/Protobuf) để producer-consumer agree. Compatibility mode (BACKWARD, FORWARD, FULL) cho phép evolve schema an toàn.</p>\n\n        <h3 id=\"section-42\">9.5. Event vs Command</h3>\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th></th><th>Event (đã xảy ra)</th><th>Command (yêu cầu làm)</th></tr></thead>\n          <tbody>\n            <tr><td>Tense</td><td>Past — \"OrderCreated\"</td><td>Imperative — \"CreateOrder\"</td></tr>\n            <tr><td>Direction</td><td>Broadcast — bất cứ ai quan tâm</td><td>Targeted — gửi cho 1 service cụ thể</td></tr>\n            <tr><td>Coupling</td><td>Loose</td><td>Tight (sender biết receiver)</td></tr>\n            <tr><td>Failure</td><td>Subscriber tự handle</td><td>Sender expect response</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>EDA chuẩn dùng <strong>event</strong>, không command — đó là sức mạnh của decoupling.</p>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-43\">10. Bài tập</h2>\n\n        <ol>\n          <li>Setup Kafka local (Docker). Tạo topic <code>order.events</code> với 3 partition. Producer Node.js publish 1000 event với key = userId. Verify cùng user vào cùng partition.</li>\n\n          <li>Implement consumer group \"billing\" với 3 consumer. Mỗi consumer xử lý 1 partition. Kill 1 consumer giữa chừng — quan sát rebalancing.</li>\n\n          <li>Implement at-least-once delivery + idempotent consumer cho \"process payment\":\n            <ul>\n              <li>Idempotency key.</li>\n              <li>Save processed event ID vào DB.</li>\n              <li>Consumer crash giữa chừng → message redelivered → không process duplicate.</li>\n            </ul>\n          </li>\n\n          <li>So sánh tools: chọn message broker phù hợp cho 4 use case:\n            <ul>\n              <li>(a) Audit log — high throughput, retain 30 ngày.</li>\n              <li>(b) Task queue gửi email — low volume, complex routing.</li>\n              <li>(c) AWS-native simple queue.</li>\n              <li>(d) Cross-microservice event-driven, replay được.</li>\n            </ul>\n          </li>\n\n          <li>Implement DLQ pattern: 3 retry với exponential backoff + jitter. Sau 3 fail → push DLQ. Tạo replay tool đọc DLQ → push lại main queue.</li>\n\n          <li>Backpressure: producer phát 10k msg/s, consumer xử lý 5k msg/s. Sau 1h chuyện gì xảy ra? 3 cách giải.</li>\n\n          <li>Thiết kế event schema cho domain e-commerce: <code>order.created</code>, <code>order.paid</code>, <code>order.shipped</code>, <code>order.cancelled</code>. Xác định: producer, các consumer, payload field.</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-44\">11. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-45\">Quiz cuối Chương 5</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Async qua message queue phù hợp NHẤT cho:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: User login\">User login</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Real-time chat\">Real-time chat</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Background work (email, transcode video, generate report), decouple service, buffer spike\">Background work (email, transcode video, generate report), decouple service, buffer spike</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Search\">Search</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">User cần response ngay → sync. Background task không cần response ngay (gửi email, generate PDF, video transcode) → async. Decouple: A publish event, B/C/D subscribe. Queue làm buffer cho burst traffic.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Kafka khác queue truyền thống ở:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Kafka chậm hơn\">Kafka chậm hơn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Kafka là distributed commit log — message persistent theo retention, có offset, replay được; không xóa khi consumer ack\">Kafka là distributed commit log — message persistent theo retention, có offset, replay được; không xóa khi consumer ack</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Kafka không support multiple consumer\">Kafka không support multiple consumer</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Kafka chỉ in-memory\">Kafka chỉ in-memory</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Queue truyền thống (RabbitMQ, SQS): xóa message khi consumer ack. Kafka: append-only log, giữ message theo retention (days/weeks). Consumer track offset của mình, có thể rewind. Cùng topic phục vụ nhiều consumer group độc lập.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Kafka guarantee message order:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Toàn topic\">Toàn topic</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cross broker\">Cross broker</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Không có guarantee\">Không có guarantee</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Trong cùng partition; cross-partition không guarantee — chọn partition key sao cho cùng entity vào cùng partition\">Trong cùng partition; cross-partition không guarantee — chọn partition key sao cho cùng entity vào cùng partition</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Order trong partition. Cùng userId → hash same partition → mọi event của user đó in-order. Nếu partition theo random → mất order. Quy tắc: key theo entity cần preserve order (userId, orderId).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">\"At-least-once delivery + idempotent consumer\" là pattern phổ biến vì:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Exactly-once cross-system rất khó implement; consumer idempotent đủ giải bài toán dedup ở app layer\">Exactly-once cross-system rất khó implement; consumer idempotent đủ giải bài toán dedup ở app layer</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Nhanh nhất\">Nhanh nhất</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tốn ít RAM\">Tốn ít RAM</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không cần code\">Không cần code</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Network không có exactly-once thuần. Kafka có \"EOS\" trong Kafka transaction nhưng cross-system (Kafka → DB) vẫn cần idempotency. Pattern thực tế: at-least-once + dedup qua idempotency key (DB) → \"effectively-once\".</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Idempotency key implementation:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Random UUID mỗi request\">Random UUID mỗi request</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cookie\">Cookie</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Client gửi key (header), server lưu lần xử lý đầu tiên + response, request sau với cùng key trả response cũ\">Client gửi key (header), server lưu lần xử lý đầu tiên + response, request sau với cùng key trả response cũ</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không cần\">Không cần</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Stripe API pattern: client tạo idempotency key (UUID), gửi qua header. Server INSERT ON CONFLICT DO NOTHING — nếu đã tồn tại, trả response cũ. Tránh double-charge khi user click submit 2 lần hoặc retry timeout.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Dead Letter Queue dùng để:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tăng throughput\">Tăng throughput</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Giữ message fail nhiều lần (poison) để debug, tránh retry vô tận block các message khác\">Giữ message fail nhiều lần (poison) để debug, tránh retry vô tận block các message khác</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Encryption\">Encryption</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cache\">Cache</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">1 message format sai, code bug → retry mãi → block toàn queue. DLQ: sau N retry (3-5), push sang queue riêng. Alert on-call. Giữ retention dài (14+ ngày). Có replay tool sau khi fix bug.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Backpressure xảy ra khi:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Producer chậm\">Producer chậm</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Network unstable\">Network unstable</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: DB full\">DB full</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Producer phát nhanh hơn consumer xử lý → queue phình → memory/disk full nếu không kiểm soát\">Producer phát nhanh hơn consumer xử lý → queue phình → memory/disk full nếu không kiểm soát</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Strategies: bounded queue (block producer khi đầy), reject new (503), drop oldest, sample, autoscale consumer. Reactive streams cho phép consumer \"pull\" số message họ kham được. Monitor consumer lag để detect sớm.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Event-Driven Architecture event vs command:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Event = &quot;đã xảy ra&quot; (past tense), broadcast loose coupling; Command = &quot;làm việc này&quot; (imperative), targeted tight coupling\">Event = \"đã xảy ra\" (past tense), broadcast loose coupling; Command = \"làm việc này\" (imperative), targeted tight coupling</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Event và command như nhau\">Event và command như nhau</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Event chỉ Kafka, command chỉ RabbitMQ\">Event chỉ Kafka, command chỉ RabbitMQ</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Event là deprecated\">Event là deprecated</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Event \"OrderCreated\" — broadcast, ai quan tâm subscribe; producer không biết consumer. Command \"CreateOrder\" — targeted, sender biết receiver, expect response. EDA chuẩn dùng event để decouple thực sự.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 5. Tiếp theo: <a href=\"/learn/system-design/chapter-06/\"><strong>Chương 6 — Microservices vs Monolith →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Vì sao Async Communication?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "1.1. Sync (synchronous) communication",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "1.2. Async communication",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "1.3. Khi nào dùng async?",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "1.4. Khi KHÔNG dùng async?",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "1.5. Trade-off",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "2. Queue vs Pub/Sub",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "2.1. Queue (point-to-point)",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "2.2. Pub/Sub (broadcast)",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "2.3. Consumer Group — best of both",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "3. Kafka Deep Dive",
+      "depth": 2
+    },
+    {
+      "id": "section-12",
+      "text": "3.1. Architecture",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "3.2. Partition key",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "3.3. Offset & retention",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "3.4. Replication",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "3.5. Producer reliability",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "3.6. Use cases",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "4. Kafka vs RabbitMQ vs SQS — chọn cái nào?",
+      "depth": 2
+    },
+    {
+      "id": "section-19",
+      "text": "4.1. Quy tắc chọn",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "4.2. RabbitMQ exchange types",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "5. Delivery Guarantees",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "5.1. Ba mức đảm bảo",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "5.2. Vì sao \"Exactly-once\" khó?",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "5.3. Pattern thực tế: At-least-once + Idempotent consumer",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "6. Idempotency — bắt buộc cho async",
+      "depth": 2
+    },
+    {
+      "id": "section-26",
+      "text": "6.1. Vì sao quan trọng?",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "6.2. Cách thiết kế idempotent",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "6.3. Idempotency key storage",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "7. Dead Letter Queue (DLQ)",
+      "depth": 2
+    },
+    {
+      "id": "section-30",
+      "text": "7.1. Setup pattern",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "7.2. DLQ best practices",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "7.3. Exponential backoff",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "8. Backpressure — controlling flow",
+      "depth": 2
+    },
+    {
+      "id": "section-34",
+      "text": "8.1. Strategies",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "8.2. Reactive Streams",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "8.3. Monitor lag",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "9. Event-Driven Architecture (EDA)",
+      "depth": 2
+    },
+    {
+      "id": "section-38",
+      "text": "9.1. Khái niệm",
+      "depth": 3
+    },
+    {
+      "id": "section-39",
+      "text": "9.2. Lợi ích",
+      "depth": 3
+    },
+    {
+      "id": "section-40",
+      "text": "9.3. Trade-off",
+      "depth": 3
+    },
+    {
+      "id": "section-41",
+      "text": "9.4. Schema registry",
+      "depth": 3
+    },
+    {
+      "id": "section-42",
+      "text": "9.5. Event vs Command",
+      "depth": 3
+    },
+    {
+      "id": "section-43",
+      "text": "10. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-44",
+      "text": "11. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-45",
+      "text": "Quiz cuối Chương 5",
+      "depth": 3
+    }
+  ],
+  "source": "SystemDesign/chuong/chuong5.html",
+  "sourceHash": "7cfe25fa155843a235fd011ffc7cd7916ceb5ad2c1d88302f243714eba4f2eae",
+  "readingMinutes": 12
+}

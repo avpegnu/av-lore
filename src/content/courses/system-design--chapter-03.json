@@ -1,0 +1,200 @@
+{
+  "id": "system-design--chapter-03",
+  "track": "system-design",
+  "trackTitle": "System Design",
+  "slug": "chapter-03",
+  "order": 3,
+  "title": "Caching Strategies",
+  "description": "Multi-tier caching, patterns, eviction policies, TTL, invalidation, stampede protection, distributed cache, cache consistency.",
+  "html": "\n\n      <section id=\"why\">\n        <h2 id=\"section-1\">1. Vì sao Caching?</h2>\n        <p>Tốc độ: cache hit ratio cao → giảm latency 10–1000×, giảm tải DB cực mạnh.</p>\n\n        <div class=\"callout callout-note\">\n          <span class=\"callout-title\">Liên hệ với Database Ch11</span>\n          Bạn đã học cache patterns ở Database Ch11. Ở đây ta nhìn từ <em>kiến trúc hệ thống</em> — cache không chỉ ở app layer, mà rải đều ở mọi tầng (browser → CDN → reverse proxy → app → DB). Mỗi tầng có trade-off riêng.\n        </div>\n\n        <h3 id=\"section-2\">1.1. Vì sao cache nhanh hơn DB?</h3>\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Layer</th><th>Latency</th><th>Throughput</th></tr></thead>\n          <tbody>\n            <tr><td>App in-memory cache</td><td>&lt; 1 µs</td><td>10M+ ops/s</td></tr>\n            <tr><td>Redis (LAN)</td><td>~ 0.5 ms</td><td>100k+ ops/s</td></tr>\n            <tr><td>Postgres single query (indexed)</td><td>1-5 ms</td><td>50k QPS</td></tr>\n            <tr><td>Postgres complex JOIN/aggregate</td><td>50-500 ms</td><td>vài k QPS</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>Với mỗi 1 cache hit, tránh được 1 DB query. Hit rate 95% nghĩa là DB chỉ phục vụ 5% traffic — scale đơn giản nhiều.</p>\n      </section>\n\n      <section id=\"multitier\">\n        <h2 id=\"section-3\">2. Multi-tier Caching</h2>\n\n        <div class=\"ascii\">  ┌──────────────────────────────────────────────────────────┐\n  │            MULTI-TIER CACHE ARCHITECTURE                  │\n  └──────────────────────────────────────────────────────────┘\n\n   USER  ────────────────────────────────────────────────►\n    │\n    ▼  HTTP cache (Cache-Control, ETag) — instant\n  ┌─────────────┐\n  │   BROWSER   │  Asset version, API response, image\n  └──────┬──────┘\n         │ MISS\n         ▼  Edge cache: 50ms (POP gần)\n  ┌─────────────┐\n  │     CDN     │  Static asset, video, image, API GET\n  └──────┬──────┘\n         │ MISS\n         ▼  In-memory L7: 1ms\n  ┌─────────────┐\n  │ Reverse Proxy│  Response cache, SSL session\n  │   (nginx)    │\n  └──────┬──────┘\n         │ MISS\n         ▼  Local + remote: 0.5–2ms\n  ┌─────────────┐\n  │     APP     │  ─► In-process cache (LRU map): &lt; 1µs\n  │   server    │  ─► Distributed cache (Redis): 0.5ms\n  └──────┬──────┘\n         │ MISS\n         ▼  Direct DB: 5-100ms\n  ┌─────────────┐\n  │   DATABASE  │  Buffer pool (RAM cache nội bộ)\n  │  (Postgres) │\n  └─────────────┘</div>\n\n        <h3 id=\"section-4\">2.1. Mỗi tầng giải vấn đề khác</h3>\n        <ul>\n          <li><strong>Browser HTTP cache</strong>: tránh request lặp với Cache-Control + ETag.</li>\n          <li><strong>CDN</strong>: serve static từ edge gần user; cache HTTP-level.</li>\n          <li><strong>Reverse proxy</strong>: cache response phổ biến, SSL session.</li>\n          <li><strong>App in-process</strong>: hot data nhỏ, lookup &lt; 1µs (config, lookup table).</li>\n          <li><strong>Distributed cache (Redis)</strong>: shared state giữa app instance.</li>\n          <li><strong>DB buffer pool</strong>: RAM cache nội bộ, không tự control.</li>\n        </ul>\n\n        <h3 id=\"section-5\">2.2. Cache hit ratio mỗi tầng</h3>\n        <p>Mục tiêu: hit ratio cao ở tầng càng \"ngoài\" càng tốt — request không đụng đến tầng trong.</p>\n\n        <p>Nếu mỗi tầng hit 80%, request đụng DB chỉ là 0.2^4 = 0.16% traffic. DB thoải mái.</p>\n\n        <h3 id=\"section-6\">2.3. Browser HTTP cache</h3>\n        <p>Cache miễn phí, đừng bỏ qua. 2 cơ chế:</p>\n\n        <ul>\n          <li><strong>Cache-Control</strong>: <code>max-age=3600, public</code> — browser cache 1h, không cần hỏi server.</li>\n          <li><strong>ETag</strong>: server gửi hash version. Request tiếp browser gửi <code>If-None-Match: hash</code> → server trả 304 Not Modified nếu chưa đổi (không cần body).</li>\n        </ul>\n\n<pre><code class=\"language-http\"># Response từ server:\nHTTP/1.1 200 OK\nContent-Type: image/png\nCache-Control: public, max-age=31536000, immutable\nETag: \"abc123\"\n\n# Request kế tiếp browser:\nGET /image.png\nIf-None-Match: \"abc123\"\n\n# Server response:\nHTTP/1.1 304 Not Modified\nETag: \"abc123\"\n# (không có body)</code></pre>\n\n        <p>Pattern URL versioning: <code>/static/app.v123.js</code> — đổi nội dung = đổi URL → cache \"đời đời\" với <code>immutable</code>.</p>\n      </section>\n\n      <section id=\"patterns\">\n        <h2 id=\"section-7\">3. Cache Patterns — recap + system view</h2>\n\n        <p>Đã học 4 pattern ở Database Ch11. Recap nhanh:</p>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Pattern</th><th>Mô tả</th><th>Khi dùng</th></tr></thead>\n          <tbody>\n            <tr><td>Cache-Aside (Lazy)</td><td>App đọc cache trước; miss → đọc DB → set cache; write → ghi DB → invalidate cache</td><td>Mặc định, 90% case</td></tr>\n            <tr><td>Read-Through</td><td>Cache là \"front\" cho DB; cache miss → cache tự fetch DB</td><td>Cache library (Guava, Caffeine) tích hợp DB</td></tr>\n            <tr><td>Write-Through</td><td>App ghi cache; cache đồng thời ghi DB</td><td>Read luôn fresh, write chậm hơn</td></tr>\n            <tr><td>Write-Behind (Write-Back)</td><td>App ghi cache, cache async flush DB</td><td>Counter, log, analytics — chấp nhận mất vài giây</td></tr>\n            <tr><td>Refresh-Ahead</td><td>Cache tự refresh trước khi expire</td><td>Hot key dự đoán được; ít dùng</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-8\">3.1. Cache-Aside cụ thể</h3>\n\n<pre><code class=\"language-typescript\">async function getUser(id: number): Promise&lt;User&gt; {\n  const cacheKey = `user:${id}`;\n\n  // 1. Đọc cache\n  const cached = await redis.get(cacheKey);\n  if (cached) {\n    metrics.increment('cache.hit');\n    return JSON.parse(cached);\n  }\n\n  metrics.increment('cache.miss');\n\n  // 2. Cache miss → đọc DB\n  const user = await db.query('SELECT * FROM users WHERE id = $1', [id]);\n  if (!user) return null;\n\n  // 3. Set cache (TTL 10 phút + jitter ±10%)\n  const ttl = 600 * (0.9 + Math.random() * 0.2);\n  await redis.set(cacheKey, JSON.stringify(user), 'EX', ttl);\n\n  return user;\n}\n\nasync function updateUser(id: number, data: Partial&lt;User&gt;) {\n  await db.query('UPDATE users SET ... WHERE id = $1', [id]);\n  await redis.del(`user:${id}`);   // invalidate\n}</code></pre>\n\n        <h3 id=\"section-9\">3.2. Lưu ý: failure mode</h3>\n        <p>Cache là <strong>optimization</strong>, không phải source of truth. Cache chết → app phải vẫn chạy (chậm hơn). Tránh:</p>\n\n<pre><code class=\"language-typescript\">// ❌ Cache chết → app chết\nconst cached = await redis.get(key);   // throws nếu Redis down\nreturn JSON.parse(cached);\n\n// ✓ Fail-open\nlet cached;\ntry {\n  cached = await redis.get(key);\n} catch (e) {\n  logger.warn('Redis error, falling back to DB', e);\n  cached = null;\n}\nreturn cached ? JSON.parse(cached) : await fetchFromDb();</code></pre>\n      </section>\n\n      <section id=\"eviction\">\n        <h2 id=\"section-10\">4. Eviction Policies</h2>\n\n        <p>Cache có giới hạn RAM. Khi đầy, eviction policy chọn key nào xóa.</p>\n\n        <h3 id=\"section-11\">4.1. Các thuật toán</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Policy</th><th>Cách</th><th>Workload phù hợp</th></tr></thead>\n          <tbody>\n            <tr><td><strong>LRU</strong> (Least Recently Used)</td><td>Xóa key ít access gần đây nhất</td><td>Mặc định tốt cho 90% case (locality temporal)</td></tr>\n            <tr><td><strong>LFU</strong> (Least Frequently Used)</td><td>Xóa key access ít lần nhất</td><td>Workload có \"hot key\" rõ rệt; CDN, content cache</td></tr>\n            <tr><td><strong>FIFO</strong></td><td>Xóa key cũ nhất (insert order)</td><td>Đơn giản, hiếm dùng</td></tr>\n            <tr><td><strong>Random</strong></td><td>Xóa ngẫu nhiên</td><td>Khi không có pattern rõ; rẻ tính toán</td></tr>\n            <tr><td><strong>TTL-based</strong></td><td>Xóa theo timestamp expire</td><td>Session, JWT, một-lần-rồi-quên</td></tr>\n            <tr><td><strong>2Q / ARC</strong></td><td>Adaptive — kết hợp LRU + LFU</td><td>Workload mixed; Postgres dùng kiểu này</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-12\">4.2. Redis maxmemory-policy</h3>\n<pre><code class=\"language-bash\"># redis.conf\nmaxmemory 4gb\nmaxmemory-policy allkeys-lru     # LRU trên mọi key — phổ biến nhất\n\n# Các option khác:\n# noeviction      — báo lỗi khi đầy (default)\n# allkeys-lru     — LRU trên mọi key\n# allkeys-lfu     — LFU trên mọi key (Redis 4+)\n# allkeys-random  — random\n# volatile-lru    — LRU chỉ key có TTL (giữ key không TTL)\n# volatile-lfu    — LFU chỉ key có TTL\n# volatile-ttl    — xóa key có TTL ngắn nhất trước</code></pre>\n\n        <h3 id=\"section-13\">4.3. LRU implementation đơn giản (in-memory app)</h3>\n\n<pre><code class=\"language-typescript\">class LRUCache&lt;K, V&gt; {\n  private cache = new Map&lt;K, V&gt;();\n  constructor(private capacity: number) {}\n\n  get(key: K): V | undefined {\n    if (!this.cache.has(key)) return undefined;\n    const value = this.cache.get(key)!;\n    // Re-insert để move to end (Map maintains insertion order)\n    this.cache.delete(key);\n    this.cache.set(key, value);\n    return value;\n  }\n\n  set(key: K, value: V): void {\n    if (this.cache.has(key)) this.cache.delete(key);\n    else if (this.cache.size &gt;= this.capacity) {\n      // Xóa key đầu (LRU)\n      const firstKey = this.cache.keys().next().value;\n      this.cache.delete(firstKey);\n    }\n    this.cache.set(key, value);\n  }\n}</code></pre>\n\n        <p>JS <code>Map</code> giữ insertion order → LRU implementation đơn giản. Caffeine (Java) dùng W-TinyLFU phức tạp hơn nhưng hit rate tốt hơn 5-15%.</p>\n      </section>\n\n      <section id=\"ttl\">\n        <h2 id=\"section-14\">5. TTL Strategies</h2>\n\n        <h3 id=\"section-15\">5.1. Chọn TTL</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Loại data</th><th>TTL gợi ý</th></tr></thead>\n          <tbody>\n            <tr><td>Session token</td><td>15 phút - 24 giờ (sliding refresh)</td></tr>\n            <tr><td>User profile</td><td>5-30 phút</td></tr>\n            <tr><td>Product catalog</td><td>1-12 giờ</td></tr>\n            <tr><td>Static config</td><td>1 ngày</td></tr>\n            <tr><td>Reference data (country, currency)</td><td>1 tuần</td></tr>\n            <tr><td>Counter (page view, like)</td><td>1-5 phút (eventual)</td></tr>\n            <tr><td>Search result</td><td>1-10 phút</td></tr>\n            <tr><td>Computed leaderboard</td><td>1-5 phút</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-16\">5.2. TTL Jitter — tránh expire đồng loạt</h3>\n        <p>Nếu set TTL = 600s cho 1000 key cùng lúc, sau 600s tất cả expire cùng → cache stampede.</p>\n\n<pre><code class=\"language-typescript\">// ❌ TTL cố định → expire đồng loạt\nawait redis.set(key, value, 'EX', 600);\n\n// ✓ TTL với jitter ±10%\nconst baseTTL = 600;\nconst jitter = Math.floor((Math.random() - 0.5) * baseTTL * 0.2);\nawait redis.set(key, value, 'EX', baseTTL + jitter);</code></pre>\n\n        <h3 id=\"section-17\">5.3. Sliding window TTL</h3>\n        <p>Mỗi access reset TTL (như session token). Đối lập với absolute TTL (cố định từ lúc tạo).</p>\n\n<pre><code class=\"language-typescript\">// Sliding: mỗi get → reset TTL\nasync function getWithSliding(key: string) {\n  const value = await redis.get(key);\n  if (value) await redis.expire(key, 1800);   // refresh TTL\n  return value;\n}</code></pre>\n\n        <h3 id=\"section-18\">5.4. Lazy expiration vs Active expiration</h3>\n        <ul>\n          <li><strong>Lazy</strong> — chỉ kiểm tra TTL khi access. Key expired vẫn ở RAM đến khi ai đó request.</li>\n          <li><strong>Active</strong> — background task scan và xóa key expired.</li>\n        </ul>\n\n        <p>Redis dùng cả hai: lazy + active sample (mỗi 100ms scan random 20 key có TTL).</p>\n      </section>\n\n      <section id=\"invalid\">\n        <h2 id=\"section-19\">6. Invalidation Strategies</h2>\n\n        <p>Phil Karlton: <em>\"There are only two hard things in Computer Science: cache invalidation and naming things.\"</em></p>\n\n        <h3 id=\"section-20\">6.1. Strategies</h3>\n\n        <ul>\n          <li><strong>TTL only</strong> — đơn giản, an toàn. Stale tối đa = TTL. Phù hợp khi tolerate stale.</li>\n          <li><strong>Event-based</strong> — khi DB update, app trigger invalidate cache key liên quan. Lỗi nếu quên 1 path.</li>\n          <li><strong>Write-through</strong> — write update cả cache + DB. Khó với multi-region.</li>\n          <li><strong>Versioning</strong> — key chứa version: <code>user:5:v123</code>. Update → bump version → key cũ orphan, tự expire qua TTL.</li>\n          <li><strong>Tag-based</strong> — group key theo tag, invalidate tag. Redis không có native, cần lib hoặc convention.</li>\n        </ul>\n\n        <h3 id=\"section-21\">6.2. Cascade invalidation</h3>\n        <p>1 entity được cache ở nhiều key:</p>\n\n<pre><code>user:5\nuser:5:profile\nhome_feed:user:5:page:1\nsearch:results:term:\"alice\"  ← chứa user 5\nteam:42:members              ← chứa user 5</code></pre>\n\n        <p>Update user 5 → phải invalidate hết. Approaches:</p>\n        <ul>\n          <li><strong>Pub/Sub</strong>: app publish event \"user:5:updated\", các cache subscriber tự xử lý.</li>\n          <li><strong>Redis SCAN + DEL</strong>: scan pattern <code>user:5:*</code> rồi xóa. Chậm trên cluster lớn.</li>\n          <li><strong>Tag stored</strong>: lưu set \"tags:user:5\" chứa các cache key liên quan.</li>\n          <li><strong>Short TTL + accept stale</strong>: dễ nhất, không cần code logic phức tạp.</li>\n        </ul>\n\n        <h3 id=\"section-22\">6.3. Stale-while-revalidate</h3>\n        <p>Pattern: trả ngay stale value, đồng thời trigger background refresh.</p>\n\n<pre><code class=\"language-typescript\">async function getWithSWR(key: string, fetcher: () =&gt; Promise&lt;any&gt;) {\n  const cached = await redis.get(key);\n  if (!cached) return await refreshAndCache(key, fetcher);\n\n  const { value, fresh_until } = JSON.parse(cached);\n\n  if (Date.now() &gt; fresh_until) {\n    // Stale — trả ngay, refresh nền\n    void refreshAndCache(key, fetcher);\n  }\n  return value;\n}\n\nasync function refreshAndCache(key: string, fetcher: () =&gt; Promise&lt;any&gt;) {\n  const value = await fetcher();\n  const cacheValue = {\n    value,\n    fresh_until: Date.now() + 5 * 60_000,\n  };\n  await redis.set(key, JSON.stringify(cacheValue), 'EX', 30 * 60);\n  return value;\n}</code></pre>\n\n        <p>Lợi: user không bao giờ chờ; cache luôn được làm mới. Nhược: stale có thể là vài phút.</p>\n\n        <p>Next.js, SWR (Vercel), Cloudflare đều support pattern này native.</p>\n      </section>\n\n      <section id=\"stampede\">\n        <h2 id=\"section-23\">7. Stampede Protection — Thundering Herd</h2>\n\n        <p>Đã đề cập Database Ch11. Đây mở rộng thêm.</p>\n\n        <h3 id=\"section-24\">7.1. Cách giải</h3>\n\n        <h4>7.1.a. Single-flight (per process)</h4>\n<pre><code class=\"language-typescript\">const inFlight = new Map&lt;string, Promise&lt;any&gt;&gt;();\n\nasync function getOnce(key: string, fetcher: () =&gt; Promise&lt;any&gt;) {\n  const cached = await redis.get(key);\n  if (cached) return JSON.parse(cached);\n\n  // Đã có request inflight → reuse promise\n  if (inFlight.has(key)) return inFlight.get(key);\n\n  const promise = (async () =&gt; {\n    try {\n      const value = await fetcher();\n      await redis.set(key, JSON.stringify(value), 'EX', 300);\n      return value;\n    } finally {\n      inFlight.delete(key);\n    }\n  })();\n\n  inFlight.set(key, promise);\n  return promise;\n}</code></pre>\n\n        <h4>7.1.b. Distributed lock (cross-process)</h4>\n<pre><code class=\"language-typescript\">async function getWithLock(key: string, fetcher: () =&gt; Promise&lt;any&gt;) {\n  const cached = await redis.get(key);\n  if (cached) return JSON.parse(cached);\n\n  const lockKey = `lock:${key}`;\n  // SETNX với expire — distributed lock\n  const acquired = await redis.set(lockKey, '1', 'NX', 'EX', 5);\n\n  if (!acquired) {\n    // Process khác đang rebuild → chờ rồi đọc\n    await new Promise(resolve =&gt; setTimeout(resolve, 50));\n    return getWithLock(key, fetcher);\n  }\n\n  try {\n    const value = await fetcher();\n    await redis.set(key, JSON.stringify(value), 'EX', 300);\n    return value;\n  } finally {\n    await redis.del(lockKey);\n  }\n}</code></pre>\n\n        <h4>7.1.c. Probabilistic early expiration (XFetch)</h4>\n        <p>Mỗi access tính xác suất \"expire sớm\" tăng dần khi gần TTL. Một process random sẽ refresh trước khi cache thực sự expire.</p>\n\n<pre><code class=\"language-typescript\">function shouldRefreshEarly(remainingTTL: number, fetchDuration: number, beta = 1) {\n  const xfetch = fetchDuration * beta * Math.log(Math.random());\n  return remainingTTL &lt; -xfetch;\n}</code></pre>\n\n        <h4>7.1.d. TTL jitter</h4>\n        <p>Đã nói. Phương pháp đơn giản nhất, ngăn nhiều key expire cùng lúc.</p>\n      </section>\n\n      <section id=\"distributed\">\n        <h2 id=\"section-25\">8. Distributed Cache</h2>\n\n        <p>Khi app có nhiều instance → cần shared cache. Redis cluster phổ biến nhất.</p>\n\n        <h3 id=\"section-26\">8.1. Redis Cluster</h3>\n        <p>Redis Cluster: 16384 hash slot, mỗi slot map đến 1 master. Client tính <code>CRC16(key) % 16384</code> để biết slot, route đến đúng master.</p>\n\n        <div class=\"ascii\">       Redis Cluster (3 master, 3 replica)\n\n   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐\n   │ Master 1     │    │ Master 2     │    │ Master 3     │\n   │ slots 0-5460 │    │ 5461-10922   │    │ 10923-16383  │\n   └──────┬───────┘    └──────┬───────┘    └──────┬───────┘\n          │                   │                    │\n          ▼                   ▼                    ▼\n   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐\n   │ Replica 1    │    │ Replica 2    │    │ Replica 3    │\n   └──────────────┘    └──────────────┘    └──────────────┘</div>\n\n        <h3 id=\"section-27\">8.2. Hash tags — multi-key operation</h3>\n        <p>Vấn đề: <code>MGET user:1 user:2 user:3</code> có thể trên 3 master khác nhau → cluster reject.</p>\n        <p>Sửa: dùng hash tag <code>{}</code> để force vào cùng slot:</p>\n\n<pre><code class=\"language-bash\">SET {team:42}:user:1 ...\nSET {team:42}:user:2 ...\nSET {team:42}:user:3 ...\n# Cả 3 vào cùng slot vì cùng tag {team:42}\nMGET {team:42}:user:1 {team:42}:user:2 {team:42}:user:3   # ✓ OK</code></pre>\n\n        <h3 id=\"section-28\">8.3. Replication &amp; failover</h3>\n        <p>Mỗi master có ≥ 1 replica. Master chết → replica tự promote. Client tự discover topology mới.</p>\n\n        <p>Failover thường &lt; 30s. Trong khoảng đó, write fail; read có thể OK qua replica (stale).</p>\n\n        <h3 id=\"section-29\">8.4. Memcached vs Redis</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th></th><th>Memcached</th><th>Redis</th></tr></thead>\n          <tbody>\n            <tr><td>Data structure</td><td>Chỉ key-string</td><td>String, Hash, List, Set, Sorted Set, Stream, Geo, Bitmap</td></tr>\n            <tr><td>Persistence</td><td>Không (RAM only)</td><td>RDB snapshot + AOF</td></tr>\n            <tr><td>Multi-thread</td><td>Có (multi-thread tốt)</td><td>Single-thread (Redis 6 có IO thread)</td></tr>\n            <tr><td>Replication</td><td>Không native</td><td>Master-replica + Cluster</td></tr>\n            <tr><td>Pub/Sub</td><td>Không</td><td>Có (Pub/Sub + Streams)</td></tr>\n            <tr><td>Use case</td><td>Pure cache đơn giản</td><td>Cache + queue + leaderboard + session + pub/sub</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>Đa số dự án mới chọn Redis vì versatility. Memcached khi chỉ cần cache key-value pure thuần và muốn multi-thread CPU.</p>\n      </section>\n\n      <section id=\"consistency\">\n        <h2 id=\"section-30\">9. Cache Consistency — vấn đề khó</h2>\n\n        <h3 id=\"section-31\">9.1. Race condition kinh điển</h3>\n\n        <div class=\"ascii\">  T1 (write):                    T2 (read):\n   ─────────                     ─────────\n   1. UPDATE DB user=Alice\n                                  2. GET cache → MISS\n   3. DEL cache\n                                  4. GET DB → user=Alice\n                                  5. SET cache: user=Alice ← OK\n\n   ─── KỊCH BẢN XẤU ───\n   1. UPDATE DB user=Alice\n                                  2. GET cache → MISS\n                                  3. GET DB → user=Alice (chưa commit!)\n   4. DEL cache (no-op, cache đã empty)\n                                  5. SET cache: user=OldName ← STALE!</div>\n\n        <p>Pattern <code>UPDATE → DEL cache</code> không thread-safe 100%. Có race window.</p>\n\n        <h3 id=\"section-32\">9.2. Mitigations</h3>\n        <ul>\n          <li><strong>Short TTL</strong> — race window có thì cache cũng tự expire sớm.</li>\n          <li><strong>Read-through write-through</strong> — không có \"cache miss + reload\" race.</li>\n          <li><strong>Versioning</strong> — đính kèm version vào key/value, đọc kiểm tra.</li>\n          <li><strong>Acceptance</strong> — chấp nhận stale ngắn hạn nếu workload tolerate.</li>\n        </ul>\n\n        <h3 id=\"section-33\">9.3. Cache vs DB consistency model</h3>\n        <ul>\n          <li><strong>Strong</strong>: write atomic cả 2; transactional cache layer (rare).</li>\n          <li><strong>Read-your-writes</strong>: dùng \"session cache\" cho user vừa write — đảm bảo họ thấy update.</li>\n          <li><strong>Eventual</strong>: TTL ngắn + invalidation best-effort; phổ biến nhất.</li>\n        </ul>\n\n        <h3 id=\"section-34\">9.4. Negative caching</h3>\n        <p>Cache cả \"không tồn tại\":</p>\n\n<pre><code class=\"language-typescript\">async function getUser(id: number) {\n  const cached = await redis.get(`user:${id}`);\n  if (cached === '__null__') return null;          // negative cache\n  if (cached) return JSON.parse(cached);\n\n  const user = await db.query(...);\n  if (!user) {\n    await redis.set(`user:${id}`, '__null__', 'EX', 60);   // cache miss 1 phút\n    return null;\n  }\n  await redis.set(`user:${id}`, JSON.stringify(user), 'EX', 600);\n  return user;\n}</code></pre>\n\n        <p>Quan trọng để tránh DB bị spam với \"id không tồn tại\". Attacker biết pattern này có thể DDoS hệ.</p>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-35\">10. Bài tập</h2>\n\n        <ol>\n          <li>Implement multi-tier cache cho 1 endpoint <code>GET /products/:id</code>:\n            <ul>\n              <li>L1: in-process LRU (max 1000 entry, TTL 60s)</li>\n              <li>L2: Redis (TTL 10 phút với jitter)</li>\n              <li>L3: DB</li>\n            </ul>\n            Đo cache hit ratio mỗi tầng và latency overall.\n          </li>\n\n          <li>Tự tay code LRU cache với capacity 100. Test với pattern access có locality vs random.</li>\n\n          <li>Reproduce cache stampede: tắt 1 hot key, gửi 1000 request đồng thời. Quan sát DB connections. Áp dụng single-flight, đo lại.</li>\n\n          <li>Tạo cache invalidation cho post + commentCount + likeCount. Khi post update, comment add, like add — invalidate đúng key. Dùng Pub/Sub Redis broadcast event.</li>\n\n          <li>Implement stale-while-revalidate cho weather API: stale OK trong 5 phút, fresh ưu tiên nhưng không block.</li>\n\n          <li>So sánh Redis vs Memcached: cho 4 use case, chọn cái nào phù hợp.\n            <ul>\n              <li>(a) Session store với TTL sliding</li>\n              <li>(b) Leaderboard top 100 user</li>\n              <li>(c) Cache user profile pure key-value</li>\n              <li>(d) Pub/Sub notification</li>\n            </ul>\n          </li>\n\n          <li>Thiết kế negative cache cho \"user không tồn tại\": TTL bao nhiêu? Cách phân biệt \"đã cached là null\" vs \"chưa cached\"?</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-36\">11. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-37\">Quiz cuối Chương 3</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Multi-tier caching architecture, mục tiêu chính:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tăng RAM\">Tăng RAM</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Giảm code\">Giảm code</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Mỗi tầng &quot;đỡ&quot; tầng dưới — request hit cache layer ngoài, không đụng đến DB\">Mỗi tầng \"đỡ\" tầng dưới — request hit cache layer ngoài, không đụng đến DB</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Tăng độ phức tạp\">Tăng độ phức tạp</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Browser cache → CDN → reverse proxy → app cache → Redis → DB. Mỗi tầng có hit ratio. Nếu mỗi tầng 80%, request đụng DB chỉ 0.16%. DB rảnh tay xử lý write + complex query.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">\"TTL jitter\" giải vấn đề:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cache chậm\">Cache chậm</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Nhiều key set cùng lúc → expire đồng loạt → thundering herd; thêm ±10% random vào TTL\">Nhiều key set cùng lúc → expire đồng loạt → thundering herd; thêm ±10% random vào TTL</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Network unstable\">Network unstable</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: DB connection\">DB connection</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Set 1000 key TTL 600s cùng lúc → 600s sau tất cả expire cùng → cache stampede. Thêm <code>baseTTL ± random(±10%)</code> để rải đều. Đơn giản, hiệu quả, gần như miễn phí.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Stale-while-revalidate:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Force revalidate\">Force revalidate</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cache offline\">Cache offline</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Refresh sync\">Refresh sync</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Trả ngay stale value, đồng thời trigger background refresh — user không phải chờ, cache luôn được làm mới\">Trả ngay stale value, đồng thời trigger background refresh — user không phải chờ, cache luôn được làm mới</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Pattern phổ biến ở Next.js, SWR, Cloudflare. Khi cache \"sắp hết hạn\", trả ngay stale, async refresh phía sau. User experience tốt hơn cache miss thuần.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">LRU vs LFU:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: LRU dựa &quot;lần access gần nhất&quot; (locality temporal); LFU dựa &quot;tần suất access&quot; (locality usage); workload khác chọn khác\">LRU dựa \"lần access gần nhất\" (locality temporal); LFU dựa \"tần suất access\" (locality usage); workload khác chọn khác</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: LRU nhanh hơn LFU\">LRU nhanh hơn LFU</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: LFU không thể implement\">LFU không thể implement</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không khác biệt\">Không khác biệt</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">LRU tốt cho temporal locality (key vừa access có khả năng access lại sớm). LFU tốt cho hot key (key access nhiều lần luôn nóng). CDN content cache thường LFU; user session cache LRU. ARC/2Q kết hợp cả 2.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Cache stampede protection — single-flight pattern:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tăng TTL\">Tăng TTL</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tắt cache\">Tắt cache</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Khi key miss, chỉ 1 request rebuild cache, các request khác chờ kết quả; tránh DB bị 1000 query đồng thời\">Khi key miss, chỉ 1 request rebuild cache, các request khác chờ kết quả; tránh DB bị 1000 query đồng thời</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Random eviction\">Random eviction</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Hot key expire → 1000 request đồng thời miss → DB nhận 1000 query. Single-flight: 1 request rebuild, 999 chờ promise đó. In-process: Map của Promise. Cross-process: distributed lock qua Redis SETNX.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Cache invalidation pattern <code>UPDATE DB → DEL cache</code> có race condition khi:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cache server chết\">Cache server chết</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: DB chậm\">DB chậm</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Network error\">Network error</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Reader đọc DB cũ trước UPDATE commit và set cache với value cũ sau khi DEL — kết quả: cache bị stale\">Reader đọc DB cũ trước UPDATE commit và set cache với value cũ sau khi DEL — kết quả: cache bị stale</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Race window: T2 đọc DB → UPDATE chưa commit → T1 commit + DEL → T2 set cache với value cũ. Mitigations: TTL ngắn, versioning, hoặc accept eventual consistency.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Negative caching:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cấm cache\">Cấm cache</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cache cả &quot;không tồn tại&quot; (null result) với TTL ngắn để tránh attacker spam DB với id không hợp lệ\">Cache cả \"không tồn tại\" (null result) với TTL ngắn để tránh attacker spam DB với id không hợp lệ</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cache với TTL âm\">Cache với TTL âm</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Pattern hiếm gặp\">Pattern hiếm gặp</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Không có negative cache, attacker biết pattern → loop request id ngẫu nhiên không tồn tại → DB nhận hết → DDoS. Cache \"__null__\" với TTL 60-300s. Phải phân biệt được \"đã cached là null\" vs \"chưa cached\".</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Hash tags <code>{}</code> trong Redis Cluster:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Force nhiều key vào cùng slot (cùng master) để hỗ trợ multi-key op (MGET, transaction)\">Force nhiều key vào cùng slot (cùng master) để hỗ trợ multi-key op (MGET, transaction)</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tạo TTL\">Tạo TTL</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Encryption\">Encryption</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Compression\">Compression</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Redis Cluster có 16384 slot. Multi-key op phải cùng slot. <code>{team:42}:user:1</code>, <code>{team:42}:user:2</code> — chỉ phần trong <code>{}</code> được hash → cùng slot → MGET hoạt động.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 3. Tiếp theo: <a href=\"/learn/system-design/chapter-04/\"><strong>Chương 4 — Database Scaling &amp; Data Patterns →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Vì sao Caching?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "1.1. Vì sao cache nhanh hơn DB?",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "2. Multi-tier Caching",
+      "depth": 2
+    },
+    {
+      "id": "section-4",
+      "text": "2.1. Mỗi tầng giải vấn đề khác",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "2.2. Cache hit ratio mỗi tầng",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "2.3. Browser HTTP cache",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "3. Cache Patterns — recap + system view",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "3.1. Cache-Aside cụ thể",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "3.2. Lưu ý: failure mode",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "4. Eviction Policies",
+      "depth": 2
+    },
+    {
+      "id": "section-11",
+      "text": "4.1. Các thuật toán",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "4.2. Redis maxmemory-policy",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "4.3. LRU implementation đơn giản (in-memory app)",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "5. TTL Strategies",
+      "depth": 2
+    },
+    {
+      "id": "section-15",
+      "text": "5.1. Chọn TTL",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "5.2. TTL Jitter — tránh expire đồng loạt",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "5.3. Sliding window TTL",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "5.4. Lazy expiration vs Active expiration",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "6. Invalidation Strategies",
+      "depth": 2
+    },
+    {
+      "id": "section-20",
+      "text": "6.1. Strategies",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "6.2. Cascade invalidation",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "6.3. Stale-while-revalidate",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "7. Stampede Protection — Thundering Herd",
+      "depth": 2
+    },
+    {
+      "id": "section-24",
+      "text": "7.1. Cách giải",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "8. Distributed Cache",
+      "depth": 2
+    },
+    {
+      "id": "section-26",
+      "text": "8.1. Redis Cluster",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "8.2. Hash tags — multi-key operation",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "8.3. Replication & failover",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "8.4. Memcached vs Redis",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "9. Cache Consistency — vấn đề khó",
+      "depth": 2
+    },
+    {
+      "id": "section-31",
+      "text": "9.1. Race condition kinh điển",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "9.2. Mitigations",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "9.3. Cache vs DB consistency model",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "9.4. Negative caching",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "10. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-36",
+      "text": "11. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-37",
+      "text": "Quiz cuối Chương 3",
+      "depth": 3
+    }
+  ],
+  "source": "SystemDesign/chuong/chuong3.html",
+  "sourceHash": "e7d5ca4019cdb1a7218af1dbed38d3e2dd53007780eb7cdb3cdd18c3654128b7",
+  "readingMinutes": 13
+}

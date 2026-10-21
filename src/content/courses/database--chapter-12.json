@@ -1,0 +1,295 @@
+{
+  "id": "database--chapter-12",
+  "track": "database",
+  "trackTitle": "Database Engineering",
+  "slug": "chapter-12",
+  "order": 12,
+  "title": "Backup, Recovery & Online Migrations",
+  "description": "Logical vs Physical backup, PITR, online schema migration cho bảng lớn, connection pooling, anti-pattern, checklist production.",
+  "html": "\n\n      <section id=\"backup-types\">\n        <h2 id=\"section-1\">1. Loại Backup</h2>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th></th><th>Logical</th><th>Physical</th></tr></thead>\n          <tbody>\n            <tr><td>Cách</td><td>Dump SQL statements (CREATE/INSERT)</td><td>Copy file binary của data directory</td></tr>\n            <tr><td>Tool Postgres</td><td><code>pg_dump</code> / <code>pg_dumpall</code></td><td><code>pg_basebackup</code> / file system snapshot</td></tr>\n            <tr><td>Kích thước</td><td>Nhỏ hơn (text + compress) — chậm khôi phục</td><td>Lớn hơn — nhanh khôi phục</td></tr>\n            <tr><td>Cross-version</td><td>Có (pg_dump 16 → restore vào 12 có thể OK)</td><td>Không (cùng major version)</td></tr>\n            <tr><td>Cross-arch</td><td>Có (x86 → ARM)</td><td>Không</td></tr>\n            <tr><td>Granularity</td><td>1 bảng / schema / db</td><td>Toàn cluster</td></tr>\n            <tr><td>Online (no lock)</td><td>Có (transactional snapshot)</td><td>Có (basebackup, ZFS snapshot)</td></tr>\n            <tr><td>Use case</td><td>Migrate, version, dev DB clone</td><td>HA, DR, PITR</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>Production thường dùng cả hai: <strong>physical backup hằng ngày</strong> + <strong>WAL archive liên tục</strong> cho PITR; <strong>logical dump tuần</strong> cho migration cross-version.</p>\n      </section>\n\n      <section id=\"pg-dump\">\n        <h2 id=\"section-2\">2. pg_dump — logical backup</h2>\n\n<pre><code class=\"language-bash\"># Dump 1 DB ra file SQL:\npg_dump -h host -U user -d shop &gt; shop.sql\n\n# Custom format (compress, parallel restore được):\npg_dump -h host -U user -d shop -F c -f shop.dump\n\n# Parallel jobs (Postgres 9.3+):\npg_dump -h host -U user -d shop -F d -j 4 -f shop_dir/\n\n# Chỉ schema (không data):\npg_dump -d shop --schema-only &gt; shop_schema.sql\n\n# Chỉ data:\npg_dump -d shop --data-only &gt; shop_data.sql\n\n# 1 bảng:\npg_dump -d shop -t users -t orders &gt; subset.sql\n\n# Dump tất cả DB + role + global object:\npg_dumpall -h host -U postgres &gt; cluster.sql</code></pre>\n\n        <h3 id=\"section-3\">2.1. Restore</h3>\n<pre><code class=\"language-bash\"># Plain SQL:\npsql -h host -U user -d shop_new &lt; shop.sql\n\n# Custom format:\npg_restore -h host -U user -d shop_new shop.dump\n\n# Parallel:\npg_restore -h host -U user -d shop_new -j 4 -F d shop_dir/\n\n# Chỉ table cụ thể:\npg_restore -d shop_new -t users shop.dump</code></pre>\n\n        <h3 id=\"section-4\">2.2. Pitfalls</h3>\n        <ul>\n          <li>pg_dump dùng <strong>snapshot transaction</strong> → consistent. Nhưng giữ snapshot lâu trên DB lớn → ngăn vacuum.</li>\n          <li>Không backup permission của user <em>khác</em> (chỉ dump objects). Cần <code>pg_dumpall -g</code> để dump role.</li>\n          <li>Chậm trên DB &gt; 100GB. Dùng physical backup thay.</li>\n        </ul>\n      </section>\n\n      <section id=\"pg-base\">\n        <h2 id=\"section-5\">3. pg_basebackup — physical backup</h2>\n\n<pre><code class=\"language-bash\"># Dùng replication slot, copy data + WAL:\npg_basebackup \\\n  -h primary \\\n  -U replicator \\\n  -D /backups/2026-05-09 \\\n  -F tar \\\n  -X stream \\\n  -P \\\n  -c fast\n\n# Output:\n# /backups/2026-05-09/base.tar      (data files)\n# /backups/2026-05-09/pg_wal.tar    (WAL needed for consistency)</code></pre>\n\n        <p>Nhanh hơn pg_dump nhiều cho DB lớn. Backup này có thể restore làm replica hoặc làm primary mới.</p>\n\n        <h3 id=\"section-6\">3.1. Filesystem snapshot</h3>\n        <p>ZFS, btrfs, LVM, EBS snapshot — tạo snapshot atomic của filesystem chứa data dir. Cực nhanh, nhưng đảm bảo Postgres flush WAL trước:</p>\n\n<pre><code class=\"language-sql\">SELECT pg_start_backup('label');\n-- Snapshot ở đây\nSELECT pg_stop_backup();</code></pre>\n\n        <p>Postgres 15+ dùng non-exclusive backup mode an toàn hơn.</p>\n\n        <p>AWS RDS, GCP CloudSQL dùng EBS/PD snapshot dưới hood để backup nhanh.</p>\n      </section>\n\n      <section id=\"pitr\">\n        <h2 id=\"section-7\">4. Point-in-Time Recovery (PITR)</h2>\n        <p>\"Restore DB về trạng thái 14:23:45 ngày hôm qua\" — trước khi script SQL điên chạy phá data.</p>\n\n        <h3 id=\"section-8\">4.1. Cấu phần PITR</h3>\n        <ol>\n          <li><strong>Base backup</strong> (pg_basebackup) — snapshot 1 thời điểm.</li>\n          <li><strong>WAL archive liên tục</strong> — mỗi WAL segment được copy ra storage an toàn (S3, NFS).</li>\n          <li>Khi restore: copy base + replay WAL đến thời điểm muốn.</li>\n        </ol>\n\n        <h3 id=\"section-9\">4.2. Setup WAL archive</h3>\n<pre><code class=\"language-ini\"># postgresql.conf:\nwal_level = replica\narchive_mode = on\narchive_command = 'aws s3 cp %p s3://my-wal-archive/%f'\n# %p = path file WAL, %f = filename\n# command phải return 0 nếu thành công</code></pre>\n\n        <p>Mỗi WAL segment 16MB. Postgres rotate xong → archive_command chạy. Không archive được → WAL tích lũy → disk full → DB hangs.</p>\n\n        <h3 id=\"section-10\">4.3. Restore</h3>\n<pre><code class=\"language-bash\"># 1. Stop Postgres\nsudo systemctl stop postgresql\n\n# 2. Restore base backup\nrm -rf /var/lib/postgresql/data/*\ntar -xf /backups/2026-05-09/base.tar -C /var/lib/postgresql/data/\n\n# 3. Tạo recovery.signal + cấu hình recovery target\necho \"\" &gt; /var/lib/postgresql/data/recovery.signal\n\n# postgresql.conf:\nrestore_command = 'aws s3 cp s3://my-wal-archive/%f %p'\nrecovery_target_time = '2026-05-09 14:23:45 UTC'\nrecovery_target_action = 'pause'   # pause, promote, shutdown\n\n# 4. Start Postgres → tự replay WAL đến time target\nsudo systemctl start postgresql\n\n# 5. Sau khi pause, kiểm tra data đúng → resume:\nSELECT pg_wal_replay_resume();</code></pre>\n\n        <h3 id=\"section-11\">4.4. Tools managed PITR</h3>\n        <ul>\n          <li><strong>WAL-G</strong> — encrypted WAL archive, S3/GCS, parallel.</li>\n          <li><strong>pgBackRest</strong> — incremental, parallel, retention policy.</li>\n          <li><strong>Barman</strong> — quản lý nhiều cluster.</li>\n          <li>RDS / CloudSQL / Crunchy Bridge — managed.</li>\n        </ul>\n      </section>\n\n      <section id=\"test\">\n        <h2 id=\"section-12\">5. Test Backup — \"untested backup = no backup\"</h2>\n        <p>Backup không test = giả thuyết. Khi cần restore thật, mới phát hiện:</p>\n        <ul>\n          <li>Backup file corrupt.</li>\n          <li>Permission missing (user không có).</li>\n          <li>Version mismatch.</li>\n          <li>Size lớn hơn tưởng → restore quá lâu.</li>\n          <li>Document quy trình lỗi/thiếu.</li>\n        </ul>\n\n        <h3 id=\"section-13\">5.1. Schedule test định kỳ</h3>\n        <ol>\n          <li>Hằng tháng: full restore test trên environment riêng.</li>\n          <li>Sau mỗi backup: tự động <code>pg_restore --list</code> để verify file readable.</li>\n          <li>Quý: PITR test — restore đến thời điểm cụ thể, verify data.</li>\n          <li>Hàng năm: full DR drill — giả lập primary chết, restore + promote replica.</li>\n        </ol>\n\n        <h3 id=\"section-14\">5.2. RPO &amp; RTO target</h3>\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Tier</th><th>RPO target</th><th>RTO target</th><th>Strategy</th></tr></thead>\n          <tbody>\n            <tr><td>Tier 1 (banking, payment)</td><td>0</td><td>&lt; 1 phút</td><td>Sync replication + auto failover Patroni</td></tr>\n            <tr><td>Tier 2 (e-commerce, SaaS)</td><td>&lt; 1 phút</td><td>&lt; 5 phút</td><td>Async replica + auto failover</td></tr>\n            <tr><td>Tier 3 (blog, internal tool)</td><td>&lt; 1 giờ</td><td>&lt; 1 giờ</td><td>Daily backup + WAL hourly</td></tr>\n          </tbody>\n        </table></div>\n      </section>\n\n      <section id=\"disaster\">\n        <h2 id=\"section-15\">6. Disaster Recovery Plan</h2>\n        <p>Tài liệu hóa:</p>\n        <ol>\n          <li>Threats: AZ outage, region outage, ransomware, accidental DROP.</li>\n          <li>Backup location: backup đặt ở region khác source (3-2-1 rule: 3 copies, 2 media, 1 offsite).</li>\n          <li>Runbook step-by-step cho từng kịch bản.</li>\n          <li>Người chịu trách nhiệm + kênh liên lạc.</li>\n          <li>Encryption: backup encrypt at rest + in transit.</li>\n          <li>Retention: bao lâu giữ backup (legal, GDPR).</li>\n          <li>Test schedule + lịch sử.</li>\n        </ol>\n      </section>\n\n      <section id=\"online-migration\">\n        <h2 id=\"section-16\">7. Online Schema Migration — đau đầu thực sự</h2>\n        <p>Mọi <code>ALTER TABLE</code> trên bảng &gt; 100M dòng có thể block production phút/giờ. Online migration = thay đổi schema mà không downtime.</p>\n\n        <h3 id=\"section-17\">7.1. Vì sao ALTER chậm?</h3>\n        <ul>\n          <li>Hầu hết ALTER cần <code>ACCESS EXCLUSIVE</code> lock → block reads + writes.</li>\n          <li>Một số ALTER rewrite toàn bảng (đổi type, thêm cột với default phức tạp ở Postgres &lt; 11).</li>\n          <li>CREATE INDEX không CONCURRENTLY block writes.</li>\n        </ul>\n\n        <h3 id=\"section-18\">7.2. Lock-light operations (Postgres 11+)</h3>\n        <p>Đỡ hơn ngày xưa nhiều:</p>\n        <ul>\n          <li><code>ADD COLUMN ... DEFAULT 'x'</code> — không rewrite (lưu default trong catalog, materialize khi UPDATE).</li>\n          <li><code>ADD COLUMN ... NULL</code> — instant.</li>\n          <li><code>ADD CONSTRAINT NOT VALID</code> + <code>VALIDATE CONSTRAINT</code> — chia thành 2 bước.</li>\n        </ul>\n\n        <h3 id=\"section-19\">7.3. Quy trình \"expand &amp; contract\"</h3>\n        <p>Pattern phổ biến cho schema thay đổi mà giữ app working liên tục:</p>\n\n        <ol class=\"steps\">\n          <li><strong>Expand</strong>: thêm cột/bảng mới SONG SONG với cũ.</li>\n          <li>App ghi cả 2 (dual-write).</li>\n          <li>Backfill data cũ sang mới (script chạy nền).</li>\n          <li>App đọc từ cả 2, prefer mới.</li>\n          <li>App chỉ đọc mới.</li>\n          <li><strong>Contract</strong>: drop cột/bảng cũ.</li>\n        </ol>\n      </section>\n\n      <section id=\"tools\">\n        <h2 id=\"section-20\">8. Tools: pg_repack, gh-ost, pt-online-schema-change</h2>\n\n        <h3 id=\"section-21\">8.1. pg_repack (Postgres)</h3>\n        <p>\"VACUUM FULL không lock\". Tạo bản sao bảng (CONCURRENTLY), sync changes qua trigger, swap ở cuối.</p>\n\n<pre><code class=\"language-bash\"># Cài:\nsudo apt install postgresql-16-repack\n\n# Repack 1 bảng:\npg_repack -d shop -t users\n\n# Reindex (rebuild bloat index):\npg_repack -d shop -t users --only-indexes</code></pre>\n\n        <p>Hữu ích khi bảng bloat nặng cần defrag, hoặc CLUSTER theo index khác.</p>\n\n        <h3 id=\"section-22\">8.2. gh-ost (MySQL, Github's tool)</h3>\n        <p>Online ALTER cho MySQL không cần trigger (đọc binlog). Used heavily ở Github, Shopify.</p>\n\n        <h3 id=\"section-23\">8.3. pt-online-schema-change (Percona, MySQL)</h3>\n        <p>Cũ hơn gh-ost, dùng trigger.</p>\n\n        <h3 id=\"section-24\">8.4. Postgres ALTER TABLE patterns thực tế</h3>\n        <p>Postgres không có công cụ migration online \"magic\" như gh-ost. Nhưng các pattern thủ công + Postgres 11+ smarts đủ cho hầu hết case.</p>\n      </section>\n\n      <section id=\"patterns\">\n        <h2 id=\"section-25\">9. Migration patterns — thực hành</h2>\n\n        <h3 id=\"section-26\">9.1. Add column nullable</h3>\n<pre><code class=\"language-sql\">-- Trong Postgres 11+: instant, không rewrite\nALTER TABLE users ADD COLUMN phone VARCHAR(20);</code></pre>\n\n        <h3 id=\"section-27\">9.2. Add column NOT NULL với default</h3>\n<pre><code class=\"language-sql\">-- ❌ Postgres &lt; 11: rewrite cả bảng\nALTER TABLE users ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'active';\n\n-- ✓ Postgres 11+: instant (default lưu trong catalog)\nALTER TABLE users ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'active';\n\n-- ✓ Pattern \"expand-contract\" cho version cũ:\n-- Bước 1:\nALTER TABLE users ADD COLUMN status VARCHAR(20);\n-- Bước 2: backfill batch:\nUPDATE users SET status = 'active' WHERE status IS NULL AND id BETWEEN 1 AND 1000000;\n-- (lặp theo batch)\n-- Bước 3: thêm DEFAULT + NOT NULL:\nALTER TABLE users ALTER COLUMN status SET DEFAULT 'active';\nALTER TABLE users ALTER COLUMN status SET NOT NULL;</code></pre>\n\n        <h3 id=\"section-28\">9.3. Drop column</h3>\n<pre><code class=\"language-sql\">-- Instant (chỉ mark trong catalog, data thật xóa khi vacuum/rewrite)\nALTER TABLE users DROP COLUMN deprecated_field;\n\n-- ⚠ Coordinate với app: deploy code không dùng cột này TRƯỚC khi drop\n-- Nếu code cũ vẫn SELECT cột → lỗi.</code></pre>\n\n        <h3 id=\"section-29\">9.4. Rename column</h3>\n        <p>Đổi tên 1 bước cực rủi ro với app deployed (rolling deploy có thể có 2 version code).</p>\n\n        <p>Pattern an toàn:</p>\n<pre><code class=\"language-sql\">-- Bước 1: thêm cột mới\nALTER TABLE users ADD COLUMN full_name VARCHAR(255);\n\n-- Bước 2: trigger sync 2 chiều (hoặc dual-write trong app)\nCREATE OR REPLACE FUNCTION sync_name() RETURNS TRIGGER AS $$\nBEGIN\n  IF NEW.name IS DISTINCT FROM OLD.name THEN\n    NEW.full_name = NEW.name;\n  ELSIF NEW.full_name IS DISTINCT FROM OLD.full_name THEN\n    NEW.name = NEW.full_name;\n  END IF;\n  RETURN NEW;\nEND $$ LANGUAGE plpgsql;\nCREATE TRIGGER sync_name_trg BEFORE UPDATE ON users\n  FOR EACH ROW EXECUTE FUNCTION sync_name();\n\n-- Bước 3: backfill\nUPDATE users SET full_name = name WHERE full_name IS NULL;\n\n-- Bước 4: deploy app version dùng full_name\n-- Bước 5: drop trigger + drop cột name\nDROP TRIGGER sync_name_trg ON users;\nALTER TABLE users DROP COLUMN name;</code></pre>\n\n        <h3 id=\"section-30\">9.5. Change column type</h3>\n        <p>Tương tự rename: thêm cột mới, dual-write, backfill, drop cũ.</p>\n\n        <h3 id=\"section-31\">9.6. Add index</h3>\n<pre><code class=\"language-sql\">-- ❌ Block writes trên bảng đang prod\nCREATE INDEX idx_users_email ON users(email);\n\n-- ✓ Online:\nCREATE INDEX CONCURRENTLY idx_users_email ON users(email);\n\n-- Nếu fail:\nDROP INDEX CONCURRENTLY idx_users_email;\n-- Rồi tạo lại</code></pre>\n\n        <h3 id=\"section-32\">9.7. Add foreign key</h3>\n<pre><code class=\"language-sql\">-- ❌ Validate ngay → scan toàn bảng, lock dài\nALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id);\n\n-- ✓ 2 bước:\nALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id)\n  REFERENCES users(id) NOT VALID;\n-- → constraint áp dụng cho dòng MỚI, không validate dòng cũ → instant.\n\nALTER TABLE orders VALIDATE CONSTRAINT fk_user;\n-- → validate dòng cũ. Lock SHARE UPDATE EXCLUSIVE — KHÔNG block reads/writes.</code></pre>\n      </section>\n\n      <section id=\"pooling\">\n        <h2 id=\"section-33\">10. Connection Pooling — bắt buộc cho production</h2>\n        <p>Mỗi Postgres connection tốn ~10MB RAM (process model). 10 000 connection = 100GB RAM. Không scale.</p>\n\n        <h3 id=\"section-34\">10.1. PgBouncer</h3>\n        <p>Connection pooler nhẹ — multiplexing client connections (rất nhiều) qua server connections (ít).</p>\n\n        <div class=\"ascii\">  10000 app workers ─┐\n                     │\n                     ▼\n              ┌──────────────┐\n              │  PgBouncer   │ pool_size=100\n              └──────┬───────┘\n                     │\n                     ▼\n              ┌──────────────┐\n              │  Postgres    │ max_connections=200\n              └──────────────┘</div>\n\n        <h3 id=\"section-35\">10.2. Pool modes</h3>\n        <ul>\n          <li><strong>session</strong> — mỗi client giữ 1 server connection cho cả session. An toàn nhưng kém scale.</li>\n          <li><strong>transaction</strong> — server connection trả về pool sau mỗi transaction. Phổ biến nhất.</li>\n          <li><strong>statement</strong> — sau mỗi statement. Cực aggressive, gãy nhiều feature.</li>\n        </ul>\n\n        <p>Chú ý transaction mode: <em>session-level state</em> (SET, prepared statements, advisory lock session) không hoạt động.</p>\n\n        <h3 id=\"section-36\">10.3. Khi nào không cần pooler?</h3>\n        <p>Serverless / Lambda / edge — connection ngắn hạn, không lâu dài. Có thể dùng RDS Proxy hoặc Neon's pooler.</p>\n\n        <p>Long-running app (Node/Java) → luôn cần PgBouncer hoặc app-level pool.</p>\n      </section>\n\n      <section id=\"antipatterns\">\n        <h2 id=\"section-37\">11. Anti-patterns thường gặp</h2>\n\n        <h3 id=\"section-38\">11.1. N+1 query</h3>\n        <p>Đã đề cập Ch8. ORM lazy loading là thủ phạm chính. Sửa: eager load (Sequelize <code>include</code>, Prisma <code>include</code>, Active Record <code>includes</code>).</p>\n\n        <h3 id=\"section-39\">11.2. SELECT * everywhere</h3>\n        <p>Lấy mọi cột → tốn RAM, network, không tận dụng được Index Only Scan. Chỉ chọn cột cần.</p>\n\n        <h3 id=\"section-40\">11.3. Soft delete tràn lan</h3>\n        <p>Mọi bảng có <code>deleted_at</code>. Mọi query phải <code>WHERE deleted_at IS NULL</code>. Quên 1 chỗ = bug bảo mật/UX. Cân nhắc archive table riêng.</p>\n\n        <h3 id=\"section-41\">11.4. UPDATE counter row mỗi request</h3>\n<pre><code class=\"language-sql\">-- ❌ Mọi page view UPDATE 1 row → contention\nUPDATE counters SET value = value + 1 WHERE name = 'page_view';\n\n-- ✓ INSERT log + aggregate batch\nINSERT INTO counter_log VALUES ('page_view', NOW());</code></pre>\n\n        <h3 id=\"section-42\">11.5. EAV ở mọi nơi</h3>\n        <p>\"Schemaless\" qua bảng (entity, attr, value). Slow, no type safety, JOIN dày. Dùng JSONB.</p>\n\n        <h3 id=\"section-43\">11.6. Polymorphic FK</h3>\n        <p><code>commentable_id + commentable_type</code> không enforce FK. Khó maintain. Tách bảng.</p>\n\n        <h3 id=\"section-44\">11.7. Long-running transaction</h3>\n        <p>Mở BEGIN trước network call → giữ snapshot lâu → bloat. Set <code>idle_in_transaction_session_timeout</code>.</p>\n\n        <h3 id=\"section-45\">11.8. Index trên mọi cột</h3>\n        <p>Mỗi index làm INSERT chậm, tốn disk. Index theo query thật.</p>\n\n        <h3 id=\"section-46\">11.9. Không monitoring</h3>\n        <p>Không metrics → không phát hiện slow query, lock wait, replication lag, disk full đến lúc đã chết. Setup pg_stat_statements, Prometheus, Grafana.</p>\n      </section>\n\n      <section id=\"checklist\">\n        <h2 id=\"section-47\">12. Production Checklist — DB sẵn sàng cho prod</h2>\n\n        <h3 id=\"section-48\">12.1. Cấu hình</h3>\n        <ul>\n          <li>☐ <code>shared_buffers</code> ~ 25% RAM</li>\n          <li>☐ <code>effective_cache_size</code> ~ 50-75% RAM</li>\n          <li>☐ <code>work_mem</code> theo workload (default 4MB thường thấp)</li>\n          <li>☐ <code>maintenance_work_mem</code> &gt; 256MB cho VACUUM/CREATE INDEX nhanh</li>\n          <li>☐ <code>random_page_cost</code> = 1.1 cho SSD</li>\n          <li>☐ <code>max_connections</code> không quá cao — dùng PgBouncer</li>\n          <li>☐ <code>idle_in_transaction_session_timeout</code> = '5min'</li>\n          <li>☐ <code>statement_timeout</code> cho query không treo vô hạn</li>\n        </ul>\n\n        <h3 id=\"section-49\">12.2. Backup &amp; DR</h3>\n        <ul>\n          <li>☐ Daily physical backup + WAL archive offsite</li>\n          <li>☐ Retention policy theo compliance</li>\n          <li>☐ Test restore mỗi tháng</li>\n          <li>☐ Documented runbook</li>\n          <li>☐ DR drill quý</li>\n        </ul>\n\n        <h3 id=\"section-50\">12.3. HA</h3>\n        <ul>\n          <li>☐ ≥ 1 streaming replica (sync hoặc async theo RPO)</li>\n          <li>☐ Auto failover tool (Patroni / pg_auto_failover)</li>\n          <li>☐ Connection routing (HAProxy / PgBouncer)</li>\n        </ul>\n\n        <h3 id=\"section-51\">12.4. Monitoring</h3>\n        <ul>\n          <li>☐ <code>pg_stat_statements</code> enabled</li>\n          <li>☐ Metrics: connection count, replication lag, cache hit ratio, dead tuples, slow query count</li>\n          <li>☐ Alert: disk &gt; 80%, replication lag &gt; 30s, connection count &gt; 80%</li>\n          <li>☐ Logging: slow queries (&gt; 1s), errors, deadlocks</li>\n        </ul>\n\n        <h3 id=\"section-52\">12.5. Security</h3>\n        <ul>\n          <li>☐ Encryption at rest (filesystem / cloud provider)</li>\n          <li>☐ TLS for connections</li>\n          <li>☐ App user khác superuser</li>\n          <li>☐ Secret management (Vault, AWS Secrets Manager)</li>\n          <li>☐ Audit log nếu cần (compliance)</li>\n          <li>☐ Network: DB không expose public, chỉ private subnet</li>\n        </ul>\n\n        <h3 id=\"section-53\">12.6. Schema &amp; Code</h3>\n        <ul>\n          <li>☐ Mọi cột thường-WHERE có index phù hợp</li>\n          <li>☐ FK constraints đầy đủ</li>\n          <li>☐ Migrations versioned (Flyway, Liquibase, dbmate)</li>\n          <li>☐ ORM eager-load để tránh N+1</li>\n          <li>☐ Connection pool app-level + PgBouncer</li>\n          <li>☐ Retry logic cho serialization failure / deadlock</li>\n        </ul>\n\n        <div class=\"callout callout-tip\">\n          <span class=\"callout-title\">Cuối cùng</span>\n          DB là phần khó nhất để fix sau khi prod chết. Đầu tư thời gian setup từ đầu — backup, monitoring, HA — sẽ tiết kiệm 100× thời gian sau này. Không có \"rebooked DB\" — mỗi giây prod chết là tiền và uy tín mất đi.\n        </div>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-54\">13. Bài tập</h2>\n\n        <ol>\n          <li>Setup pg_basebackup hằng ngày + WAL archive lên S3 cho 1 Postgres local. Test restore PITR đến thời điểm 1 phút trước.</li>\n          <li>Practice migration \"rename column\" theo expand-contract pattern. Đo downtime (kỳ vọng = 0).</li>\n          <li>Cài PgBouncer trước Postgres. Bench với 1000 connection từ app. Đo throughput vs không có PgBouncer.</li>\n          <li>Implement <code>statement_timeout</code> + <code>idle_in_transaction_session_timeout</code>. Test với query treo cố ý.</li>\n          <li>Dùng <code>pg_stat_statements</code> tìm 5 query chậm nhất trong DB của bạn. Tối ưu top 1.</li>\n          <li>Đề xuất DR plan đầy đủ cho 1 e-commerce SaaS với RPO &lt; 1min, RTO &lt; 5min. Liệt kê tools, schedule, runbook outline.</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-55\">14. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-56\">Quiz cuối Chương 12</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">pg_dump (logical) so với pg_basebackup (physical):</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: pg_dump nhanh hơn cho DB lớn\">pg_dump nhanh hơn cho DB lớn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hai cái giống nhau\">Hai cái giống nhau</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: pg_dump dùng cho cross-version migration; pg_basebackup nhanh hơn cho HA + PITR\">pg_dump dùng cho cross-version migration; pg_basebackup nhanh hơn cho HA + PITR</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: pg_basebackup chỉ backup schema\">pg_basebackup chỉ backup schema</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">pg_dump xuất SQL (chậm restore, cross-version OK). pg_basebackup copy file binary (nhanh restore, cùng version). Production thường dùng cả 2: physical hằng ngày, logical tuần.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">PITR (Point-in-Time Recovery) cần:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Chỉ pg_dump hằng ngày\">Chỉ pg_dump hằng ngày</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Base backup + WAL archive liên tục → restore base + replay WAL đến target time\">Base backup + WAL archive liên tục → restore base + replay WAL đến target time</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Trigger + log table\">Trigger + log table</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Snapshot ZFS hằng giờ\">Snapshot ZFS hằng giờ</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">PITR = base backup (snapshot 1 thời điểm) + tất cả WAL từ thời điểm đó tới target. Postgres replay WAL forward. Cho phép restore đến giây bất kỳ.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">\"Untested backup = no backup\" nghĩa là:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Backup phải encrypt\">Backup phải encrypt</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Backup chỉ là tùy chọn\">Backup chỉ là tùy chọn</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Backup phải nhanh\">Backup phải nhanh</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Phải định kỳ test restore — không restore thử thì không biết backup có dùng được\">Phải định kỳ test restore — không restore thử thì không biết backup có dùng được</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Backup không test = giả thuyết. Khi disaster đến, mới phát hiện file corrupt, version mismatch, missing role, runbook lỗi. Test định kỳ + DR drill.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">\"Expand &amp; Contract\" pattern cho schema migration:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Thêm cột/bảng mới song song với cũ → dual-write → backfill → switch reads → drop cũ\">Thêm cột/bảng mới song song với cũ → dual-write → backfill → switch reads → drop cũ</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: DROP rồi CREATE\">DROP rồi CREATE</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tắt app, ALTER, bật lại\">Tắt app, ALTER, bật lại</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Chỉ áp dụng cho NoSQL\">Chỉ áp dụng cho NoSQL</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Pattern phổ biến nhất cho zero-downtime migration. Mỗi bước app vẫn hoạt động (có thể đọc/ghi mới và cũ). Quan trọng cho rolling deploy + CI/CD.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">CREATE INDEX trên bảng prod nên:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tắt DB\">Tắt DB</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Lock toàn bảng\">Lock toàn bảng</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Dùng CONCURRENTLY — không block writes/reads\">Dùng CONCURRENTLY — không block writes/reads</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Dùng VACUUM FULL\">Dùng VACUUM FULL</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\"><code>CREATE INDEX CONCURRENTLY</code> 2-3× chậm hơn nhưng không block. Mặc định cho production. Nếu fail, index ở state \"INVALID\" → drop concurrently rồi tạo lại.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">PgBouncer transaction mode:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: 1 client giữ 1 server connection cả session\">1 client giữ 1 server connection cả session</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Server connection trả pool sau mỗi transaction → multiplex tốt nhưng break session-level state\">Server connection trả pool sau mỗi transaction → multiplex tốt nhưng break session-level state</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Mỗi statement trả pool\">Mỗi statement trả pool</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Random\">Random</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Transaction mode multiplex hiệu quả: 1000 client share 100 server connection. Tradeoff: SET, prepared statements (cũ), advisory lock session level không hoạt động vì server connection thay đổi giữa các transaction.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">FK NOT VALID + VALIDATE CONSTRAINT pattern:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Add FK instant (chỉ enforce dòng mới), validate dòng cũ sau với lock nhẹ — tránh lock dài bảng lớn\">Add FK instant (chỉ enforce dòng mới), validate dòng cũ sau với lock nhẹ — tránh lock dài bảng lớn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Bug\">Bug</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tắt FK\">Tắt FK</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Migration syntax\">Migration syntax</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Postgres ALTER TABLE ADD FK validate ngay → lock dài. <code>ADD CONSTRAINT ... NOT VALID</code> instant (chỉ enforce dòng mới). <code>VALIDATE CONSTRAINT</code> sau scan dòng cũ với SHARE UPDATE EXCLUSIVE — không block reads/writes.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Production checklist — đâu KHÔNG phải bắt buộc?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: pg_stat_statements enabled\">pg_stat_statements enabled</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Streaming replica với failover\">Streaming replica với failover</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: PgBouncer hoặc connection pooler\">PgBouncer hoặc connection pooler</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Mỗi cột phải có index riêng\">Mỗi cột phải có index riêng</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Index theo query thật, không index bừa. Mỗi index làm INSERT chậm + tốn disk. Setup quan sát + backup + HA mới là bắt buộc; index là theo workload.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        🎉 <strong>Hoàn thành toàn bộ 12 chương Database Mastery!</strong> Chúc mừng bạn đã đi qua hành trình từ Relational Model cơ bản đến Production-grade Database Engineering. Chúc bạn ứng dụng tốt vào dự án thật và phỏng vấn thành công.\n      </p>\n      <p>\n        ← <a href=\"/learn/database/\">Về lộ trình</a> · <a href=\"/learn/database/\">Đọc lại giáo trình tổng quan</a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Loại Backup",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "2. pg_dump — logical backup",
+      "depth": 2
+    },
+    {
+      "id": "section-3",
+      "text": "2.1. Restore",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "2.2. Pitfalls",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "3. pg_basebackup — physical backup",
+      "depth": 2
+    },
+    {
+      "id": "section-6",
+      "text": "3.1. Filesystem snapshot",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "4. Point-in-Time Recovery (PITR)",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "4.1. Cấu phần PITR",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "4.2. Setup WAL archive",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "4.3. Restore",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "4.4. Tools managed PITR",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "5. Test Backup — \"untested backup = no backup\"",
+      "depth": 2
+    },
+    {
+      "id": "section-13",
+      "text": "5.1. Schedule test định kỳ",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "5.2. RPO & RTO target",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "6. Disaster Recovery Plan",
+      "depth": 2
+    },
+    {
+      "id": "section-16",
+      "text": "7. Online Schema Migration — đau đầu thực sự",
+      "depth": 2
+    },
+    {
+      "id": "section-17",
+      "text": "7.1. Vì sao ALTER chậm?",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "7.2. Lock-light operations (Postgres 11+)",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "7.3. Quy trình \"expand & contract\"",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "8. Tools: pg_repack, gh-ost, pt-online-schema-change",
+      "depth": 2
+    },
+    {
+      "id": "section-21",
+      "text": "8.1. pg_repack (Postgres)",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "8.2. gh-ost (MySQL, Github's tool)",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "8.3. pt-online-schema-change (Percona, MySQL)",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "8.4. Postgres ALTER TABLE patterns thực tế",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "9. Migration patterns — thực hành",
+      "depth": 2
+    },
+    {
+      "id": "section-26",
+      "text": "9.1. Add column nullable",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "9.2. Add column NOT NULL với default",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "9.3. Drop column",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "9.4. Rename column",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "9.5. Change column type",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "9.6. Add index",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "9.7. Add foreign key",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "10. Connection Pooling — bắt buộc cho production",
+      "depth": 2
+    },
+    {
+      "id": "section-34",
+      "text": "10.1. PgBouncer",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "10.2. Pool modes",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "10.3. Khi nào không cần pooler?",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "11. Anti-patterns thường gặp",
+      "depth": 2
+    },
+    {
+      "id": "section-38",
+      "text": "11.1. N+1 query",
+      "depth": 3
+    },
+    {
+      "id": "section-39",
+      "text": "11.2. SELECT * everywhere",
+      "depth": 3
+    },
+    {
+      "id": "section-40",
+      "text": "11.3. Soft delete tràn lan",
+      "depth": 3
+    },
+    {
+      "id": "section-41",
+      "text": "11.4. UPDATE counter row mỗi request",
+      "depth": 3
+    },
+    {
+      "id": "section-42",
+      "text": "11.5. EAV ở mọi nơi",
+      "depth": 3
+    },
+    {
+      "id": "section-43",
+      "text": "11.6. Polymorphic FK",
+      "depth": 3
+    },
+    {
+      "id": "section-44",
+      "text": "11.7. Long-running transaction",
+      "depth": 3
+    },
+    {
+      "id": "section-45",
+      "text": "11.8. Index trên mọi cột",
+      "depth": 3
+    },
+    {
+      "id": "section-46",
+      "text": "11.9. Không monitoring",
+      "depth": 3
+    },
+    {
+      "id": "section-47",
+      "text": "12. Production Checklist — DB sẵn sàng cho prod",
+      "depth": 2
+    },
+    {
+      "id": "section-48",
+      "text": "12.1. Cấu hình",
+      "depth": 3
+    },
+    {
+      "id": "section-49",
+      "text": "12.2. Backup & DR",
+      "depth": 3
+    },
+    {
+      "id": "section-50",
+      "text": "12.3. HA",
+      "depth": 3
+    },
+    {
+      "id": "section-51",
+      "text": "12.4. Monitoring",
+      "depth": 3
+    },
+    {
+      "id": "section-52",
+      "text": "12.5. Security",
+      "depth": 3
+    },
+    {
+      "id": "section-53",
+      "text": "12.6. Schema & Code",
+      "depth": 3
+    },
+    {
+      "id": "section-54",
+      "text": "13. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-55",
+      "text": "14. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-56",
+      "text": "Quiz cuối Chương 12",
+      "depth": 3
+    }
+  ],
+  "source": "Database/chuong/chuong12.html",
+  "sourceHash": "5618969544bb083178846b87653d9dac7b11b3d72f9714c29d918f1fc43d05a4",
+  "readingMinutes": 12
+}

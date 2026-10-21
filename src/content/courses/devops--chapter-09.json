@@ -1,0 +1,275 @@
+{
+  "id": "devops--chapter-09",
+  "track": "devops",
+  "trackTitle": "DevOps Engineering",
+  "slug": "chapter-09",
+  "order": 9,
+  "title": "Configuration Management & Secrets",
+  "description": "Tách config khỏi code (12-Factor App). Ansible — workhorse cho server config. Vault, AWS Secrets Manager, GCP Secret Manager — quản lý secret nghiêm túc. GitOps với ArgoCD/Flux — Git là source of truth, agent sync về cluster.",
+  "html": "\n\n      <section id=\"12-factor\">\n        <h2 id=\"section-1\">1. The Twelve-Factor App</h2>\n\n        <p>2011, Heroku xuất bản <strong>12-Factor App</strong> (12factor.net) — 12 nguyên lý xây cloud-native app. Vẫn relevant 2026.</p>\n\n        <ol class=\"steps\">\n          <li><strong>Codebase</strong> — 1 codebase tracked in Git, nhiều deploy.</li>\n          <li><strong>Dependencies</strong> — declare explicitly (package.json, requirements.txt), không phụ thuộc system-wide.</li>\n          <li><strong>Config</strong> — store in environment variables, KHÔNG hardcode trong code.</li>\n          <li><strong>Backing services</strong> — DB, cache, queue là attached resources, swappable qua URL/config.</li>\n          <li><strong>Build, release, run</strong> — strictly separate stages.</li>\n          <li><strong>Processes</strong> — execute as stateless processes (state ở backing service).</li>\n          <li><strong>Port binding</strong> — service self-contained, expose via port (không dependent web server external).</li>\n          <li><strong>Concurrency</strong> — scale out via process model.</li>\n          <li><strong>Disposability</strong> — fast startup, graceful shutdown.</li>\n          <li><strong>Dev/prod parity</strong> — keep environments similar (cùng OS, DB version).</li>\n          <li><strong>Logs</strong> — treat as event streams, write to stdout/stderr.</li>\n          <li><strong>Admin processes</strong> — run admin tasks (migration) as one-off processes.</li>\n        </ol>\n\n        <p>Factor 3 (Config) là tâm điểm chương này.</p>\n      </section>\n\n      <section id=\"config-vs-code\">\n        <h2 id=\"section-2\">2. Config tách khỏi code — Vì sao?</h2>\n\n        <h3 id=\"section-3\">2.1. Anti-pattern: hardcode</h3>\n\n<pre><code class=\"language-typescript\">// ❌ BAD\nconst db = new Pool({\n  host: 'prod-db.example.com',\n  port: 5432,\n  user: 'admin',\n  password: 'P@ssw0rd123!',                    // SECRET in code!\n});\n\nconst apiKey = 'sk_live_4xPdL3...';            // SECRET in code!\n</code></pre>\n\n        <p>Vấn đề:</p>\n        <ul>\n          <li>Secret leak qua git push (vĩnh viễn trong history).</li>\n          <li>Cannot reuse code giữa env (dev/staging/prod).</li>\n          <li>Developer không nên thấy prod password.</li>\n          <li>Đổi password = redeploy.</li>\n        </ul>\n\n        <h3 id=\"section-4\">2.2. Pattern đúng: Environment Variables</h3>\n\n<pre><code class=\"language-typescript\">// ✓ GOOD\nconst db = new Pool({\n  host: process.env.DB_HOST,\n  port: parseInt(process.env.DB_PORT ?? '5432'),\n  user: process.env.DB_USER,\n  password: process.env.DB_PASSWORD,\n});\n\nconst apiKey = process.env.STRIPE_API_KEY;\n\nif (!apiKey) {\n  throw new Error('STRIPE_API_KEY required');\n}\n</code></pre>\n\n        <p>Env vars set khi deploy:</p>\n\n<pre><code class=\"language-bash\"># Local dev — .env file (gitignored)\nDB_HOST=localhost\nDB_USER=app\nDB_PASSWORD=devpass\nSTRIPE_API_KEY=sk_test_xxx\n\n# Production — set qua secret manager (xem section 7-9)\n</code></pre>\n\n        <h3 id=\"section-5\">2.3. Config types</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Type</th><th>Storage</th><th>Examples</th></tr></thead>\n          <tbody>\n            <tr><td>Code</td><td>Git (commit)</td><td>Business logic, framework</td></tr>\n            <tr><td>Config</td><td>Env vars / ConfigMap (commit)</td><td>LOG_LEVEL, FEATURE_FLAGS, region</td></tr>\n            <tr><td>Secret</td><td>Secret manager (NEVER commit)</td><td>API key, DB password, JWT secret</td></tr>\n            <tr><td>Data</td><td>DB / object storage</td><td>User data, files</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-6\">2.4. Config best practices</h3>\n\n        <ol>\n          <li>Validate config at startup — fail fast nếu thiếu.</li>\n          <li>Type-safe config (TypeScript, Zod, Pydantic).</li>\n          <li>Different env values: dev .env, staging via CI, prod via secret manager.</li>\n          <li>Document required vars (README, .env.example).</li>\n          <li>Rotate secret regularly (90 days).</li>\n        </ol>\n      </section>\n\n      <section id=\"ansible\">\n        <h2 id=\"section-7\">3. Ansible — Configuration Management</h2>\n\n        <h3 id=\"section-8\">3.1. Vì sao Ansible?</h3>\n\n        <p>IaC (Terraform) tạo <em>infrastructure</em> (VM, network). Còn <em>cài software trên VM</em> (nginx, fluent-bit, monitoring agent), <em>cấu hình OS</em> (firewall, sysctl), <em>deploy app</em>? Đó là <strong>configuration management</strong>.</p>\n\n        <p>Ansible (Red Hat, 2012):</p>\n        <ul>\n          <li><strong>Agentless</strong> — chỉ cần SSH, không cài daemon trên target.</li>\n          <li><strong>YAML</strong> — declarative playbook.</li>\n          <li><strong>Idempotent</strong> — chạy nhiều lần OK.</li>\n          <li><strong>1500+ modules</strong> — apt, yum, file, service, user, ...</li>\n        </ul>\n\n        <h3 id=\"section-9\">3.2. Cài</h3>\n\n<pre><code class=\"language-bash\">pip install ansible\nansible --version\n\n# Hoặc\nbrew install ansible\n</code></pre>\n\n        <h3 id=\"section-10\">3.3. Inventory — danh sách host</h3>\n\n<pre><code class=\"language-ini\"># inventory.ini\n[web]\nweb1.example.com\nweb2.example.com\nweb3.example.com\n\n[db]\ndb.example.com\n\n[all:vars]\nansible_user=ubuntu\nansible_ssh_private_key_file=~/.ssh/id_ed25519\n</code></pre>\n\n<pre><code class=\"language-yaml\"># inventory.yml — recommended (more features)\nall:\n  children:\n    web:\n      hosts:\n        web1:\n          ansible_host: 10.0.1.10\n        web2:\n          ansible_host: 10.0.1.11\n    db:\n      hosts:\n        db1:\n          ansible_host: 10.0.10.10\n  vars:\n    ansible_user: ubuntu\n</code></pre>\n\n        <h3 id=\"section-11\">3.4. Ad-hoc commands</h3>\n\n<pre><code class=\"language-bash\"># Ping all hosts\nansible all -i inventory.ini -m ping\n\n# Run command\nansible web -i inventory.ini -m shell -a \"uptime\"\n\n# Copy file\nansible web -m copy -a \"src=app.conf dest=/etc/app/app.conf owner=root mode=0644\"\n\n# Install package\nansible web -m apt -a \"name=nginx state=present\" --become\n</code></pre>\n\n        <p><code>--become</code> = sudo. <code>-m</code> = module name.</p>\n      </section>\n\n      <section id=\"playbook\">\n        <h2 id=\"section-12\">4. Playbooks &amp; Roles</h2>\n\n        <h3 id=\"section-13\">4.1. Playbook đầu tiên</h3>\n\n<pre><code class=\"language-yaml\"># playbook.yml\n---\n- name: Setup web server\n  hosts: web\n  become: yes\n  vars:\n    nginx_version: \"1.24\"\n    app_dir: /opt/myapp\n\n  tasks:\n    - name: Update apt cache\n      apt:\n        update_cache: yes\n        cache_valid_time: 3600\n\n    - name: Install dependencies\n      apt:\n        name:\n          - nginx\n          - curl\n          - htop\n        state: present\n\n    - name: Create app user\n      user:\n        name: myapp\n        system: yes\n        shell: /bin/false\n\n    - name: Create app directory\n      file:\n        path: \"{{ app_dir }}\"\n        state: directory\n        owner: myapp\n        group: myapp\n        mode: '0755'\n\n    - name: Copy nginx config\n      template:\n        src: nginx.conf.j2\n        dest: /etc/nginx/sites-available/myapp\n        mode: '0644'\n      notify: reload nginx\n\n    - name: Enable nginx site\n      file:\n        src: /etc/nginx/sites-available/myapp\n        dest: /etc/nginx/sites-enabled/myapp\n        state: link\n      notify: reload nginx\n\n    - name: Start nginx\n      service:\n        name: nginx\n        state: started\n        enabled: yes\n\n  handlers:\n    - name: reload nginx\n      service:\n        name: nginx\n        state: reloaded\n</code></pre>\n\n<pre><code class=\"language-bash\"># Run\nansible-playbook -i inventory.ini playbook.yml\n\n# Dry-run (check mode)\nansible-playbook -i inventory.ini playbook.yml --check --diff\n\n# Limit hosts\nansible-playbook playbook.yml --limit web1\n</code></pre>\n\n        <h3 id=\"section-14\">4.2. Variables &amp; Templates (Jinja2)</h3>\n\n<pre><code class=\"language-jinja\"># templates/nginx.conf.j2\nupstream backend {\n{% for host in groups['web'] %}\n    server {{ hostvars[host]['ansible_host'] }}:3000;\n{% endfor %}\n}\n\nserver {\n    listen 80;\n    server_name {{ domain_name | default('example.com') }};\n\n    location / {\n        proxy_pass http://backend;\n        proxy_set_header Host $host;\n    }\n\n    {% if enable_ssl | default(false) %}\n    listen 443 ssl;\n    ssl_certificate {{ ssl_cert_path }};\n    ssl_certificate_key {{ ssl_key_path }};\n    {% endif %}\n}\n</code></pre>\n\n        <h3 id=\"section-15\">4.3. Roles — reusable playbook</h3>\n\n<pre><code>roles/\n├── nginx/\n│   ├── defaults/main.yml      # default vars (lowest priority)\n│   ├── vars/main.yml          # vars (higher priority)\n│   ├── tasks/main.yml         # main task list\n│   ├── handlers/main.yml      # handler list\n│   ├── templates/             # jinja2 templates\n│   ├── files/                 # static files\n│   └── meta/main.yml          # dependencies\n└── postgres/\n    └── ...\n</code></pre>\n\n<pre><code class=\"language-yaml\"># site.yml — top-level\n- name: Configure web tier\n  hosts: web\n  become: yes\n  roles:\n    - common\n    - nginx\n    - { role: monitoring, agent_type: prometheus }\n\n- name: Configure DB tier\n  hosts: db\n  become: yes\n  roles:\n    - common\n    - postgres\n</code></pre>\n\n        <h3 id=\"section-16\">4.4. Ansible Vault — encrypt secret in repo</h3>\n\n<pre><code class=\"language-bash\"># Tạo file encrypted\nansible-vault create secrets.yml\n# Editor mở, type secrets:\n# db_password: secret123\n\n# View\nansible-vault view secrets.yml\n\n# Edit\nansible-vault edit secrets.yml\n\n# Encrypt existing file\nansible-vault encrypt vars.yml\n\n# Decrypt\nansible-vault decrypt secrets.yml\n\n# Run với password\nansible-playbook playbook.yml --ask-vault-pass\nansible-playbook playbook.yml --vault-password-file=~/.vault_pass\n</code></pre>\n\n        <p>Pattern: vault password ở 1Password / env var, không commit. Secrets.yml encrypted commit OK.</p>\n\n        <h3 id=\"section-17\">4.5. Ansible Galaxy — community roles</h3>\n\n<pre><code class=\"language-bash\"># Cài role từ Galaxy\nansible-galaxy install geerlingguy.nginx\nansible-galaxy install geerlingguy.postgresql\n\n# requirements.yml\nansible-galaxy install -r requirements.yml\n</code></pre>\n      </section>\n\n      <section id=\"alternatives-cm\">\n        <h2 id=\"section-18\">5. Alternatives — Chef, Puppet, Salt</h2>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Tool</th><th>Approach</th><th>Language</th><th>Notes</th></tr></thead>\n          <tbody>\n            <tr>\n              <td><strong>Ansible</strong></td>\n              <td>Push (SSH), agentless</td>\n              <td>YAML</td>\n              <td>Most popular, dễ học</td>\n            </tr>\n            <tr>\n              <td><strong>Chef</strong></td>\n              <td>Pull, agent-based</td>\n              <td>Ruby DSL</td>\n              <td>Mature, enterprise; learning curve cao</td>\n            </tr>\n            <tr>\n              <td><strong>Puppet</strong></td>\n              <td>Pull, agent-based</td>\n              <td>Puppet DSL</td>\n              <td>Mature, enterprise; declarative</td>\n            </tr>\n            <tr>\n              <td><strong>Salt</strong></td>\n              <td>Push or pull</td>\n              <td>YAML + Python</td>\n              <td>Fast (ZeroMQ), event-driven</td>\n            </tr>\n          </tbody>\n        </table></div>\n\n        <p>Trend modern: container-first → ít nhu cầu CM cho VM. Ansible vẫn relevant cho:</p>\n        <ul>\n          <li>VM bare metal / on-prem.</li>\n          <li>Network device (Cisco, Juniper).</li>\n          <li>Cloud day-1 setup (initial bootstrap K8s, install ops tools).</li>\n          <li>Application deployment ngoài K8s.</li>\n        </ul>\n\n        <h3 id=\"section-19\">5.1. Cloud-init — alternative cho cloud</h3>\n\n<pre><code class=\"language-yaml\">#cloud-config\npackage_update: true\npackages:\n  - nginx\n  - htop\n\nwrite_files:\n  - path: /etc/nginx/sites-available/myapp\n    content: |\n      server {\n        listen 80;\n        location / { proxy_pass http://localhost:3000; }\n      }\n\nruncmd:\n  - ln -sf /etc/nginx/sites-available/myapp /etc/nginx/sites-enabled/\n  - systemctl reload nginx\n</code></pre>\n\n        <p>cloud-init chạy 1 lần khi VM boot lần đầu — bootstrap đơn giản. Sau đó dùng Ansible cho ongoing changes.</p>\n\n        <h3 id=\"section-20\">5.2. Image-based pattern (immutable)</h3>\n\n        <p>Modern best practice: thay sửa server đang chạy → bake image với Packer + redeploy.</p>\n\n<pre><code class=\"language-hcl\"># packer/web.pkr.hcl\nsource \"amazon-ebs\" \"web\" {\n  ami_name      = \"myapp-web-{{ timestamp }}\"\n  instance_type = \"t3.medium\"\n  region        = \"us-east-1\"\n  source_ami    = \"ami-...\"\n  ssh_username  = \"ubuntu\"\n}\n\nbuild {\n  sources = [\"source.amazon-ebs.web\"]\n\n  provisioner \"ansible\" {\n    playbook_file = \"ansible/web.yml\"\n  }\n}\n</code></pre>\n\n        <p>Workflow: Packer + Ansible → tạo AMI → ASG launch instance từ AMI mới → rolling update. <em>Immutable infrastructure</em>.</p>\n      </section>\n\n      <section id=\"secrets-problem\">\n        <h2 id=\"section-21\">6. Secrets — Vấn đề thật</h2>\n\n        <h3 id=\"section-22\">6.1. Common mistakes</h3>\n\n        <ul>\n          <li>Hardcode trong code.</li>\n          <li>Commit .env vào Git.</li>\n          <li>Slack/Email với password.</li>\n          <li>Lưu secret trong CI variable plaintext.</li>\n          <li>Long-lived API key, không rotate.</li>\n          <li>Cùng password cho nhiều env (dev = prod).</li>\n          <li>Print secret vào CI log.</li>\n        </ul>\n\n        <h3 id=\"section-23\">6.2. Hậu quả secret leak</h3>\n\n        <ul>\n          <li>Cloud bill $100k qua đêm (crypto miner trên AWS với leaked key).</li>\n          <li>DB exfiltrate.</li>\n          <li>GDPR fine.</li>\n          <li>Reputation damage.</li>\n        </ul>\n\n        <p>2024 GitGuardian report: 12.8M secrets leak qua public GitHub repos. AWS keys, Stripe key, OpenAI key thường gặp.</p>\n\n        <h3 id=\"section-24\">6.3. Best practices</h3>\n\n        <ol class=\"steps\">\n          <li><strong>Never commit</strong> — gitleaks, trufflehog scan trong pre-commit + CI.</li>\n          <li><strong>Centralized secret manager</strong> — Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault.</li>\n          <li><strong>Short-lived</strong> — IAM Role + STS thay long-lived key. OIDC (xem chương 4).</li>\n          <li><strong>Rotation</strong> — auto rotate every 90 days.</li>\n          <li><strong>Audit</strong> — log mọi access secret.</li>\n          <li><strong>Least privilege</strong> — mỗi service chỉ truy cập secret cần.</li>\n          <li><strong>Encryption-at-rest + in-transit</strong>.</li>\n          <li><strong>Detect leak</strong> — GitGuardian, GitHub Secret Scanning.</li>\n        </ol>\n\n        <h3 id=\"section-25\">6.4. Phản ứng khi secret leak</h3>\n\n        <ol>\n          <li><strong>Rotate immediately</strong> — invalidate key cũ, tạo mới.</li>\n          <li><strong>Audit logs</strong> — kiểm tra dùng đến đâu.</li>\n          <li><strong>Notify</strong> — security team, downstream services.</li>\n          <li><strong>Fix root cause</strong> — script leak, dev workflow, ...</li>\n          <li><strong>Postmortem</strong>.</li>\n        </ol>\n\n        <div class=\"callout callout-warn\">\n          <span class=\"callout-title\">CRITICAL</span>\n          Secret commit vào Git = secret <em>vĩnh viễn</em> trong history. <code>git rebase</code> remove file KHÔNG xóa từ history hoàn toàn (force push + clone reset). Phải:\n          <ul>\n            <li><strong>Rotate secret ngay</strong> (assume compromised).</li>\n            <li>BFG Repo-Cleaner / git-filter-repo để rewrite history (drastic, break clones).</li>\n          </ul>\n        </div>\n      </section>\n\n      <section id=\"vault\">\n        <h2 id=\"section-26\">7. HashiCorp Vault — Industry Standard</h2>\n\n        <h3 id=\"section-27\">7.1. Vault concepts</h3>\n\n        <ul>\n          <li><strong>Secrets engines</strong> — KV (key-value), database (dynamic creds), AWS, PKI, transit (encryption-as-a-service), ...</li>\n          <li><strong>Auth methods</strong> — token, AppRole, K8s, AWS IAM, JWT/OIDC, LDAP, ...</li>\n          <li><strong>Policies</strong> — HCL, control access (path-based).</li>\n          <li><strong>Audit log</strong> — log mọi request.</li>\n          <li><strong>Seal/Unseal</strong> — Vault encrypted at rest, unseal qua Shamir's secret sharing.</li>\n        </ul>\n\n        <h3 id=\"section-28\">7.2. Setup Vault dev</h3>\n\n<pre><code class=\"language-bash\"># Cài\nbrew install vault\n\n# Dev mode (NEVER in prod — không persist)\nvault server -dev\n# Output:\n# Root Token: hvs.xxx...\n# Unseal Key: ...\n\nexport VAULT_ADDR='http://127.0.0.1:8200'\nexport VAULT_TOKEN='hvs.xxx'\n\nvault status\n</code></pre>\n\n        <h3 id=\"section-29\">7.3. KV secrets</h3>\n\n<pre><code class=\"language-bash\"># KV v2\nvault kv put secret/myapp/prod \\\n  db_password=secret123 \\\n  api_key=sk_live_xxx \\\n  jwt_secret=$(openssl rand -hex 32)\n\nvault kv get secret/myapp/prod\nvault kv get -field=db_password secret/myapp/prod\nvault kv get -format=json secret/myapp/prod\n\n# Versioning\nvault kv get -version=1 secret/myapp/prod\nvault kv rollback -version=2 secret/myapp/prod\n\n# Delete + undelete\nvault kv delete secret/myapp/prod\nvault kv undelete -versions=3 secret/myapp/prod\n</code></pre>\n\n        <h3 id=\"section-30\">7.4. Policies</h3>\n\n<pre><code class=\"language-hcl\"># myapp-policy.hcl\npath \"secret/data/myapp/prod\" {\n  capabilities = [\"read\"]\n}\n\npath \"secret/metadata/myapp/prod\" {\n  capabilities = [\"list\", \"read\"]\n}\n\n# Database dynamic secret\npath \"database/creds/myapp-readonly\" {\n  capabilities = [\"read\"]\n}\n</code></pre>\n\n<pre><code class=\"language-bash\">vault policy write myapp myapp-policy.hcl\nvault policy list\nvault policy read myapp\n</code></pre>\n\n        <h3 id=\"section-31\">7.5. AppRole auth (for app)</h3>\n\n<pre><code class=\"language-bash\"># Enable AppRole\nvault auth enable approle\n\n# Create role\nvault write auth/approle/role/myapp \\\n  policies=\"myapp\" \\\n  token_ttl=1h \\\n  token_max_ttl=24h\n\n# Get role_id (commit OK, like username)\nvault read auth/approle/role/myapp/role-id\n\n# Get secret_id (DON'T commit — like password)\nvault write -f auth/approle/role/myapp/secret-id\n</code></pre>\n\n<pre><code class=\"language-typescript\">// App login + read secret\nimport vault from 'node-vault';\n\nconst client = vault({ endpoint: 'http://vault:8200' });\n\n// Login\nconst { auth } = await client.approleLogin({\n  role_id: process.env.VAULT_ROLE_ID,\n  secret_id: process.env.VAULT_SECRET_ID,\n});\n\nclient.token = auth.client_token;\n\n// Read secret\nconst { data } = await client.read('secret/data/myapp/prod');\nconst dbPassword = data.data.db_password;\n</code></pre>\n\n        <h3 id=\"section-32\">7.6. Database dynamic secret — game changer</h3>\n\n<pre><code class=\"language-bash\"># Enable database secrets engine\nvault secrets enable database\n\n# Configure Postgres\nvault write database/config/myapp-db \\\n  plugin_name=postgresql-database-plugin \\\n  allowed_roles=\"myapp-readonly\" \\\n  connection_url=\"postgresql://{{username}}:{{password}}@db:5432/myapp\" \\\n  username=\"vault\" password=\"vault_master_password\"\n\n# Define role\nvault write database/roles/myapp-readonly \\\n  db_name=myapp-db \\\n  creation_statements=\"CREATE ROLE \\\"{{name}}\\\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; \\\n                        GRANT SELECT ON ALL TABLES IN SCHEMA public TO \\\"{{name}}\\\";\" \\\n  default_ttl=\"1h\" \\\n  max_ttl=\"24h\"\n\n# App đọc credentials → Vault tự CREATE USER với password random, TTL 1h\nvault read database/creds/myapp-readonly\n# Key            Value\n# username       v-myapp-readonly-AbCd1234...\n# password       random_strong_pass\n# lease_duration 1h\n</code></pre>\n\n        <p>Lợi ích: mỗi app instance có credential riêng, tự expire — không có credential static để leak.</p>\n      </section>\n\n      <section id=\"cloud-secrets\">\n        <h2 id=\"section-33\">8. Cloud Secret Managers</h2>\n\n        <h3 id=\"section-34\">8.1. AWS Secrets Manager</h3>\n\n<pre><code class=\"language-bash\"># Tạo secret\naws secretsmanager create-secret \\\n  --name prod/myapp/db \\\n  --secret-string '{\"username\":\"app\",\"password\":\"secret123\"}'\n\n# Read\naws secretsmanager get-secret-value --secret-id prod/myapp/db\n\n# Update\naws secretsmanager update-secret \\\n  --secret-id prod/myapp/db \\\n  --secret-string '{\"username\":\"app\",\"password\":\"newpass\"}'\n\n# Auto rotation (Lambda rotate secret, update DB password)\naws secretsmanager rotate-secret \\\n  --secret-id prod/myapp/db \\\n  --rotation-lambda-arn arn:aws:lambda:...\n</code></pre>\n\n        <p>Pricing: $0.40/secret/month + $0.05/10k API call.</p>\n\n        <h3 id=\"section-35\">8.2. AWS Parameter Store (Systems Manager)</h3>\n\n<pre><code class=\"language-bash\"># String / SecureString\naws ssm put-parameter \\\n  --name /myapp/prod/db_password \\\n  --value secret123 \\\n  --type SecureString\n\naws ssm get-parameter --name /myapp/prod/db_password --with-decryption\n</code></pre>\n\n        <p>Cheaper alternative: Standard parameter free, advanced $0.05/10k.</p>\n\n        <h3 id=\"section-36\">8.3. GCP Secret Manager</h3>\n\n<pre><code class=\"language-bash\">gcloud secrets create myapp-db-password \\\n  --data-file=- &lt;&lt;&lt; \"secret123\"\n\ngcloud secrets versions access latest --secret=myapp-db-password\n</code></pre>\n\n        <h3 id=\"section-37\">8.4. Azure Key Vault</h3>\n\n<pre><code class=\"language-bash\">az keyvault create --name myKeyVault --resource-group myRG --location eastus\n\naz keyvault secret set --vault-name myKeyVault \\\n  --name db-password \\\n  --value secret123\n\naz keyvault secret show --vault-name myKeyVault --name db-password\n</code></pre>\n\n        <h3 id=\"section-38\">8.5. Đọc secret từ K8s — External Secrets Operator</h3>\n\n<pre><code class=\"language-yaml\">apiVersion: external-secrets.io/v1beta1\nkind: ClusterSecretStore\nmetadata:\n  name: aws-secrets\nspec:\n  provider:\n    aws:\n      service: SecretsManager\n      region: us-east-1\n      auth:\n        jwt:\n          serviceAccountRef:\n            name: external-secrets-sa     # IRSA cho SA này\n\n---\napiVersion: external-secrets.io/v1beta1\nkind: ExternalSecret\nmetadata:\n  name: app-secrets\n  namespace: production\nspec:\n  refreshInterval: 1h\n  secretStoreRef:\n    name: aws-secrets\n    kind: ClusterSecretStore\n  target:\n    name: app-secrets                       # K8s Secret được tạo\n  data:\n    - secretKey: db-password\n      remoteRef:\n        key: prod/myapp/db\n        property: password\n    - secretKey: api-key\n      remoteRef:\n        key: prod/myapp/api\n</code></pre>\n\n        <p>ESO sync từ Secrets Manager → tạo K8s Secret. Pod mount Secret. Source of truth ở Secrets Manager (audit, rotation).</p>\n      </section>\n\n      <section id=\"sealed\">\n        <h2 id=\"section-39\">9. Sealed Secrets / SOPS — Encrypt secret trong Git</h2>\n\n        <p>GitOps yêu cầu mọi config trong Git. Nhưng plaintext secret trong Git = dead. Solution: encrypt secret trước khi commit.</p>\n\n        <h3 id=\"section-40\">9.1. Sealed Secrets (Bitnami)</h3>\n\n<pre><code class=\"language-bash\"># Cài controller trên cluster\nhelm install sealed-secrets sealed-secrets/sealed-secrets\n\n# Cài CLI\nbrew install kubeseal\n\n# Tạo Secret bình thường\necho -n 'secret123' | kubectl create secret generic db-pw \\\n  --dry-run=client --from-file=password=/dev/stdin -o yaml &gt; secret.yaml\n\n# Encrypt với public key của controller (trên cluster)\nkubeseal -o yaml &lt; secret.yaml &gt; sealed-secret.yaml\n\n# Now commit sealed-secret.yaml vào Git — safe!\n# Khi apply lên cluster, controller decrypt với private key\nkubectl apply -f sealed-secret.yaml\n</code></pre>\n\n        <h3 id=\"section-41\">9.2. SOPS (Mozilla)</h3>\n\n<pre><code class=\"language-bash\">brew install sops\n\n# Encrypt với KMS / age / PGP\nexport SOPS_KMS_ARN=\"arn:aws:kms:us-east-1:...\"\nsops -e secrets.yaml &gt; secrets.enc.yaml\n\n# Edit (decrypt + edit + encrypt)\nsops secrets.enc.yaml\n\n# Decrypt for use\nsops -d secrets.enc.yaml\n</code></pre>\n\n        <p>SOPS phổ biến vì: support YAML/JSON/ENV, integrate với Helm Secrets, Terraform, ArgoCD.</p>\n\n        <h3 id=\"section-42\">9.3. age — modern alternative GPG</h3>\n\n<pre><code class=\"language-bash\">age-keygen -o key.txt\n# AGE-SECRET-KEY-1...\n# Public: age1xxx...\n\n# Encrypt\nage -r age1xxx -o secrets.age secrets.txt\n\n# Decrypt\nage -d -i key.txt secrets.age\n</code></pre>\n      </section>\n\n      <section id=\"gitops\">\n        <h2 id=\"section-43\">10. GitOps — ArgoCD &amp; Flux</h2>\n\n        <h3 id=\"section-44\">10.1. GitOps là gì?</h3>\n\n        <p>GitOps (Weaveworks 2017) — pattern dùng Git làm <strong>single source of truth</strong> cho infrastructure + app:</p>\n\n        <ol>\n          <li>Mọi desired state declarative trong Git (K8s YAML, Helm chart, Kustomize).</li>\n          <li>Agent trong cluster <em>pull</em> from Git → apply.</li>\n          <li>Drift detection: agent compare Git ↔ cluster, alert/auto-fix.</li>\n          <li>Rollback = git revert.</li>\n        </ol>\n\n        <h3 id=\"section-45\">10.2. Push vs Pull</h3>\n\n        <div class=\"compare\">\n          <div>\n            <h4>Push (CI deploy)</h4>\n            <ul>\n              <li>CI có credential cluster</li>\n              <li>CI gọi <code>kubectl apply</code></li>\n              <li>Cluster bị động</li>\n              <li>Nếu CI bị compromise → cluster compromise</li>\n            </ul>\n          </div>\n          <div>\n            <h4>Pull (GitOps)</h4>\n            <ul>\n              <li>Agent trong cluster, pull từ Git</li>\n              <li>Cluster credential không out</li>\n              <li>Drift auto-detect/fix</li>\n              <li>Audit qua Git history</li>\n            </ul>\n          </div>\n        </div>\n\n        <h3 id=\"section-46\">10.3. ArgoCD</h3>\n\n<pre><code class=\"language-bash\"># Cài ArgoCD\nkubectl create namespace argocd\nkubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml\n\n# Get admin password\nkubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d\n\n# Port-forward UI\nkubectl port-forward svc/argocd-server -n argocd 8080:443\n# https://localhost:8080\n</code></pre>\n\n<pre><code class=\"language-yaml\"># Application manifest\napiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: myapp\n  namespace: argocd\nspec:\n  project: default\n  source:\n    repoURL: https://github.com/me/k8s-manifests.git\n    targetRevision: main\n    path: manifests/production\n  destination:\n    server: https://kubernetes.default.svc\n    namespace: production\n  syncPolicy:\n    automated:\n      prune: true              # delete resource khi xóa từ Git\n      selfHeal: true           # revert manual changes về Git state\n    syncOptions:\n      - CreateNamespace=true\n</code></pre>\n\n        <p>Với <code>automated.selfHeal: true</code>: nếu ai <code>kubectl edit</code> trên cluster, ArgoCD revert về Git state trong vài giây.</p>\n\n        <h3 id=\"section-47\">10.4. App-of-apps pattern</h3>\n\n<pre><code class=\"language-yaml\">apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: bootstrap\nspec:\n  source:\n    repoURL: https://github.com/me/k8s-manifests.git\n    path: bootstrap/                   # folder chứa Application manifests khác\n  destination:\n    server: https://kubernetes.default.svc\n    namespace: argocd\n  syncPolicy:\n    automated: {}\n</code></pre>\n\n        <p>1 Application \"bootstrap\" deploy nhiều Application khác → manage cluster declaratively.</p>\n\n        <h3 id=\"section-48\">10.5. Flux v2</h3>\n\n<pre><code class=\"language-bash\"># Install\nflux bootstrap github \\\n  --owner=$GITHUB_USER \\\n  --repository=fleet-infra \\\n  --branch=main \\\n  --path=clusters/prod \\\n  --personal\n</code></pre>\n\n<pre><code class=\"language-yaml\">apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: myapp\n  namespace: flux-system\nspec:\n  interval: 1m\n  url: https://github.com/me/myapp-config\n  ref:\n    branch: main\n\n---\napiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: myapp\n  namespace: flux-system\nspec:\n  interval: 5m\n  path: ./manifests\n  prune: true\n  sourceRef:\n    kind: GitRepository\n    name: myapp\n</code></pre>\n\n        <h3 id=\"section-49\">10.6. ArgoCD vs Flux</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Feature</th><th>ArgoCD</th><th>Flux</th></tr></thead>\n          <tbody>\n            <tr><td>UI</td><td>Đẹp, app-centric</td><td>Limited</td></tr>\n            <tr><td>Multi-tenancy</td><td>Project, RBAC</td><td>Notifications + Helm</td></tr>\n            <tr><td>App-of-apps</td><td>Native</td><td>Kustomization composition</td></tr>\n            <tr><td>Helm/Kustomize</td><td>Both</td><td>Both</td></tr>\n            <tr><td>Image automation</td><td>Plugin</td><td>Native (Image Reflector)</td></tr>\n            <tr><td>Maturity</td><td>Stable, popular</td><td>Stable, CNCF graduated</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>Cả 2 đều CNCF graduated. ArgoCD UI tốt hơn → phổ biến hơn ở team có nhiều app. Flux đơn giản hơn cho infrastructure.</p>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-50\">11. Bài tập</h2>\n\n        <ol>\n          <li><strong>12-Factor audit</strong>: review 1 app bạn maintain. Check 12 factors. Yếu tố nào violate? Plan fix.</li>\n\n          <li><strong>Ansible inventory + ping</strong>: setup 3 VM (cloud hoặc local). Ansible inventory. <code>ansible all -m ping</code>.</li>\n\n          <li><strong>Web server playbook</strong>: viết playbook install nginx + custom config + start service. Test idempotent (chạy 2 lần OK).</li>\n\n          <li><strong>Roles</strong>: refactor playbook trên thành role. Tạo role thứ 2 (postgres). site.yml combine.</li>\n\n          <li><strong>Ansible Vault</strong>: encrypt vars file chứa db password. Run playbook với --ask-vault-pass.</li>\n\n          <li><strong>Vault dev</strong>: setup Vault dev mode. Store secret (db_password). Read qua API.</li>\n\n          <li><strong>Vault AppRole</strong>: tạo role \"myapp\", policy chỉ read 1 secret. Đọc secret từ Node.js/Python qua AppRole login.</li>\n\n          <li><strong>Dynamic DB credential</strong>: setup Vault database secrets engine với Postgres. Verify mỗi <code>vault read</code> tạo user mới với TTL.</li>\n\n          <li><strong>AWS Secrets Manager</strong>: store DB credential. Lambda đọc secret. Setup auto-rotation Lambda.</li>\n\n          <li><strong>External Secrets Operator</strong>: cài ESO trên K8s. Tạo ExternalSecret sync từ AWS Secrets Manager → K8s Secret.</li>\n\n          <li><strong>Sealed Secrets</strong>: encrypt secret bằng kubeseal. Commit sealed-secret.yaml vào Git. Apply, verify Secret được tạo.</li>\n\n          <li><strong>SOPS</strong>: encrypt secrets.yaml với SOPS + age. Decrypt khi cần. Integrate với Helm Secrets.</li>\n\n          <li><strong>ArgoCD setup</strong>: cài ArgoCD, tạo Application trỏ Git repo. Push commit → verify ArgoCD auto-sync.</li>\n\n          <li><strong>Self-heal demo</strong>: trong ArgoCD setup ở trên, <code>kubectl edit</code> deployment để thay đổi replicas. Watch ArgoCD revert về Git state.</li>\n\n          <li><strong>Flux compare</strong>: setup tương tự với Flux. So sánh ergonomics.</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-51\">12. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-52\">Quiz cuối Chương 9</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">12-Factor App Factor 3 (Config) khuyến nghị:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Hardcode config trong code\">Hardcode config trong code</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Lưu config trong Git\">Lưu config trong Git</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Store config trong environment variables — tách khỏi code, không phụ thuộc deploy environment\">Store config trong environment variables — tách khỏi code, không phụ thuộc deploy environment</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Dùng JSON file\">Dùng JSON file</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Factor 3: \"config that varies between deploys\" (DB URL, API key, region) phải ở env var, không trong code. Lý do: cùng codebase chạy được dev/staging/prod chỉ qua đổi env. Test: nếu codebase rò ra public mà không leak credential → pass factor 3. Lưu ý: language-config (port, log level) OK ở config file commit.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Ansible khác Chef/Puppet ở:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Ansible mạnh hơn\">Ansible mạnh hơn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Ansible agentless (chỉ SSH); Chef/Puppet cần agent install trên target — Ansible đơn giản hơn để setup\">Ansible agentless (chỉ SSH); Chef/Puppet cần agent install trên target — Ansible đơn giản hơn để setup</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Ansible dùng Ruby\">Ansible dùng Ruby</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cùng architecture\">Cùng architecture</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Ansible push model: control node SSH vào target, chạy module Python. Không cần install agent. Chef/Puppet pull model: agent trên target periodically pull config từ master. Pros pull: scale tốt hơn (target tự pull); Cons: phải maintain agent. Ansible win cho startup/medium team vì zero-friction setup.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Idempotent trong Ansible nghĩa:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Chạy nhanh\">Chạy nhanh</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Chỉ chạy 1 lần\">Chỉ chạy 1 lần</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Không chạy đồng thời\">Không chạy đồng thời</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Chạy nhiều lần cho ra cùng kết quả; module check current state trước action — vd state: present không reinstall nếu package có\">Chạy nhiều lần cho ra cùng kết quả; module check current state trước action — vd <code>state: present</code> không reinstall nếu package có</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Idempotency là cốt lõi config management. Module Ansible (apt, file, service, ...) check trước khi action. Lợi: chạy playbook lặp đi lặp lại safely; partial failure → re-run từ đầu OK. Đối lập: bash script <code>apt install nginx</code> chạy 100 lần install 1 lần thực sự (apt check), nhưng <code>useradd alice</code> chạy lần 2 sẽ fail.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Khi secret commit vào Git public, hành động đầu tiên là:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Rotate secret ngay (assume compromised); secret trong Git history vĩnh viễn — không thể &quot;delete&quot;\">Rotate secret ngay (assume compromised); secret trong Git history vĩnh viễn — không thể \"delete\"</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Force push để xóa\">Force push để xóa</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Email security team trước\">Email security team trước</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Đợi xem có ai dùng không\">Đợi xem có ai dùng không</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Bot scan public GitHub trong giây — secret leak = compromised ngay. Rotate (invalidate cũ + tạo mới) là priority #1. Force push xóa file KHÔNG đủ (commit vẫn ở reflog, fork, clone đã có). Sau rotate: BFG/git-filter-repo rewrite history (drastic, break clones), audit log để xem dùng đến đâu. GitHub Secret Scanning + GitGuardian help detect.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Vault Database dynamic secret advantage:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Faster query\">Faster query</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cheaper\">Cheaper</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Mỗi app instance có credential riêng + auto-expire (TTL 1h) — không có credential static để leak; revoke chỉ delete user\">Mỗi app instance có credential riêng + auto-expire (TTL 1h) — không có credential static để leak; revoke chỉ delete user</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Replace database\">Replace database</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Static DB password: 1 password share giữa nhiều instance, leak = compromise hoàn toàn, rotate = downtime để update mọi nơi. Dynamic: Vault tạo CREATE USER với password random mỗi request, TTL 1h. App restart = credential mới. Audit: mỗi user 1 lifecycle. Drawback: load thêm trên DB (CREATE/DROP user).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Sealed Secrets giải quyết bài toán:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tăng tốc K8s\">Tăng tốc K8s</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Encrypt secret trước khi commit Git → safe trong public repo; controller trên cluster decrypt khi apply (asymmetric encryption)\">Encrypt secret trước khi commit Git → safe trong public repo; controller trên cluster decrypt khi apply (asymmetric encryption)</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Database password\">Database password</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Network security\">Network security</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">GitOps yêu cầu mọi config trong Git. K8s Secret base64 không phải encryption — không thể commit. Sealed Secrets: kubeseal CLI encrypt với public key (controller có private key trên cluster). Sealed-secret.yaml safe trong Git. Apply lên cluster → controller decrypt → K8s Secret thật. SOPS làm tương tự với KMS/age/PGP, generic hơn (work với Helm, Terraform).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">GitOps khác push-based deploy ở:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Pull model: agent trong cluster pull từ Git, apply; vs push: CI gọi kubectl apply. GitOps ưu điểm: cluster credential không out, drift auto-detect, audit qua Git\">Pull model: agent trong cluster pull từ Git, apply; vs push: CI gọi kubectl apply. GitOps ưu điểm: cluster credential không out, drift auto-detect, audit qua Git</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tốc độ deploy\">Tốc độ deploy</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: UI khác\">UI khác</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cùng cách\">Cùng cách</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Push: CI runner có kubeconfig admin → gọi <code>kubectl apply</code>. Risk: CI compromise = cluster compromise; CI cần network access vào K8s API; manual changes trên cluster không revert. Pull (GitOps): ArgoCD/Flux trong cluster pull Git mỗi N giây, apply. Cluster credential không leak. Drift detection + self-heal. Audit qua Git commit (ai approve, khi nào).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">ArgoCD selfHeal: true behavior:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tự fix bug\">Tự fix bug</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Restart Pod\">Restart Pod</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Update image\">Update image</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Manual change qua kubectl bị revert về Git state — đảm bảo Git là source of truth tuyệt đối\">Manual change qua kubectl bị revert về Git state — đảm bảo Git là source of truth tuyệt đối</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">selfHeal=true: ArgoCD compare cluster với Git mỗi 3 phút (default) — bất kỳ drift đều revert. Use case: prevent ad-hoc <code>kubectl edit</code> \"tạm thời\" trở thành drift. Drawback: emergency hotfix qua kubectl bị undo trước khi PR merge. Practice: tắt selfHeal cho cluster system + bật cho app namespace.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">External Secrets Operator (ESO) trên K8s vai trò:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tạo Secret từ scratch\">Tạo Secret từ scratch</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Encrypt Secret\">Encrypt Secret</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Sync secret từ external secret manager (Vault, AWS SM, GCP, Azure) vào K8s Secret — source of truth ở external, K8s chỉ cache\">Sync secret từ external secret manager (Vault, AWS SM, GCP, Azure) vào K8s Secret — source of truth ở external, K8s chỉ cache</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Replace Vault\">Replace Vault</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">ESO: K8s controller watch ExternalSecret resource → fetch từ provider (Vault/AWS SM/GCP SM/Azure KV) → tạo K8s Secret. Refresh interval (1h) auto-update khi rotate ở provider. Lợi: source of truth ở enterprise secret manager (audit, rotation, compliance), K8s không lưu master copy. Pod mount K8s Secret bình thường (no app code change).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Packer vs Ansible — pattern modern khuyến nghị:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Ansible chạy mỗi deploy\">Ansible chạy mỗi deploy</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Packer + Ansible tạo AMI immutable; deploy = launch instance từ AMI mới (rolling, blue-green); không Ansible trên live server\">Packer + Ansible tạo AMI immutable; deploy = launch instance từ AMI mới (rolling, blue-green); không Ansible trên live server</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cùng tool\">Cùng tool</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Packer thay Terraform\">Packer thay Terraform</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Immutable infrastructure: KHÔNG sửa server đang chạy. Build phase: Packer + Ansible bake AMI/image với app version cụ thể. Deploy phase: ASG/MIG launch instance từ AMI mới, terminate cũ (rolling). Lợi: reproducible, no config drift, fast scale (boot từ AMI sẵn nhanh hơn provision). Pattern: dev = Ansible OK, prod = immutable image.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 9. Tiếp theo: <a href=\"/learn/devops/chapter-10/\"><strong>Chương 10 — Monitoring &amp; Observability →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. The Twelve-Factor App",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "2. Config tách khỏi code — Vì sao?",
+      "depth": 2
+    },
+    {
+      "id": "section-3",
+      "text": "2.1. Anti-pattern: hardcode",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "2.2. Pattern đúng: Environment Variables",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "2.3. Config types",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "2.4. Config best practices",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "3. Ansible — Configuration Management",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "3.1. Vì sao Ansible?",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "3.2. Cài",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "3.3. Inventory — danh sách host",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "3.4. Ad-hoc commands",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "4. Playbooks & Roles",
+      "depth": 2
+    },
+    {
+      "id": "section-13",
+      "text": "4.1. Playbook đầu tiên",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "4.2. Variables & Templates (Jinja2)",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "4.3. Roles — reusable playbook",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "4.4. Ansible Vault — encrypt secret in repo",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "4.5. Ansible Galaxy — community roles",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "5. Alternatives — Chef, Puppet, Salt",
+      "depth": 2
+    },
+    {
+      "id": "section-19",
+      "text": "5.1. Cloud-init — alternative cho cloud",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "5.2. Image-based pattern (immutable)",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "6. Secrets — Vấn đề thật",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "6.1. Common mistakes",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "6.2. Hậu quả secret leak",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "6.3. Best practices",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "6.4. Phản ứng khi secret leak",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "7. HashiCorp Vault — Industry Standard",
+      "depth": 2
+    },
+    {
+      "id": "section-27",
+      "text": "7.1. Vault concepts",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "7.2. Setup Vault dev",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "7.3. KV secrets",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "7.4. Policies",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "7.5. AppRole auth (for app)",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "7.6. Database dynamic secret — game changer",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "8. Cloud Secret Managers",
+      "depth": 2
+    },
+    {
+      "id": "section-34",
+      "text": "8.1. AWS Secrets Manager",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "8.2. AWS Parameter Store (Systems Manager)",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "8.3. GCP Secret Manager",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "8.4. Azure Key Vault",
+      "depth": 3
+    },
+    {
+      "id": "section-38",
+      "text": "8.5. Đọc secret từ K8s — External Secrets Operator",
+      "depth": 3
+    },
+    {
+      "id": "section-39",
+      "text": "9. Sealed Secrets / SOPS — Encrypt secret trong Git",
+      "depth": 2
+    },
+    {
+      "id": "section-40",
+      "text": "9.1. Sealed Secrets (Bitnami)",
+      "depth": 3
+    },
+    {
+      "id": "section-41",
+      "text": "9.2. SOPS (Mozilla)",
+      "depth": 3
+    },
+    {
+      "id": "section-42",
+      "text": "9.3. age — modern alternative GPG",
+      "depth": 3
+    },
+    {
+      "id": "section-43",
+      "text": "10. GitOps — ArgoCD & Flux",
+      "depth": 2
+    },
+    {
+      "id": "section-44",
+      "text": "10.1. GitOps là gì?",
+      "depth": 3
+    },
+    {
+      "id": "section-45",
+      "text": "10.2. Push vs Pull",
+      "depth": 3
+    },
+    {
+      "id": "section-46",
+      "text": "10.3. ArgoCD",
+      "depth": 3
+    },
+    {
+      "id": "section-47",
+      "text": "10.4. App-of-apps pattern",
+      "depth": 3
+    },
+    {
+      "id": "section-48",
+      "text": "10.5. Flux v2",
+      "depth": 3
+    },
+    {
+      "id": "section-49",
+      "text": "10.6. ArgoCD vs Flux",
+      "depth": 3
+    },
+    {
+      "id": "section-50",
+      "text": "11. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-51",
+      "text": "12. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-52",
+      "text": "Quiz cuối Chương 9",
+      "depth": 3
+    }
+  ],
+  "source": "DevOps/chuong/chuong9.html",
+  "sourceHash": "87b9f245e5728b67ffab60239b55d5308beb4080cecd2eb3b0c57ab48360481d",
+  "readingMinutes": 16
+}

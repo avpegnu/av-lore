@@ -1,0 +1,370 @@
+{
+  "id": "devops--chapter-13",
+  "track": "devops",
+  "trackTitle": "DevOps Engineering",
+  "slug": "chapter-13",
+  "order": 13,
+  "title": "Performance & Scaling",
+  "description": "Performance không phải feature — là requirement. Load testing với k6/Locust. Profiling CPU/heap. Autoscaling K8s (HPA/VPA/Cluster). Caching layers. CDN. Database scaling. Performance budget. FinOps cost optimization. Đo trước, tối ưu sau, scale theo dữ liệu.",
+  "html": "\n\n      <section id=\"why\">\n        <h2 id=\"section-1\">1. Performance đo gì?</h2>\n\n        <h3 id=\"section-2\">1.1. Key metrics</h3>\n\n        <ul>\n          <li><strong>Latency</strong> — thời gian xử lý 1 request (ms). Đo P50/P95/P99.</li>\n          <li><strong>Throughput</strong> — request/giây (RPS, QPS).</li>\n          <li><strong>Concurrency</strong> — số request đang xử lý cùng lúc.</li>\n          <li><strong>Error rate</strong> — % request fail.</li>\n          <li><strong>Resource utilization</strong> — CPU, RAM, disk, network usage.</li>\n          <li><strong>TTFB</strong> — Time To First Byte (web).</li>\n        </ul>\n\n        <h3 id=\"section-3\">1.2. Little's Law</h3>\n\n        <p><strong>L = λ × W</strong>:</p>\n        <ul>\n          <li>L = số request đang trong hệ.</li>\n          <li>λ = throughput (RPS).</li>\n          <li>W = latency trung bình (s).</li>\n        </ul>\n\n        <p>Ví dụ: app 100ms/request, 50 worker → throughput tối đa = 50 / 0.1 = 500 QPS.</p>\n\n        <h3 id=\"section-4\">1.3. Vì sao P99 quan trọng hơn average?</h3>\n\n        <p>10 request: 9 cái 50ms, 1 cái 5000ms.</p>\n        <ul>\n          <li>Mean = 545ms — không user nào trải nghiệm.</li>\n          <li>P50 = 50ms — median.</li>\n          <li>P99 = 5000ms — worst case 1% user gặp.</li>\n        </ul>\n\n        <p>Web app modern có many backend call. Tail latency amplification (Jeff Dean):</p>\n\n<pre><code>Mỗi service P99 = 1% chậm.\nRequest fan-out tới 10 service → xác suất hit P99 = 1 - (0.99)^10 ≈ 10%.\nP99 tổng &gt; P99 từng service rất nhiều.</code></pre>\n\n        <p>→ giảm P99 ở mọi service quan trọng hơn cải thiện mean.</p>\n\n        <h3 id=\"section-5\">1.4. Premature optimization</h3>\n\n        <blockquote>\n          \"Premature optimization is the root of all evil.\" — Donald Knuth\n        </blockquote>\n\n        <p>Đừng tối ưu khi chưa đo. 90% code không cần fast — tối ưu wrong place = tốn thời gian + tăng complexity.</p>\n\n        <p>Quy trình: <em>measure → identify bottleneck → optimize bottleneck → measure again</em>.</p>\n      </section>\n\n      <section id=\"load-test\">\n        <h2 id=\"section-6\">2. Load Testing</h2>\n\n        <h3 id=\"section-7\">2.1. Types of test</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Type</th><th>Mục đích</th></tr></thead>\n          <tbody>\n            <tr><td><strong>Smoke test</strong></td><td>Sanity check — system up?</td></tr>\n            <tr><td><strong>Load test</strong></td><td>Expected load, đo latency/throughput</td></tr>\n            <tr><td><strong>Stress test</strong></td><td>Tăng dần đến vỡ → tìm capacity limit</td></tr>\n            <tr><td><strong>Spike test</strong></td><td>Load tăng đột ngột → kiểm tra autoscale</td></tr>\n            <tr><td><strong>Endurance / Soak test</strong></td><td>Load steady vài giờ-ngày → tìm memory leak, GC</td></tr>\n            <tr><td><strong>Capacity test</strong></td><td>Tìm sweet spot capacity vs cost</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-8\">2.2. Tools</h3>\n\n        <ul>\n          <li><strong>k6</strong> — modern, JS scripting, multiprotocol, output cloud.</li>\n          <li><strong>Locust</strong> — Python, distributed, web UI.</li>\n          <li><strong>JMeter</strong> — Java, GUI, classic, complex test.</li>\n          <li><strong>wrk / wrk2</strong> — simple, high throughput.</li>\n          <li><strong>vegeta</strong> — Go CLI.</li>\n          <li><strong>Gatling</strong> — Scala, beautiful HTML report.</li>\n          <li><strong>Artillery</strong> — Node.js, simple.</li>\n        </ul>\n\n        <h3 id=\"section-9\">2.3. Test environment</h3>\n\n        <p>Load test phải <em>như production</em>:</p>\n        <ul>\n          <li>Same hardware specs (instance type).</li>\n          <li>Same DB version + data volume.</li>\n          <li>Same network topology.</li>\n          <li>Realistic data (production-like).</li>\n        </ul>\n\n        <p>Anti-pattern: test trên localhost, single user — meaningless.</p>\n\n        <div class=\"callout callout-warn\">\n          <span class=\"callout-title\">Đừng tự DDoS production!</span>\n          Cẩn thận rate limit, downstream impact. Notify ops team trước. Ideal: load test môi trường staging giống prod, hoặc canary in prod với traffic share.\n        </div>\n      </section>\n\n      <section id=\"k6\">\n        <h2 id=\"section-10\">3. k6 Deep Dive</h2>\n\n        <h3 id=\"section-11\">3.1. Cài + script đầu tiên</h3>\n\n<pre><code class=\"language-bash\">brew install k6\n# Hoặc Docker: docker run --rm -i grafana/k6 run - &lt; test.js\n</code></pre>\n\n<pre><code class=\"language-javascript\">// test.js\nimport http from 'k6/http';\nimport { check, sleep } from 'k6';\n\nexport const options = {\n  vus: 10,           // virtual users\n  duration: '30s',\n};\n\nexport default function () {\n  const res = http.get('https://api.example.com/users/1');\n  check(res, {\n    'status 200': (r) =&gt; r.status === 200,\n    'duration &lt; 500ms': (r) =&gt; r.timings.duration &lt; 500,\n  });\n  sleep(1);\n}\n</code></pre>\n\n<pre><code class=\"language-bash\">k6 run test.js\n\n# Output:\n#   http_req_duration..............: avg=145ms p(95)=320ms p(99)=520ms\n#   http_reqs......................: 245    8.166/s\n#   checks.........................: 100.00% ✓ 490 ✗ 0\n</code></pre>\n\n        <h3 id=\"section-12\">3.2. Stages — ramp up/down</h3>\n\n<pre><code class=\"language-javascript\">export const options = {\n  stages: [\n    { duration: '2m', target: 100 },   // ramp up to 100 VUs\n    { duration: '5m', target: 100 },   // stay\n    { duration: '2m', target: 200 },   // ramp up\n    { duration: '5m', target: 200 },\n    { duration: '2m', target: 0 },     // ramp down\n  ],\n  thresholds: {\n    'http_req_duration{status:200}': ['p(95)&lt;500', 'p(99)&lt;1000'],\n    'http_req_failed': ['rate&lt;0.01'],   // &lt; 1% errors\n    'http_reqs': ['rate&gt;100'],          // sustain &gt; 100 RPS\n  },\n};\n</code></pre>\n\n        <p>Threshold fail → exit code 1 → CI fail.</p>\n\n        <h3 id=\"section-13\">3.3. Realistic scenarios</h3>\n\n<pre><code class=\"language-javascript\">import http from 'k6/http';\nimport { check, sleep, group } from 'k6';\nimport { SharedArray } from 'k6/data';\n\nconst users = new SharedArray('users', function () {\n  return JSON.parse(open('./users.json'));\n});\n\nexport const options = {\n  scenarios: {\n    browse: {\n      executor: 'ramping-vus',\n      startVUs: 0,\n      stages: [\n        { duration: '5m', target: 50 },\n        { duration: '20m', target: 50 },\n        { duration: '5m', target: 0 },\n      ],\n      exec: 'browseScenario',\n    },\n    checkout: {\n      executor: 'constant-arrival-rate',\n      rate: 10,                       // 10 checkouts/sec\n      timeUnit: '1s',\n      duration: '20m',\n      preAllocatedVUs: 20,\n      exec: 'checkoutScenario',\n    },\n  },\n};\n\nexport function browseScenario() {\n  group('Homepage', () =&gt; {\n    const res = http.get('https://shop.example.com/');\n    check(res, { 'status 200': (r) =&gt; r.status === 200 });\n  });\n\n  group('Product page', () =&gt; {\n    const productId = Math.floor(Math.random() * 100);\n    const res = http.get(`https://shop.example.com/product/${productId}`);\n    check(res, { 'status 200': (r) =&gt; r.status === 200 });\n  });\n\n  sleep(2);\n}\n\nexport function checkoutScenario() {\n  const user = users[Math.floor(Math.random() * users.length)];\n\n  // Login\n  const loginRes = http.post('https://shop.example.com/api/login',\n    JSON.stringify({ email: user.email, password: user.password }),\n    { headers: { 'Content-Type': 'application/json' } }\n  );\n  check(loginRes, { 'login ok': (r) =&gt; r.status === 200 });\n  const token = loginRes.json('token');\n\n  // Add to cart\n  http.post('https://shop.example.com/api/cart',\n    JSON.stringify({ productId: 'abc', qty: 1 }),\n    { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }\n  );\n\n  // Checkout\n  const checkoutRes = http.post('https://shop.example.com/api/checkout',\n    JSON.stringify({ payment: 'mock' }),\n    { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }\n  );\n  check(checkoutRes, { 'checkout ok': (r) =&gt; r.status === 201 });\n}\n</code></pre>\n\n        <h3 id=\"section-14\">3.4. CI integration</h3>\n\n<pre><code class=\"language-yaml\"># .github/workflows/perf.yml\nname: Performance Test\n\non:\n  schedule:\n    - cron: '0 2 * * *'    # nightly\n  pull_request:\n    paths: ['src/api/**']\n\njobs:\n  load-test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: grafana/k6-action@v0.3.1\n        with:\n          filename: tests/load.js\n          flags: --out cloud   # k6 Cloud\n        env:\n          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}\n</code></pre>\n\n        <p>Track regression: nếu P95 latency tăng &gt; 20% so baseline, fail CI.</p>\n      </section>\n\n      <section id=\"profiling\">\n        <h2 id=\"section-15\">4. Profiling</h2>\n\n        <h3 id=\"section-16\">4.1. CPU profiling</h3>\n\n        <p>Tìm function nào ăn CPU nhiều nhất:</p>\n\n        <ul>\n          <li><strong>Node.js</strong> — <code>--prof</code>, Clinic.js, 0x.</li>\n          <li><strong>Python</strong> — cProfile, py-spy, scalene.</li>\n          <li><strong>Go</strong> — pprof (built-in).</li>\n          <li><strong>Java</strong> — JFR (Java Flight Recorder), async-profiler.</li>\n          <li><strong>Rust</strong> — cargo flamegraph, perf.</li>\n          <li><strong>OS-level</strong> — perf, eBPF.</li>\n        </ul>\n\n        <h3 id=\"section-17\">4.2. Go pprof example</h3>\n\n<pre><code class=\"language-go\">// main.go\nimport _ \"net/http/pprof\"\nimport \"net/http\"\n\nfunc main() {\n  go http.ListenAndServe(\":6060\", nil)\n  // app code...\n}\n</code></pre>\n\n<pre><code class=\"language-bash\"># CPU profile (30s)\ngo tool pprof http://localhost:6060/debug/pprof/profile?seconds=30\n(pprof) top\n(pprof) list functionName\n(pprof) web                # SVG flame graph\n\n# Heap profile\ngo tool pprof http://localhost:6060/debug/pprof/heap\n\n# Goroutine\ngo tool pprof http://localhost:6060/debug/pprof/goroutine\n</code></pre>\n\n        <h3 id=\"section-18\">4.3. Flame graph</h3>\n\n        <p>Visualize CPU time stack: width = thời gian, x-axis = sample sorted, y-axis = stack depth. Wide function = hot path.</p>\n\n        <p>Tools: <a href=\"https://www.brendangregg.com/flamegraphs.html\" target=\"_blank\" rel=\"noopener noreferrer\">Brendan Gregg's FlameGraph</a>, pprof <code>web</code> command.</p>\n\n        <h3 id=\"section-19\">4.4. Heap profiling — memory leak</h3>\n\n<pre><code class=\"language-bash\"># Node.js heap snapshot\nnode --inspect server.js\n# Open chrome://inspect → Take heap snapshot, compare\n\n# Python\npip install memory-profiler\npython -m memory_profiler script.py\n\n# Go\ngo tool pprof -alloc_objects http://localhost:6060/debug/pprof/heap\n</code></pre>\n\n        <h3 id=\"section-20\">4.5. Distributed tracing for perf</h3>\n\n        <p>Tracing (chương 10) là profiling cho microservice. P99 latency request = trace có waterfall view, identify slowest span.</p>\n\n        <h3 id=\"section-21\">4.6. Continuous profiling</h3>\n\n        <p>Tools chạy continuous trong production:</p>\n        <ul>\n          <li><strong>Pyroscope</strong> (Grafana) — open source.</li>\n          <li><strong>Parca</strong> — eBPF-based.</li>\n          <li><strong>Datadog Continuous Profiler</strong>, <strong>Pixie</strong> (acquired by NewRelic).</li>\n          <li><strong>Google Cloud Profiler</strong>.</li>\n        </ul>\n\n        <p>Always-on profiling (1-2% overhead) — catch regression real-time.</p>\n      </section>\n\n      <section id=\"cache\">\n        <h2 id=\"section-22\">5. Caching</h2>\n\n        <p>Phil Karlton: <em>\"There are only two hard things in Computer Science: cache invalidation and naming things.\"</em></p>\n\n        <h3 id=\"section-23\">5.1. Caching layers</h3>\n\n        <div class=\"ascii\">┌─────────────────────────────────────────────┐\n│  Browser cache (HTTP Cache-Control)         │\n└──────────────────┬──────────────────────────┘\n                   ↓\n┌─────────────────────────────────────────────┐\n│  CDN / Edge cache (CloudFront, Cloudflare)  │\n└──────────────────┬──────────────────────────┘\n                   ↓\n┌─────────────────────────────────────────────┐\n│  Reverse proxy cache (nginx, Varnish)       │\n└──────────────────┬──────────────────────────┘\n                   ↓\n┌─────────────────────────────────────────────┐\n│  Application cache (Redis, Memcached)       │\n└──────────────────┬──────────────────────────┘\n                   ↓\n┌─────────────────────────────────────────────┐\n│  DB query cache (Postgres shared_buffers)   │\n└─────────────────────────────────────────────┘</div>\n\n        <h3 id=\"section-24\">5.2. Cache patterns</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Pattern</th><th>Behavior</th><th>Use</th></tr></thead>\n          <tbody>\n            <tr><td>Cache-Aside (Lazy)</td><td>App check cache, miss → fetch DB + populate cache</td><td>Most common, read-heavy</td></tr>\n            <tr><td>Read-Through</td><td>Cache layer fetch DB on miss tự động</td><td>Cleaner code</td></tr>\n            <tr><td>Write-Through</td><td>Write cache + DB cùng lúc</td><td>Strong consistency</td></tr>\n            <tr><td>Write-Behind</td><td>Write cache, async write DB sau</td><td>Write-heavy, eventual consist</td></tr>\n            <tr><td>Refresh-Ahead</td><td>Refresh cache trước expire</td><td>Predictable hot data</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-25\">5.3. Cache-Aside example</h3>\n\n<pre><code class=\"language-typescript\">async function getUser(id: string): Promise&lt;User&gt; {\n  // 1. Check cache\n  const cached = await redis.get(`user:${id}`);\n  if (cached) return JSON.parse(cached);\n\n  // 2. Miss — fetch DB\n  const user = await db.user.findById(id);\n  if (!user) throw new Error('Not found');\n\n  // 3. Populate cache (TTL 5 min)\n  await redis.set(`user:${id}`, JSON.stringify(user), 'EX', 300);\n\n  return user;\n}\n\n// Invalidation on update\nasync function updateUser(id: string, data: Partial&lt;User&gt;) {\n  await db.user.update(id, data);\n  await redis.del(`user:${id}`);\n}\n</code></pre>\n\n        <h3 id=\"section-26\">5.4. Cache invalidation</h3>\n\n        <p>3 strategy:</p>\n        <ol>\n          <li><strong>TTL</strong> — expire sau N giây. Đơn giản, eventual consistent.</li>\n          <li><strong>Write invalidate</strong> — delete cache khi update. Fresh nhưng race condition.</li>\n          <li><strong>Pub/Sub invalidate</strong> — N service shared cache, broadcast invalidation event.</li>\n        </ol>\n\n        <h3 id=\"section-27\">5.5. Eviction policies</h3>\n\n        <ul>\n          <li><strong>LRU</strong> (Least Recently Used) — đẩy ra cái lâu không dùng. Default Redis.</li>\n          <li><strong>LFU</strong> (Least Frequently Used) — đẩy ra cái ít dùng.</li>\n          <li><strong>FIFO</strong> — first in first out.</li>\n          <li><strong>Random</strong> — random.</li>\n          <li><strong>TTL-based</strong> — expire hardcoded.</li>\n        </ul>\n\n        <h3 id=\"section-28\">5.6. Common pitfalls</h3>\n\n        <h4>5.6.1. Thundering herd / Cache stampede</h4>\n\n        <p>Hot key expire → 1000 request cùng lúc miss → 1000 query DB → DB chết.</p>\n\n        <p>Fix:</p>\n        <ul>\n          <li><strong>Lock</strong>: chỉ 1 request fetch DB, others wait.</li>\n          <li><strong>Probabilistic early refresh</strong>: refresh trước expire.</li>\n          <li><strong>Stale-while-revalidate</strong>: serve stale + async refresh.</li>\n        </ul>\n\n        <h4>5.6.2. Negative cache</h4>\n\n        <p>Query \"user 99999\" không tồn tại → DB miss → app cache \"not found\"? Yes — tránh repeat DB query attack.</p>\n\n        <h4>5.6.3. Cache penetration</h4>\n\n        <p>Attacker query random ID → all miss cache → flood DB. Fix: bloom filter check existence trước.</p>\n\n        <h3 id=\"section-29\">5.7. Redis cluster</h3>\n\n        <p>Single Redis instance limit ~10GB RAM, 100k QPS. Scale:</p>\n        <ul>\n          <li><strong>Read replica</strong> — write primary, read replica.</li>\n          <li><strong>Redis Cluster</strong> — sharded across nodes.</li>\n          <li><strong>Managed</strong> — ElastiCache, Memorystore, Azure Cache.</li>\n        </ul>\n      </section>\n\n      <section id=\"cdn\">\n        <h2 id=\"section-30\">6. CDN — Edge Caching</h2>\n\n        <h3 id=\"section-31\">6.1. Vì sao CDN?</h3>\n\n        <ul>\n          <li><strong>Latency</strong> — user nhận content từ edge gần (~10ms thay vì cross-continent ~150ms).</li>\n          <li><strong>Egress cost</strong> — CDN cache reduce origin egress (cloud egress đắt).</li>\n          <li><strong>DDoS protection</strong> — CDN absorb attack.</li>\n          <li><strong>Origin scale</strong> — CDN serve majority traffic, origin chỉ handle uncached.</li>\n        </ul>\n\n        <h3 id=\"section-32\">6.2. Providers</h3>\n\n        <ul>\n          <li><strong>Cloudflare</strong> — popular, free tier rộng, security focus.</li>\n          <li><strong>Fastly</strong> — developer-friendly, instant purge, edge compute.</li>\n          <li><strong>AWS CloudFront</strong> — tích hợp AWS.</li>\n          <li><strong>GCP Cloud CDN</strong>.</li>\n          <li><strong>Akamai</strong> — enterprise, high reach.</li>\n          <li><strong>Bunny.net</strong> — cheap, simple.</li>\n        </ul>\n\n        <h3 id=\"section-33\">6.3. Cache-Control headers</h3>\n\n<pre><code class=\"language-http\">Cache-Control: public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600\n\n# public            — both browser and CDN cache\n# private           — only browser cache\n# no-cache          — must revalidate before use\n# no-store          — never cache\n# max-age=N         — browser cache N seconds\n# s-maxage=N        — CDN cache N seconds\n# stale-while-revalidate=N — serve stale while async fetch fresh\n# stale-if-error=N  — serve stale if origin error\n</code></pre>\n\n        <h3 id=\"section-34\">6.4. Cache strategy by content type</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Content</th><th>Cache</th><th>TTL</th></tr></thead>\n          <tbody>\n            <tr><td>Static assets (JS/CSS bundle với hash)</td><td>Public, immutable</td><td>1 năm</td></tr>\n            <tr><td>Images</td><td>Public</td><td>1 tuần - 1 tháng</td></tr>\n            <tr><td>HTML pages (mostly static)</td><td>Public, SWR</td><td>1-5 phút + revalidate</td></tr>\n            <tr><td>API GET (public data)</td><td>Public</td><td>30s - 5 phút</td></tr>\n            <tr><td>API GET (per-user)</td><td>Private</td><td>0 - 30s</td></tr>\n            <tr><td>API POST/PUT/DELETE</td><td>No cache</td><td>—</td></tr>\n            <tr><td>Auth/PII data</td><td>No-store</td><td>—</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-35\">6.5. Cache invalidation</h3>\n\n<pre><code class=\"language-bash\"># CloudFront invalidation\naws cloudfront create-invalidation \\\n  --distribution-id E123456 \\\n  --paths \"/index.html\" \"/api/*\"\n\n# Cloudflare API\ncurl -X POST \"https://api.cloudflare.com/client/v4/zones/$ZONE/purge_cache\" \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -d '{\"files\":[\"https://example.com/index.html\"]}'\n</code></pre>\n\n        <p>Best practice: cache-busting qua filename (<code>app.abc123.js</code>) thay vì invalidation API. Build tool tạo hash filename mỗi build.</p>\n\n        <h3 id=\"section-36\">6.6. Edge compute</h3>\n\n        <p>Modern CDN run code at edge:</p>\n        <ul>\n          <li><strong>Cloudflare Workers</strong> — V8 isolate.</li>\n          <li><strong>Fastly Compute@Edge</strong> — WASM.</li>\n          <li><strong>AWS Lambda@Edge / CloudFront Functions</strong>.</li>\n          <li><strong>Vercel Edge Functions</strong>.</li>\n        </ul>\n\n        <p>Use case: A/B testing, auth, header manipulation, redirect, edge cache logic.</p>\n      </section>\n\n      <section id=\"db-scaling\">\n        <h2 id=\"section-37\">7. Database Scaling</h2>\n\n        <h3 id=\"section-38\">7.1. Vertical scaling (scale up)</h3>\n\n        <p>Bigger instance — easier, cheaper to start. Cloud max: ~24 TB RAM, 192 vCPU. Đến giới hạn: 1 node Postgres ~50k QPS read, ~20k QPS write.</p>\n\n        <h3 id=\"section-39\">7.2. Read replicas</h3>\n\n        <p>Async replication primary → replica. Route read sang replica, write vào primary.</p>\n\n<pre><code class=\"language-typescript\">// App routing\nclass DB {\n  primary = new Pool({ host: 'primary.db' });\n  replica = new Pool({ host: 'replica.db' });\n\n  async write(query: string, params: any[]) {\n    return this.primary.query(query, params);\n  }\n\n  async read(query: string, params: any[]) {\n    // Async replica có thể stale (ms delay)\n    return this.replica.query(query, params);\n  }\n\n  async readAfterWrite(query: string, params: any[]) {\n    // Need read-your-write consistency? Use primary\n    return this.primary.query(query, params);\n  }\n}\n</code></pre>\n\n        <h3 id=\"section-40\">7.3. Sharding</h3>\n\n        <p>Chia data ra nhiều DB instance theo key (user_id mod N, range, ...).</p>\n\n        <p>Pros: scale write, capacity. Cons: complexity (cross-shard query khó), hot shard, rebalance đau.</p>\n\n        <p>Tools: Vitess (YouTube), Citus (Postgres extension), CockroachDB (distributed SQL native).</p>\n\n        <h3 id=\"section-41\">7.4. NoSQL — built-in sharding</h3>\n\n        <ul>\n          <li>DynamoDB / Cassandra — partition key sharding tự động.</li>\n          <li>MongoDB — replica set + sharding.</li>\n          <li>Redis Cluster — 16384 slots.</li>\n        </ul>\n\n        <h3 id=\"section-42\">7.5. Connection pooling</h3>\n\n        <p>Postgres mỗi connection = 1 process (~10MB). 1000 client direct → DB overload.</p>\n\n        <p>Solution: pooler:</p>\n        <ul>\n          <li><strong>PgBouncer</strong> — Postgres pooler.</li>\n          <li><strong>RDS Proxy</strong> — managed.</li>\n          <li><strong>Supabase Pooler</strong>.</li>\n        </ul>\n\n        <h3 id=\"section-43\">7.6. Caching tier</h3>\n\n        <p>DB là expensive resource. Cache (Redis) absorb majority read → DB chỉ handle uncached + write.</p>\n\n        <h3 id=\"section-44\">7.7. Database for specific workload</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Workload</th><th>DB suitable</th></tr></thead>\n          <tbody>\n            <tr><td>OLTP (transactions)</td><td>Postgres, MySQL</td></tr>\n            <tr><td>OLAP (analytics)</td><td>BigQuery, Snowflake, Redshift, ClickHouse</td></tr>\n            <tr><td>Time series</td><td>InfluxDB, TimescaleDB, Prometheus</td></tr>\n            <tr><td>Search</td><td>ElasticSearch, OpenSearch, Algolia</td></tr>\n            <tr><td>Graph</td><td>Neo4j, Neptune, ArangoDB</td></tr>\n            <tr><td>Document</td><td>MongoDB, Firestore</td></tr>\n            <tr><td>Key-value</td><td>DynamoDB, Redis, etcd</td></tr>\n            <tr><td>Cache</td><td>Redis, Memcached</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>\"Right tool for right job\" — không 1 DB cho mọi workload.</p>\n      </section>\n\n      <section id=\"autoscale\">\n        <h2 id=\"section-45\">8. Autoscaling — K8s deep</h2>\n\n        <h3 id=\"section-46\">8.1. HPA (Horizontal Pod Autoscaler)</h3>\n\n<pre><code class=\"language-yaml\">apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: web-hpa\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: web\n  minReplicas: 3\n  maxReplicas: 100\n\n  metrics:\n    - type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n          averageUtilization: 70\n\n    - type: Pods                         # custom metric per Pod\n      pods:\n        metric:\n          name: http_requests_per_second\n        target:\n          type: AverageValue\n          averageValue: \"100\"             # 100 RPS per Pod\n\n    - type: External                     # external metric (queue length)\n      external:\n        metric:\n          name: sqs_messages\n          selector:\n            matchLabels:\n              queue: orders\n        target:\n          type: Value\n          value: \"30\"\n\n  behavior:\n    scaleUp:\n      stabilizationWindowSeconds: 30\n      policies:\n        - type: Percent\n          value: 100                      # double up to\n          periodSeconds: 30\n        - type: Pods\n          value: 5                         # or +5 pods\n          periodSeconds: 30\n      selectPolicy: Max                   # use max of policies\n\n    scaleDown:\n      stabilizationWindowSeconds: 300     # 5 phút cool-down\n      policies:\n        - type: Percent\n          value: 10                       # scale down 10% mỗi 60s\n          periodSeconds: 60\n</code></pre>\n\n        <h3 id=\"section-47\">8.2. KEDA (Event-driven)</h3>\n\n<pre><code class=\"language-yaml\">apiVersion: keda.sh/v1alpha1\nkind: ScaledObject\nmetadata:\n  name: order-processor\nspec:\n  scaleTargetRef:\n    name: order-worker\n  minReplicaCount: 0                     # scale-to-zero!\n  maxReplicaCount: 50\n\n  triggers:\n    - type: kafka\n      metadata:\n        bootstrapServers: kafka:9092\n        consumerGroup: orders\n        topic: orders\n        lagThreshold: \"100\"\n\n    - type: prometheus\n      metadata:\n        serverAddress: http://prometheus:9090\n        metricName: pending_jobs\n        threshold: \"10\"\n        query: sum(rabbitmq_queue_messages_ready{queue=\"orders\"})\n</code></pre>\n\n        <p>KEDA scale-to-zero: khi không event, 0 pod (no cost). HPA min = 1.</p>\n\n        <h3 id=\"section-48\">8.3. VPA (Vertical Pod Autoscaler)</h3>\n\n        <p>Adjust CPU/RAM <em>request</em>, không thay replica. Mode:</p>\n        <ul>\n          <li>Off — recommend only.</li>\n          <li>Initial — set when pod creation.</li>\n          <li>Auto — restart pod với resource mới (disruptive).</li>\n        </ul>\n\n        <p>VPA + HPA cùng CPU = conflict. Use VPA Recommend mode + HPA on CPU.</p>\n\n        <h3 id=\"section-49\">8.4. Cluster Autoscaler / Karpenter</h3>\n\n        <ul>\n          <li><strong>Cluster Autoscaler (CA)</strong> — original, scale node group dựa trên unschedulable pods.</li>\n          <li><strong>Karpenter (AWS)</strong> — modern, faster (no node group), better bin-packing, mixed instance types, spot support.</li>\n        </ul>\n\n<pre><code class=\"language-yaml\"># Karpenter NodePool\napiVersion: karpenter.sh/v1beta1\nkind: NodePool\nmetadata:\n  name: default\nspec:\n  template:\n    spec:\n      requirements:\n        - key: kubernetes.io/arch\n          operator: In\n          values: [\"amd64\"]\n        - key: karpenter.k8s.aws/instance-category\n          operator: In\n          values: [\"c\", \"m\", \"r\"]\n        - key: karpenter.k8s.aws/instance-cpu\n          operator: In\n          values: [\"4\", \"8\", \"16\"]\n        - key: karpenter.sh/capacity-type\n          operator: In\n          values: [\"spot\", \"on-demand\"]\n      nodeClassRef:\n        name: default\n  limits:\n    cpu: \"1000\"\n  disruption:\n    consolidationPolicy: WhenUnderutilized\n    expireAfter: 720h                    # 30 days\n</code></pre>\n\n        <h3 id=\"section-50\">8.5. PodDisruptionBudget</h3>\n\n        <p>Đảm bảo không quá nhiều Pod down cùng lúc khi voluntary disruption (drain, autoscaler):</p>\n\n<pre><code class=\"language-yaml\">apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web-pdb\nspec:\n  minAvailable: 80%                      # hoặc maxUnavailable: 20%\n  selector:\n    matchLabels: { app: web }\n</code></pre>\n      </section>\n\n      <section id=\"bottleneck\">\n        <h2 id=\"section-51\">9. Bottleneck Analysis</h2>\n\n        <h3 id=\"section-52\">9.1. Common bottlenecks</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Layer</th><th>Symptoms</th><th>Diagnose</th></tr></thead>\n          <tbody>\n            <tr><td>CPU</td><td>High utilization, high latency</td><td>top, profiler, flame graph</td></tr>\n            <tr><td>Memory</td><td>OOM, swap, GC pause</td><td>free, heap profile, GC log</td></tr>\n            <tr><td>Disk I/O</td><td>High iowait, slow query</td><td>iostat -x, iotop, EXPLAIN ANALYZE</td></tr>\n            <tr><td>Network</td><td>Latency, packet drop</td><td>iperf, tcpdump, mtr</td></tr>\n            <tr><td>DB</td><td>Slow query, lock wait</td><td>pg_stat_statements, slow query log</td></tr>\n            <tr><td>Cache miss</td><td>High DB load với cache</td><td>Cache hit rate metric</td></tr>\n            <tr><td>External API</td><td>Latency variance</td><td>Trace span timing</td></tr>\n            <tr><td>Connection pool</td><td>Wait time queue</td><td>Pool metrics</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-53\">9.2. USE Method</h3>\n\n        <p>Brendan Gregg: cho mỗi resource, check:</p>\n        <ul>\n          <li><strong>U</strong>tilization — % busy.</li>\n          <li><strong>S</strong>aturation — work queued.</li>\n          <li><strong>E</strong>rrors.</li>\n        </ul>\n\n        <p>Resource: CPU, RAM, network, disk, file descriptor, ...</p>\n\n        <h3 id=\"section-54\">9.3. Amdahl's Law</h3>\n\n        <p>Speedup tối đa với parallelization: <strong>S = 1 / ((1-p) + p/n)</strong>.</p>\n\n        <p>Nếu 90% code parallelizable, dùng 100 core: S = 1 / (0.1 + 0.9/100) = 9.17×, KHÔNG 100×.</p>\n\n        <p>Hệ quả: serial portion là wall — không break được. \"Add more servers\" có giới hạn.</p>\n\n        <h3 id=\"section-55\">9.4. Don't run &gt; 80% utilization</h3>\n\n        <p>Khi gần 100% capacity, queue overflow → latency tăng vọt 10-100×. Quy tắc: run &lt; 80% (autoscale at 70%).</p>\n\n        <h3 id=\"section-56\">9.5. Real example: API chậm</h3>\n\n<pre><code>Symptom: P95 latency 2000ms (was 200ms last week).\n\nStep 1: Time series — when did it start?\n  → Spike at 2024-01-15 10:00.\n\nStep 2: Recent change?\n  → Deploy at 09:55 — likely cause.\n\nStep 3: Profile request flow (trace).\n  → Slowest span: db.query \"SELECT FROM orders\".\n  → 1500ms in DB!\n\nStep 4: DB-side investigation.\n  → EXPLAIN ANALYZE: Seq Scan instead of Index Scan.\n  → Index dropped in migration!\n\nFix: Add back index. Latency back to 200ms.\n\nPostmortem action: pre-deploy DB performance check.\n</code></pre>\n      </section>\n\n      <section id=\"perf-budget\">\n        <h2 id=\"section-57\">10. Performance Budget</h2>\n\n        <h3 id=\"section-58\">10.1. Concept</h3>\n\n        <p>Define max acceptable latency / size, enforce trong CI:</p>\n\n<pre><code class=\"language-yaml\"># performance-budget.yml\napi:\n  endpoint: /api/users\n  P50: 50ms\n  P95: 200ms\n  P99: 500ms\n  error_rate: &lt; 0.1%\n\nfrontend:\n  bundle_size_js: 200 KB         # gzipped\n  bundle_size_css: 50 KB\n  Largest_Contentful_Paint: 2.5s\n  Time_To_Interactive: 3.0s\n  Cumulative_Layout_Shift: &lt; 0.1\n</code></pre>\n\n        <h3 id=\"section-59\">10.2. Enforce trong CI</h3>\n\n<pre><code class=\"language-yaml\">- name: Build\n  run: npm run build\n\n- name: Bundle size check\n  run: npx bundlesize           # fail if exceed budget\n\n- name: Lighthouse CI\n  uses: treosh/lighthouse-ci-action@v11\n  with:\n    configPath: './lighthouserc.json'\n    # Lighthouse thresholds:\n    # performance: 90, LCP &lt; 2.5s, CLS &lt; 0.1\n\n- name: API perf test\n  run: k6 run perf-test.js\n  # Threshold fail → CI fail\n</code></pre>\n\n        <h3 id=\"section-60\">10.3. Web vitals (Frontend)</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Metric</th><th>Good</th><th>Poor</th></tr></thead>\n          <tbody>\n            <tr><td>LCP (Largest Contentful Paint)</td><td>≤ 2.5s</td><td>&gt; 4s</td></tr>\n            <tr><td>FID (First Input Delay) → INP (Interaction to Next Paint)</td><td>≤ 100ms / 200ms</td><td>&gt; 300ms / 500ms</td></tr>\n            <tr><td>CLS (Cumulative Layout Shift)</td><td>≤ 0.1</td><td>&gt; 0.25</td></tr>\n            <tr><td>TTFB (Time to First Byte)</td><td>≤ 800ms</td><td>&gt; 1800ms</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>Google ranking factor — performance ảnh hưởng SEO.</p>\n      </section>\n\n      <section id=\"finops\">\n        <h2 id=\"section-61\">11. FinOps — Cost Optimization</h2>\n\n        <h3 id=\"section-62\">11.1. Common waste</h3>\n\n        <ul>\n          <li>Over-provisioned instances (high RAM but low usage).</li>\n          <li>Unused resources (orphan EBS, unused EIPs).</li>\n          <li>Forgotten dev/staging running 24/7.</li>\n          <li>Egress trafic unnecessary cross-region.</li>\n          <li>Unoptimized images / data transfer.</li>\n          <li>NAT Gateway expensive.</li>\n          <li>Reserved Instance không matching workload.</li>\n        </ul>\n\n        <h3 id=\"section-63\">11.2. Right-sizing</h3>\n\n        <p>Tools recommend instance size based on actual usage:</p>\n        <ul>\n          <li>AWS Compute Optimizer.</li>\n          <li>GCP Recommender.</li>\n          <li>K8s VPA recommend mode.</li>\n        </ul>\n\n        <h3 id=\"section-64\">11.3. Spot / Preemptible</h3>\n\n        <p>Discount 60-90% off on-demand. Use cho:</p>\n        <ul>\n          <li>Stateless worker.</li>\n          <li>Batch job (replay if killed).</li>\n          <li>CI runner.</li>\n          <li>K8s dev/staging clusters.</li>\n          <li>Mixed cluster: 30% on-demand baseline + 70% spot burst.</li>\n        </ul>\n\n        <h3 id=\"section-65\">11.4. Reserved / Committed Use</h3>\n\n        <p>Cam kết 1-3 năm cho discount 40-72%. Pattern:</p>\n        <ul>\n          <li>Reserved cho baseline (steady).</li>\n          <li>Spot cho burst.</li>\n          <li>On-demand cho overflow.</li>\n        </ul>\n\n        <h3 id=\"section-66\">11.5. Auto stop dev/staging</h3>\n\n<pre><code class=\"language-bash\"># EventBridge rule schedule stop EC2 after 6pm\naws events put-rule --schedule-expression \"cron(0 18 ? * MON-FRI *)\"\n\n# Auto resume morning\n# Tag-based: tag instances \"AutoStop: true\"\n</code></pre>\n\n        <p>Tools: AWS Instance Scheduler, GCP Instance Groups schedule.</p>\n\n        <h3 id=\"section-67\">11.6. Cost monitoring</h3>\n\n        <ul>\n          <li><strong>Tag everything</strong> — Owner, Project, Env, CostCenter.</li>\n          <li><strong>Budget alert</strong> — Slack notification 80% / 100%.</li>\n          <li><strong>Showback / chargeback</strong> — chia phí theo team.</li>\n          <li><strong>Anomaly detection</strong> — alert khi cost spike.</li>\n        </ul>\n\n        <p>Tools: AWS Cost Explorer / Budget, Vantage, Infracost (preview cost của Terraform PR), CloudHealth.</p>\n\n        <h3 id=\"section-68\">11.7. Infracost trong CI</h3>\n\n<pre><code class=\"language-yaml\">- name: Infracost diff\n  uses: infracost/infracost-action@v3\n  with:\n    api_key: ${{ secrets.INFRACOST_API_KEY }}\n    path: ./terraform\n  # Comment cost difference vào PR\n</code></pre>\n\n        <p>Result: PR comment \"this PR will increase monthly cost by $1200\" — review trước approve.</p>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-69\">12. Bài tập</h2>\n\n        <ol>\n          <li><strong>k6 first test</strong>: load test API với 50 VUs, 5 phút. Check P95 &lt; 500ms threshold. CI integration.</li>\n\n          <li><strong>Stress test</strong>: ramp up 0 → 1000 VUs trong 10 phút. Tìm breaking point. Plot RPS vs latency.</li>\n\n          <li><strong>Profile</strong>: lấy CPU profile của Node.js / Go app trong 30s. Generate flame graph. Identify hot path.</li>\n\n          <li><strong>Heap leak</strong>: tạo intentional memory leak. Reproduce với stress test. Take heap snapshot, find leak.</li>\n\n          <li><strong>Cache implementation</strong>: thêm Redis cache-aside cho 1 endpoint. Đo cache hit rate. Compare latency before/after.</li>\n\n          <li><strong>CDN setup</strong>: setup CloudFront/Cloudflare cho static site. Measure latency từ different region. Verify cache header.</li>\n\n          <li><strong>DB optimization</strong>: identify N+1 query. Fix. Add index for slow query (EXPLAIN ANALYZE). Measure.</li>\n\n          <li><strong>HPA</strong>: setup HPA cho web deployment. Stress test, watch scale up. Setup behavior policy (no flapping).</li>\n\n          <li><strong>KEDA scale-to-zero</strong>: deploy worker với KEDA scale theo Redis queue length. Idle = 0 pod. Add msg = scale up.</li>\n\n          <li><strong>Karpenter</strong>: trên EKS, deploy Karpenter. Schedule pod request more than node available, watch Karpenter spin up new node.</li>\n\n          <li><strong>PodDisruptionBudget</strong>: setup PDB minAvailable 80% cho web. Drain node, verify K8s không violate PDB.</li>\n\n          <li><strong>Performance budget</strong>: define + enforce: API P95 latency, JS bundle &lt; 200KB, Lighthouse score &gt; 90.</li>\n\n          <li><strong>Cost analysis</strong>: review AWS cost 30 ngày qua. Top 5 categories. Identify 3 quick wins (vd: unused EBS, forgotten staging EC2).</li>\n\n          <li><strong>Right-sizing</strong>: dùng Compute Optimizer / VPA recommend. Apply suggestions, đo cost saving.</li>\n\n          <li><strong>Infracost CI</strong>: setup Infracost trong PR. Test bằng PR thêm large RDS — verify cost diff comment.</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-70\">13. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-71\">Quiz cuối Chương 13</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Vì sao P99 quan trọng hơn average latency?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: P99 dễ tính hơn\">P99 dễ tính hơn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Average không dùng được\">Average không dùng được</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Latency phân phối long-tail; mean bị skew bởi outlier; P99 phản ánh &quot;worst case 1% user&quot;; tail latency amplification: request fan-out 10 service mỗi P99 1% = P99 tổng ~10%\">Latency phân phối long-tail; mean bị skew bởi outlier; P99 phản ánh \"worst case 1% user\"; tail latency amplification: request fan-out 10 service mỗi P99 1% = P99 tổng ~10%</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: P99 luôn nhỏ hơn\">P99 luôn nhỏ hơn</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">10 request: 9 cái 50ms + 1 cái 5000ms → mean 545ms (no user trải nghiệm). P50=50ms, P99=5000ms. P99 = 1% user worst case. Microservice fan-out: mỗi service chậm 1% (P99) → request đi 10 service có ~10% chance hit. Reduce P99 tail latency khó nhưng impact lớn hơn cải thiện average. Jeff Dean (Google): hedged request, tied request mitigate.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Cache stampede / thundering herd là:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cache full\">Cache full</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hot key expire → 1000 request cùng lúc miss → all 1000 query DB → DB chết; mitigate bằng lock (chỉ 1 fetch DB), probabilistic early refresh, stale-while-revalidate\">Hot key expire → 1000 request cùng lúc miss → all 1000 query DB → DB chết; mitigate bằng lock (chỉ 1 fetch DB), probabilistic early refresh, stale-while-revalidate</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cache slow\">Cache slow</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Network issue\">Network issue</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Common pattern: viral content cache 5 phút. Khi expire đúng peak traffic → all request miss simultaneously → DB flood. Solutions: (1) distributed lock (Redis SETNX), (2) probabilistic early refresh (refresh trước expire với probability tăng dần), (3) stale-while-revalidate (serve stale + async fresh), (4) jitter expiry (TTL ± random).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Cache-Aside pattern:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cache write tự động\">Cache write tự động</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cache layer fetch DB tự\">Cache layer fetch DB tự</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: No caching\">No caching</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: App check cache → miss thì fetch DB + populate cache → return; pattern phổ biến nhất, simple, app control\">App check cache → miss thì fetch DB + populate cache → return; pattern phổ biến nhất, simple, app control</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Cache-Aside (Lazy Loading): app code explicit cache check + miss handling. Pros: simple, app control invalidation. Cons: cache miss = 2 round-trip (cache + DB). Read-Through: cache layer transparent fetch DB on miss (cleaner code). Write-Through: write cache + DB sync (strong consistency, slower write). Write-Behind: write cache, async DB (fast write, eventual consistency).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Cache-Control: max-age=300, s-maxage=3600 nghĩa:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Browser cache 5 phút, CDN cache 1 giờ — s-maxage override max-age cho shared cache (CDN)\">Browser cache 5 phút, CDN cache 1 giờ — s-maxage override max-age cho shared cache (CDN)</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cache 5 phút\">Cache 5 phút</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cache 1 giờ\">Cache 1 giờ</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Total 65 phút\">Total 65 phút</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">max-age cho browser (private cache); s-maxage cho shared cache (CDN, proxy). Pattern phổ biến: short max-age (browser fresh) + long s-maxage (CDN absorb traffic). stale-while-revalidate=N: serve stale + async refresh. stale-if-error=N: fallback stale khi origin error. immutable: never check freshness (cho hashed assets).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Read replica trong DB scaling chú ý:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Synchronous\">Synchronous</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: No lag\">No lag</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Async replication có lag (ms-s); read-your-write consistency cần route về primary; tail của replica có thể stale\">Async replication có lag (ms-s); read-your-write consistency cần route về primary; tail của replica có thể stale</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Replace primary\">Replace primary</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Replica eventually consistent với primary (Postgres streaming replication async, replica lag few ms-s). Read-your-write issue: user POST update → immediately GET → có thể không thấy (replica chưa sync). Solutions: route GET sau write tới primary (in same session), hoặc accept eventual consistency in UI. Sync replication = latency penalty cho write.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">HPA vs VPA vs CA:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cùng tool\">Cùng tool</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: HPA scale replica số (ngang); VPA scale resource request mỗi pod (dọc); CA/Karpenter scale node số (cluster) — cả 3 work together\">HPA scale replica số (ngang); VPA scale resource request mỗi pod (dọc); CA/Karpenter scale node số (cluster) — cả 3 work together</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: VPA replace HPA\">VPA replace HPA</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Chỉ HPA cần\">Chỉ HPA cần</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">HPA: kube-controller scale replicas dựa trên CPU/RAM/custom metric. VPA: adjust pod resource request (Auto mode restart pod, disruptive). CA / Karpenter: thêm node khi pod pending. Combined: HPA scale pod số, CA scale node để fit pod. VPA + HPA conflict trên cùng metric → use VPA recommend mode + HPA on CPU. KEDA event-driven (Kafka lag, queue) extension HPA.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">KEDA scale-to-zero ưu điểm:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Faster scale\">Faster scale</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cheaper than HPA always\">Cheaper than HPA always</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: More accurate metrics\">More accurate metrics</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Khi không event (queue empty, no message), scale xuống 0 pod = no cost; HPA min replica = 1; phù hợp event-driven worker burst-y traffic\">Khi không event (queue empty, no message), scale xuống 0 pod = no cost; HPA min replica = 1; phù hợp event-driven worker burst-y traffic</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">HPA minReplicas &gt;= 1. KEDA + ScaledObject minReplicaCount: 0 → khi metric trigger không match (queue empty), pods xuống 0. Use case: ETL job, image processing, notification worker — không có event, không pay. Đầu tiên message: KEDA tạo 1 pod (cold start ~5-10s). Trade-off: cold start vs cost.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">PodDisruptionBudget vai trò:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Giới hạn cost\">Giới hạn cost</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Resource limit\">Resource limit</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Đảm bảo không quá nhiều Pod down cùng lúc khi voluntary disruption (drain, autoscaler scale down) — minAvailable: 80% giữ HA\">Đảm bảo không quá nhiều Pod down cùng lúc khi voluntary disruption (drain, autoscaler scale down) — minAvailable: 80% giữ HA</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: RBAC\">RBAC</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Voluntary disruption: <code>kubectl drain</code>, cluster autoscaler scale down, rolling update. K8s honors PDB → won't disrupt nếu vi phạm. Involuntary (node hardware fail, OOM): K8s không enforce PDB. Pattern: minAvailable: 50% cho ít critical, 80%+ cho critical. Cũng support absolute number: minAvailable: 2 (luôn ≥ 2 pod available).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">\"Don't run server &gt; 80% utilization\" lý do:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Khi gần 100%, mọi spike traffic → queue overflow → latency tăng vọt 10-100× (não-tuyến tính); cần buffer cho burst, GC pause, autoscale lag\">Khi gần 100%, mọi spike traffic → queue overflow → latency tăng vọt 10-100× (não-tuyến tính); cần buffer cho burst, GC pause, autoscale lag</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tiết kiệm điện\">Tiết kiệm điện</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Hardware bền hơn\">Hardware bền hơn</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Compliance\">Compliance</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Queueing theory: latency = service_time / (1 - utilization). 80% util: latency 5× service time. 95% util: 20×. 99%: 100×. Real-world: GC pause, network jitter, traffic spike all eat capacity. Quy tắc: autoscale at 70% utilization, leave 30% buffer. Reserved capacity giúp predictable performance under load.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">FinOps quick wins thường gặp:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Buy more reserved\">Buy more reserved</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Right-size over-provisioned instances; cleanup unused resources (orphan EBS, unused EIP); auto-stop dev/staging cuối ngày; tag-based showback\">Right-size over-provisioned instances; cleanup unused resources (orphan EBS, unused EIP); auto-stop dev/staging cuối ngày; tag-based showback</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Multi-cloud\">Multi-cloud</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Disable monitoring\">Disable monitoring</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Common waste: EC2 m5.4xlarge với 5% CPU avg → m5.large đủ (8× cost saving). Orphan EBS sau terminate EC2 ($0.10/GB/month). Forgotten staging chạy weekend ($300/month). Public Elastic IP unused ($3.6/month each). Easy ROI: tag everything → identify owner → review monthly. Reserved Instance chỉ optimize sau khi đo baseline (cam kết wrong size = waste).</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 13. Tiếp theo: <a href=\"/learn/devops/chapter-14/\"><strong>Chương 14 — Production Mastery →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Performance đo gì?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "1.1. Key metrics",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "1.2. Little's Law",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "1.3. Vì sao P99 quan trọng hơn average?",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "1.4. Premature optimization",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "2. Load Testing",
+      "depth": 2
+    },
+    {
+      "id": "section-7",
+      "text": "2.1. Types of test",
+      "depth": 3
+    },
+    {
+      "id": "section-8",
+      "text": "2.2. Tools",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "2.3. Test environment",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "3. k6 Deep Dive",
+      "depth": 2
+    },
+    {
+      "id": "section-11",
+      "text": "3.1. Cài + script đầu tiên",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "3.2. Stages — ramp up/down",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "3.3. Realistic scenarios",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "3.4. CI integration",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "4. Profiling",
+      "depth": 2
+    },
+    {
+      "id": "section-16",
+      "text": "4.1. CPU profiling",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "4.2. Go pprof example",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "4.3. Flame graph",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "4.4. Heap profiling — memory leak",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "4.5. Distributed tracing for perf",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "4.6. Continuous profiling",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "5. Caching",
+      "depth": 2
+    },
+    {
+      "id": "section-23",
+      "text": "5.1. Caching layers",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "5.2. Cache patterns",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "5.3. Cache-Aside example",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "5.4. Cache invalidation",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "5.5. Eviction policies",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "5.6. Common pitfalls",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "5.7. Redis cluster",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "6. CDN — Edge Caching",
+      "depth": 2
+    },
+    {
+      "id": "section-31",
+      "text": "6.1. Vì sao CDN?",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "6.2. Providers",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "6.3. Cache-Control headers",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "6.4. Cache strategy by content type",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "6.5. Cache invalidation",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "6.6. Edge compute",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "7. Database Scaling",
+      "depth": 2
+    },
+    {
+      "id": "section-38",
+      "text": "7.1. Vertical scaling (scale up)",
+      "depth": 3
+    },
+    {
+      "id": "section-39",
+      "text": "7.2. Read replicas",
+      "depth": 3
+    },
+    {
+      "id": "section-40",
+      "text": "7.3. Sharding",
+      "depth": 3
+    },
+    {
+      "id": "section-41",
+      "text": "7.4. NoSQL — built-in sharding",
+      "depth": 3
+    },
+    {
+      "id": "section-42",
+      "text": "7.5. Connection pooling",
+      "depth": 3
+    },
+    {
+      "id": "section-43",
+      "text": "7.6. Caching tier",
+      "depth": 3
+    },
+    {
+      "id": "section-44",
+      "text": "7.7. Database for specific workload",
+      "depth": 3
+    },
+    {
+      "id": "section-45",
+      "text": "8. Autoscaling — K8s deep",
+      "depth": 2
+    },
+    {
+      "id": "section-46",
+      "text": "8.1. HPA (Horizontal Pod Autoscaler)",
+      "depth": 3
+    },
+    {
+      "id": "section-47",
+      "text": "8.2. KEDA (Event-driven)",
+      "depth": 3
+    },
+    {
+      "id": "section-48",
+      "text": "8.3. VPA (Vertical Pod Autoscaler)",
+      "depth": 3
+    },
+    {
+      "id": "section-49",
+      "text": "8.4. Cluster Autoscaler / Karpenter",
+      "depth": 3
+    },
+    {
+      "id": "section-50",
+      "text": "8.5. PodDisruptionBudget",
+      "depth": 3
+    },
+    {
+      "id": "section-51",
+      "text": "9. Bottleneck Analysis",
+      "depth": 2
+    },
+    {
+      "id": "section-52",
+      "text": "9.1. Common bottlenecks",
+      "depth": 3
+    },
+    {
+      "id": "section-53",
+      "text": "9.2. USE Method",
+      "depth": 3
+    },
+    {
+      "id": "section-54",
+      "text": "9.3. Amdahl's Law",
+      "depth": 3
+    },
+    {
+      "id": "section-55",
+      "text": "9.4. Don't run > 80% utilization",
+      "depth": 3
+    },
+    {
+      "id": "section-56",
+      "text": "9.5. Real example: API chậm",
+      "depth": 3
+    },
+    {
+      "id": "section-57",
+      "text": "10. Performance Budget",
+      "depth": 2
+    },
+    {
+      "id": "section-58",
+      "text": "10.1. Concept",
+      "depth": 3
+    },
+    {
+      "id": "section-59",
+      "text": "10.2. Enforce trong CI",
+      "depth": 3
+    },
+    {
+      "id": "section-60",
+      "text": "10.3. Web vitals (Frontend)",
+      "depth": 3
+    },
+    {
+      "id": "section-61",
+      "text": "11. FinOps — Cost Optimization",
+      "depth": 2
+    },
+    {
+      "id": "section-62",
+      "text": "11.1. Common waste",
+      "depth": 3
+    },
+    {
+      "id": "section-63",
+      "text": "11.2. Right-sizing",
+      "depth": 3
+    },
+    {
+      "id": "section-64",
+      "text": "11.3. Spot / Preemptible",
+      "depth": 3
+    },
+    {
+      "id": "section-65",
+      "text": "11.4. Reserved / Committed Use",
+      "depth": 3
+    },
+    {
+      "id": "section-66",
+      "text": "11.5. Auto stop dev/staging",
+      "depth": 3
+    },
+    {
+      "id": "section-67",
+      "text": "11.6. Cost monitoring",
+      "depth": 3
+    },
+    {
+      "id": "section-68",
+      "text": "11.7. Infracost trong CI",
+      "depth": 3
+    },
+    {
+      "id": "section-69",
+      "text": "12. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-70",
+      "text": "13. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-71",
+      "text": "Quiz cuối Chương 13",
+      "depth": 3
+    }
+  ],
+  "source": "DevOps/chuong/chuong13.html",
+  "sourceHash": "1317af97bea9f50321f6f287df813bc09f9ad2a5e9ce93ca164ffc02fb3b5062",
+  "readingMinutes": 18
+}

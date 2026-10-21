@@ -1,0 +1,290 @@
+{
+  "id": "system-design--chapter-08",
+  "track": "system-design",
+  "trackTitle": "System Design",
+  "slug": "chapter-08",
+  "order": 8,
+  "title": "Design Case Studies",
+  "description": "Năm case study kinh điển vận dụng mọi kiến thức 7 chương: URL shortener, Twitter timeline, Uber geospatial, Netflix, Notification service. Khung tư duy phỏng vấn.",
+  "html": "\n\n      <section id=\"framework\">\n        <h2 id=\"section-1\">1. Khung tư duy thiết kế hệ thống</h2>\n\n        <p>Mỗi case study đi theo 8 bước:</p>\n\n        <ol class=\"steps\">\n          <li><strong>Clarify requirements</strong> — functional (tính năng) + non-functional (scale, latency, reliability). Hỏi nhiều ở bước này.</li>\n          <li><strong>Capacity estimation</strong> — DAU, QPS read/write, storage, bandwidth.</li>\n          <li><strong>API design</strong> — endpoint chính, request/response shape.</li>\n          <li><strong>Data model</strong> — schema cho top entity, ước lượng size.</li>\n          <li><strong>High-level architecture</strong> — vẽ box và arrow. Bắt đầu đơn giản (1 server + 1 DB), scale dần.</li>\n          <li><strong>Detailed design</strong> — sharding, cache layer, queue, replication.</li>\n          <li><strong>Identify bottleneck</strong> — đâu là bottleneck đầu tiên khi load tăng 10×?</li>\n          <li><strong>Discuss trade-offs</strong> — mỗi quyết định có cost.</li>\n        </ol>\n      </section>\n\n      <!-- ============================================================== -->\n      <!-- CASE 1: URL SHORTENER -->\n      <!-- ============================================================== -->\n      <section id=\"case1\">\n        <h2 id=\"section-2\">2. Case 1: URL Shortener (Bit.ly / TinyURL)</h2>\n\n        <h3 id=\"section-3\">2.1. Requirements</h3>\n        <p><strong>Functional:</strong></p>\n        <ul>\n          <li>POST <code>/shorten</code> nhận long URL, trả short URL.</li>\n          <li>GET <code>/{shortCode}</code> redirect đến long URL.</li>\n          <li>Optional: custom alias, expiration, analytics (click count).</li>\n        </ul>\n\n        <p><strong>Non-functional:</strong></p>\n        <ul>\n          <li>Read &gt;&gt; Write (100:1).</li>\n          <li>Latency thấp cho redirect (~10ms).</li>\n          <li>Highly available — link không bao giờ broken.</li>\n          <li>Short code không đoán được (security).</li>\n        </ul>\n\n        <h3 id=\"section-4\">2.2. Capacity</h3>\n        <ul>\n          <li>500M URL mới/tháng → 500M/30/86400 ≈ 200/s write avg, peak ~1000/s.</li>\n          <li>Read 100× = 20k/s avg, peak ~100k/s.</li>\n          <li>Storage: 500M × 12 tháng × 5 năm = 30B URL. Mỗi URL ~500 byte → 15TB.</li>\n          <li>Hot data (URL được click thường xuyên): ~100GB → fit Redis cluster.</li>\n        </ul>\n\n        <h3 id=\"section-5\">2.3. API</h3>\n<pre><code class=\"language-http\">POST /api/v1/shorten\nAuthorization: Bearer &lt;api_key&gt;\n{ \"long_url\": \"https://example.com/very/long/path?q=1\", \"custom_alias\": null, \"expire_at\": null }\n\n201 Created\n{ \"short_url\": \"https://sho.rt/abc1234\", \"short_code\": \"abc1234\" }\n\n# Redirect\nGET /abc1234\n\n302 Found\nLocation: https://example.com/very/long/path?q=1</code></pre>\n\n        <h3 id=\"section-6\">2.4. Short code generation — quan trọng nhất</h3>\n\n        <p>3 strategies:</p>\n\n        <h4>2.4.a. Hash long URL (MD5/SHA, take 7 char)</h4>\n        <p>(+) Deterministic — cùng URL = cùng short. (−) Collision có thể; cần check + retry. Conflict tăng theo time.</p>\n\n        <h4>2.4.b. Random Base62 (a-zA-Z0-9, 7 chars = 62^7 ≈ 3.5T combination)</h4>\n        <p>(+) Đơn giản, không đoán được. (−) Collision → check DB + retry. (−) Khó scale ngang nếu collision frequent.</p>\n\n        <h4>2.4.c. Counter-based với Base62 encoding (Recommended)</h4>\n        <p>Distributed counter (Snowflake-like, hoặc DB sequence) → Base62 encode → unique guaranteed.</p>\n\n<pre><code class=\"language-typescript\">// Snowflake-like ID: 64 bit\n// [timestamp 41 bit][machine 10 bit][seq 12 bit]\n// Capacity: 4096 ID/ms × 1024 machine = 4M ID/ms\n\nconst id = generateSnowflake();   // bigint unique\nconst shortCode = base62(id);     // \"abc1234\" (7 char ≈ enough)\n\nfunction base62(n: bigint): string {\n  const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';\n  let result = '';\n  while (n &gt; 0n) {\n    result = chars[Number(n % 62n)] + result;\n    n /= 62n;\n  }\n  return result;\n}</code></pre>\n\n        <p>Vấn đề: counter sequential → predictable. Có thể obscure bằng pre-generated pool randomized, hoặc chỉ Base62 + thêm checksum.</p>\n\n        <h3 id=\"section-7\">2.5. Architecture</h3>\n\n        <div class=\"ascii\">  Client\n    │\n    ▼\n  CDN (CloudFlare) ─────► cache redirect responses (HTTP 302 with Location)\n    │ MISS\n    ▼\n  API Gateway / nginx ──► rate limit, auth API key\n    │\n    ├─► Write: POST /shorten ─► App ─► Snowflake ID ─► DB write + cache write\n    │\n    └─► Read: GET /:code ─► App ─► Redis lookup ─► hit: return 302\n                                          miss: DB lookup ─► set cache ─► 302</div>\n\n        <h3 id=\"section-8\">2.6. Data model</h3>\n<pre><code class=\"language-sql\">-- Postgres\nCREATE TABLE urls (\n  id            BIGINT PRIMARY KEY,             -- snowflake ID\n  short_code    VARCHAR(10) UNIQUE NOT NULL,    -- base62(id) + nullable custom alias\n  long_url      TEXT NOT NULL,\n  user_id       BIGINT,                         -- nullable (anonymous OK)\n  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n  expire_at     TIMESTAMPTZ,\n  click_count   BIGINT DEFAULT 0\n);\n\nCREATE INDEX idx_urls_short_code ON urls(short_code);\nCREATE INDEX idx_urls_user ON urls(user_id) WHERE user_id IS NOT NULL;</code></pre>\n\n        <p>Khi 30B row: shard theo <code>short_code</code> hash. 1000 shard logical, 10 physical Postgres.</p>\n\n        <h3 id=\"section-9\">2.7. Scaling decisions</h3>\n        <ul>\n          <li><strong>Cache hot URL</strong> — 80/20 rule: top 20% URL nhận 80% click. Redis cluster 100GB.</li>\n          <li><strong>CDN cache redirect</strong> — Cloudflare cache 302 response 1h → cực giảm tải app.</li>\n          <li><strong>Read replica</strong> — primary chỉ write, multiple replica cho read.</li>\n          <li><strong>Click count async</strong> — không UPDATE mỗi redirect. Push event vào Kafka, batch update mỗi phút.</li>\n          <li><strong>Geographic</strong> — multi-region với eventual consistency. URL ở 1 region, replicate đến region khác.</li>\n        </ul>\n\n        <h3 id=\"section-10\">2.8. Trade-offs</h3>\n        <ul>\n          <li><strong>Counter-based</strong> dễ predict — nếu cần obscure, thêm random hoặc encrypt.</li>\n          <li><strong>302 vs 301</strong>: 301 cache mạnh hơn ở browser nhưng mất analytics (browser không hit server lần sau). Bit.ly dùng 301; analytics service riêng lấy data từ Cloudflare logs.</li>\n          <li><strong>Strong vs eventual consistency</strong>: URL mới tạo có thể \"không tìm thấy\" 1-2 giây nếu đọc replica chưa apply. Mitigation: read primary cho recent write.</li>\n        </ul>\n      </section>\n\n      <!-- ============================================================== -->\n      <!-- CASE 2: TWITTER TIMELINE -->\n      <!-- ============================================================== -->\n      <section id=\"case2\">\n        <h2 id=\"section-11\">3. Case 2: Twitter Timeline (Fan-out)</h2>\n\n        <h3 id=\"section-12\">3.1. Requirements</h3>\n        <ul>\n          <li>User post tweet 280 char.</li>\n          <li>User follow nhiều user khác.</li>\n          <li>Home timeline: tweets từ followee, sorted by time, paginated.</li>\n          <li>User profile: tweets của user đó.</li>\n        </ul>\n\n        <h3 id=\"section-13\">3.2. Capacity</h3>\n        <ul>\n          <li>500M user, 100M DAU.</li>\n          <li>Mỗi DAU đọc timeline 5 lần, post 0.5 tweet → 500M read, 50M write/day.</li>\n          <li>Read peak ~10k QPS; write peak ~3k QPS.</li>\n          <li>Mỗi tweet 1KB → 50GB/day, 18TB/year.</li>\n          <li>Top user 100M follower (celebrity).</li>\n        </ul>\n\n        <h3 id=\"section-14\">3.3. Bài toán cốt lõi: Timeline generation</h3>\n        <p>Cách naive: <code>SELECT tweets WHERE author_id IN (SELECT followee FROM follows WHERE follower=me) ORDER BY created DESC LIMIT 20</code>.</p>\n\n        <p>Vấn đề: user follow 1000 người, mỗi lần view timeline phải scan tweets của 1000 user. 100M user view timeline → DB chết.</p>\n\n        <h3 id=\"section-15\">3.4. Hai pattern: Fan-out on Read vs Fan-out on Write</h3>\n\n        <div class=\"compare\">\n          <div>\n            <h4>Fan-out on Read (Pull)</h4>\n            <p>Khi user view timeline → query tweets của followee → merge → return.</p>\n            <ul>\n              <li>(+) Write rẻ — chỉ insert 1 tweet.</li>\n              <li>(−) Read đắt — mỗi view tốn nhiều query.</li>\n              <li>Phù hợp: user follow ít (LinkedIn).</li>\n            </ul>\n          </div>\n          <div>\n            <h4>Fan-out on Write (Push)</h4>\n            <p>Khi user post tweet → ghi tweet_id vào timeline cache của TẤT CẢ follower.</p>\n            <ul>\n              <li>(+) Read cực rẻ — chỉ đọc list đã pre-computed.</li>\n              <li>(−) Write đắt — fan-out đến hàng triệu follower.</li>\n              <li>Phù hợp: user follow nhiều, đọc nhiều (Twitter, Instagram).</li>\n            </ul>\n          </div>\n        </div>\n\n        <h3 id=\"section-16\">3.5. Twitter pattern: Hybrid</h3>\n\n        <ul>\n          <li><strong>User thường</strong> (&lt; 1M follower): fan-out on write. Khi post, ghi tweet_id vào Redis list của mỗi follower (timeline:userId).</li>\n          <li><strong>Celebrity</strong> (&gt; 1M follower): fan-out on read. Khi follower view timeline, merge tweets của celebrity họ follow with pre-computed list.</li>\n        </ul>\n\n        <p>Hybrid tránh cả 2 vấn đề:</p>\n        <ul>\n          <li>Celebrity post → không phải ghi 100M entry (sẽ kẹt vài giây/phút).</li>\n          <li>User thường read → không phải merge tweets của 1000 followee mỗi lần.</li>\n        </ul>\n\n        <h3 id=\"section-17\">3.6. Architecture</h3>\n\n        <div class=\"ascii\">  Post tweet:\n   User ──► API ──► Tweet Service ──► tweets DB (Cassandra/Postgres)\n                              │\n                              ▼ async (Kafka)\n                        Fan-out Service\n                              │\n                              ├─ if user.followers &lt; 1M:\n                              │    foreach follower:\n                              │       LPUSH timeline:follower tweet_id\n                              │       LTRIM timeline:follower 0 999\n                              │\n                              └─ else: skip (celebrity, fan-out on read)\n\n  View timeline:\n   User ──► API ──► Timeline Service:\n                       1. Read pre-computed: LRANGE timeline:userId 0 19\n                       2. Get celebrity list: SELECT celebrity_followees WHERE follower=userId\n                       3. For each celebrity: LRANGE timeline:celebrity 0 19 (recent)\n                       4. Merge sort by timestamp, take top 20\n                       5. Hydrate tweet_id → tweet content (Redis tweet cache)</div>\n\n        <h3 id=\"section-18\">3.7. Data store choices</h3>\n        <ul>\n          <li><strong>Tweets</strong>: Cassandra/ScyllaDB sharded by user_id — write-heavy, append-only natural fit. Or Postgres sharded.</li>\n          <li><strong>Follows</strong>: graph relations — Postgres or Cassandra với (follower_id, followee_id) composite key.</li>\n          <li><strong>Timeline cache</strong>: Redis cluster — list per user, 1000 entry mới nhất. TTL 30 ngày (active user).</li>\n          <li><strong>Tweet content cache</strong>: Redis với LRU eviction, hot tweet luôn ở RAM.</li>\n        </ul>\n\n        <h3 id=\"section-19\">3.8. Optimizations</h3>\n        <ul>\n          <li><strong>Lazy fan-out</strong> — chỉ fan-out đến active user (login &lt; 7 ngày). Inactive user lazy-load khi login lại.</li>\n          <li><strong>Read replica geographic</strong> — timeline cache ở region gần user.</li>\n          <li><strong>Tweet content shared</strong> — không duplicate tweet body trong mỗi follower's list. Chỉ lưu tweet_id, hydrate khi đọc.</li>\n        </ul>\n\n        <h3 id=\"section-20\">3.9. Trade-offs</h3>\n        <ul>\n          <li>Eventual consistency — tweet mới có thể delay 1-2 giây để xuất hiện trong timeline tất cả follower.</li>\n          <li>Memory cost — 100M user × 1000 tweet_id × 8 byte = 800GB Redis cho timeline cache. Nhiều shard.</li>\n          <li>Inactive user — nếu cache TTL hết, lazy regenerate khi login.</li>\n        </ul>\n      </section>\n\n      <!-- ============================================================== -->\n      <!-- CASE 3: UBER GEOSPATIAL -->\n      <!-- ============================================================== -->\n      <section id=\"case3\">\n        <h2 id=\"section-21\">4. Case 3: Uber-like Geospatial Service</h2>\n\n        <h3 id=\"section-22\">4.1. Requirements</h3>\n        <ul>\n          <li>Driver send vị trí mỗi 4 giây.</li>\n          <li>Rider request → tìm driver gần nhất trong vài giây.</li>\n          <li>Surge pricing area — phát hiện high-demand zone.</li>\n          <li>Realtime cập nhật vị trí driver trên map.</li>\n        </ul>\n\n        <h3 id=\"section-23\">4.2. Capacity</h3>\n        <ul>\n          <li>10M driver active, mỗi cái gửi vị trí mỗi 4s → 2.5M write/s.</li>\n          <li>Rider request 100k/s peak.</li>\n          <li>Storage cho location history (90 ngày) huge.</li>\n        </ul>\n\n        <h3 id=\"section-24\">4.3. Bài toán cốt lõi: tìm driver gần</h3>\n        <p>Naive: <code>SELECT driver WHERE distance(loc, rider_loc) &lt; 5km ORDER BY distance LIMIT 10</code>.</p>\n        <p>Vấn đề: tính khoảng cách cho 10M driver mỗi request → cực chậm. Cần spatial index.</p>\n\n        <h3 id=\"section-25\">4.4. Geohash — bảng trị giá vàng</h3>\n        <p>Chia trái đất thành lưới chữ nhật. Mỗi ô có hash unique. Hash càng dài, ô càng nhỏ.</p>\n\n        <ul>\n          <li>5 char (~5km × 5km): \"9q5cs\".</li>\n          <li>6 char (~1km × 1km): \"9q5csb\".</li>\n          <li>7 char (~150m × 150m): \"9q5csbf\".</li>\n        </ul>\n\n        <p>Đặc tính: prefix giống → vị trí gần. <code>9q5cs</code> chứa mọi vị trí <code>9q5cs*</code>.</p>\n\n        <h3 id=\"section-26\">4.5. Architecture</h3>\n\n        <div class=\"ascii\">  Driver location update (mỗi 4s):\n   Driver ──► API Gateway ──► WebSocket / gRPC stream ──►\n                                  │\n                                  ▼\n                          Location Service\n                                  │\n                                  ▼\n                          Redis GEOADD driver_locations lat lon driverId\n                                  │\n                                  ▼ (snapshot mỗi N giây)\n                          Kafka ──► Location Archive (Cassandra)\n\n  Rider request:\n   Rider ──► API ──► Matching Service:\n                        1. Compute geohash của rider location\n                        2. Query Redis GEORADIUS driver_locations rider_lat rider_lon 5 km\n                           (Redis GEO native dùng geohash + sorted set)\n                        3. Filter: driver available, rating &gt; threshold\n                        4. Sort by distance + estimated arrival time\n                        5. Return top 5</div>\n\n        <h3 id=\"section-27\">4.6. Redis GEO commands</h3>\n<pre><code class=\"language-bash\">GEOADD drivers -122.4194 37.7749 driver-123        # San Francisco\nGEOADD drivers -73.9857 40.7484 driver-456         # New York\n\n# Tìm driver trong 5km của rider:\nGEORADIUS drivers -122.4180 37.7758 5 km WITHCOORD WITHDIST COUNT 10 ASC\n\n# Output: list (driver-id, distance, [lon, lat])</code></pre>\n\n        <p>Redis GEO dùng sorted set + geohash internal. Cực nhanh — &lt; 1ms cho hàng triệu driver.</p>\n\n        <h3 id=\"section-28\">4.7. Sharding theo region</h3>\n        <p>1 Redis cluster cho mỗi region (US-West, US-East, EU, APAC). Driver mặc định trong cluster region của họ. Cross-region rare (chuyến bay đến nơi khác).</p>\n\n        <p>Sharding theo geohash level cao (vd: 4 char = 50km × 50km) cũng được — nhưng phức tạp khi driver di chuyển cross-shard.</p>\n\n        <h3 id=\"section-29\">4.8. Quad-tree (alternative)</h3>\n        <p>Cây 4 nhánh — mỗi node chia khu vực thành 4 quadrant. Khi node quá đông, split. Điều chỉnh density tự động — vùng đông (downtown) nhiều node nhỏ, vùng thưa (rural) ít node lớn.</p>\n\n        <p>Phù hợp khi mật độ không đều. Geohash đơn giản hơn nhưng kém adaptive.</p>\n\n        <h3 id=\"section-30\">4.9. Surge pricing detection</h3>\n        <p>Stream rider request và driver count theo geohash → real-time aggregation:</p>\n<pre><code>area_demand_supply_ratio = rider_requests_5min / available_drivers\nif ratio &gt; threshold: surge multiplier 1.5-3x</code></pre>\n\n        <p>Implementation: Kafka stream + Flink/Kafka Streams aggregation per geohash bucket.</p>\n\n        <h3 id=\"section-31\">4.10. Trade-offs</h3>\n        <ul>\n          <li><strong>Update frequency vs cost</strong>: 4s update là balance giữa accuracy (driver location) và load. Faster = more accurate, more load.</li>\n          <li><strong>Geohash boundary</strong>: 2 vị trí cách 100m có thể có geohash hoàn toàn khác (ranh giới cell). Workaround: search 9 cell adjacent.</li>\n          <li><strong>Eventual consistency</strong>: rider thấy driver ở vị trí 4s trước. Acceptable.</li>\n          <li><strong>Hot region</strong> (đông user) tách shard riêng.</li>\n        </ul>\n      </section>\n\n      <!-- ============================================================== -->\n      <!-- CASE 4: NETFLIX -->\n      <!-- ============================================================== -->\n      <section id=\"case4\">\n        <h2 id=\"section-32\">5. Case 4: Netflix-like Video Streaming</h2>\n\n        <h3 id=\"section-33\">5.1. Requirements</h3>\n        <ul>\n          <li>User upload + view video.</li>\n          <li>Multiple resolution (240p, 480p, 720p, 1080p, 4K).</li>\n          <li>Adaptive bitrate streaming.</li>\n          <li>Low latency play start (&lt; 2s).</li>\n          <li>Recommendation.</li>\n        </ul>\n\n        <h3 id=\"section-34\">5.2. Capacity</h3>\n        <ul>\n          <li>200M user, 100M concurrent peak.</li>\n          <li>Average 2 hour/day stream.</li>\n          <li>1080p ≈ 5 Mbps → 100M × 5 Mbps = 500 Tbps peak — Internet-scale bandwidth.</li>\n          <li>Storage: 5000 movies × 5 resolutions × ~10GB = 250TB.</li>\n        </ul>\n\n        <h3 id=\"section-35\">5.3. Component chính</h3>\n\n        <ol>\n          <li><strong>Upload service</strong> — multipart upload to S3.</li>\n          <li><strong>Transcoding pipeline</strong> — async, Kafka job → video transcoder workers (FFmpeg) sinh nhiều resolution.</li>\n          <li><strong>Storage</strong> — S3 cho master file, CDN cho delivery.</li>\n          <li><strong>CDN</strong> — Open Connect (Netflix custom) hoặc CloudFront.</li>\n          <li><strong>Adaptive streaming</strong> — HLS / DASH protocol.</li>\n          <li><strong>Recommendation</strong> — ML pipeline với user history.</li>\n        </ol>\n\n        <h3 id=\"section-36\">5.4. Adaptive Bitrate Streaming (HLS)</h3>\n        <p>Video chia thành chunks 2-10s. Mỗi chunk có nhiều resolution version. Client tự chọn version theo bandwidth thực tế.</p>\n\n<pre><code class=\"language-text\">video.m3u8 (manifest):\n  #EXTM3U\n  #EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=480x270\n  240p/playlist.m3u8\n  #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\n  720p/playlist.m3u8\n  #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080\n  1080p/playlist.m3u8\n\n720p/playlist.m3u8:\n  #EXTM3U\n  #EXTINF:6.0\n  segment-001.ts\n  #EXTINF:6.0\n  segment-002.ts\n  ...</code></pre>\n\n        <p>Network slow → client tự switch xuống 480p, không buffer. Network OK → 1080p.</p>\n\n        <h3 id=\"section-37\">5.5. CDN strategy</h3>\n        <p>Netflix có Open Connect — CDN custom tích hợp ISP. Cache video phổ biến ngay tại ISP datacenter → user nhận từ \"ISP local server\" thay đường dài.</p>\n\n        <p>Cache hit rate Netflix 95%+. Origin chỉ phục vụ video hiếm.</p>\n\n        <h3 id=\"section-38\">5.6. Recommendation</h3>\n        <p>2 component:</p>\n\n        <ul>\n          <li><strong>Offline batch</strong> — Spark job hằng ngày, train ML model, generate top 100 recommendation per user.</li>\n          <li><strong>Online realtime</strong> — A/B test, contextual (giờ trong ngày, device).</li>\n        </ul>\n\n        <p>Recommendation pre-computed lưu Cassandra: <code>(user_id) → [movie_ids]</code>. View hiển thị → đọc nhanh.</p>\n\n        <h3 id=\"section-39\">5.7. Architecture</h3>\n\n        <div class=\"ascii\">  Upload:\n   Creator ──► Upload Service ──► S3 (master)\n                          │\n                          ▼ Kafka job\n                    Transcoding workers (FFmpeg)\n                          │\n                          ▼ generate 5 resolution\n                    S3 (transcoded chunks)\n                          │\n                          ▼ replicate\n                    CDN (Open Connect, CloudFront)\n\n  View:\n   Viewer ──► API Gateway ──► get manifest ──► CDN\n                          │\n                          ▼ return manifest URL\n   Viewer ──► CDN ──► load chunks adaptive bitrate\n\n  Background:\n   View events ──► Kafka ──► Recommendation pipeline (Spark)\n                                     │\n                                     ▼ daily batch\n                              Cassandra (precomputed recs)\n                                     │\n                                     ▼\n                          Recommendation API\n\n  Analytics:\n   View events ──► Kafka ──► Real-time dashboard (Druid/ClickHouse)</div>\n\n        <h3 id=\"section-40\">5.8. Trade-offs</h3>\n        <ul>\n          <li><strong>Storage cost</strong> — multi-resolution chiếm 2-3× single. Worth cho UX.</li>\n          <li><strong>Encode time</strong> — 1 movie = vài giờ transcode. Acceptable async.</li>\n          <li><strong>Pre-positioning</strong> — Open Connect push popular content đến ISP đêm low-traffic.</li>\n        </ul>\n      </section>\n\n      <!-- ============================================================== -->\n      <!-- CASE 5: NOTIFICATION SERVICE -->\n      <!-- ============================================================== -->\n      <section id=\"case5\">\n        <h2 id=\"section-41\">6. Case 5: Notification Service (Email / SMS / Push)</h2>\n\n        <h3 id=\"section-42\">6.1. Requirements</h3>\n        <ul>\n          <li>Multi-channel: email, SMS, push notification (iOS, Android), in-app.</li>\n          <li>Trigger từ nhiều service: order confirmation, password reset, marketing campaign.</li>\n          <li>Throttling — không spam user.</li>\n          <li>User preferences — opt-out per channel.</li>\n          <li>Delivery tracking — sent, delivered, opened, clicked.</li>\n          <li>Retry on failure.</li>\n        </ul>\n\n        <h3 id=\"section-43\">6.2. Capacity</h3>\n        <ul>\n          <li>100M user.</li>\n          <li>10 notification/user/day → 1B notification/day.</li>\n          <li>Avg 12k/s, peak 100k/s (marketing burst).</li>\n          <li>Multi-region.</li>\n        </ul>\n\n        <h3 id=\"section-44\">6.3. Architecture</h3>\n\n        <div class=\"ascii\">  Producer service (order, auth, marketing) ──► publish event Kafka\n                                                          │\n                                                          ▼\n                                              ┌─ Notification Service ─┐\n                                              │  Validate, dedup,      │\n                                              │  apply user prefs,     │\n                                              │  throttle              │\n                                              └────────┬───────────────┘\n                                                       │\n                              ┌────────────────────────┼────────────────────────┐\n                              ▼                        ▼                        ▼\n                         Email queue              SMS queue               Push queue\n                              │                        │                        │\n                              ▼                        ▼                        ▼\n                       SendGrid worker          Twilio worker            FCM/APNS worker\n                              │                        │                        │\n                              ▼                        ▼                        ▼\n                       External Email API      External SMS API        External Push API\n                              │                        │                        │\n                              ▼                        ▼                        ▼\n                       Delivery callback ──► Tracking DB (Cassandra)</div>\n\n        <h3 id=\"section-45\">6.4. Component</h3>\n\n        <h4>6.4.a. Notification Service core</h4>\n        <ul>\n          <li>Subscribe Kafka events (order.created, password.reset_requested, ...).</li>\n          <li>Map event → template + channels.</li>\n          <li>Hydrate user data (name, email, phone) from User Service.</li>\n          <li>Check user preferences — opt-out?</li>\n          <li>Apply throttling — user nhận &lt; X notification/hour.</li>\n          <li>Dedup — same notification ID → only send once (idempotency).</li>\n          <li>Push to channel-specific queue.</li>\n        </ul>\n\n        <h4>6.4.b. Channel workers</h4>\n        <ul>\n          <li>Pool workers per channel (email, SMS, push).</li>\n          <li>Pull from queue, call external API (SendGrid, Twilio, FCM).</li>\n          <li>Retry với exponential backoff khi fail.</li>\n          <li>DLQ sau 3-5 retry.</li>\n          <li>Update tracking DB với delivery status.</li>\n        </ul>\n\n        <h4>6.4.c. Tracking</h4>\n        <p>Cassandra schema:</p>\n<pre><code class=\"language-cql\">CREATE TABLE notifications (\n  id UUID,\n  user_id BIGINT,\n  channel TEXT,           -- email, sms, push\n  template_id TEXT,\n  status TEXT,            -- queued, sent, delivered, opened, clicked, failed\n  sent_at TIMESTAMP,\n  delivered_at TIMESTAMP,\n  opened_at TIMESTAMP,\n  PRIMARY KEY ((user_id), id)\n) WITH CLUSTERING ORDER BY (id DESC);</code></pre>\n\n        <p>Partition by user_id → query \"lịch sử notification của user\" nhanh.</p>\n\n        <h3 id=\"section-46\">6.5. Idempotency — critical</h3>\n        <p>Notification gửi 2 lần là tệ (user nhận 2 email cùng nội dung). Producer phải gửi với <code>notification_id</code> unique:</p>\n\n<pre><code class=\"language-typescript\">// Producer\nconst notifId = `order.confirmed:${orderId}`;\nawait kafka.send({\n  topic: 'notifications',\n  messages: [{\n    key: notifId,    // Kafka idempotent producer\n    value: JSON.stringify({ user_id, type: 'order.confirmed', data: {...} }),\n  }],\n});\n\n// Consumer (Notification Service)\nasync function process(event) {\n  const notifId = event.id;\n  const exists = await db.query('SELECT 1 FROM notifications WHERE id=$1', [notifId]);\n  if (exists.rowCount &gt; 0) return;   // already processed\n  // ... send notification\n  await db.query('INSERT INTO notifications (id, ...) VALUES ($1, ...)', [notifId, ...]);\n}</code></pre>\n\n        <h3 id=\"section-47\">6.6. Throttling logic</h3>\n<pre><code class=\"language-typescript\">async function shouldThrottle(userId: number, channel: string): Promise&lt;boolean&gt; {\n  const key = `notif_count:${userId}:${channel}:${Math.floor(Date.now() / 3600_000)}`;\n  const count = await redis.incr(key);\n  if (count === 1) await redis.expire(key, 3600);\n\n  const limit = channel === 'email' ? 5 : channel === 'sms' ? 2 : 20;\n  return count &gt; limit;\n}</code></pre>\n\n        <p>Marketing campaign cần special path — bulk send nhưng vẫn respect user preference.</p>\n\n        <h3 id=\"section-48\">6.7. Trade-offs</h3>\n        <ul>\n          <li><strong>At-least-once</strong> — accept may duplicate, dedup at consumer. Easier than exactly-once.</li>\n          <li><strong>Eventual delivery</strong> — notification có thể delay 1-30s normal, nhiều phút khi external API down (retry).</li>\n          <li><strong>Cost</strong> — SMS đắt ($0.005/SMS). Marketing cần budget cap.</li>\n          <li><strong>Provider redundancy</strong> — primary SendGrid + backup AWS SES. Nếu primary down, switch.</li>\n        </ul>\n      </section>\n\n      <section id=\"tips\">\n        <h2 id=\"section-49\">7. Interview Tips</h2>\n\n        <h3 id=\"section-50\">7.1. Quy tắc phỏng vấn 45-60 phút</h3>\n        <ol class=\"steps\">\n          <li><strong>5 phút</strong>: clarify requirements (functional + non-functional). Đừng bỏ qua. Senior phỏng vấn cố tình mơ hồ — bạn phải hỏi.</li>\n          <li><strong>5 phút</strong>: capacity estimation. Show \"back-of-envelope\" math. Tự tin với số liệu.</li>\n          <li><strong>5 phút</strong>: API + data model. Top 3-5 endpoint + key schema.</li>\n          <li><strong>15 phút</strong>: high-level architecture. Vẽ box và arrow. Bắt đầu đơn giản (1 server + 1 DB), evolve theo bottleneck.</li>\n          <li><strong>15 phút</strong>: deep dive 1-2 component (interviewer thường chọn).</li>\n          <li><strong>5 phút</strong>: bottleneck + optimization + monitoring.</li>\n          <li><strong>5 phút</strong>: trade-offs + ask questions.</li>\n        </ol>\n\n        <h3 id=\"section-51\">7.2. Lời khuyên</h3>\n        <ul>\n          <li><strong>Bắt đầu đơn giản</strong>. Đừng vẽ kiến trúc Twitter-scale ngay khi prompt là \"design TODO list\". Evolve theo nhu cầu.</li>\n          <li><strong>Think out loud</strong>. Senior muốn biết tư duy bạn, không chỉ kết quả cuối.</li>\n          <li><strong>Trade-off mọi quyết định</strong>. \"Tôi chọn Postgres vì cần ACID, mặc dù MongoDB scale tốt hơn.\" Show awareness.</li>\n          <li><strong>Capacity math thật</strong>. Đừng nói \"scalable\" mà không có số. \"10k QPS\" là minimum.</li>\n          <li><strong>Hỏi lại khi mơ hồ</strong>. \"Read-heavy hay write-heavy?\" \"Latency target?\" \"Multi-region?\".</li>\n          <li><strong>Đừng buzzword bingo</strong>. Đừng nói \"Kafka + Kubernetes + microservice\" cho TODO app.</li>\n          <li><strong>Acknowledge limit</strong>. \"Tôi không quen specific X, but here's how I'd approach it.\"</li>\n        </ul>\n\n        <h3 id=\"section-52\">7.3. Pattern phỏng vấn phổ biến</h3>\n        <ul>\n          <li>Design Twitter / Instagram (timeline)</li>\n          <li>Design URL Shortener / Pastebin (key-value, ID gen)</li>\n          <li>Design Uber / Lyft (geospatial)</li>\n          <li>Design YouTube / Netflix (video streaming, CDN)</li>\n          <li>Design WhatsApp / Discord (real-time chat)</li>\n          <li>Design Google Drive / Dropbox (file storage, sync)</li>\n          <li>Design Search (autocomplete, ranking)</li>\n          <li>Design Notification Service</li>\n          <li>Design Rate Limiter</li>\n          <li>Design Distributed Cache</li>\n          <li>Design Stock Exchange (low-latency)</li>\n          <li>Design Recommendation Engine</li>\n        </ul>\n\n        <p>Resources:</p>\n        <ul>\n          <li>\"System Design Interview\" — Alex Xu (book series).</li>\n          <li>\"Designing Data-Intensive Applications\" — Martin Kleppmann.</li>\n          <li>Engineering blog: Stripe, Discord, Uber, Cloudflare, Netflix, Shopify, GitHub.</li>\n          <li>HighScalability.com — case studies từ tech giant.</li>\n          <li>System Design Primer (GitHub repo).</li>\n        </ul>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-53\">8. Bài tập</h2>\n\n        <ol>\n          <li>Design \"WhatsApp\" — real-time chat 500M user. Phải xử lý: 1-1 chat, group chat 256 người, online status, typing indicator, message persist + sync cross-device, end-to-end encryption.</li>\n\n          <li>Design \"Google Drive\" — file storage và sync. 100M user, file đến 5GB, sync cross-device realtime, conflict resolution, version history.</li>\n\n          <li>Design \"Distributed rate limiter\" — service mà 1000+ instance dùng chung counter. Cho 10k QPS / API key. Latency &lt; 5ms.</li>\n\n          <li>Design \"Search autocomplete\" — gợi ý 10 query phổ biến khi user gõ. 5 tỉ query/day. Gợi ý &lt; 100ms. Trending term cập nhật trong giờ.</li>\n\n          <li>Design \"Stock Exchange order matching engine\" — match buy/sell order trong &lt; 1ms. 10k order/s. Strict ordering. Atomic execution.</li>\n\n          <li>Design \"Discord-like\" — real-time chat, voice, video. 200M user. Cassandra + Erlang/Elixir/Rust. Phân tích trade-off vs WhatsApp design.</li>\n\n          <li>Cho 1 case study bất kỳ ở mục 7.3, viết detailed design 1 trang theo khung 8 bước. Practice 1 case/tuần trong 2 tháng.</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-54\">9. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-55\">Quiz cuối Chương 8 (chương cuối)</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">URL Shortener — counter-based ID + Base62 encoding tốt hơn random Base62 vì:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Random nhanh hơn\">Random nhanh hơn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Counter ngắn hơn\">Counter ngắn hơn</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Counter unique guaranteed (không collision); random phải check DB + retry, conflict tăng theo time\">Counter unique guaranteed (không collision); random phải check DB + retry, conflict tăng theo time</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Counter đẹp hơn\">Counter đẹp hơn</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Snowflake ID phân tán → unique guaranteed, scale ngang. Random Base62 7 char = 62^7 ≈ 3.5T combination, đủ cho ~5% utilization mới conflict cao. Production thường dùng counter (Snowflake-like) với Base62 encoding.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Twitter timeline — celebrity (100M follower) gây vấn đề gì với fan-out on write?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Read chậm\">Read chậm</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cache miss\">Cache miss</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: DB schema phức tạp\">DB schema phức tạp</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Mỗi tweet phải ghi 100M entry vào timeline cache → kẹt vài phút; giải bằng hybrid: celebrity dùng fan-out on read\">Mỗi tweet phải ghi 100M entry vào timeline cache → kẹt vài phút; giải bằng hybrid: celebrity dùng fan-out on read</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Fan-out on write tốt cho user thường (&lt; 1M follower). Celebrity post → 100M write fan-out → kẹt. Twitter solution: hybrid — celebrity tweet không pre-compute, khi user view timeline thì merge tweets từ celebrity họ follow with pre-computed list.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Geohash phù hợp cho Uber-like geospatial vì:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Prefix giống → vị trí gần; cho phép range query &quot;tìm driver trong X km&quot; nhanh trên sorted index như Redis GEO\">Prefix giống → vị trí gần; cho phép range query \"tìm driver trong X km\" nhanh trên sorted index như Redis GEO</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Compress location\">Compress location</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Encryption\">Encryption</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Random\">Random</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Geohash chia trái đất thành lưới chữ nhật. 6 char ≈ 1km×1km. Property: prefix giống = location gần. Redis GEO native dùng geohash + sorted set → GEORADIUS &lt; 1ms cho millions driver. Boundary issue: search 9 cell adjacent.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Netflix HLS adaptive bitrate streaming:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Server chọn resolution\">Server chọn resolution</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Video chia chunks 2-10s, mỗi chunk có nhiều resolution; client tự switch theo network — slow → 480p, OK → 1080p\">Video chia chunks 2-10s, mỗi chunk có nhiều resolution; client tự switch theo network — slow → 480p, OK → 1080p</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cache toàn video\">Cache toàn video</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Compression\">Compression</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">HLS / DASH protocol. Manifest list available resolution + chunks. Client measure bandwidth, switch chunk-by-chunk. UX: không buffer khi network kém — tự xuống 480p; khi recover lên lại 1080p. Netflix Open Connect cache chunks tại ISP datacenter.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Notification Service — idempotency quan trọng vì:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tốc độ\">Tốc độ</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Compress\">Compress</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tránh user nhận 2 email/SMS cùng nội dung khi producer retry hoặc consumer redeliver\">Tránh user nhận 2 email/SMS cùng nội dung khi producer retry hoặc consumer redeliver</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: DB\">DB</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Producer publish event với id unique (vd: \"order.confirmed:orderId\"). Consumer check DB trước khi gửi. Redelivery (Kafka at-least-once + consumer crash) → duplicate event nhưng không duplicate notification. SMS đắt + UX tệ nếu spam.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Khung phỏng vấn system design 45 phút, bước đầu tiên QUAN TRỌNG nhất:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Vẽ architecture\">Vẽ architecture</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Chọn DB\">Chọn DB</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tính capacity\">Tính capacity</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Clarify requirements (functional + non-functional, scale, latency target) — interviewer cố tình mơ hồ; bạn phải hỏi\">Clarify requirements (functional + non-functional, scale, latency target) — interviewer cố tình mơ hồ; bạn phải hỏi</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Đa số candidate fail vì nhảy vào architecture ngay. Senior interviewer prompt mơ hồ test bạn có hỏi không. \"Read-heavy hay write?\", \"Latency target?\", \"Multi-region?\", \"Consistency requirement?\". 5 phút clarify quyết định cả tiếng còn lại đi đúng hướng.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Khi phỏng vấn, \"trade-off awareness\" là điểm cộng vì:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Mọi quyết định trong system design có cost; senior muốn biết bạn nhận thức cost, không chỉ &quot;chọn cái này hay nhất&quot;\">Mọi quyết định trong system design có cost; senior muốn biết bạn nhận thức cost, không chỉ \"chọn cái này hay nhất\"</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Trade-off luôn xấu\">Trade-off luôn xấu</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Không quan trọng\">Không quan trọng</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Chỉ cần ở junior level\">Chỉ cần ở junior level</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">\"Tôi chọn Postgres vì ACID quan trọng cho banking, dù MongoDB scale tốt hơn cho document data\" — show awareness. \"Microservice cho team scale 50+, nhưng acknowledge complexity tăng\". Senior phỏng vấn quan tâm tư duy, không chỉ kết quả \"đúng\".</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">\"Buzzword bingo\" trong phỏng vấn:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Là điểm cộng\">Là điểm cộng</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Liệt kê tech mà không hiểu trade-off cụ thể là red flag — &quot;Kafka + Kubernetes + microservice + GraphQL&quot; cho TODO app\">Liệt kê tech mà không hiểu trade-off cụ thể là red flag — \"Kafka + Kubernetes + microservice + GraphQL\" cho TODO app</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Bắt buộc\">Bắt buộc</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cho thấy kiến thức\">Cho thấy kiến thức</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Senior nhận ra ngay khi candidate \"diễn\". Better: nói ít tech name, nhiều về vấn đề và lý do. \"Tôi cần persistent message với replay — Kafka phù hợp\" tốt hơn \"Tôi sẽ dùng Kafka\". Tránh over-engineer cho problem nhỏ.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        🎉 <strong>Hoàn thành toàn bộ 8 chương System Design — và TOÀN BỘ 6 trụ cột IT Basic!</strong>\n      </p>\n      <p>\n        Bạn đã đi qua hành trình từ CLI → DSA → OS → Networking → Database → OOP &amp; Design Patterns → System Design.\n        Đây là vốn nền tảng đủ để tự tin với phỏng vấn IT năm 4 và bắt đầu sự nghiệp software engineering.\n      </p>\n      <p>\n        Lời cuối: thiết kế hệ thống không có công thức đúng — chỉ có <em>trade-off có ý thức</em> dựa trên context cụ thể.\n        Đọc engineering blog từ Stripe, Discord, Cloudflare, Uber thường xuyên. Practice case studies hằng tuần.\n        Build dự án thật. Học không bao giờ dừng — chỉ là bạn đã có nền tảng để học hiệu quả hơn.\n      </p>\n      <p>\n        ← <a href=\"/learn/system-design/\">Về lộ trình</a> · <a href=\"/learn/system-design/\">Đọc lại giáo trình tổng quan</a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Khung tư duy thiết kế hệ thống",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "2. Case 1: URL Shortener (Bit.ly / TinyURL)",
+      "depth": 2
+    },
+    {
+      "id": "section-3",
+      "text": "2.1. Requirements",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "2.2. Capacity",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "2.3. API",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "2.4. Short code generation — quan trọng nhất",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "2.5. Architecture",
+      "depth": 3
+    },
+    {
+      "id": "section-8",
+      "text": "2.6. Data model",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "2.7. Scaling decisions",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "2.8. Trade-offs",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "3. Case 2: Twitter Timeline (Fan-out)",
+      "depth": 2
+    },
+    {
+      "id": "section-12",
+      "text": "3.1. Requirements",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "3.2. Capacity",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "3.3. Bài toán cốt lõi: Timeline generation",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "3.4. Hai pattern: Fan-out on Read vs Fan-out on Write",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "3.5. Twitter pattern: Hybrid",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "3.6. Architecture",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "3.7. Data store choices",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "3.8. Optimizations",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "3.9. Trade-offs",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "4. Case 3: Uber-like Geospatial Service",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "4.1. Requirements",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "4.2. Capacity",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "4.3. Bài toán cốt lõi: tìm driver gần",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "4.4. Geohash — bảng trị giá vàng",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "4.5. Architecture",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "4.6. Redis GEO commands",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "4.7. Sharding theo region",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "4.8. Quad-tree (alternative)",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "4.9. Surge pricing detection",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "4.10. Trade-offs",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "5. Case 4: Netflix-like Video Streaming",
+      "depth": 2
+    },
+    {
+      "id": "section-33",
+      "text": "5.1. Requirements",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "5.2. Capacity",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "5.3. Component chính",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "5.4. Adaptive Bitrate Streaming (HLS)",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "5.5. CDN strategy",
+      "depth": 3
+    },
+    {
+      "id": "section-38",
+      "text": "5.6. Recommendation",
+      "depth": 3
+    },
+    {
+      "id": "section-39",
+      "text": "5.7. Architecture",
+      "depth": 3
+    },
+    {
+      "id": "section-40",
+      "text": "5.8. Trade-offs",
+      "depth": 3
+    },
+    {
+      "id": "section-41",
+      "text": "6. Case 5: Notification Service (Email / SMS / Push)",
+      "depth": 2
+    },
+    {
+      "id": "section-42",
+      "text": "6.1. Requirements",
+      "depth": 3
+    },
+    {
+      "id": "section-43",
+      "text": "6.2. Capacity",
+      "depth": 3
+    },
+    {
+      "id": "section-44",
+      "text": "6.3. Architecture",
+      "depth": 3
+    },
+    {
+      "id": "section-45",
+      "text": "6.4. Component",
+      "depth": 3
+    },
+    {
+      "id": "section-46",
+      "text": "6.5. Idempotency — critical",
+      "depth": 3
+    },
+    {
+      "id": "section-47",
+      "text": "6.6. Throttling logic",
+      "depth": 3
+    },
+    {
+      "id": "section-48",
+      "text": "6.7. Trade-offs",
+      "depth": 3
+    },
+    {
+      "id": "section-49",
+      "text": "7. Interview Tips",
+      "depth": 2
+    },
+    {
+      "id": "section-50",
+      "text": "7.1. Quy tắc phỏng vấn 45-60 phút",
+      "depth": 3
+    },
+    {
+      "id": "section-51",
+      "text": "7.2. Lời khuyên",
+      "depth": 3
+    },
+    {
+      "id": "section-52",
+      "text": "7.3. Pattern phỏng vấn phổ biến",
+      "depth": 3
+    },
+    {
+      "id": "section-53",
+      "text": "8. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-54",
+      "text": "9. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-55",
+      "text": "Quiz cuối Chương 8 (chương cuối)",
+      "depth": 3
+    }
+  ],
+  "source": "SystemDesign/chuong/chuong8.html",
+  "sourceHash": "2bd9cf2a0a9d50b45ede3b48a3305ac85588288fbe735873cf49a280c4522520",
+  "readingMinutes": 17
+}

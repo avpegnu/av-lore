@@ -1,0 +1,190 @@
+{
+  "id": "database--chapter-05",
+  "track": "database",
+  "trackTitle": "Database Engineering",
+  "slug": "chapter-05",
+  "order": 5,
+  "title": "Indexes — B-tree, Hash, GIN, Composite",
+  "description": "Cấu trúc index, khi nào index được dùng, khi nào KHÔNG, composite/covering/partial/functional index, và đọc EXPLAIN cơ bản.",
+  "html": "\n\n      <section id=\"why\">\n        <h2 id=\"section-1\">1. Vì sao cần Index?</h2>\n        <p>Bảng <code>users</code> có 10 triệu dòng, cột email không có index. Câu query:</p>\n<pre><code class=\"language-sql\">SELECT * FROM users WHERE email = 'alice@example.com';</code></pre>\n        <p>DB phải <strong>Sequential Scan</strong>: đọc toàn bộ 10 triệu dòng từ disk, so sánh từng cái — có thể mất nhiều giây đến phút.</p>\n        <p>Với <strong>B-tree index</strong> trên <code>email</code>, DB chỉ cần <code>log₂(10⁷) ≈ 23</code> bước để tìm. Mỗi bước đọc 1 page (~8KB) → <strong>~1ms</strong> tổng.</p>\n\n        <p>Khác biệt: <strong>30 giây</strong> vs <strong>1 mili-giây</strong> = <strong>30 000 lần</strong>.</p>\n\n        <h3 id=\"section-2\">1.1. Index không miễn phí</h3>\n        <ul>\n          <li><strong>Tốn dung lượng disk</strong> — index thường 10–30% kích thước bảng. 10 index = thêm 1–3× dung lượng.</li>\n          <li><strong>Làm chậm INSERT/UPDATE/DELETE</strong> — mỗi thao tác phải cập nhật cả index. Bảng càng nhiều index, ghi càng chậm.</li>\n          <li><strong>Tốn RAM</strong> — index \"nóng\" được DB cache vào shared_buffers. Quá nhiều → thiếu RAM cho bảng chính.</li>\n          <li><strong>Mất thời gian build</strong> — CREATE INDEX trên bảng 1 tỉ dòng có thể mất nhiều giờ.</li>\n        </ul>\n\n        <p><strong>Quy tắc:</strong> chỉ tạo index cho cột thực sự được query thường xuyên. Đừng \"đánh index phòng xa\".</p>\n      </section>\n\n      <section id=\"btree\">\n        <h2 id=\"section-3\">2. B-tree — index mặc định</h2>\n        <p>\"B\" trong B-tree = \"Balanced\" (cây cân bằng), không phải \"Binary\". B-tree là cây nhiều con (mỗi node có nhiều key) và <strong>luôn được giữ cân bằng</strong> qua mỗi insert/delete.</p>\n\n        <div class=\"ascii\">      B-tree (đơn giản, fanout=4, height=2):\n\n      ┌──────────────────────────────────┐\n      │           [25 | 50 | 75]          │  ← root (level 0)\n      └────┬──────────┬──────────┬───────┬┘\n           │          │          │       │\n       ┌───▼──┐    ┌──▼───┐   ┌──▼───┐ ┌─▼────┐\n       │5,15,│    │30,40,│   │60,70,│ │80,90,│  ← leaves (level 1)\n       │20,22│    │45,48 │   │72    │ │95,99│\n       └─────┘    └──────┘   └──────┘ └─────┘\n         │            │          │        │\n         ▼            ▼          ▼        ▼\n       row ptr     row ptr     row ptr   row ptr  → bảng heap</div>\n\n        <h3 id=\"section-4\">2.1. Đặc tính</h3>\n        <ul>\n          <li><strong>Tra cứu O(log n)</strong> — chỉ cần ~log_fanout(N) bước. Với fanout 200 và 10⁹ dòng: ~5 bước.</li>\n          <li><strong>Range scan O(log n + k)</strong> — leaves được link doubly để duyệt khoảng (<code>WHERE x BETWEEN A AND B</code>).</li>\n          <li><strong>Sorted output</strong> — duyệt B-tree → dữ liệu đã sorted theo key. <code>ORDER BY index_col</code> miễn sort.</li>\n          <li><strong>Insert balanced</strong> — page split khi đầy, propagate lên cha.</li>\n        </ul>\n\n        <h3 id=\"section-5\">2.2. B-tree trong Postgres dùng được cho:</h3>\n        <ul>\n          <li><code>=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></li>\n          <li><code>BETWEEN</code></li>\n          <li><code>IN</code></li>\n          <li><code>IS NULL</code> / <code>IS NOT NULL</code></li>\n          <li><code>LIKE 'prefix%'</code> (chỉ với prefix — KHÔNG <code>'%suffix'</code>)</li>\n          <li><code>ORDER BY col</code></li>\n        </ul>\n\n        <h3 id=\"section-6\">2.3. Tạo B-tree</h3>\n<pre><code class=\"language-sql\">-- Mặc định CREATE INDEX là B-tree\nCREATE INDEX idx_users_email ON users(email);\n\n-- Tương đương:\nCREATE INDEX idx_users_email ON users USING BTREE (email);\n\n-- Multi-column (composite):\nCREATE INDEX idx_orders_user_created ON orders(user_id, created_at DESC);\n\n-- DESC, NULLS FIRST/LAST:\nCREATE INDEX idx_users_created ON users(created_at DESC NULLS LAST);\n\n-- UNIQUE B-tree:\nCREATE UNIQUE INDEX idx_users_email_uniq ON users(LOWER(email));\n\n-- CONCURRENTLY (không lock writes — luôn dùng ở production):\nCREATE INDEX CONCURRENTLY idx_orders_status ON orders(status);</code></pre>\n\n        <div class=\"callout callout-tip\">\n          <span class=\"callout-title\">CONCURRENTLY ở production</span>\n          Mặc định <code>CREATE INDEX</code> lock toàn bảng cho writes. Trên bảng 100M dòng có thể lock 30 phút. Luôn dùng <code>CREATE INDEX CONCURRENTLY</code> ở production — chậm hơn 2–3× nhưng không block ghi.\n        </div>\n      </section>\n\n      <section id=\"hash\">\n        <h2 id=\"section-7\">3. Hash index</h2>\n        <p>Map key → bucket qua hash function. Tra cứu O(1) trung bình.</p>\n\n        <h3 id=\"section-8\">3.1. Khi dùng?</h3>\n        <ul>\n          <li>Chỉ cho <code>=</code>, KHÔNG cho range/order.</li>\n          <li>Trên Postgres &lt; 10: hash index không WAL, mất khi crash → không khuyến nghị.</li>\n          <li>Postgres 10+: hash index đã ổn, nhưng B-tree thường vẫn nhanh ngang và linh hoạt hơn.</li>\n        </ul>\n\n<pre><code class=\"language-sql\">CREATE INDEX idx_users_email_hash ON users USING HASH (email);</code></pre>\n\n        <p><strong>Thực hành:</strong> hầu như không cần. Chỉ dùng khi profiling chỉ ra B-tree không đủ và workload chỉ có equality.</p>\n      </section>\n\n      <section id=\"gin\">\n        <h2 id=\"section-9\">4. GIN / GiST / BRIN — index chuyên biệt</h2>\n\n        <h3 id=\"section-10\">4.1. GIN (Generalized Inverted Index)</h3>\n        <p>\"Inverted\" — như index ngược trong sách: từ → các trang chứa từ đó. Phù hợp với cột chứa <strong>nhiều giá trị nhỏ</strong>:</p>\n        <ul>\n          <li>Full-text search (cột <code>tsvector</code>)</li>\n          <li>Array (<code>tags TEXT[]</code>)</li>\n          <li>JSONB</li>\n        </ul>\n\n<pre><code class=\"language-sql\">-- Full-text:\nALTER TABLE posts ADD COLUMN search_vector tsvector\n  GENERATED ALWAYS AS (to_tsvector('simple', title || ' ' || body)) STORED;\nCREATE INDEX idx_posts_search ON posts USING GIN(search_vector);\n\nSELECT * FROM posts\nWHERE search_vector @@ to_tsquery('database &amp; (postgres | mysql)');\n\n-- Array:\nCREATE INDEX idx_posts_tags ON posts USING GIN(tags);\nSELECT * FROM posts WHERE tags @&gt; ARRAY['sql','tutorial'];\n\n-- JSONB:\nCREATE INDEX idx_users_meta ON users USING GIN(meta);\nSELECT * FROM users WHERE meta @&gt; '{\"role\":\"admin\"}';\nSELECT * FROM users WHERE meta -&gt; 'preferences' -&gt;&gt; 'theme' = 'dark';</code></pre>\n\n        <h3 id=\"section-11\">4.2. GiST (Generalized Search Tree)</h3>\n        <p>Cây tổng quát hỗ trợ các kiểu phức tạp: geometry, range, full-text. Tốt hơn GIN cho:</p>\n        <ul>\n          <li>Spatial (PostGIS) — <code>&amp;&amp;</code>, <code>ST_Contains</code></li>\n          <li>Range types — <code>tstzrange &amp;&amp;</code> (overlap)</li>\n          <li>K-nearest neighbor</li>\n        </ul>\n\n<pre><code class=\"language-sql\">CREATE INDEX idx_bookings_during ON bookings USING GIST (during);\nSELECT * FROM bookings WHERE during &amp;&amp; '[2026-05-09,2026-05-10)'::tstzrange;</code></pre>\n\n        <h3 id=\"section-12\">4.3. BRIN (Block Range Index)</h3>\n        <p>Cực nhỏ, lưu min/max của mỗi block (page) chứ không từng dòng. Phù hợp dữ liệu <strong>tự nhiên sorted</strong> (ví dụ <code>created_at</code> luôn tăng).</p>\n\n<pre><code class=\"language-sql\">CREATE INDEX idx_logs_created_brin ON logs USING BRIN(created_at);</code></pre>\n        <p>Index này có thể nhỏ hơn 1000× B-tree, đổi lại scan rộng hơn. Phù hợp khi bảng 1+ tỉ dòng và bạn muốn index \"rẻ\".</p>\n\n        <h3 id=\"section-13\">4.4. So sánh nhanh</h3>\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Loại</th><th>Tốt cho</th><th>Kích thước</th><th>Tốc độ tra cứu</th></tr></thead>\n          <tbody>\n            <tr><td>B-tree</td><td>=, &lt;, &gt;, range, prefix LIKE, ORDER BY</td><td>10–30% bảng</td><td>O(log n) — rất nhanh</td></tr>\n            <tr><td>Hash</td><td>= duy nhất</td><td>Tương tự B-tree</td><td>O(1) — bằng B-tree</td></tr>\n            <tr><td>GIN</td><td>Array, JSONB, full-text</td><td>Có thể bằng/lớn hơn bảng</td><td>O(log n)</td></tr>\n            <tr><td>GiST</td><td>Spatial, range, KNN</td><td>10–30%</td><td>O(log n) — chậm hơn B-tree</td></tr>\n            <tr><td>BRIN</td><td>Cột sorted tự nhiên, table cực lớn</td><td>&lt; 1%</td><td>Chậm nhưng cheap</td></tr>\n          </tbody>\n        </table></div>\n      </section>\n\n      <section id=\"bitmap\">\n        <h2 id=\"section-14\">5. Bitmap Index Scan (planner technique)</h2>\n        <p>Khác với MySQL/Oracle có <em>bitmap index</em> như loại index riêng, Postgres có <strong>Bitmap Index Scan</strong> — kỹ thuật planner tạo bitmap tạm thời từ B-tree để kết hợp nhiều điều kiện.</p>\n\n<pre><code class=\"language-sql\">SELECT * FROM users\nWHERE country = 'VN' AND age &gt; 25;\n\n-- Plan có thể là:\n-- BitmapAnd\n--   Bitmap Index Scan idx_country (country='VN')   → bitmap A\n--   Bitmap Index Scan idx_age (age &gt; 25)            → bitmap B\n-- Bitmap Heap Scan: A AND B → đọc dòng thật</code></pre>\n\n        <p>Hiệu quả khi 1 index không đủ chọn lọc, 2 index AND lại sẽ chọn lọc cao.</p>\n      </section>\n\n      <section id=\"composite\">\n        <h2 id=\"section-15\">6. Composite Index — index nhiều cột</h2>\n        <p>Một index trên nhiều cột. Thứ tự cột <strong>cực kỳ quan trọng</strong>.</p>\n\n<pre><code class=\"language-sql\">CREATE INDEX idx_orders_user_created ON orders(user_id, created_at DESC);</code></pre>\n\n        <p>Index này phục vụ tốt:</p>\n        <ul>\n          <li><code>WHERE user_id = 5</code></li>\n          <li><code>WHERE user_id = 5 AND created_at &gt; '2026-01-01'</code></li>\n          <li><code>WHERE user_id = 5 ORDER BY created_at DESC</code></li>\n        </ul>\n\n        <p>NHƯNG <strong>không tốt</strong> cho:</p>\n        <ul>\n          <li><code>WHERE created_at &gt; '2026-01-01'</code> (không có user_id, prefix mismatch — DB có thể skip-scan nhưng kém)</li>\n        </ul>\n\n        <h3 id=\"section-16\">6.1. Quy tắc thứ tự cột</h3>\n        <p><strong>Equality trước, range sau.</strong></p>\n\n<pre><code class=\"language-sql\">-- Query: WHERE country = 'VN' AND age &gt; 25\n-- ✓ Tốt:  CREATE INDEX ... ON users(country, age);   ← equality first\n-- ✗ Tệ:  CREATE INDEX ... ON users(age, country);   ← range first, equality không dùng</code></pre>\n\n        <p><strong>Lý do:</strong> trong B-tree composite, các dòng được sắp theo cột 1, rồi cột 2. Equality trên cột 1 thu hẹp khoảng → range trên cột 2 trở thành sequential scan trong khoảng nhỏ. Ngược lại, range trên cột 1 → cột 2 không sắp cùng → không scan tuần tự được.</p>\n\n        <h3 id=\"section-17\">6.2. Số cột trong composite index</h3>\n        <p>Hiếm khi cần &gt; 3 cột. Nhiều cột = index lớn = ghi chậm + ít phù hợp với nhiều query.</p>\n      </section>\n\n      <section id=\"covering\">\n        <h2 id=\"section-18\">7. Covering Index — INCLUDE clause</h2>\n        <p>Index chứa <strong>thêm cột non-key</strong> để query có thể được trả lời <em>chỉ từ index</em>, không đụng heap. Gọi là \"Index-Only Scan\".</p>\n\n<pre><code class=\"language-sql\">-- Query phổ biến:\nSELECT id, email FROM users WHERE country = 'VN';\n\n-- Index thường: lookup index → đọc heap để lấy email\nCREATE INDEX idx_country ON users(country);\n\n-- Covering: include email vào index, không cần đọc heap\nCREATE INDEX idx_country_inc ON users(country) INCLUDE (email);</code></pre>\n\n        <p>Lợi: 2× nhanh trở lên cho query phù hợp. Hại: index lớn hơn.</p>\n\n        <p>Trước Postgres 11 (chưa có INCLUDE), người ta tạo composite index <code>(country, email)</code> để cùng đạt hiệu ứng — nhưng cột email trở thành part of key, ảnh hưởng sort order. INCLUDE rõ ràng hơn.</p>\n      </section>\n\n      <section id=\"partial\">\n        <h2 id=\"section-19\">8. Partial Index — chỉ index một phần dữ liệu</h2>\n        <p>Index có <code>WHERE</code> clause — chỉ index các dòng thỏa.</p>\n\n<pre><code class=\"language-sql\">-- 90% user đã verify; query luôn lọc unverified:\nCREATE INDEX idx_users_unverified ON users(email)\n  WHERE email_verified = FALSE;\n\n-- Soft delete: chỉ index dòng chưa xóa:\nCREATE INDEX idx_orders_active ON orders(created_at)\n  WHERE deleted_at IS NULL;\n\n-- Status nóng:\nCREATE INDEX idx_orders_pending ON orders(user_id, created_at)\n  WHERE status = 'pending';</code></pre>\n\n        <p><strong>Lợi:</strong> index nhỏ hơn nhiều → tra cứu nhanh hơn, tốn ít disk/RAM. <strong>Điều kiện:</strong> query phải có cùng predicate trong WHERE để planner dùng được index.</p>\n      </section>\n\n      <section id=\"functional\">\n        <h2 id=\"section-20\">9. Functional / Expression Index</h2>\n        <p>Index trên kết quả 1 hàm/expression.</p>\n\n<pre><code class=\"language-sql\">-- Email case-insensitive:\nCREATE UNIQUE INDEX idx_users_email_lower ON users(LOWER(email));\nSELECT * FROM users WHERE LOWER(email) = LOWER('ALICE@x.com');\n\n-- JSONB attribute:\nCREATE INDEX idx_users_role ON users((meta-&gt;&gt;'role'));\nSELECT * FROM users WHERE meta-&gt;&gt;'role' = 'admin';\n\n-- Date trunc:\nCREATE INDEX idx_orders_month ON orders(DATE_TRUNC('month', created_at));\nSELECT COUNT(*) FROM orders\nWHERE DATE_TRUNC('month', created_at) = '2026-05-01';</code></pre>\n\n        <p><strong>Lưu ý:</strong> query phải dùng đúng expression như index. <code>WHERE email = ...</code> không match <code>idx ON LOWER(email)</code>.</p>\n      </section>\n\n      <section id=\"selectivity\">\n        <h2 id=\"section-21\">10. Selectivity — chìa khóa quyết định index</h2>\n        <p><strong>Selectivity</strong> = số dòng kết quả / tổng số dòng. Càng nhỏ càng tốt cho index.</p>\n        <ul>\n          <li>Cột <code>email</code> trên 10M user, mỗi email unique → selectivity = 1/10M = cực thấp → index <em>cực hữu ích</em>.</li>\n          <li>Cột <code>gender</code> với 2 giá trị → selectivity = 50% → <em>index gần như vô dụng</em>, planner sẽ chọn Seq Scan.</li>\n          <li>Cột <code>status</code> với 80% dòng = 'paid', 20% = 'pending' → index trên 'pending' (rare value) hữu ích, trên 'paid' không.</li>\n        </ul>\n\n        <p>Quy tắc: <strong>nếu DB ước tính query sẽ trả &gt; 5–10% bảng, planner sẽ Sequential Scan thay vì dùng index</strong>. Random IO của index lookup tốn hơn sequential disk read.</p>\n\n        <p>Đó là lý do <strong>Partial Index</strong> mạnh — bạn ép index chỉ chứa phần selective.</p>\n      </section>\n\n      <section id=\"not-used\">\n        <h2 id=\"section-22\">11. Khi nào index KHÔNG được dùng (mặc dù đã tạo)?</h2>\n\n        <h3 id=\"section-23\">11.1. Function trên cột</h3>\n<pre><code class=\"language-sql\">-- ❌ Index trên `email` không được dùng:\nSELECT * FROM users WHERE LOWER(email) = 'a@b.com';\n\n-- ✓ Functional index, hoặc:\nSELECT * FROM users WHERE email = 'A@B.com';  -- nhưng case-sensitive!</code></pre>\n\n        <h3 id=\"section-24\">11.2. Implicit type cast</h3>\n<pre><code class=\"language-sql\">-- email là VARCHAR, nhưng query dùng số:\nSELECT * FROM users WHERE email = 12345;  -- DB cast: ::text\n-- Có thể skip index do mismatch.</code></pre>\n\n        <h3 id=\"section-25\">11.3. <code>OR</code> trên 2 cột khác nhau</h3>\n<pre><code class=\"language-sql\">SELECT * FROM users WHERE email = 'a@x' OR phone = '0912';\n-- Index trên email và phone riêng lẻ — không phải lúc nào planner cũng OR-bitmap-scan.\n-- Có thể fallback Seq Scan. Cách thay thế: UNION 2 query.</code></pre>\n\n        <h3 id=\"section-26\">11.4. Wildcard prefix LIKE</h3>\n<pre><code class=\"language-sql\">-- ❌ Không dùng B-tree:\nSELECT * FROM users WHERE email LIKE '%@gmail.com';\n-- Cần GIN trigram (pg_trgm extension) hoặc full-text search.\n\n-- ✓ Dùng B-tree được:\nSELECT * FROM users WHERE email LIKE 'alice%';</code></pre>\n\n        <h3 id=\"section-27\">11.5. Selectivity quá cao</h3>\n        <p>Nếu query trả về &gt; 5–10% bảng, planner thường chọn Seq Scan. Đó là <em>đúng</em>, không phải bug.</p>\n\n        <h3 id=\"section-28\">11.6. Statistics outdated</h3>\n        <p>Postgres dùng statistics (do <code>ANALYZE</code> thu thập) để estimate. Sau load lớn, chạy:</p>\n<pre><code class=\"language-sql\">ANALYZE users;\n-- Hoặc chỉ 1 cột:\nANALYZE users (email);</code></pre>\n\n        <h3 id=\"section-29\">11.7. Composite mismatch order</h3>\n<pre><code class=\"language-sql\">CREATE INDEX idx ON orders(user_id, created_at);\n\n-- ✓ Dùng:\nWHERE user_id = 5;\nWHERE user_id = 5 AND created_at &gt; '2026-01-01';\n\n-- ✗ Không dùng tốt:\nWHERE created_at &gt; '2026-01-01';  -- prefix là user_id, không có → không tận dụng được</code></pre>\n\n        <h3 id=\"section-30\">11.8. NULL với constraint</h3>\n        <p>Default Postgres index B-tree <em>có</em> bao gồm NULL. Nhưng <code>WHERE col IS NULL</code> với index không-partial có thể không hiệu quả nếu nhiều NULL.</p>\n      </section>\n\n      <section id=\"explain\">\n        <h2 id=\"section-31\">12. EXPLAIN cơ bản — đo xem index có được dùng</h2>\n        <p>Bạn không \"biết\" index được dùng — bạn <strong>kiểm tra</strong> bằng EXPLAIN.</p>\n\n<pre><code class=\"language-sql\">EXPLAIN SELECT * FROM users WHERE email = 'alice@x.com';\n\n-- Output:\n-- Index Scan using idx_users_email on users  (cost=0.42..8.44 rows=1 width=85)\n--   Index Cond: (email = 'alice@x.com'::text)</code></pre>\n\n        <p>Điểm quan trọng:</p>\n        <ul>\n          <li><strong>Index Scan</strong> — index được dùng ✓</li>\n          <li><strong>Seq Scan</strong> — index KHÔNG được dùng (hoặc không có)</li>\n          <li><strong>Bitmap Index Scan</strong> — kết hợp nhiều index</li>\n          <li><strong>Index Only Scan</strong> — covering index, không đụng heap</li>\n        </ul>\n\n        <h3 id=\"section-32\">12.1. EXPLAIN ANALYZE — chạy thật, đo thật</h3>\n<pre><code class=\"language-sql\">EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'alice@x.com';\n\n-- Index Scan using idx_users_email on users\n--   (cost=0.42..8.44 rows=1 width=85)\n--   (actual time=0.024..0.025 rows=1 loops=1)\n--   Index Cond: (email = 'alice@x.com'::text)\n-- Planning Time: 0.123 ms\n-- Execution Time: 0.045 ms</code></pre>\n\n        <p><strong>\"actual\" vs \"estimate\"</strong>: planner đoán dựa trên statistics. Nếu actual lệch estimate quá nhiều (10× trở lên), nghĩa là statistics outdated → chạy ANALYZE.</p>\n\n        <p>Sẽ học EXPLAIN sâu hơn ở Ch8.</p>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-33\">13. Bài tập</h2>\n\n        <p>Schema:</p>\n<pre><code class=\"language-sql\">CREATE TABLE orders (\n  id BIGSERIAL PRIMARY KEY,\n  user_id BIGINT, status VARCHAR(20),\n  total DECIMAL(10,2),\n  created_at TIMESTAMPTZ DEFAULT NOW(),\n  deleted_at TIMESTAMPTZ\n);\n-- 100M dòng, 1M user, status có 5 giá trị (paid 70%, pending 5%, ...)</code></pre>\n\n        <p>Đề xuất index cho từng query sau, giải thích lựa chọn:</p>\n        <ol>\n          <li><code>SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20;</code> (timeline user)</li>\n          <li><code>SELECT * FROM orders WHERE status = 'pending';</code> (queue xử lý)</li>\n          <li><code>SELECT * FROM orders WHERE status = 'paid' AND created_at &gt; '2026-05-01';</code> (báo cáo)</li>\n          <li><code>SELECT id, total FROM orders WHERE user_id = ?;</code> (lấy nhanh số tiền của user)</li>\n          <li><code>SELECT * FROM orders WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 100;</code> (recent active)</li>\n        </ol>\n\n        <p><strong>Bài 2.</strong> Vì sao composite <code>(status, user_id)</code> phục vụ <code>WHERE status='X' AND user_id=Y</code> tốt nhưng phục vụ <code>WHERE user_id=Y</code> kém? Có nên đổi sang <code>(user_id, status)</code>?</p>\n\n        <p><strong>Bài 3.</strong> Bạn có 1 index <code>idx_email ON users(email)</code>. Query <code>SELECT * FROM users WHERE LOWER(email) = LOWER('A@B.com')</code> chạy chậm. Vì sao? Sửa thế nào?</p>\n\n        <p><strong>Bài 4.</strong> Cho bảng <code>logs(id, level, message, created_at)</code> với 1 tỉ dòng và <code>created_at</code> tăng dần. Đề xuất loại index phù hợp + lý do.</p>\n\n        <p><strong>Bài 5.</strong> Khi nào nên dùng <code>INCLUDE</code> thay vì thêm cột vào key của composite index?</p>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-34\">14. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-35\">Quiz cuối Chương 5</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Composite index <code>(user_id, created_at)</code> KHÔNG dùng tốt cho query nào?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: WHERE user_id = 5\">WHERE user_id = 5</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: WHERE user_id = 5 AND created_at > '2026'\">WHERE user_id = 5 AND created_at &gt; '2026'</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: WHERE created_at > '2026'\">WHERE created_at &gt; '2026'</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: WHERE user_id = 5 ORDER BY created_at DESC\">WHERE user_id = 5 ORDER BY created_at DESC</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Composite index sắp xếp theo cột 1 trước. Query không có cột 1 (user_id) → không có \"prefix\" để bắt đầu. Postgres có thể skip-scan nhưng không hiệu quả. Nên đảo thứ tự nếu cần phục vụ cả query không user_id, hoặc tạo index riêng.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Quy tắc thứ tự cột trong composite index:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Range trước, equality sau\">Range trước, equality sau</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Equality trước, range sau\">Equality trước, range sau</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cột nhỏ trước, cột lớn sau\">Cột nhỏ trước, cột lớn sau</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không có quy tắc\">Không có quy tắc</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Equality khóa giá trị cố định → range tiếp theo trở thành scan tuần tự trong khoảng nhỏ. Range trước thì cột tiếp theo không liên tục → kém hiệu quả.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Index NÀO phù hợp nhất cho cột <code>tags TEXT[]</code> với query <code>WHERE tags @&gt; ARRAY['sql']</code>?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: B-tree\">B-tree</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hash\">Hash</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: BRIN\">BRIN</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: GIN\">GIN</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">GIN (Generalized Inverted Index) thiết kế cho cột có nhiều giá trị (array, JSONB, full-text). Truy vấn \"tags chứa X\" được tối ưu trên GIN, không thể trên B-tree.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Partial index hữu ích khi:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Bạn chỉ query một subset nhỏ của bảng và muốn index nhỏ hơn / nhanh hơn\">Bạn chỉ query một subset nhỏ của bảng và muốn index nhỏ hơn / nhanh hơn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Bảng có ít dòng\">Bảng có ít dòng</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Bạn muốn tránh constraint\">Bạn muốn tránh constraint</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Có composite key\">Có composite key</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Partial index có WHERE clause — chỉ index dòng thỏa. Hữu ích khi 90%+ dòng không bao giờ được query (vd: deleted_at IS NULL, status = 'pending'). Index nhỏ hơn = nhanh hơn + tiết kiệm.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">\"Index Only Scan\" trong EXPLAIN nghĩa là:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Index không được dùng\">Index không được dùng</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Index dùng nhưng vẫn phải đọc heap\">Index dùng nhưng vẫn phải đọc heap</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Toàn bộ thông tin lấy được từ index, không cần đọc heap → cực nhanh\">Toàn bộ thông tin lấy được từ index, không cần đọc heap → cực nhanh</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Index bị corruption\">Index bị corruption</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Khi index chứa đủ tất cả cột query cần (covering index, hoặc INCLUDE), DB không cần đọc heap → giảm 1 lần IO. Postgres còn cần check visibility map nhưng vẫn nhanh hơn nhiều.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">CREATE INDEX trên bảng 100M dòng ở production nên dùng:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: CREATE INDEX (chuẩn)\">CREATE INDEX (chuẩn)</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: CREATE INDEX CONCURRENTLY (không lock writes)\">CREATE INDEX CONCURRENTLY (không lock writes)</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: DROP INDEX trước\">DROP INDEX trước</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Tắt DB\">Tắt DB</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">CREATE INDEX chuẩn lock bảng → khóa app vài phút/giờ. CONCURRENTLY chậm hơn 2-3× nhưng không block ghi/đọc → mặc định cho production.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Index trên cột <code>gender</code> chỉ có 2 giá trị (M/F):</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cực hữu ích\">Cực hữu ích</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tăng tốc tất cả query\">Tăng tốc tất cả query</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Bắt buộc\">Bắt buộc</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Hầu như vô dụng — selectivity ~50%, planner sẽ Seq Scan\">Hầu như vô dụng — selectivity ~50%, planner sẽ Seq Scan</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Khi selectivity cao (5-10%+), random IO của index tốn hơn sequential scan. Với gender 50/50, planner chọn Seq Scan. Index thừa, lãng phí ghi.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">B-tree index KHÔNG phục vụ tốt cho:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: LIKE '%suffix' (wildcard đầu)\">LIKE '%suffix' (wildcard đầu)</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: LIKE 'prefix%'\">LIKE 'prefix%'</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: BETWEEN\">BETWEEN</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: ORDER BY col\">ORDER BY col</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">B-tree dựa trên thứ tự key. <code>'%suffix'</code> không có prefix cố định → không thể tận dụng cây. Cần GIN trigram (pg_trgm) hoặc reverse string. <code>'prefix%'</code> thì OK vì biết bắt đầu ở đâu.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 5. Tiếp theo: <a href=\"/learn/database/chapter-06/\"><strong>Chương 6 — Transactions &amp; ACID Isolation Levels →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Vì sao cần Index?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "1.1. Index không miễn phí",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "2. B-tree — index mặc định",
+      "depth": 2
+    },
+    {
+      "id": "section-4",
+      "text": "2.1. Đặc tính",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "2.2. B-tree trong Postgres dùng được cho:",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "2.3. Tạo B-tree",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "3. Hash index",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "3.1. Khi dùng?",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "4. GIN / GiST / BRIN — index chuyên biệt",
+      "depth": 2
+    },
+    {
+      "id": "section-10",
+      "text": "4.1. GIN (Generalized Inverted Index)",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "4.2. GiST (Generalized Search Tree)",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "4.3. BRIN (Block Range Index)",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "4.4. So sánh nhanh",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "5. Bitmap Index Scan (planner technique)",
+      "depth": 2
+    },
+    {
+      "id": "section-15",
+      "text": "6. Composite Index — index nhiều cột",
+      "depth": 2
+    },
+    {
+      "id": "section-16",
+      "text": "6.1. Quy tắc thứ tự cột",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "6.2. Số cột trong composite index",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "7. Covering Index — INCLUDE clause",
+      "depth": 2
+    },
+    {
+      "id": "section-19",
+      "text": "8. Partial Index — chỉ index một phần dữ liệu",
+      "depth": 2
+    },
+    {
+      "id": "section-20",
+      "text": "9. Functional / Expression Index",
+      "depth": 2
+    },
+    {
+      "id": "section-21",
+      "text": "10. Selectivity — chìa khóa quyết định index",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "11. Khi nào index KHÔNG được dùng (mặc dù đã tạo)?",
+      "depth": 2
+    },
+    {
+      "id": "section-23",
+      "text": "11.1. Function trên cột",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "11.2. Implicit type cast",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "11.3. OR trên 2 cột khác nhau",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "11.4. Wildcard prefix LIKE",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "11.5. Selectivity quá cao",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "11.6. Statistics outdated",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "11.7. Composite mismatch order",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "11.8. NULL với constraint",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "12. EXPLAIN cơ bản — đo xem index có được dùng",
+      "depth": 2
+    },
+    {
+      "id": "section-32",
+      "text": "12.1. EXPLAIN ANALYZE — chạy thật, đo thật",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "13. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-34",
+      "text": "14. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-35",
+      "text": "Quiz cuối Chương 5",
+      "depth": 3
+    }
+  ],
+  "source": "Database/chuong/chuong5.html",
+  "sourceHash": "112718e2204bb81ed75dcc2ff7fb9444d2fb84297414317dcc8d36dad45e4f45",
+  "readingMinutes": 12
+}

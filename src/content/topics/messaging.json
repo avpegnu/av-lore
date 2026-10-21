@@ -1,0 +1,179 @@
+{
+  "id": "messaging",
+  "title": "Messaging, Kafka & Jobs",
+  "group": "05 · Hệ thống phân tán",
+  "description": "Tách producer/consumer nhưng vẫn giữ retry, ordering và dữ liệu đúng.",
+  "sources": [
+    {
+      "title": "RabbitMQ confirms",
+      "url": "https://www.rabbitmq.com/docs/confirms"
+    },
+    {
+      "title": "AWS outbox",
+      "url": "https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html"
+    },
+    {
+      "title": "Kafka design",
+      "url": "https://kafka.apache.org/documentation/#design"
+    }
+  ],
+  "imageRefs": [
+    "A15",
+    "D11",
+    "F16–F17"
+  ],
+  "prerequisites": [
+    "database",
+    "backend"
+  ],
+  "notes": [
+    {
+      "id": "queue",
+      "title": "Queue khác event stream",
+      "body": [
+        "Work queue phân phối tác vụ cho worker; event stream giữ chuỗi sự kiện theo retention để consumer đọc và có thể replay theo mô hình. Kafka topic gồm partition với offset; consumer group phối hợp chia partition. Không có total order tự động giữa mọi partition.",
+        "Chọn message key để giữ order cần thiết trong partition nhưng tránh hot partition. Số consumer hữu ích trong group bị ràng buộc bởi số partition và cách assignment. RabbitMQ có các loại queue/stream, không nên suy mọi sản phẩm chỉ có một mô hình."
+      ],
+      "example": "",
+      "pitfall": "",
+      "exercise": "Chọn partition key cho event đơn hàng: order ID hay user ID và đánh đổi?"
+    },
+    {
+      "id": "delivery",
+      "title": "ACK, retry, DLQ và idempotent consumer",
+      "body": [
+        "Publisher confirm xác nhận broker nhận theo guarantee; consumer ACK xác nhận việc xử lý ở phía consumer theo protocol. Hai việc độc lập. At-least-once có thể giao lặp; ACK trước commit có thể mất công việc, ACK sau commit có thể lặp khi response/ACK mất.",
+        "Thiết kế consumer idempotent bằng event ID/business key và transaction với thay đổi nghiệp vụ. Retry có backoff/jitter, giới hạn và phân loại lỗi. Poison message vào DLQ cần alert, công cụ kiểm tra và quy trình replay."
+      ],
+      "example": "",
+      "pitfall": "Đưa vào DLQ không tự giải quyết lỗi. Không mặc định exactly-once bao được email hoặc API bên ngoài.",
+      "exercise": "Consumer commit DB rồi chết trước ACK: chạy lại có tạo đơn trùng không?"
+    },
+    {
+      "id": "outbox",
+      "title": "Dual-write và transactional outbox",
+      "body": [
+        "Ghi DB rồi publish message có cửa sổ chết giữa hai bước. Publish trước commit có thể tạo event cho dữ liệu chưa thành công. Outbox ghi dữ liệu nghiệp vụ và ý định event trong cùng transaction của một DB; relay đọc outbox rồi publish.",
+        "Relay có thể publish lặp sau crash, vì vậy consumer vẫn cần idempotency. Ordering, cleanup, CDC/polling và độ trễ là các quyết định vận hành. Đây không phải phép biến distributed side effect thành transaction toàn cục."
+      ],
+      "example": "",
+      "pitfall": "",
+      "exercise": "Mô phỏng relay publish thành công nhưng chưa đánh dấu sent thì crash.",
+      "diagram": {
+        "type": "flow",
+        "title": "Transactional outbox",
+        "nodes": [
+          "Transaction: order + outbox row",
+          "Commit DB",
+          "Relay đọc/publish",
+          "Broker → consumer",
+          "Deduplicate + thực hiện"
+        ],
+        "caption": "Ranh giới nguyên tử là DB transaction; publish/ACK vẫn có thể lặp."
+      }
+    },
+    {
+      "id": "jobs",
+      "title": "Background jobs và backpressure",
+      "body": [
+        "Job cần payload/schema version, idempotency key, trạng thái, retry policy và khả năng quan sát. Queue hấp thụ burst nhưng không tạo công suất vô hạn; nếu tốc độ vào lớn hơn tốc độ xử lý lâu dài, backlog sẽ tăng.",
+        "Giới hạn concurrency theo downstream, theo dõi queue age cùng queue length. Scheduler cần phối hợp để không chạy một cron nhiều lần ngoài ý định. Cancellation và timeout không tự hoàn tác side effect đã hoàn tất."
+      ],
+      "example": "",
+      "pitfall": "",
+      "exercise": "Thiết kế export báo cáo: nhận job, trả ID, poll trạng thái, lưu file hết hạn và retry an toàn."
+    }
+  ],
+  "questions": [
+    {
+      "id": "queue",
+      "question": "Queue và stream khác nhau thế nào?",
+      "answer": "Queue nhấn mạnh phân phối việc; stream nhấn mạnh log sự kiện có retention/replay theo mô hình.",
+      "explanation": "Sản phẩm có nhiều chế độ; cần mô tả cụ thể durability và consumption.",
+      "followUp": "Audit log có cần giữ event sau khi xử lý không?",
+      "note": "queue",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "partition",
+      "question": "Kafka bảo đảm ordering ở phạm vi nào?",
+      "answer": "Trong partition theo guarantee và cấu hình/usage cụ thể, không tự giữa mọi partition.",
+      "explanation": "Producer retries và consumer concurrency cũng cần thiết kế phù hợp.",
+      "followUp": "Giữ thứ tự cho cùng order bằng key nào?",
+      "note": "queue",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "group",
+      "question": "Thêm consumer có luôn tăng throughput không?",
+      "answer": "Không. Partition assignment, bottleneck downstream và công việc quyết định.",
+      "explanation": "Consumer vượt số partition có thể idle trong group; thêm concurrency còn gây contention.",
+      "followUp": "Database nghẽn thì scale consumer gây gì?",
+      "note": "queue",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "ack",
+      "question": "Publisher confirm khác consumer ACK thế nào?",
+      "answer": "Một cái phản hồi broker nhận từ producer; một cái báo consumer đã xử lý delivery.",
+      "explanation": "Confirm không chứng minh nghiệp vụ consumer hoàn tất.",
+      "followUp": "ACK trước DB commit có rủi ro gì?",
+      "note": "delivery",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "exactly",
+      "question": "Exactly-once có bao mọi side effect không?",
+      "answer": "Không tự động. Guarantee có phạm vi, ví dụ transaction trong một nền tảng.",
+      "explanation": "Email, payment hoặc DB ngoài cần phối hợp/idempotency riêng.",
+      "followUp": "Bạn mô tả ranh giới guarantee trong thiết kế thế nào?",
+      "note": "delivery",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "duplicate",
+      "question": "Consumer chống xử lý trùng thế nào?",
+      "answer": "Dùng event/business key và lưu dedup cùng thay đổi nghiệp vụ một cách nguyên tử khi có thể.",
+      "explanation": "Set trong RAM mất khi restart và không phối hợp replica.",
+      "followUp": "Dedup record giữ bao lâu?",
+      "note": "delivery",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "outbox",
+      "question": "Outbox giải quyết vấn đề gì?",
+      "answer": "Cửa sổ dual-write giữa lưu nghiệp vụ và ý định phát event.",
+      "explanation": "Không tự loại duplicate; relay và consumer vẫn cần thiết kế retry.",
+      "followUp": "Relay chết sau publish nhưng trước đánh dấu sent thì sao?",
+      "note": "outbox",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "dlq",
+      "question": "DLQ nên được vận hành thế nào?",
+      "answer": "Có alert, thông tin lỗi, kiểm tra dữ liệu và quy trình replay có kiểm soát.",
+      "explanation": "Không đổ retry vô hạn vào DLQ rồi bỏ quên; sửa lỗi trước replay.",
+      "followUp": "Poison message khác lỗi mạng tạm thời thế nào?",
+      "note": "delivery",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "backpressure",
+      "question": "Queue tăng liên tục thì thêm buffer đủ không?",
+      "answer": "Không. Nếu công suất xử lý thiếu lâu dài thì backlog và độ trễ vẫn tăng.",
+      "explanation": "Cần giảm tốc vào, tăng công suất thật, ưu tiên hoặc bỏ bớt theo nghiệp vụ.",
+      "followUp": "Queue age hay queue length phản ánh SLA tốt hơn khi nào?",
+      "note": "jobs",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "cron",
+      "question": "Cron nhiều replica có thể chạy trùng không?",
+      "answer": "Có nếu mỗi replica tự schedule mà không phối hợp.",
+      "explanation": "Có thể dùng scheduler chung, lease/lock phù hợp hoặc job idempotent; crash và expiry vẫn cần xét.",
+      "followUp": "Lock hết hạn trong khi job còn chạy thì sao?",
+      "note": "jobs",
+      "level": "Vận dụng"
+    }
+  ]
+}

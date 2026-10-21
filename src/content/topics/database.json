@@ -1,0 +1,407 @@
+{
+  "id": "database",
+  "title": "Database, Index & Transaction",
+  "group": "04 · Dữ liệu",
+  "description": "Giữ dữ liệu đúng trước, đo truy vấn rồi mới tối ưu.",
+  "sources": [
+    {
+      "title": "PostgreSQL isolation",
+      "url": "https://www.postgresql.org/docs/current/transaction-iso.html"
+    },
+    {
+      "title": "PostgreSQL EXPLAIN",
+      "url": "https://www.postgresql.org/docs/current/using-explain.html"
+    }
+  ],
+  "imageRefs": [
+    "A06",
+    "A08–A09",
+    "C10",
+    "C14–C15",
+    "C19–C20",
+    "D06–D07",
+    "F11"
+  ],
+  "prerequisites": [
+    "sql"
+  ],
+  "notes": [
+    {
+      "id": "schema",
+      "title": "Keys, constraints và chuẩn hóa",
+      "body": [
+        "Primary key định danh hàng; foreign key ràng buộc quan hệ; unique/check/not-null bảo vệ invariant ngay trong DB. Cardinality, nullable và delete behavior là quyết định nghiệp vụ. Chuẩn hóa giảm redundancy/anomaly theo phụ thuộc dữ liệu; denormalization cần kế hoạch đồng bộ và đo lợi ích.",
+        "Schema tốt diễn đạt bất biến như mỗi ghế chỉ có một booking active theo mô hình phù hợp. Kiểm tra ở ứng dụng vẫn cần, nhưng constraint giúp chống race giữa nhiều writer."
+      ],
+      "example": "CREATE TABLE accounts (\n id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n email text NOT NULL UNIQUE,\n balance numeric(18,2) NOT NULL CHECK (balance >= 0)\n);",
+      "pitfall": "Kiểm tra “chưa tồn tại” rồi INSERT không đủ chống cạnh tranh nếu thiếu unique constraint.",
+      "exercise": "Vẽ ERD customers–orders–order_items–products; chỉ rõ giá snapshot trong order item.",
+      "diagram": {
+        "type": "graph",
+        "title": "ERD giản lược cho đặt hàng",
+        "nodes": [
+          [
+            115,
+            70,
+            "customers"
+          ],
+          [
+            320,
+            70,
+            "orders"
+          ],
+          [
+            320,
+            215,
+            "order_items"
+          ],
+          [
+            535,
+            215,
+            "products"
+          ]
+        ],
+        "edges": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            3,
+            2
+          ]
+        ],
+        "caption": "customers 1→N orders; orders 1→N order_items; products 1→N order_items. Mỗi item giữ quantity và giá snapshot theo nghiệp vụ; arrow diễn đạt quan hệ, không là HTTP flow."
+      }
+    },
+    {
+      "id": "indexes",
+      "title": "B-tree, composite index và query plan",
+      "body": [
+        "Index là cấu trúc hỗ trợ một số truy cập, kèm chi phí ghi, dung lượng và bảo trì. B-tree phục vụ nhiều truy vấn equality/range/order; hash phục vụ trường hợp khác theo DBMS. Composite index cần xét thứ tự cột, predicate, sort và selectivity.",
+        "EXPLAIN cho plan ước lượng; EXPLAIN ANALYZE thực thi query và đo actual nên cần cẩn trọng với câu lệnh ghi. Sequential scan có thể đúng và nhanh hơn index khi đọc nhiều dữ liệu. Clustered/nonclustered có semantics khác giữa PostgreSQL, MySQL và SQL Server."
+      ],
+      "example": "CREATE INDEX orders_customer_created\nON orders (customer_id, created_at DESC, id DESC);\nEXPLAIN SELECT id FROM orders\nWHERE customer_id = 42\nORDER BY created_at DESC, id DESC LIMIT 20;",
+      "pitfall": "Không kết luận index cột sau luôn vô dụng nếu thiếu cột đầu; khả năng plan còn phụ thuộc DBMS, phiên bản và dữ liệu.",
+      "exercise": "So sánh estimate/actual rows và thời gian trước/sau index với dữ liệu đại diện."
+    },
+    {
+      "id": "transactions",
+      "title": "ACID, isolation và MVCC",
+      "body": [
+        "Atomicity: nhóm thay đổi cùng thành công/thất bại. Consistency: transaction giữ invariant được thiết kế. Isolation: kiểm soát quan sát/tương tác đồng thời. Durability: commit bền theo cấu hình và cam kết hệ thống. ACID consistency khác consistency trong CAP.",
+        "MVCC giữ nhiều phiên bản để đọc theo snapshot; không có nghĩa không cần lock hoặc không có conflict. Isolation level có hành vi cụ thể theo DBMS; PostgreSQL Read Uncommitted hoạt động như Read Committed. Serializable có thể buộc ứng dụng retry transaction."
+      ],
+      "example": "",
+      "pitfall": "Transaction không tự sửa invariant chưa được biểu diễn đúng trong query/constraint/isolation.",
+      "exercise": "Mô phỏng lost update và sửa bằng atomic UPDATE hoặc locking/version check.",
+      "diagram": {
+        "type": "sequence",
+        "title": "Lost update nếu đọc rồi ghi thiếu phối hợp",
+        "actors": [
+          "Request A",
+          "Database",
+          "Request B"
+        ],
+        "steps": [
+          [
+            0,
+            1,
+            "Đọc stock = 1"
+          ],
+          [
+            2,
+            1,
+            "Đọc stock = 1"
+          ],
+          [
+            0,
+            1,
+            "Ghi stock = 0; bán 1"
+          ],
+          [
+            2,
+            1,
+            "Ghi stock = 0; bán thêm 1"
+          ]
+        ],
+        "caption": "Hai lần bán cùng một đơn vị hàng. Dùng phép cập nhật có điều kiện và kiểm tra kết quả để giữ invariant."
+      }
+    },
+    {
+      "id": "locks",
+      "title": "Lock, optimistic concurrency và deadlock",
+      "body": [
+        "Pessimistic locking giữ tài nguyên trong transaction; optimistic concurrency kiểm tra version/predicate khi cập nhật. UPDATE products SET stock=stock-1 WHERE id=? AND stock>0 là một mẫu nguyên tử trong DB phù hợp; ứng dụng phải kiểm tra số hàng tác động.",
+        "Deadlock được DB phát hiện có thể khiến một transaction bị hủy. Giữ transaction ngắn, lấy lock theo thứ tự nhất quán và retry toàn transaction khi lỗi cho phép; không retry vô hạn hoặc lặp tác dụng phụ ngoài DB."
+      ],
+      "example": "UPDATE products SET stock = stock - 1\nWHERE id = $1 AND stock > 0\nRETURNING id, stock;\n\nUPDATE documents SET body = $1, version = version + 1\nWHERE id = $2 AND version = $3;",
+      "pitfall": "Không giữ transaction/lock trong lúc chờ người dùng hay API ngoài chậm.",
+      "exercise": "Thiết kế đặt vé có reservation hết hạn và unique constraint phù hợp."
+    },
+    {
+      "id": "scale",
+      "title": "Replication, partitioning và migration",
+      "body": [
+        "Read replica tăng khả năng đọc nhưng có replication lag; đọc ngay sau ghi có thể cần primary hoặc cơ chế đảm bảo theo hệ. Partition chia dữ liệu trong hệ quản trị; sharding chia qua các node theo kiến trúc. Chọn shard key cần xét hot key, cross-shard query và rebalance.",
+        "Migration tương thích thường dùng expand–migrate–contract: thêm cấu trúc mới, chuyển code/dữ liệu có theo dõi, rồi loại cũ khi không còn consumer. Thêm index/constraint có thể lock hoặc làm tải tăng, cần cách rollout theo DBMS."
+      ],
+      "example": "",
+      "pitfall": "Backup chưa được thử restore chưa chứng minh đạt RPO/RTO.",
+      "exercise": "Thêm cột bắt buộc cho bảng lớn trong khi hai phiên bản ứng dụng cùng chạy.",
+      "diagram": {
+        "type": "graph",
+        "title": "Read replica và phân tách đường đọc",
+        "nodes": [
+          [
+            110,
+            150,
+            "Ứng dụng"
+          ],
+          [
+            340,
+            65,
+            "Primary"
+          ],
+          [
+            340,
+            245,
+            "Read replica"
+          ],
+          [
+            550,
+            150,
+            "Replication"
+          ]
+        ],
+        "edges": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            3,
+            2
+          ],
+          [
+            0,
+            2
+          ]
+        ],
+        "caption": "Ghi đi primary; đọc có thể đi replica khi chấp nhận guarantee tương ứng. Replication có độ trễ; đường đọc cuối không có nghĩa mọi read đều được phép stale."
+      }
+    },
+    {
+      "id": "normalization",
+      "title": "1NF, 2NF, 3NF và snapshot nghiệp vụ",
+      "body": [
+        "Trong cách trình bày quan hệ phổ biến, 1NF yêu cầu giá trị thuộc domain theo mô hình quan hệ, không dùng nhóm lặp tùy tiện; “atomic” phụ thuộc domain đã định nghĩa. 2NF loại phụ thuộc một phần của thuộc tính không khóa vào một phần candidate key tổng hợp. 3NF kiểm soát phụ thuộc bắc cầu theo định nghĩa phụ thuộc hàm.",
+        "Ví dụ order_items(order_id,product_id,product_name,quantity) có product_name phụ thuộc product_id; có thể tách products. Nhưng giá/name snapshot tại lúc mua là dữ liệu lịch sử nghiệp vụ, không nhất thiết phải luôn trỏ tới giá/name hiện tại. Chuẩn hóa phải đi cùng semantics."
+      ],
+      "example": "",
+      "pitfall": "",
+      "exercise": "Tách bảng enrollment(student_id,course_id,student_name,course_name,grade) rồi chỉ ra candidate key và phụ thuộc hàm."
+    },
+    {
+      "id": "read-models",
+      "title": "View, materialized view, procedure và trigger",
+      "body": [
+        "View thông thường định nghĩa query, không tự lưu kết quả như bảng riêng; materialized view lưu kết quả và cần refresh/maintenance. Stored procedure/function đặt logic gần dữ liệu theo khả năng DBMS. Trigger chạy theo event bảng và có thể giữ invariant hoặc audit, nhưng tạo tác dụng phụ khó thấy nếu thiếu tài liệu.",
+        "Đọc code ứng dụng không đủ để biết toàn bộ hành vi khi có trigger. Cần migration, permissions, test và monitoring cho logic DB. Cursor xử lý theo từng hàng có chỗ dùng nhưng thường nên xem set-based operation trước."
+      ],
+      "example": "",
+      "pitfall": "",
+      "exercise": "Chọn view hay materialized view cho dashboard có thể trễ 5 phút; xác định refresh và quyền truy cập."
+    }
+  ],
+  "questions": [
+    {
+      "id": "key",
+      "question": "Primary key và unique khác nhau thế nào?",
+      "answer": "Primary key là khóa định danh chính với NOT NULL; unique bảo đảm tính duy nhất theo semantics DBMS.",
+      "explanation": "NULL, index backing và constraint behavior có khác biệt; cần đọc hệ đang dùng.",
+      "followUp": "Foreign key có tự tạo index ở mọi DBMS không?",
+      "note": "schema",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "normalize",
+      "question": "Khi nào denormalize?",
+      "answer": "Khi có nhu cầu đọc đã đo và chấp nhận chi phí đồng bộ/bất nhất được kiểm soát.",
+      "explanation": "Giữ nguồn sự thật và cách rebuild dữ liệu dẫn xuất rõ ràng.",
+      "followUp": "Giá sản phẩm trong đơn có nên lấy giá hiện tại không?",
+      "note": "schema",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "index",
+      "question": "Thêm index có luôn làm nhanh không?",
+      "answer": "Không. Có chi phí ghi/bộ nhớ/storage và optimizer có thể chọn scan tốt hơn.",
+      "explanation": "Đánh giá workload đọc–ghi, selectivity, sort và actual plan.",
+      "followUp": "Tại sao bảng nhỏ có thể không dùng index?",
+      "note": "indexes",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "explain",
+      "question": "EXPLAIN khác EXPLAIN ANALYZE thế nào?",
+      "answer": "EXPLAIN mô tả plan; ANALYZE thực thi để đo actual.",
+      "explanation": "Cần chú ý tác dụng phụ với statement ghi và overhead đo.",
+      "followUp": "Estimate rows lệch nhiều gợi ý gì?",
+      "note": "indexes",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "acid",
+      "question": "ACID có bảo đảm không overselling tự động không?",
+      "answer": "Không nếu quy tắc tồn kho chưa được mã hóa với query/constraint/isolation phù hợp.",
+      "explanation": "Atomic transaction không ngăn mọi logic đọc-rồi-ghi cạnh tranh ở mọi level.",
+      "followUp": "Một atomic conditional UPDATE giải quyết gì?",
+      "note": "transactions",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "mvcc",
+      "question": "MVCC có nghĩa không dùng lock không?",
+      "answer": "Không. Nó hỗ trợ nhiều phiên bản để giảm một số xung đột đọc/ghi.",
+      "explanation": "Writer vẫn có lock/conflict; snapshot và isolation quyết định quan sát.",
+      "followUp": "Long transaction ảnh hưởng cleanup phiên bản ra sao?",
+      "note": "transactions",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "isolation",
+      "question": "Repeatable Read có hành vi giống nhau mọi DB không?",
+      "answer": "Không. Tên level theo chuẩn nhưng implementation và anomaly được ngăn có thể khác.",
+      "explanation": "Phải mô tả PostgreSQL/MySQL cụ thể và test tình huống.",
+      "followUp": "Serializable failure cần xử lý ở ứng dụng thế nào?",
+      "note": "transactions",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "optimistic",
+      "question": "Optimistic locking dùng khi nào?",
+      "answer": "Khi conflict không quá thường xuyên và có thể phát hiện qua version/predicate rồi retry/báo conflict.",
+      "explanation": "Không giữ lock trong toàn thời gian người dùng sửa; update 0 row cần được xử lý.",
+      "followUp": "Hai editor cùng lưu sẽ thấy gì?",
+      "note": "locks",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "deadlock",
+      "question": "DB báo deadlock thì ứng dụng nên làm gì?",
+      "answer": "Rollback/retry transaction theo loại lỗi và policy có giới hạn.",
+      "explanation": "Giảm thời gian giữ lock, thống nhất thứ tự và tách side effect ngoài DB.",
+      "followUp": "Retry chỉ statement cuối có đúng không?",
+      "note": "locks",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "replica",
+      "question": "Đọc ngay sau ghi từ replica có rủi ro gì?",
+      "answer": "Có thể thấy dữ liệu cũ do replication lag.",
+      "explanation": "Routing, session consistency hoặc DB feature có thể đáp ứng yêu cầu read-your-writes.",
+      "followUp": "UI nên làm gì khi đơn mới chưa xuất hiện?",
+      "note": "scale",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "shard",
+      "question": "Partitioning khác sharding thế nào?",
+      "answer": "Partitioning phân chia dữ liệu; sharding thường chỉ việc phân bố qua nhiều node/database.",
+      "explanation": "Thuật ngữ theo sản phẩm có thể chồng lấn; cần mô tả topology cụ thể.",
+      "followUp": "Shard theo tenant gặp hot tenant thì sao?",
+      "note": "scale",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "migration",
+      "question": "Expand–contract giải quyết vấn đề gì?",
+      "answer": "Cho nhiều phiên bản ứng dụng cùng tồn tại trong khi thay schema.",
+      "explanation": "Không xóa field cũ trước khi mọi consumer chuyển; cần backfill và quan sát.",
+      "followUp": "Rollback code khi schema đã đổi cần điều kiện gì?",
+      "note": "scale",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "fkindex",
+      "question": "Foreign key có tự được index trong PostgreSQL không?",
+      "answer": "Không tự tạo index cho cột referencing chỉ vì khai báo foreign key.",
+      "explanation": "Index trên phía được tham chiếu gắn với constraint tương ứng; phía referencing cần cân nhắc theo truy vấn/delete/update.",
+      "followUp": "Xóa parent có nhiều child mà thiếu index ảnh hưởng gì?",
+      "note": "schema",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "thirdnf",
+      "question": "3NF giúp ngăn những anomaly nào?",
+      "answer": "Giảm một số update/insert/delete anomaly do phụ thuộc dữ liệu bị lưu lặp.",
+      "explanation": "Cần xác định candidate key và phụ thuộc hàm, không chỉ đếm số bảng.",
+      "followUp": "Snapshot giá đơn hàng có phải redundancy sai không?",
+      "note": "normalization",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "view",
+      "question": "View khác materialized view thế nào?",
+      "answer": "View định nghĩa query; materialized view lưu kết quả cần được làm mới.",
+      "explanation": "Freshness, chi phí refresh và quyền quyết định lựa chọn.",
+      "followUp": "Khi nào refresh làm người dùng thấy dữ liệu cũ?",
+      "note": "read-models",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "trigger",
+      "question": "Trigger có nhược điểm gì?",
+      "answer": "Hành vi ẩn, coupling và khó debug nếu không quản lý/test tốt.",
+      "explanation": "Có thể hữu ích cho invariant/audit nhưng cần thấy rõ transaction và lỗi.",
+      "followUp": "Trigger gửi API ngoài trực tiếp có rủi ro gì?",
+      "note": "read-models",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "oltp",
+      "question": "OLTP khác OLAP thế nào?",
+      "answer": "OLTP ưu tiên giao dịch ngắn/ghi và truy cập nghiệp vụ; OLAP ưu tiên phân tích nhiều dữ liệu.",
+      "explanation": "Schema, index, storage và freshness khác; có thể tách workload để giảm cạnh tranh.",
+      "followUp": "Chạy report lớn trên primary checkout gây gì?",
+      "note": "scale",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "nplusdb",
+      "question": "Connection pooling có giới hạn nào cần đặt?",
+      "answer": "Max connections, thời gian chờ, idle/lifetime và tổng pool qua mọi replica.",
+      "explanation": "Pool lớn quá làm DB contention; pool nhỏ quá làm queue wait.",
+      "followUp": "Autoscale từ 5 lên 50 Pod tác động tổng connections thế nào?",
+      "note": "scale",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "write-skew",
+      "question": "Write skew khác lost update thế nào?",
+      "answer": "Write skew có thể do transaction đọc cùng điều kiện rồi ghi các hàng khác nhau, phá invariant chung.",
+      "explanation": "Không nhất thiết có hai writer cùng một row; snapshot isolation không tự ngăn mọi trường hợp.",
+      "followUp": "Quy tắc luôn có một bác sĩ trực bị phá ra sao?",
+      "note": "transactions",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "migrationback",
+      "question": "Backfill bảng lớn cần chú ý gì?",
+      "answer": "Chia batch, giới hạn tải, resumability, kiểm tra consistency và tương thích code cũ/mới.",
+      "explanation": "Một UPDATE khổng lồ có thể giữ lock, tạo WAL và tăng replica lag.",
+      "followUp": "Làm sao biết backfill đã đủ trước khi contract?",
+      "note": "scale",
+      "level": "Đào sâu"
+    }
+  ]
+}

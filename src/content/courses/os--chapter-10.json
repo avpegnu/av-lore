@@ -1,0 +1,195 @@
+{
+  "id": "os--chapter-10",
+  "track": "os",
+  "trackTitle": "Operating Systems",
+  "slug": "chapter-10",
+  "order": 10,
+  "title": "File System& I/O Models",
+  "description": "Chương cuối — File system và I/O. Hiểu inode, file descriptor, blocking vs non-blocking I/O, epoll, page cache, fsync. Đây là nền tảng giải thích tại sao Node.js xử lý I/O nhanh, tại sao Redis save bị chậm, tại sao Docker volume hoạt động được.",
+  "html": "\n\n        <!-- 10.1 -->\n        <section id=\"overview\">\n          <h2 id=\"section-1\">10.1 File System Overview</h2>\n\n          <p>File system tổ chức dữ liệu trên storage device thành cấu trúc cây với:</p>\n          <ul>\n            <li><strong>Files</strong>: chuỗi byte có tên + metadata</li>\n            <li><strong>Directories</strong>: container chứa file/directory khác</li>\n            <li><strong>Mount points</strong>: gắn filesystem khác vào path</li>\n          </ul>\n\n          <h3 id=\"section-2\">Filesystem layout (ext4 / XFS / FAT32)</h3>\n\n          <div class=\"ascii-art\">\n   ┌─────────────────────────────────────────┐\n   │  Boot Block      │ MBR / boot loader    │\n   ├─────────────────────────────────────────┤\n   │  Super Block     │ Metadata: size, free │\n   │                  │ blocks, version...   │\n   ├─────────────────────────────────────────┤\n   │  Inode bitmap    │ Free/used inodes     │\n   ├─────────────────────────────────────────┤\n   │  Block bitmap    │ Free/used blocks     │\n   ├─────────────────────────────────────────┤\n   │  Inode table     │ Mảng inodes          │\n   ├─────────────────────────────────────────┤\n   │                                         │\n   │  Data blocks     │ Nội dung file        │\n   │                  │ (block ~4KB)         │\n   │                                         │\n   └─────────────────────────────────────────┘\n          </div>\n\n          <h3 id=\"section-3\">Filesystems thực tế</h3>\n          <ul>\n            <li><strong>Linux</strong>: ext4 (default), XFS, btrfs, ZFS</li>\n            <li><strong>macOS</strong>: APFS</li>\n            <li><strong>Windows</strong>: NTFS</li>\n            <li><strong>Distributed</strong>: HDFS, S3, GCS, Ceph</li>\n            <li><strong>Network</strong>: NFS, SMB</li>\n          </ul>\n        </section>\n\n        <!-- 10.2 -->\n        <section id=\"inode\">\n          <h2 id=\"section-4\">10.2 Inode — \"thẻ căn cước\" của file</h2>\n\n          <p>\n            Mỗi file có 1 <strong>inode</strong> chứa <em>metadata</em>:\n          </p>\n          <ul>\n            <li>File size</li>\n            <li>Owner (UID), Group (GID)</li>\n            <li>Permission (rwx cho user/group/other)</li>\n            <li>Timestamps: <code>atime</code> (access), <code>mtime</code> (modify), <code>ctime</code> (inode change)</li>\n            <li>Link count (số hardlink)</li>\n            <li>File type (regular, directory, symlink, device, FIFO, socket)</li>\n            <li><strong>Pointers tới data blocks</strong></li>\n          </ul>\n\n          <p>\n            Inode <strong>KHÔNG chứa filename</strong>! Filename nằm trong <em>directory entry</em>. Đó là cách hardlink hoạt động.\n          </p>\n\n          <h3 id=\"section-5\">Cấu trúc pointer trong inode (ext4)</h3>\n\n          <pre data-lang=\"text\"><code>┌─────────────────────────────────┐\n│ Inode metadata (size, perms..)  │\n├─────────────────────────────────┤\n│ Direct[0..11]: 12 pointer       │ → 12 × 4KB = 48 KB\n├─────────────────────────────────┤\n│ Single Indirect ─→ block        │ → 1024 pointers × 4KB = 4 MB\n│                    of pointers  │\n├─────────────────────────────────┤\n│ Double Indirect ─→ block ─→     │ → 1024² × 4KB = 4 GB\n│                    of blocks    │\n├─────────────────────────────────┤\n│ Triple Indirect                 │ → 1024³ × 4KB = 4 TB\n└─────────────────────────────────┘</code></pre>\n\n          <p>Cấu trúc này cho phép file nhỏ chỉ tốn 1 inode + ít direct pointer; file lớn có nhiều tầng indirect.</p>\n\n          <h3 id=\"section-6\">Quan sát inode</h3>\n          <pre data-lang=\"bash\"><code>ls -i myfile.txt          # show inode number\n# 1234567 myfile.txt\n\nstat myfile.txt           # full inode info\n# File: myfile.txt\n# Size: 100   Inode: 1234567   Links: 1\n# Access: (0644/-rw-r--r--)  Uid: ( 1000/ user)\n# Access: 2025-05-09 ...\n# Modify: 2025-05-09 ...\n# Change: 2025-05-09 ...\n\ndf -i                     # số inode còn dư trên filesystem</code></pre>\n\n          <div class=\"callout warning\">\n            <div class=\"callout-title\">⚠️ Hết inode</div>\n            Mỗi filesystem có số inode <strong>cố định</strong> khi format. Nếu tạo quá nhiều file nhỏ → có thể hết inode dù còn space.\n            Lúc đó <code>touch</code> báo \"No space left\" dù <code>df</code> hiện còn GB. Check với <code>df -i</code>.\n          </div>\n        </section>\n\n        <!-- 10.3 -->\n        <section id=\"links\">\n          <h2 id=\"section-7\">10.3 Hard Link vs Symbolic Link</h2>\n\n          <div class=\"compare\">\n            <div class=\"good\">\n              <h4 class=\"text-green\">Hard Link</h4>\n              <ul>\n                <li>2+ filename trỏ vào <strong>cùng inode</strong></li>\n                <li>Không phân biệt \"bản gốc\" — đều là alias bình đẳng</li>\n                <li>Inode link count tăng. Khi link count = 0, file thật sự bị xoá.</li>\n                <li>Không cross filesystem</li>\n                <li>Không hardlink directory (trên hầu hết FS)</li>\n              </ul>\n            </div>\n            <div class=\"good\">\n              <h4 class=\"text-green\">Symbolic Link (Symlink)</h4>\n              <ul>\n                <li>File <em>đặc biệt</em> chứa path đến file/dir khác</li>\n                <li>Có \"bản gốc\" và \"shortcut\"</li>\n                <li>Cross filesystem OK</li>\n                <li>Nếu target bị xoá → symlink \"dangling\" (broken)</li>\n              </ul>\n            </div>\n          </div>\n\n          <pre data-lang=\"bash\"><code># Tạo hard link\nln file.txt hardlink.txt\nls -li file.txt hardlink.txt\n# 12345 file.txt   (cùng inode 12345)\n# 12345 hardlink.txt\n\n# Tạo symlink\nln -s file.txt softlink.txt\nls -li file.txt softlink.txt\n# 12345 file.txt\n# 67890 softlink.txt -&gt; file.txt   (inode khác)\n\n# Xoá file gốc:\nrm file.txt\ncat hardlink.txt    # vẫn đọc được — link count = 1, data còn\ncat softlink.txt    # error — broken symlink</code></pre>\n        </section>\n\n        <!-- 10.4 -->\n        <section id=\"fd\">\n          <h2 id=\"section-8\">10.4 File Descriptor (fd)</h2>\n\n          <p>\n            Khi process mở file, kernel trả về <strong>file descriptor</strong> — một số nguyên nhỏ (vd 3, 4, 5...).\n            Process dùng fd để đọc/ghi/đóng file.\n          </p>\n\n          <div class=\"ascii-art\">\n   Process (user space)              Kernel\n   ┌─────────────────┐               ┌──────────────┐\n   │ fd table        │ ──── 3 ─────▶ │ Open File    │\n   │ [0] stdin       │               │ Description  │\n   │ [1] stdout      │ ──── 4 ─────▶ │  - offset    │\n   │ [2] stderr      │               │  - flags     │\n   │ [3] file.txt    │               │  - inode ptr │\n   │ [4] socket      │               └──────┬───────┘\n   │ [5] ...         │                      │\n   └─────────────────┘                      ▼\n                                      ┌──────────────┐\n                                      │   Inode      │\n                                      └──────────────┘\n          </div>\n\n          <p>\n            <strong>fd</strong> là index trong file descriptor table của process. Nhiều fd có thể trỏ vào cùng open file description (vd sau <code>dup</code>).\n          </p>\n\n          <h3 id=\"section-9\">Số fd tối đa</h3>\n          <pre data-lang=\"bash\"><code>ulimit -n            # giới hạn fd của shell hiện tại — thường 1024 hoặc 4096\ncat /proc/sys/fs/file-max    # giới hạn toàn hệ thống\n\n# Web server cần handle 100K connection → tăng:\nulimit -n 65535</code></pre>\n\n          <div class=\"callout warning\">\n            <div class=\"callout-title\">⚠️ \"Too many open files\"</div>\n            Lỗi quen thuộc khi server bị leak fd (mở mà không đóng). Mỗi connection, mỗi file mở — đều tốn 1 fd.\n            Web server hết fd → reject connection mới. Fix: code phải <code>close()</code> khi xong.\n          </div>\n        </section>\n\n        <!-- 10.5 -->\n        <section id=\"std-fd\">\n          <h2 id=\"section-10\">10.5 stdin / stdout / stderr</h2>\n\n          <p>Mỗi process khởi tạo có sẵn 3 fd:</p>\n          <ul>\n            <li><strong>fd 0</strong>: <code>stdin</code> — đầu vào (thường là keyboard)</li>\n            <li><strong>fd 1</strong>: <code>stdout</code> — đầu ra (thường là terminal)</li>\n            <li><strong>fd 2</strong>: <code>stderr</code> — đầu ra lỗi (thường là terminal)</li>\n          </ul>\n\n          <h3 id=\"section-11\">Redirect trong shell</h3>\n\n          <pre data-lang=\"bash\"><code># Stdout to file\nls &gt; out.txt              # ghi đè\nls &gt;&gt; out.txt             # append\n\n# Stderr to file\nls /no &gt; out.txt 2&gt; err.txt\n\n# Stderr to stdout (rồi cùng vào file)\nls /no &gt; all.txt 2&gt;&amp;1\n\n# Tất cả to /dev/null (vứt đi)\nls &gt;/dev/null 2&gt;&amp;1\n\n# Pipe: stdout của ls vào stdin của grep\nls -l | grep .txt\n\n# Stdin from file\nsort &lt; input.txt</code></pre>\n\n          <p>Cơ chế: shell <code>dup2</code> để thay đổi fd 0/1/2 trỏ vào file/pipe trước khi <code>exec</code>.</p>\n        </section>\n\n        <!-- 10.6 -->\n        <section id=\"syscalls\">\n          <h2 id=\"section-12\">10.6 open / read / write / close — file lifecycle</h2>\n\n          <pre data-lang=\"c\"><code>#include &lt;fcntl.h&gt;\n#include &lt;unistd.h&gt;\n\nint main() {\n    // 1. Open\n    int fd = open(\"data.txt\", O_RDWR | O_CREAT, 0644);\n    if (fd &lt; 0) { perror(\"open\"); return 1; }\n\n    // 2. Write\n    const char *msg = \"Hello\\n\";\n    ssize_t written = write(fd, msg, 6);\n\n    // 3. Seek (di chuyển offset)\n    lseek(fd, 0, SEEK_SET);  // về đầu file\n\n    // 4. Read\n    char buf[100];\n    ssize_t n = read(fd, buf, sizeof(buf));\n\n    // 5. Close\n    close(fd);\n    return 0;\n}</code></pre>\n\n          <h3 id=\"section-13\">open() flags quan trọng</h3>\n          <ul>\n            <li><code>O_RDONLY</code>, <code>O_WRONLY</code>, <code>O_RDWR</code></li>\n            <li><code>O_CREAT</code>: tạo nếu chưa có</li>\n            <li><code>O_EXCL</code>: dùng với O_CREAT — fail nếu đã tồn tại (atomic create)</li>\n            <li><code>O_APPEND</code>: ghi vào cuối file (atomic — tốt cho log)</li>\n            <li><code>O_TRUNC</code>: cắt file về 0 byte khi mở</li>\n            <li><code>O_NONBLOCK</code>: non-blocking I/O (xem 10.8)</li>\n            <li><code>O_DIRECT</code>: bypass page cache, đọc/ghi thẳng disk</li>\n            <li><code>O_SYNC</code>: write đảm bảo flush xuống disk</li>\n          </ul>\n        </section>\n\n        <!-- 10.7 -->\n        <section id=\"blocking\">\n          <h2 id=\"section-14\">10.7 Blocking I/O</h2>\n\n          <p>Mặc định, syscall I/O là <strong>blocking</strong>: thread đợi đến khi I/O xong.</p>\n\n          <pre data-lang=\"c\"><code>// Server thread — 1 client 1 thread (blocking)\nwhile (1) {\n    int client = accept(server_fd, ...);  // BLOCK đến khi có connection\n    pthread_create(&amp;t, NULL, handle, client);\n}\n\nvoid* handle(void* arg) {\n    int fd = *(int*)arg;\n    char buf[1024];\n    int n = read(fd, buf, 1024);  // BLOCK đến khi client gửi data\n    write(fd, response, ...);      // BLOCK đến khi gửi xong\n    close(fd);\n}</code></pre>\n\n          <p>\n            Đơn giản nhưng <strong>scale kém</strong>: 10K client = 10K thread. Mỗi thread tốn 1MB stack → 10GB chỉ riêng stack.\n            Đây là vấn đề <strong>C10K</strong> nổi tiếng — Apache prefork đụng phải.\n          </p>\n        </section>\n\n        <!-- 10.8 -->\n        <section id=\"nonblocking\">\n          <h2 id=\"section-15\">10.8 Non-blocking I/O</h2>\n\n          <p>Set fd thành non-blocking (<code>O_NONBLOCK</code>): syscall không đợi, trả về ngay.</p>\n\n          <pre data-lang=\"c\"><code>fcntl(fd, F_SETFL, O_NONBLOCK);\n\nint n = read(fd, buf, 1024);\nif (n == -1) {\n    if (errno == EAGAIN) {\n        // Chưa có data — không phải error\n        // Có thể làm việc khác, retry sau\n    } else {\n        // Lỗi thật\n    }\n}</code></pre>\n\n          <p>\n            Nhược: phải <strong>polling</strong> liên tục — vẫn tốn CPU. Cần cơ chế tốt hơn → I/O Multiplexing.\n          </p>\n        </section>\n\n        <!-- 10.9 -->\n        <section id=\"mux\">\n          <h2 id=\"section-16\">10.9 I/O Multiplexing — select / poll / epoll / kqueue</h2>\n\n          <p>\n            <strong>Ý tưởng:</strong> 1 thread quản lý nhiều fd, hỏi kernel \"fd nào sẵn sàng đọc/ghi?\". Kernel báo lại, thread chỉ thao tác fd đó.\n          </p>\n\n          <h3 id=\"section-17\">select() — POSIX cổ</h3>\n          <pre data-lang=\"c\"><code>fd_set readfds;\nFD_ZERO(&amp;readfds);\nFD_SET(fd1, &amp;readfds);\nFD_SET(fd2, &amp;readfds);\n\nint n = select(maxfd + 1, &amp;readfds, NULL, NULL, NULL);\n// n = số fd ready\n// FD_ISSET(fd1, &amp;readfds) → check từng fd</code></pre>\n\n          <p>Nhược: giới hạn 1024 fd, copy fd_set cho mỗi call → O(n).</p>\n\n          <h3 id=\"section-18\">poll() — như select nhưng không giới hạn 1024</h3>\n\n          <h3 id=\"section-19\">epoll (Linux) / kqueue (BSD/macOS) — modern</h3>\n          <pre data-lang=\"c\"><code>int epfd = epoll_create1(0);\n\n// Đăng ký fd cần watch\nstruct epoll_event ev = {.events = EPOLLIN, .data.fd = client_fd};\nepoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &amp;ev);\n\n// Đợi event\nstruct epoll_event events[100];\nint n = epoll_wait(epfd, events, 100, -1);\n\n// Xử lý fd ready\nfor (int i = 0; i &lt; n; i++) {\n    if (events[i].events &amp; EPOLLIN) {\n        read(events[i].data.fd, ...);\n    }\n}</code></pre>\n\n          <h3 id=\"section-20\">Tại sao epoll nhanh hơn select?</h3>\n          <ul>\n            <li><strong>O(1) thay vì O(n)</strong>: chỉ trả về fd ready, không scan hết</li>\n            <li>Không cần copy fd set mỗi lần</li>\n            <li>Hỗ trợ <strong>edge-triggered</strong>: chỉ thông báo khi state đổi (avoid trigger lặp)</li>\n            <li>Scale lên hàng trăm nghìn fd</li>\n          </ul>\n\n          <p>nginx, Node.js, Redis, và mọi web server hiện đại đều dùng epoll/kqueue.</p>\n\n          <h3 id=\"section-21\">Pattern Reactor</h3>\n          <p>\n            Single-thread + epoll = pattern <strong>Reactor</strong>. Thread chính chạy event loop, dispatch event đến handler.\n            Đây chính xác là cách Node.js libuv hoạt động (chương 3).\n          </p>\n        </section>\n\n        <!-- 10.10 -->\n        <section id=\"async\">\n          <h2 id=\"section-22\">10.10 Async I/O — io_uring (mới nhất)</h2>\n\n          <p>\n            epoll hỏi \"fd nào ready?\" rồi mới đọc. Async I/O đi xa hơn: \"kernel đọc giúp tôi, báo khi xong\".\n          </p>\n\n          <h3 id=\"section-23\">POSIX AIO (cũ, ít dùng)</h3>\n          <p>API hỗn loạn, ít kernel support tốt.</p>\n\n          <h3 id=\"section-24\">io_uring (Linux 5.1+, 2019)</h3>\n          <p>\n            2 ring buffer giữa user và kernel: submission queue (SQ) và completion queue (CQ). User submit op vào SQ, kernel xử lý, push kết quả vào CQ.\n            Ít syscall, batch nhiều op. Hiện đang là standard mới cho high-perf I/O.\n          </p>\n\n          <p>Database, message broker, file server hiện đại đang chuyển sang io_uring.</p>\n        </section>\n\n        <!-- 10.11 -->\n        <section id=\"cache\">\n          <h2 id=\"section-25\">10.11 Page Cache — kernel buffer cho file</h2>\n\n          <p>\n            Khi process <code>read()</code> file, kernel đọc từ disk vào <strong>page cache</strong> (vùng RAM kernel quản lý), rồi copy sang user buffer.\n            Lần đọc tiếp theo (cùng page) → trả từ cache, không đọc disk lại.\n          </p>\n\n          <p>Đó là lý do file vừa đọc xong, đọc lại cực nhanh.</p>\n\n          <pre data-lang=\"bash\"><code># Đọc file 1GB lần đầu — ~5s\ntime cat bigfile &gt; /dev/null\n\n# Lần 2 — &lt;1s vì đã cache\ntime cat bigfile &gt; /dev/null\n\n# Xoá page cache\necho 3 | sudo tee /proc/sys/vm/drop_caches</code></pre>\n\n          <h3 id=\"section-26\">Write-back cache</h3>\n          <p>\n            <code>write()</code> không lập tức vào disk. Kernel ghi vào page cache, mark dirty, return success ngay. Background kthread ghi xuống disk sau (vài giây).\n          </p>\n\n          <p>Đó là lý do <strong>copy file nhanh</strong> nhưng <strong>tháo USB ngay sau khi copy lại nguy hiểm</strong> — data có thể chưa flush.</p>\n\n          <h3 id=\"section-27\">Quan sát page cache</h3>\n          <pre data-lang=\"bash\"><code>free -h\n#               total   used   free   shared   buff/cache   available\n# Mem:           16G    4G    1G     1G        11G          11G\n# (buff/cache 11G — phần lớn là page cache, có thể giải phóng nếu cần)</code></pre>\n        </section>\n\n        <!-- 10.12 -->\n        <section id=\"fsync\">\n          <h2 id=\"section-28\">10.12 fsync() &amp; Durability</h2>\n\n          <p>\n            Sau <code>write()</code>, data chỉ ở page cache. Mất điện = mất data. Để chắc chắn data <em>persist trên disk</em>:\n          </p>\n\n          <pre data-lang=\"c\"><code>write(fd, buf, n);   // ghi vào page cache (nhanh)\nfsync(fd);            // CHỜ đến khi data thật sự xuống disk (chậm)</code></pre>\n\n          <p><code>fsync</code> tốn ~5-50ms (HDD), ~200µs (SSD). Database (MySQL, PostgreSQL, Redis) gọi fsync mỗi commit để đảm bảo durability.</p>\n\n          <h3 id=\"section-29\">Trade-off database thực tế</h3>\n          <ul>\n            <li><strong>fsync mỗi commit</strong>: an toàn nhất nhưng chậm. Default của PostgreSQL.</li>\n            <li><strong>fsync định kỳ</strong> (vd mỗi giây): nhanh hơn, có thể mất 1s data nếu crash. MySQL <code>innodb_flush_log_at_trx_commit=2</code>, Redis AOF <code>everysec</code>.</li>\n            <li><strong>Không fsync</strong>: nhanh nhất, mất nhiều data nếu crash. Chỉ dùng cho cache.</li>\n          </ul>\n\n          <h3 id=\"section-30\">fsync vs sync vs fdatasync</h3>\n          <ul>\n            <li><code>fsync(fd)</code>: ghi data + metadata của file xuống disk</li>\n            <li><code>fdatasync(fd)</code>: chỉ ghi data + metadata cần (vd file size). Nhanh hơn fsync.</li>\n            <li><code>sync()</code>: flush mọi dirty page (cả filesystem)</li>\n          </ul>\n        </section>\n\n        <!-- 10.13 -->\n        <section id=\"node\">\n          <h2 id=\"section-31\">10.13 Node.js File I/O — kết nối với chương 3</h2>\n\n          <p>Node.js fs API có 2 cách: callback + promise.</p>\n\n          <pre data-lang=\"javascript\"><code>const fs = require('fs').promises;\n\n// Read file\nconst data = await fs.readFile('input.txt', 'utf8');\n\n// Write file\nawait fs.writeFile('output.txt', data);\n\n// Append\nawait fs.appendFile('log.txt', 'new entry\\n');\n\n// Stream (cho file lớn)\nconst fs = require('fs');\nconst readStream = fs.createReadStream('huge.csv');\nreadStream.on('data', (chunk) =&gt; { /* xử lý */ });\n\n// Watch directory\nfs.watch('./uploads', (event, filename) =&gt; {\n  console.log(event, filename);\n});</code></pre>\n\n          <h3 id=\"section-32\">Tại sao Node fs nhanh dù single-thread?</h3>\n          <p>\n            Như đã học chương 3: Node main thread không block. <code>fs.readFile</code> được delegate sang <strong>libuv thread pool</strong>\n            (default 4 thread). Khi đọc xong, callback đẩy vào event loop queue.\n          </p>\n\n          <p>\n            Tip: nếu app I/O-heavy, tăng UV_THREADPOOL_SIZE: <code>UV_THREADPOOL_SIZE=16 node app.js</code>.\n          </p>\n\n          <h3 id=\"section-33\">Async I/O qua io_uring</h3>\n          <p>Node 20+ có experimental <code>fs.openAsBlob</code> và 1 số API dùng io_uring trên Linux. Trong tương lai có thể bypass thread pool.</p>\n        </section>\n\n        <!-- Bài tập -->\n        <section id=\"exercises\">\n          <h2 id=\"section-34\">Bài tập</h2>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 1 — Inode &amp; hardlink</div>\n            <p>Tạo file. <code>ln</code> tạo hardlink. <code>ls -li</code> xem inode. Xoá file gốc — hardlink vẫn dùng được. Giải thích.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 2 — Symlink dangling</div>\n            <p>Tạo symlink. Xoá target. Cố cat symlink — error. Quan sát hành vi.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 3 — Đếm fd của process</div>\n            <p><code>ls /proc/$$/fd</code> liệt kê fd. <code>lsof -p PID</code> chi tiết. Mở file trong shell rồi kiểm tra.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 4 — Page cache demo</div>\n            <p>Đọc file 100MB lần đầu — đo thời gian. Đọc lần 2 — nhanh hơn nhiều. <code>echo 3 &gt; /proc/sys/vm/drop_caches</code> rồi đọc lần 3 — chậm lại.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 5 — fsync benchmark</div>\n            <p>Viết C program: write 1000 lần với fsync vs không fsync. So sánh thời gian. Trên SSD vs HDD nếu có.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 6 — epoll echo server</div>\n            <p>Viết server C dùng epoll handle 100 client đồng thời (echo back). 1 thread, không thread pool.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 7 — Node.js stream big file</div>\n            <p>Viết Node script copy file 1GB bằng <code>readFile</code> (load hết) vs <code>createReadStream</code>. So sánh memory usage qua <code>process.memoryUsage()</code>.</p>\n          </div>\n        </section>\n\n        <!-- Quiz -->\n        <section id=\"quiz\">\n          <div class=\"quiz\">\n            <h3 id=\"section-35\">🧪 Quiz cuối chương</h3>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 1.</strong> Inode chứa gì?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Filename\">Filename</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Path\">Path</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Metadata (size, perms, timestamps) + pointers tới data blocks — KHÔNG có filename\">Metadata (size, perms, timestamps) + pointers tới data blocks — KHÔNG có filename</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Nội dung file\">Nội dung file</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: metadata + data pointers.</strong> Filename nằm trong directory entry trỏ về inode. Đó là cách hardlink hoạt động.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 2.</strong> Hard link và Symbolic link khác nhau?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Hard link = nhiều filename cùng inode; Symlink = file đặc biệt chứa path\">Hard link = nhiều filename cùng inode; Symlink = file đặc biệt chứa path</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cả hai cùng nghĩa\">Cả hai cùng nghĩa</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Hard link chỉ trên Linux\">Hard link chỉ trên Linux</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Symlink nhanh hơn\">Symlink nhanh hơn</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: cùng inode vs path.</strong> Hard link không cross filesystem; symlink có thể bị broken.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 3.</strong> Khi process mở file, kernel trả về?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Pointer trực tiếp đến file\">Pointer trực tiếp đến file</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: File descriptor — số nguyên nhỏ, index trong fd table của process\">File descriptor — số nguyên nhỏ, index trong fd table của process</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Inode number\">Inode number</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Path string\">Path string</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: file descriptor.</strong> Giới hạn số fd là <code>ulimit -n</code>; web server hay phải tăng.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 4.</strong> Tại sao epoll nhanh hơn select?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: O(1) — chỉ trả về fd ready; select O(n) scan hết\">O(1) — chỉ trả về fd ready; select O(n) scan hết</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: epoll dùng SSD\">epoll dùng SSD</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: select chỉ trên Windows\">select chỉ trên Windows</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cùng tốc độ\">Cùng tốc độ</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: O(1).</strong> select scan hết fd_set; epoll register fd 1 lần, kernel chỉ trả ready ones.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 5.</strong> Page cache trong Linux?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cache cho page table\">Cache cho page table</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cache cho CPU\">Cache cho CPU</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Vùng RAM kernel cache nội dung file đã đọc/ghi — đọc lại nhanh\">Vùng RAM kernel cache nội dung file đã đọc/ghi — đọc lại nhanh</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cache cho process\">Cache cho process</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: cache nội dung file.</strong> Đó là lý do file vừa đọc, đọc lại nhanh. <code>free -h</code> cột buff/cache.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 6.</strong> <code>fsync()</code> dùng để?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Đóng file\">Đóng file</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Đảm bảo data thật sự xuống disk (durability) — quan trọng cho database\">Đảm bảo data thật sự xuống disk (durability) — quan trọng cho database</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Đọc file nhanh hơn\">Đọc file nhanh hơn</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cấp phát memory\">Cấp phát memory</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: ép flush xuống disk.</strong> Mất điện sau write nhưng không fsync = mất data.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 7.</strong> stdin / stdout / stderr có fd lần lượt là?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: 1, 2, 3\">1, 2, 3</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: 3, 4, 5\">3, 4, 5</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: 0, 1, 2\">0, 1, 2</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: 10, 11, 12\">10, 11, 12</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: 0, 1, 2.</strong> Mọi process khởi tạo có sẵn 3 fd này. Lý do <code>2&gt;&amp;1</code> redirect stderr sang stdout.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 8.</strong> Lỗi \"Too many open files\" do?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Process đạt giới hạn fd (ulimit -n) — thường do leak fd (mở mà không đóng)\">Process đạt giới hạn fd (ulimit -n) — thường do leak fd (mở mà không đóng)</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hết RAM\">Hết RAM</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Disk đầy\">Disk đầy</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: CPU quá tải\">CPU quá tải</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: hết fd.</strong> Mỗi connection, mỗi file mở tốn 1 fd. Web server cần code <code>close()</code> đúng chỗ.\n              </p>\n            </div>\n          </div>\n        </section>\n\n        <section>\n          <h2 id=\"section-36\">Tổng kết chương 10 — và toàn bộ giáo trình OS</h2>\n          <ul>\n            <li>✅ Filesystem layout: superblock + inode table + data blocks</li>\n            <li>✅ <strong>Inode</strong> = metadata + data pointers; KHÔNG có filename (filename ở dir entry)</li>\n            <li>✅ Hard link (cùng inode) ≠ Symlink (file path đến target)</li>\n            <li>✅ <strong>File Descriptor</strong> = số nguyên index trong fd table của process</li>\n            <li>✅ stdin/stdout/stderr = fd 0/1/2; shell redirect dùng <code>dup2</code></li>\n            <li>✅ Blocking I/O đơn giản nhưng không scale; Non-blocking + I/O multiplexing là nền tảng web server hiện đại</li>\n            <li>✅ <strong>epoll/kqueue</strong> O(1) → scale lên hàng trăm nghìn fd. Pattern Reactor.</li>\n            <li>✅ <strong>io_uring</strong>: future of async I/O</li>\n            <li>✅ <strong>Page Cache</strong>: read/write đi qua RAM trước → fast; trade-off với durability</li>\n            <li>✅ <strong>fsync</strong> đảm bảo data xuống disk — đắt, dùng cho DB commit</li>\n            <li>✅ Node.js fs API: callback/promise; libuv thread pool cho I/O</li>\n          </ul>\n\n          <div class=\"callout tip\">\n            <div class=\"callout-title\">🎓 Kết thúc giáo trình OS Mastery</div>\n            <p>\n              Bạn đã đi qua 10 chương — từ kernel/syscall đến file system. Kết hợp với DSA, bạn đã có 2/6 trụ cột nền tảng IT.\n              Sau OS, các trụ cột tiếp theo:\n            </p>\n            <ol>\n              <li><strong>Networking</strong> — TCP/IP, HTTP, DNS, sockets</li>\n              <li><strong>Database</strong> — SQL, indexing, transaction</li>\n              <li><strong>OOP &amp; Design Patterns</strong></li>\n              <li><strong>System Design</strong> — kiến trúc hệ thống lớn</li>\n            </ol>\n            <p>\n              Đề xuất thực hành ngay sau khi học OS:\n            </p>\n            <ul>\n              <li>Đọc sách <em>Operating Systems: Three Easy Pieces</em> (free PDF) cho lý thuyết sâu hơn</li>\n              <li>Cài Linux VM hoặc dùng macOS terminal — thử mọi command đã học</li>\n              <li>Đọc man page: <code>man 2 fork</code>, <code>man 2 mmap</code>, <code>man 7 epoll</code></li>\n              <li>Build mini project: web server đơn giản dùng epoll, hoặc shell tự viết</li>\n            </ul>\n            <p><strong>Chúc bạn thành công ở mọi vòng phỏng vấn backend / SRE / DevOps!</strong></p>\n          </div>\n        </section>\n\n      ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "10.1 File System Overview",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "Filesystem layout (ext4 / XFS / FAT32)",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "Filesystems thực tế",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "10.2 Inode — \"thẻ căn cước\" của file",
+      "depth": 2
+    },
+    {
+      "id": "section-5",
+      "text": "Cấu trúc pointer trong inode (ext4)",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "Quan sát inode",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "10.3 Hard Link vs Symbolic Link",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "10.4 File Descriptor (fd)",
+      "depth": 2
+    },
+    {
+      "id": "section-9",
+      "text": "Số fd tối đa",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "10.5 stdin / stdout / stderr",
+      "depth": 2
+    },
+    {
+      "id": "section-11",
+      "text": "Redirect trong shell",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "10.6 open / read / write / close — file lifecycle",
+      "depth": 2
+    },
+    {
+      "id": "section-13",
+      "text": "open() flags quan trọng",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "10.7 Blocking I/O",
+      "depth": 2
+    },
+    {
+      "id": "section-15",
+      "text": "10.8 Non-blocking I/O",
+      "depth": 2
+    },
+    {
+      "id": "section-16",
+      "text": "10.9 I/O Multiplexing — select / poll / epoll / kqueue",
+      "depth": 2
+    },
+    {
+      "id": "section-17",
+      "text": "select() — POSIX cổ",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "poll() — như select nhưng không giới hạn 1024",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "epoll (Linux) / kqueue (BSD/macOS) — modern",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "Tại sao epoll nhanh hơn select?",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "Pattern Reactor",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "10.10 Async I/O — io_uring (mới nhất)",
+      "depth": 2
+    },
+    {
+      "id": "section-23",
+      "text": "POSIX AIO (cũ, ít dùng)",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "io_uring (Linux 5.1+, 2019)",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "10.11 Page Cache — kernel buffer cho file",
+      "depth": 2
+    },
+    {
+      "id": "section-26",
+      "text": "Write-back cache",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "Quan sát page cache",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "10.12 fsync() & Durability",
+      "depth": 2
+    },
+    {
+      "id": "section-29",
+      "text": "Trade-off database thực tế",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "fsync vs sync vs fdatasync",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "10.13 Node.js File I/O — kết nối với chương 3",
+      "depth": 2
+    },
+    {
+      "id": "section-32",
+      "text": "Tại sao Node fs nhanh dù single-thread?",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "Async I/O qua io_uring",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-35",
+      "text": "🧪 Quiz cuối chương",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "Tổng kết chương 10 — và toàn bộ giáo trình OS",
+      "depth": 2
+    }
+  ],
+  "source": "OS/chuong/chuong10.html",
+  "sourceHash": "7c6f4e6797d1e31ef216f47b0f532732303c9b45ebce25b872b1945c2b3ea21b",
+  "readingMinutes": 12
+}

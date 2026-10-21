@@ -1,0 +1,190 @@
+{
+  "id": "database--chapter-07",
+  "track": "database",
+  "trackTitle": "Database Engineering",
+  "slug": "chapter-07",
+  "order": 7,
+  "title": "Concurrency Control — Locking, MVCC, Deadlock",
+  "description": "2PL, Optimistic vs Pessimistic, MVCC trong Postgres, các loại lock thực tế, deadlock detection và cách viết code không deadlock.",
+  "html": "\n\n      <section id=\"why\">\n        <h2 id=\"section-1\">1. Vì sao cần Concurrency Control?</h2>\n        <p>Ở Ch6 ta đã thấy: nhiều transaction chạy song song có thể tạo ra anomaly (lost update, phantom, write skew). DB cần cơ chế để <em>tuần tự hóa</em> các thao tác xung đột mà vẫn cho phép song song tối đa khi không xung đột.</p>\n\n        <p>Có 2 phương pháp lớn:</p>\n        <ul>\n          <li><strong>Locking</strong> — chặn transaction khác đụng vào tài nguyên đang dùng.</li>\n          <li><strong>MVCC</strong> — tạo nhiều phiên bản dữ liệu, mỗi transaction thấy snapshot riêng.</li>\n        </ul>\n        <p>Postgres kết hợp cả hai: MVCC cho read (không cần lock), row-lock cho write conflict.</p>\n      </section>\n\n      <section id=\"2pl\">\n        <h2 id=\"section-2\">2. Two-Phase Locking (2PL) — lý thuyết</h2>\n        <p>Cổ điển. Mỗi transaction có 2 pha:</p>\n        <ol>\n          <li><strong>Growing phase</strong> — chỉ acquire lock, không release.</li>\n          <li><strong>Shrinking phase</strong> — chỉ release, không acquire mới.</li>\n        </ol>\n\n        <div class=\"ascii\">  Locks held\n        ▲\n        │           ┌────────────┐\n        │          ╱│            │╲\n        │         ╱ │            │ ╲\n        │        ╱  │            │  ╲\n        │       ╱   │            │   ╲\n        │      ╱    │            │    ╲\n        │     ╱     │            │     ╲\n        │    ╱      │            │      ╲\n        │   ╱       │            │       ╲\n        ├──────────────────────────────────► time\n            growing    plateau     shrinking\n            (acquire)   (work)     (release at COMMIT)</div>\n\n        <p><strong>Strict 2PL</strong>: không release write lock cho đến COMMIT/ROLLBACK. Đảm bảo serializability + recoverability.</p>\n\n        <h3 id=\"section-3\">2.1. Loại lock</h3>\n        <ul>\n          <li><strong>Shared (S) lock</strong> — read lock. Nhiều S cùng tồn tại OK.</li>\n          <li><strong>Exclusive (X) lock</strong> — write lock. Không tồn tại với bất kỳ S/X khác.</li>\n        </ul>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Có lock</th><th>S</th><th>X</th></tr></thead>\n          <tbody>\n            <tr><td>Yêu cầu S</td><td>OK (chia sẻ)</td><td>BLOCK</td></tr>\n            <tr><td>Yêu cầu X</td><td>BLOCK</td><td>BLOCK</td></tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-4\">2.2. Hạn chế của 2PL thuần</h3>\n        <ul>\n          <li>Throughput thấp dưới read-heavy workload.</li>\n          <li>Read và write block nhau → ứng dụng cảm thấy chậm.</li>\n          <li>Dễ deadlock nếu không có thứ tự lock cố định.</li>\n        </ul>\n        <p>Đó là lý do hầu hết DB hiện đại (Postgres, Oracle, MySQL InnoDB) dùng MVCC thay 2PL thuần.</p>\n      </section>\n\n      <section id=\"opt-pess\">\n        <h2 id=\"section-5\">3. Optimistic vs Pessimistic Locking</h2>\n\n        <div class=\"compare\">\n          <div>\n            <h4>Pessimistic locking</h4>\n            <p>\"Giả định sẽ có conflict — lock trước, chấp nhận chờ.\"</p>\n            <ul>\n              <li>Dùng <code>SELECT FOR UPDATE</code> để khóa row.</li>\n              <li>Transaction khác chờ.</li>\n              <li>Phù hợp với contention cao.</li>\n              <li>Đơn giản, nhưng giảm concurrency.</li>\n            </ul>\n<pre><code class=\"language-sql\">BEGIN;\nSELECT balance FROM accounts WHERE id=1 FOR UPDATE;\n-- transaction khác phải chờ ở đây\nUPDATE accounts SET balance = balance + 50 WHERE id=1;\nCOMMIT;</code></pre>\n          </div>\n          <div>\n            <h4>Optimistic locking</h4>\n            <p>\"Giả định không conflict — kiểm tra ở COMMIT, retry nếu cần.\"</p>\n            <ul>\n              <li>Thêm cột <code>version</code> hoặc dùng MVCC + check.</li>\n              <li>UPDATE check xem row có thay đổi không.</li>\n              <li>Phù hợp với contention thấp.</li>\n              <li>App phải handle retry.</li>\n            </ul>\n<pre><code class=\"language-sql\">-- Đọc:\nSELECT balance, version FROM accounts WHERE id=1;\n-- App nhớ version=5\n\n-- Ghi (CAS):\nUPDATE accounts\nSET balance = balance + 50, version = version + 1\nWHERE id = 1 AND version = 5;\n-- Nếu rowcount = 0 → ai đó đã update, retry.</code></pre>\n          </div>\n        </div>\n\n        <p><strong>Khi nào chọn cái nào?</strong></p>\n        <ul>\n          <li>Read-heavy + ít update conflict → <strong>Optimistic</strong> (Stripe, Shopify thường dùng cho update đơn giản).</li>\n          <li>Write-heavy + tranh chấp gắt → <strong>Pessimistic</strong> (đặt vé, queue).</li>\n        </ul>\n      </section>\n\n      <section id=\"pg-locks\">\n        <h2 id=\"section-6\">4. Lock trong Postgres — toàn cảnh</h2>\n\n        <p>Postgres có nhiều granularity lock:</p>\n        <ul>\n          <li><strong>Row-level</strong> — lock 1 dòng (qua <code>FOR UPDATE</code>, <code>UPDATE</code>, <code>DELETE</code>).</li>\n          <li><strong>Table-level</strong> — lock cả bảng (qua <code>LOCK TABLE</code>, hoặc DDL).</li>\n          <li><strong>Page-level</strong> — lock 1 page (ít gặp, nội bộ).</li>\n          <li><strong>Advisory</strong> — lock do app tự định nghĩa, không gắn với object.</li>\n        </ul>\n\n        <p>Postgres KHÔNG có lock-escalation tự động (khác SQL Server) — bạn lock row 100 cái thì 100 row-lock, không bao giờ \"leo\" thành table lock.</p>\n      </section>\n\n      <section id=\"row-locks\">\n        <h2 id=\"section-7\">5. Row-level lock</h2>\n\n        <h3 id=\"section-8\">5.1. Bốn cường độ row lock (Postgres)</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Mode</th><th>Khi nào</th><th>Conflict với</th></tr></thead>\n          <tbody>\n            <tr>\n              <td><code>FOR KEY SHARE</code></td>\n              <td>FK reference check</td>\n              <td>FOR UPDATE, FOR NO KEY UPDATE</td>\n            </tr>\n            <tr>\n              <td><code>FOR SHARE</code></td>\n              <td>Read mà không ai update</td>\n              <td>FOR UPDATE, FOR NO KEY UPDATE</td>\n            </tr>\n            <tr>\n              <td><code>FOR NO KEY UPDATE</code></td>\n              <td>UPDATE cột không phải key</td>\n              <td>FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE</td>\n            </tr>\n            <tr>\n              <td><code>FOR UPDATE</code></td>\n              <td>UPDATE/DELETE tổng quát</td>\n              <td>Mọi lock khác</td>\n            </tr>\n          </tbody>\n        </table></div>\n\n        <h3 id=\"section-9\">5.2. Cú pháp <code>SELECT FOR UPDATE</code></h3>\n\n<pre><code class=\"language-sql\">-- Khóa độc quyền row, transaction khác đụng vào row sẽ chờ:\nBEGIN;\nSELECT * FROM accounts WHERE id = 1 FOR UPDATE;\n-- ...thao tác...\nUPDATE accounts SET balance = balance - 100 WHERE id = 1;\nCOMMIT;\n\n-- NOWAIT: lỗi ngay nếu không lock được:\nSELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;\n-- ERROR: could not obtain lock on row in relation \"accounts\"\n\n-- SKIP LOCKED: bỏ qua row đang bị lock (queue worker pattern):\nSELECT * FROM jobs WHERE status = 'pending'\nORDER BY id LIMIT 1\nFOR UPDATE SKIP LOCKED;</code></pre>\n\n        <h3 id=\"section-10\">5.3. Pattern: Queue worker với SKIP LOCKED</h3>\n\n<pre><code class=\"language-sql\">-- N worker cùng pull job, không tranh chấp:\nBEGIN;\nSELECT id, payload FROM jobs\nWHERE status = 'pending'\nORDER BY priority, created_at\nLIMIT 1\nFOR UPDATE SKIP LOCKED;\n\n-- App xử lý job\nUPDATE jobs SET status = 'done' WHERE id = ?;\nCOMMIT;</code></pre>\n\n        <p><strong>SKIP LOCKED</strong> là magic — Postgres bỏ qua row đang bị transaction khác lock, lấy row tiếp theo. Mỗi worker tự nhiên lấy job khác nhau, không cần coordination.</p>\n      </section>\n\n      <section id=\"table-locks\">\n        <h2 id=\"section-11\">6. Table-level lock</h2>\n\n        <p>Postgres có 8 mức table lock. Quan trọng nhất:</p>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Lock mode</th><th>Trigger by</th><th>Block writes?</th><th>Block reads?</th></tr></thead>\n          <tbody>\n            <tr><td>ACCESS SHARE</td><td>SELECT</td><td>Không</td><td>Không</td></tr>\n            <tr><td>ROW SHARE</td><td>SELECT FOR UPDATE/SHARE</td><td>Không</td><td>Không</td></tr>\n            <tr><td>ROW EXCLUSIVE</td><td>UPDATE/INSERT/DELETE</td><td>Không</td><td>Không</td></tr>\n            <tr><td>SHARE UPDATE EXCLUSIVE</td><td>VACUUM, CREATE INDEX CONCURRENTLY, ALTER TABLE</td><td>Không</td><td>Không</td></tr>\n            <tr><td>SHARE</td><td>CREATE INDEX (không CONCURRENTLY)</td><td>YES</td><td>Không</td></tr>\n            <tr><td>SHARE ROW EXCLUSIVE</td><td>CREATE TRIGGER, ALTER TABLE</td><td>YES</td><td>Không</td></tr>\n            <tr><td>EXCLUSIVE</td><td>REFRESH MATERIALIZED VIEW CONCURRENTLY</td><td>YES</td><td>Một phần</td></tr>\n            <tr><td>ACCESS EXCLUSIVE</td><td>DROP, TRUNCATE, ALTER TABLE (đa số), CLUSTER</td><td>YES</td><td>YES</td></tr>\n          </tbody>\n        </table></div>\n\n<pre><code class=\"language-sql\">-- Explicit lock:\nLOCK TABLE accounts IN ACCESS EXCLUSIVE MODE;\n\n-- Trong transaction, lock tự release ở COMMIT.</code></pre>\n\n        <div class=\"callout callout-warn\">\n          <span class=\"callout-title\">DDL lock = production downtime</span>\n          <code>ALTER TABLE</code> mặc định cần ACCESS EXCLUSIVE — block mọi reads/writes. Trên bảng lớn có thể lock vài giây tới vài phút. Để migration online, dùng pattern \"add column nullable + backfill + add NOT NULL not valid + validate\". Sẽ học sâu ở Ch12.\n        </div>\n\n        <h3 id=\"section-12\">6.1. <code>pg_locks</code> — xem lock đang bị giữ</h3>\n\n<pre><code class=\"language-sql\">SELECT\n  l.locktype, l.mode, l.granted,\n  a.pid, a.query, a.state,\n  age(now(), a.query_start) AS age\nFROM pg_locks l\nJOIN pg_stat_activity a USING (pid)\nWHERE NOT a.pid = pg_backend_pid()\nORDER BY age DESC;</code></pre>\n\n        <p>Cứu cánh khi debug \"tại sao query của tôi treo?\".</p>\n      </section>\n\n      <section id=\"mvcc\">\n        <h2 id=\"section-13\">7. MVCC sâu — <code>xmin</code>, <code>xmax</code>, visibility</h2>\n\n        <p>Mỗi tuple trong Postgres có 2 cột ẩn:</p>\n        <ul>\n          <li><code>xmin</code> — XID của transaction <em>tạo</em> tuple này.</li>\n          <li><code>xmax</code> — XID của transaction <em>xóa/update</em> tuple này (0 nếu chưa).</li>\n        </ul>\n\n<pre><code class=\"language-sql\">-- Xem xmin/xmax:\nSELECT xmin, xmax, * FROM accounts WHERE id = 1;</code></pre>\n\n        <h3 id=\"section-14\">7.1. Visibility rule</h3>\n        <p>Một tuple visible với snapshot xid_S khi:</p>\n        <ul>\n          <li><code>xmin</code> đã commit và <code>xmin &lt; xid_S</code> và <code>xmin</code> không trong \"active list\" của snapshot.</li>\n          <li>VÀ (<code>xmax</code> = 0 OR <code>xmax</code> chưa commit OR <code>xmax &gt; xid_S</code>).</li>\n        </ul>\n\n        <p>Nói cách khác: \"Tuple này được tạo trước snapshot và chưa bị xóa bởi transaction đã commit trước snapshot.\"</p>\n\n        <h3 id=\"section-15\">7.2. UPDATE thực ra là INSERT + mark old DELETE</h3>\n\n        <div class=\"ascii\">  Trước UPDATE:\n  ┌────────────────────────────────────┐\n  │ xmin=10  xmax=0   id=1  balance=100│  ← visible\n  └────────────────────────────────────┘\n\n  Sau UPDATE balance = 200 trong tx 20:\n  ┌────────────────────────────────────┐\n  │ xmin=10  xmax=20  id=1  balance=100│  ← old, sẽ bị xóa\n  ├────────────────────────────────────┤\n  │ xmin=20  xmax=0   id=1  balance=200│  ← new\n  └────────────────────────────────────┘\n\n  Sau khi tx 10 (snapshot cũ) hoàn thành và VACUUM:\n  ┌────────────────────────────────────┐\n  │ xmin=20  xmax=0   id=1  balance=200│\n  └────────────────────────────────────┘</div>\n\n        <h3 id=\"section-16\">7.3. Hệ quả: dead tuple, table bloat</h3>\n        <p>Mỗi UPDATE/DELETE để lại \"dead tuple\". Vacuum (autovacuum) phải dọn. Nếu không kịp → bảng phình to → query chậm.</p>\n        <p>Workload UPDATE-heavy là kẻ thù của MVCC. Giải pháp: HOT updates (Heap-Only Tuple — UPDATE không đụng index) khi không thay đổi cột indexed, và vacuum thường xuyên.</p>\n      </section>\n\n      <section id=\"deadlock\">\n        <h2 id=\"section-17\">8. Deadlock — phát hiện và phòng tránh</h2>\n\n        <p>Deadlock = vòng luẩn quẩn lock:</p>\n\n        <div class=\"ascii\">  T1 holds row A           T2 holds row B\n       │                          │\n       │ wants B                  │ wants A\n       └────────►   ◄────────────┘\n                 ╳ DEADLOCK ╳</div>\n\n        <h3 id=\"section-18\">8.1. Postgres detection</h3>\n        <p>Postgres scan lock graph mỗi <code>deadlock_timeout</code> (mặc định 1s). Khi phát hiện chu trình → abort 1 transaction (thường là ngắn nhất). App nhận lỗi <code>40P01 deadlock_detected</code>.</p>\n\n<pre><code class=\"language-sql\">-- Demo deadlock:\n-- Session A:\nBEGIN;\nUPDATE accounts SET balance=balance-10 WHERE id=1;\n-- (chờ B)\nUPDATE accounts SET balance=balance+10 WHERE id=2;\n\n-- Session B (đồng thời):\nBEGIN;\nUPDATE accounts SET balance=balance-5 WHERE id=2;\n-- (chờ A)\nUPDATE accounts SET balance=balance+5 WHERE id=1;\n-- → 1s sau, 1 trong 2 sẽ nhận:\n-- ERROR: deadlock detected</code></pre>\n\n        <h3 id=\"section-19\">8.2. Phòng tránh — luôn lock theo thứ tự nhất quán</h3>\n\n<pre><code class=\"language-typescript\">// Bug-prone: app A khóa (id=1, id=2), app B khóa (id=2, id=1)\nasync function transfer(from, to, amount) {\n  // ✓ Sort theo id trước khi lock:\n  const [a, b] = [from, to].sort();\n  await tx.lock(a);\n  await tx.lock(b);\n  // ...\n}</code></pre>\n\n        <p>Quy tắc: luôn acquire lock theo cùng thứ tự (sort by id, lexicographic, …) trong toàn app.</p>\n\n        <h3 id=\"section-20\">8.3. Lock timeout</h3>\n<pre><code class=\"language-sql\">SET lock_timeout = '5s';\nBEGIN;\nSELECT * FROM accounts WHERE id=1 FOR UPDATE;\n-- Nếu không lock được trong 5s → ERROR canceled.</code></pre>\n\n        <p>Tốt cho UI — không để user chờ vô hạn.</p>\n      </section>\n\n      <section id=\"advisory\">\n        <h2 id=\"section-21\">9. Advisory Lock — lock do app định nghĩa</h2>\n        <p>Lock không gắn với object DB cụ thể, chỉ là 1 cặp (key1, key2) integer hoặc 1 bigint. Tự app dùng để serialize logic.</p>\n\n<pre><code class=\"language-sql\">-- Acquire (block nếu đã có ai giữ):\nSELECT pg_advisory_lock(12345);\n\n-- Try acquire (không block):\nSELECT pg_try_advisory_lock(12345);   -- → true/false\n\n-- Release:\nSELECT pg_advisory_unlock(12345);\n\n-- Tự release ở COMMIT:\nSELECT pg_advisory_xact_lock(12345);</code></pre>\n\n        <h3 id=\"section-22\">9.1. Use case</h3>\n        <ul>\n          <li><strong>Cron singleton</strong> — đảm bảo chỉ 1 instance chạy job tại 1 thời điểm.</li>\n          <li><strong>Migration leader</strong> — chỉ 1 process chạy migration trên cluster.</li>\n          <li><strong>Distributed mutex</strong> — Postgres làm lock manager.</li>\n        </ul>\n\n<pre><code class=\"language-typescript\">async function runIfLeader(jobName: string) {\n  const lockKey = hash(jobName);\n  const acquired = await db.query('SELECT pg_try_advisory_lock($1)', [lockKey]);\n  if (!acquired.rows[0].pg_try_advisory_lock) return; // ai đó đang chạy\n  try { await runJob(); }\n  finally { await db.query('SELECT pg_advisory_unlock($1)', [lockKey]); }\n}</code></pre>\n      </section>\n\n      <section id=\"vacuum\">\n        <h2 id=\"section-23\">10. Vacuum &amp; Bloat</h2>\n\n        <p>Như đã nói, MVCC tạo dead tuple. <strong>VACUUM</strong> dọn:</p>\n        <ul>\n          <li>Đánh dấu dead tuple là free space (re-use cho INSERT/UPDATE sau).</li>\n          <li>Cập nhật <code>visibility map</code> → cho phép Index Only Scan.</li>\n          <li>Cập nhật statistics cho planner.</li>\n        </ul>\n\n        <h3 id=\"section-24\">10.1. Autovacuum</h3>\n        <p>Postgres tự động chạy autovacuum khi % dead tuple vượt threshold. Mặc định OK cho hầu hết workload, nhưng workload nặng có thể cần tune:</p>\n<pre><code class=\"language-sql\">ALTER TABLE hot_table SET (\n  autovacuum_vacuum_scale_factor = 0.05,    -- 5% thay vì 20%\n  autovacuum_vacuum_cost_limit = 1000       -- chạy nhanh hơn\n);</code></pre>\n\n        <h3 id=\"section-25\">10.2. VACUUM vs VACUUM FULL</h3>\n        <ul>\n          <li><strong>VACUUM</strong> — không reclaim dung lượng disk, chỉ free space cho re-use. Online, không block.</li>\n          <li><strong>VACUUM FULL</strong> — viết lại bảng, reclaim disk. Lock toàn bảng (ACCESS EXCLUSIVE). Chỉ dùng khi thực sự cần.</li>\n        </ul>\n\n        <p>Thay vì VACUUM FULL trên prod, dùng <code>pg_repack</code> — viết lại bảng online.</p>\n\n        <h3 id=\"section-26\">10.3. Bloat detection</h3>\n<pre><code class=\"language-sql\">SELECT\n  schemaname, relname,\n  pg_size_pretty(pg_total_relation_size(relid)) AS size,\n  n_dead_tup, n_live_tup,\n  ROUND(n_dead_tup::numeric / NULLIF(n_live_tup,0) * 100, 1) AS dead_pct\nFROM pg_stat_user_tables\nORDER BY n_dead_tup DESC LIMIT 10;</code></pre>\n      </section>\n\n      <section id=\"patterns\">\n        <h2 id=\"section-27\">11. Patterns thực tế</h2>\n\n        <h3 id=\"section-28\">11.1. Update với optimistic version</h3>\n<pre><code class=\"language-sql\">CREATE TABLE products (\n  id BIGSERIAL PRIMARY KEY,\n  name VARCHAR, price DECIMAL,\n  version INT NOT NULL DEFAULT 0\n);\n\n-- App đọc:\nSELECT id, name, price, version FROM products WHERE id = 1;\n-- → version = 5\n\n-- App ghi với CAS:\nUPDATE products\nSET name = $1, price = $2, version = version + 1\nWHERE id = 1 AND version = 5\nRETURNING version;\n-- Nếu rowcount = 0 → conflict, retry.</code></pre>\n\n        <h3 id=\"section-29\">11.2. Distributed counter — write contention</h3>\n<pre><code class=\"language-sql\">-- ❌ Mọi request UPDATE row counter — tất cả tranh nhau lock 1 row.\nUPDATE counters SET value = value + 1 WHERE name = 'page_view';\n\n-- ✓ Sharded counter:\nINSERT INTO counter_log (name, delta) VALUES ('page_view', 1);\n-- (định kỳ aggregate vào counters)\n\n-- HOẶC random shard:\nUPDATE counter_shards SET value = value + 1\nWHERE name = 'page_view' AND shard = floor(random() * 100);</code></pre>\n\n        <h3 id=\"section-30\">11.3. SELECT … FOR UPDATE NOWAIT cho UI</h3>\n<pre><code class=\"language-sql\">BEGIN;\nSELECT * FROM seats WHERE id = $1 AND available = TRUE\nFOR UPDATE NOWAIT;\n-- Nếu LOCK NOT GRANTED → trả 409 Conflict cho user, không block UI</code></pre>\n\n        <h3 id=\"section-31\">11.4. Worker queue pattern</h3>\n<pre><code class=\"language-sql\">-- N worker pull job:\nDELETE FROM jobs WHERE id = (\n  SELECT id FROM jobs\n  WHERE status = 'pending'\n  ORDER BY priority, created_at\n  FOR UPDATE SKIP LOCKED\n  LIMIT 1\n)\nRETURNING *;</code></pre>\n\n        <p>Khá magic, là pattern queue cơ bản dùng Postgres làm message broker (đủ cho moderate scale).</p>\n\n        <h3 id=\"section-32\">11.5. Idempotency key</h3>\n<pre><code class=\"language-sql\">-- Đảm bảo POST /charge không double-charge nếu retry:\nINSERT INTO charges (id, idem_key, amount)\nVALUES (gen_random_uuid(), $1, 100)\nON CONFLICT (idem_key) DO NOTHING\nRETURNING id;\n-- Nếu row trả về null → đã xử lý, return cùng response.</code></pre>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-33\">12. Bài tập</h2>\n\n        <ol>\n          <li>Mở 2 psql, demo deadlock cố ý theo mục 8.1. Quan sát error.</li>\n          <li>Cài đặt queue worker với <code>FOR UPDATE SKIP LOCKED</code>. Test 4 worker đồng thời pull từ bảng 1000 job.</li>\n          <li>Implement optimistic locking với cột <code>version</code> cho bảng products. Viết function update với retry.</li>\n          <li>Đo dead_pct của 1 bảng UPDATE-heavy. Tune autovacuum để giảm.</li>\n          <li>Vì sao SELECT thông thường KHÔNG block UPDATE trong Postgres? (MVCC).</li>\n          <li>So sánh: tại sao MySQL InnoDB cũng MVCC nhưng default REPEATABLE READ dùng \"next-key locks\", còn Postgres không?</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-34\">13. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-35\">Quiz cuối Chương 7</h3>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">FOR UPDATE SKIP LOCKED hữu ích nhất cho:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Báo cáo BI\">Báo cáo BI</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Worker queue — N worker pull job khác nhau\">Worker queue — N worker pull job khác nhau</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Phân quyền\">Phân quyền</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Backup\">Backup</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">SKIP LOCKED bỏ qua row đang bị lock và lấy row tiếp theo. Mỗi worker tự nhiên lấy job khác nhau, không cần coordination ngoài DB. Postgres trở thành job queue đơn giản nhưng đủ mạnh cho moderate scale.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">MVCC nghĩa là khi UPDATE:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Sửa trực tiếp tuple cũ\">Sửa trực tiếp tuple cũ</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Lock toàn bảng\">Lock toàn bảng</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tạo tuple version mới, đánh dấu version cũ với xmax\">Tạo tuple version mới, đánh dấu version cũ với xmax</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Ghi log binary\">Ghi log binary</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">UPDATE = INSERT new tuple + mark old tuple's xmax = current_xid. Snapshot khác có thể vẫn thấy tuple cũ. Vacuum dọn dead tuple sau khi không snapshot nào còn tham chiếu.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Cách hiệu quả nhất tránh deadlock:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Tắt deadlock detection\">Tắt deadlock detection</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Dùng READ UNCOMMITTED\">Dùng READ UNCOMMITTED</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Lock cả bảng\">Lock cả bảng</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Acquire lock theo cùng thứ tự nhất quán trong toàn app (sort by id)\">Acquire lock theo cùng thứ tự nhất quán trong toàn app (sort by id)</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Deadlock cần chu trình lock. Nếu mọi transaction lock theo cùng thứ tự → không tạo được chu trình. Sort row id trước khi lock là pattern phổ biến nhất.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Optimistic locking dùng:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cột version + UPDATE WHERE version = ? + retry nếu conflict\">Cột version + UPDATE WHERE version = ? + retry nếu conflict</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: SELECT FOR UPDATE\">SELECT FOR UPDATE</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: LOCK TABLE\">LOCK TABLE</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Advisory lock\">Advisory lock</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Optimistic = không lock trước, kiểm tra ở update. Compare-and-swap (CAS) qua cột version. App phải retry khi rowcount = 0 (conflict).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">VACUUM trong Postgres làm:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Backup dữ liệu\">Backup dữ liệu</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Encrypt\">Encrypt</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Dọn dead tuple, free space, cập nhật statistics\">Dọn dead tuple, free space, cập nhật statistics</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Sort lại bảng\">Sort lại bảng</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">VACUUM thường: đánh dấu dead tuple thành free space cho re-use, cập nhật visibility map (cho Index Only Scan), update statistics. KHÔNG reclaim disk space (đó là VACUUM FULL).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Advisory lock phù hợp với:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Lock dòng cụ thể\">Lock dòng cụ thể</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cron singleton — đảm bảo chỉ 1 process chạy job\">Cron singleton — đảm bảo chỉ 1 process chạy job</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Constraint check\">Constraint check</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Index\">Index</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Advisory lock không gắn object DB. App dùng key tự định nghĩa để serialize logic level. Pattern phổ biến: cron leader, distributed mutex qua Postgres.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Read và Write trong Postgres:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Block nhau toàn bộ\">Block nhau toàn bộ</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Read luôn block Write\">Read luôn block Write</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Write luôn block Read\">Write luôn block Read</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: KHÔNG block nhau (nhờ MVCC) — Read xem snapshot\">KHÔNG block nhau (nhờ MVCC) — Read xem snapshot</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Đây là sức mạnh chính của MVCC. SELECT chỉ đọc tuple visible với snapshot, không cần lock. UPDATE/DELETE tạo version mới. Read và write song song hoàn toàn.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Long-running transaction trên workload UPDATE-heavy:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Ngăn vacuum dọn dead tuple → table bloat\">Ngăn vacuum dọn dead tuple → table bloat</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tăng performance\">Tăng performance</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Không có ảnh hưởng\">Không có ảnh hưởng</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Tự động tối ưu index\">Tự động tối ưu index</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Vacuum chỉ dọn được tuple version mà không snapshot nào còn tham chiếu. Long-running transaction giữ snapshot cũ → vacuum không đụng được dead tuple → bloat tăng → query chậm dần. Đặt <code>idle_in_transaction_session_timeout</code>.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 7. Tiếp theo: <a href=\"/learn/database/chapter-08/\"><strong>Chương 8 — Query Optimization &amp; Execution Plan →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Vì sao cần Concurrency Control?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "2. Two-Phase Locking (2PL) — lý thuyết",
+      "depth": 2
+    },
+    {
+      "id": "section-3",
+      "text": "2.1. Loại lock",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "2.2. Hạn chế của 2PL thuần",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "3. Optimistic vs Pessimistic Locking",
+      "depth": 2
+    },
+    {
+      "id": "section-6",
+      "text": "4. Lock trong Postgres — toàn cảnh",
+      "depth": 2
+    },
+    {
+      "id": "section-7",
+      "text": "5. Row-level lock",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "5.1. Bốn cường độ row lock (Postgres)",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "5.2. Cú pháp SELECT FOR UPDATE",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "5.3. Pattern: Queue worker với SKIP LOCKED",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "6. Table-level lock",
+      "depth": 2
+    },
+    {
+      "id": "section-12",
+      "text": "6.1. pg_locks — xem lock đang bị giữ",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "7. MVCC sâu — xmin, xmax, visibility",
+      "depth": 2
+    },
+    {
+      "id": "section-14",
+      "text": "7.1. Visibility rule",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "7.2. UPDATE thực ra là INSERT + mark old DELETE",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "7.3. Hệ quả: dead tuple, table bloat",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "8. Deadlock — phát hiện và phòng tránh",
+      "depth": 2
+    },
+    {
+      "id": "section-18",
+      "text": "8.1. Postgres detection",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "8.2. Phòng tránh — luôn lock theo thứ tự nhất quán",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "8.3. Lock timeout",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "9. Advisory Lock — lock do app định nghĩa",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "9.1. Use case",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "10. Vacuum & Bloat",
+      "depth": 2
+    },
+    {
+      "id": "section-24",
+      "text": "10.1. Autovacuum",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "10.2. VACUUM vs VACUUM FULL",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "10.3. Bloat detection",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "11. Patterns thực tế",
+      "depth": 2
+    },
+    {
+      "id": "section-28",
+      "text": "11.1. Update với optimistic version",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "11.2. Distributed counter — write contention",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "11.3. SELECT … FOR UPDATE NOWAIT cho UI",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "11.4. Worker queue pattern",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "11.5. Idempotency key",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "12. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-34",
+      "text": "13. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-35",
+      "text": "Quiz cuối Chương 7",
+      "depth": 3
+    }
+  ],
+  "source": "Database/chuong/chuong7.html",
+  "sourceHash": "27f6706378509f106fb17f311b3bd494e0f34e134c2020252b540fef6aefc31b",
+  "readingMinutes": 11
+}

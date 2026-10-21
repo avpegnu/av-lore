@@ -1,0 +1,250 @@
+{
+  "id": "networking--chapter-10",
+  "track": "networking",
+  "trackTitle": "Networking",
+  "slug": "chapter-10",
+  "order": 10,
+  "title": "CORS, CSRF, XSS,CDN, Load Balancer",
+  "description": "Chương cuối — Web security cơ bản (CORS, CSRF, XSS, CSP) + Infrastructure (CDN, Load Balancer, Reverse Proxy, Rate Limit). Phỏng vấn backend/DevOps/SRE hỏi 100%. Học xong, bạn có thể debug \"CORS error\", thiết kế hệ thống chống DDoS, hiểu nginx config.",
+  "html": "\n\n        <!-- 10.1 -->\n        <section id=\"sop\">\n          <h2 id=\"section-1\">10.1 Same-Origin Policy (SOP)</h2>\n\n          <p>\n            <strong>SOP</strong> là <em>nguyên tắc bảo mật cốt lõi của browser</em>: JS từ origin A KHÔNG được đọc dữ liệu từ origin B.\n          </p>\n\n          <h3 id=\"section-2\">Origin = scheme + host + port</h3>\n          <pre data-lang=\"text\"><code>https://example.com:443/path1   ┐\nhttps://example.com:443/path2   │  cùng origin\nhttps://example.com/            ┘  (port 443 ngầm)\n\nhttp://example.com              ✗ scheme khác\nhttps://api.example.com         ✗ host khác (subdomain ≠ same)\nhttps://example.com:8080        ✗ port khác</code></pre>\n\n          <h3 id=\"section-3\">Tại sao cần SOP?</h3>\n          <p>Không có SOP, JS từ <code>evil.com</code> có thể:</p>\n          <ul>\n            <li>Đọc cookie của bank.com</li>\n            <li>Gửi AJAX request đến bank.com (với cookie của user)</li>\n            <li>Đọc response → steal data</li>\n          </ul>\n\n          <p>SOP block tất cả → web mới an toàn. Nhưng có lúc cần legitimate cross-origin → cần CORS để mở \"ngoại lệ\".</p>\n        </section>\n\n        <!-- 10.2 -->\n        <section id=\"cors\">\n          <h2 id=\"section-4\">10.2 CORS — Cross-Origin Resource Sharing</h2>\n\n          <p>\n            <strong>CORS</strong> là cơ chế <em>server</em> \"cho phép\" origin khác đọc response của mình. Browser thực thi.\n          </p>\n\n          <h3 id=\"section-5\">Simple request — chỉ check response headers</h3>\n          <p>Request đáp ứng: GET/HEAD/POST + content type form/text/url-encoded + không có custom header → \"simple\". Browser gửi luôn, sau đó kiểm response:</p>\n\n          <pre data-lang=\"http\"><code># Browser tự thêm\nOrigin: https://app.example.com\n\n# Server response\nAccess-Control-Allow-Origin: https://app.example.com\n# Hoặc: Access-Control-Allow-Origin: *  (any origin)</code></pre>\n\n          <p>Nếu header thiếu / không match origin → browser <strong>block JS đọc response</strong>. Request vẫn đến server (đó là lý do CSRF vẫn nguy hiểm — xem 10.3).</p>\n\n          <h3 id=\"section-6\">Preflight — OPTIONS request</h3>\n          <p>Request \"non-simple\" (PUT/DELETE/PATCH, custom header, JSON body) → browser gửi <strong>OPTIONS preflight</strong> trước:</p>\n\n          <pre data-lang=\"http\"><code># Preflight (browser tự gửi)\nOPTIONS /api/data HTTP/1.1\nOrigin: https://app.example.com\nAccess-Control-Request-Method: PUT\nAccess-Control-Request-Headers: Content-Type, Authorization\n\n# Server response\nHTTP/1.1 204 No Content\nAccess-Control-Allow-Origin: https://app.example.com\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE\nAccess-Control-Allow-Headers: Content-Type, Authorization\nAccess-Control-Max-Age: 86400         # cache preflight 1 day\n\n# Sau đó browser mới gửi PUT thật\nPUT /api/data ...</code></pre>\n\n          <h3 id=\"section-7\">Credentials (cookies)</h3>\n          <p>Cross-origin request mặc định <strong>KHÔNG gửi cookies</strong>. Để gửi:</p>\n          <pre data-lang=\"javascript\"><code>fetch('https://api.example.com/me', {\n  credentials: 'include'   // gửi cookies\n});</code></pre>\n\n          <p>Server phải:</p>\n          <pre data-lang=\"http\"><code>Access-Control-Allow-Origin: https://app.example.com   # KHÔNG được \"*\"\nAccess-Control-Allow-Credentials: true</code></pre>\n\n          <h3 id=\"section-8\">CORS error phổ biến</h3>\n          <ul>\n            <li><strong>\"No 'Access-Control-Allow-Origin' header\"</strong> → server thiếu header</li>\n            <li><strong>\"Wildcard cannot be used with credentials\"</strong> → khi <code>credentials: include</code>, không được dùng <code>*</code></li>\n            <li><strong>\"Method PUT not allowed\"</strong> → server không khai báo method</li>\n          </ul>\n\n          <div class=\"callout warning\">\n            <div class=\"callout-title\">⚠️ CORS không phải \"security feature\" của server</div>\n            CORS là feature của <strong>browser</strong> bảo vệ user. Nếu attacker dùng curl/Postman → CORS không có ý nghĩa.\n            Server vẫn cần auth riêng. CORS chỉ giới hạn: JS trong browser từ origin lạ không đọc response.\n          </div>\n        </section>\n\n        <!-- 10.3 -->\n        <section id=\"csrf\">\n          <h2 id=\"section-9\">10.3 CSRF — Cross-Site Request Forgery</h2>\n\n          <p>\n            User đã login bank.com (có cookie session). Sau đó visit evil.com. Trang evil chứa:\n          </p>\n\n          <pre data-lang=\"html\"><code>&lt;form action=\"https://bank.com/transfer\" method=\"POST\"&gt;\n  &lt;input name=\"to\" value=\"attacker\"&gt;\n  &lt;input name=\"amount\" value=\"1000\"&gt;\n&lt;/form&gt;\n&lt;script&gt;document.forms[0].submit();&lt;/script&gt;</code></pre>\n\n          <p>\n            Browser tự gửi cookie session bank.com → bank.com tin là user → chuyển tiền.\n            CORS không giúp vì JS evil <em>không cần đọc response</em>, chỉ cần gửi request.\n          </p>\n\n          <h3 id=\"section-10\">Phòng tránh CSRF</h3>\n\n          <h4>1. SameSite cookie (modern, easy)</h4>\n          <pre data-lang=\"http\"><code>Set-Cookie: session=...; SameSite=Lax; Secure; HttpOnly</code></pre>\n          <p>Browser không gửi cookie với cross-site POST → request đến bank.com không có cookie → bank reject. Default Chrome 80+.</p>\n\n          <h4>2. CSRF Token (truyền thống)</h4>\n          <p>Server gửi CSRF token trong form. Khi submit, server check token match session.</p>\n          <pre data-lang=\"html\"><code>&lt;form action=\"/transfer\" method=\"POST\"&gt;\n  &lt;input type=\"hidden\" name=\"csrf_token\" value=\"abc123xyz\"&gt;\n  &lt;input name=\"amount\"&gt;\n&lt;/form&gt;</code></pre>\n          <p>Evil.com không biết token (SOP chặn đọc trang bank) → không tạo được form hợp lệ.</p>\n\n          <h4>3. Custom header</h4>\n          <p>API JSON yêu cầu header <code>X-Requested-With: XMLHttpRequest</code> hoặc <code>Content-Type: application/json</code>. Browser bắt buộc preflight → phát hiện cross-origin.</p>\n\n          <h4>4. Double-submit cookie</h4>\n          <p>Token gửi cả qua cookie và body. Server check 2 cái khớp. Evil không đặt được cookie cho bank.com.</p>\n\n          <h4>5. Origin / Referer header check</h4>\n          <p>Server check <code>Origin</code> hoặc <code>Referer</code> header có khớp domain không.</p>\n        </section>\n\n        <!-- 10.4 -->\n        <section id=\"xss\">\n          <h2 id=\"section-11\">10.4 XSS — Cross-Site Scripting</h2>\n\n          <p>\n            Attacker chèn JavaScript vào trang của bạn → script chạy trong browser của user khác → đánh cắp cookie, session, làm việc thay user.\n          </p>\n\n          <h3 id=\"section-12\">3 loại XSS</h3>\n\n          <h4>1. Stored XSS (nguy hiểm nhất)</h4>\n          <p>Script lưu trên server. Vd: comment chứa <code>&lt;script&gt;...&lt;/script&gt;</code> → mọi user xem comment đều chạy script.</p>\n\n          <h4>2. Reflected XSS</h4>\n          <p>Script trong URL, server \"echo\" lại trong response. Vd: <code>example.com/search?q=&lt;script&gt;alert(1)&lt;/script&gt;</code> → server hiển thị \"Bạn tìm: &lt;script&gt;...\" → script chạy.</p>\n\n          <h4>3. DOM-based XSS</h4>\n          <p>Server không liên quan. Attacker dụ user vào URL với fragment chứa script. JS client side đọc <code>location.hash</code> và <code>innerHTML</code> → script chạy.</p>\n\n          <h3 id=\"section-13\">Phòng tránh XSS</h3>\n\n          <h4>1. Output escaping</h4>\n          <p>Mọi user input khi render HTML phải <em>escape</em>:</p>\n          <pre data-lang=\"text\"><code>&lt;  →  &amp;lt;\n&gt;  →  &amp;gt;\n\"  →  &amp;quot;\n&amp;  →  &amp;amp;</code></pre>\n          <p>Modern framework (React, Vue, Angular) escape mặc định. Vue: <code>{{ name }}</code> escape; <code>v-html</code> không escape (nguy hiểm).</p>\n\n          <h4>2. Tránh innerHTML / dangerouslySetInnerHTML</h4>\n          <p>Dùng <code>textContent</code> thay <code>innerHTML</code>. Dùng React <code>{name}</code> thay <code>dangerouslySetInnerHTML</code>.</p>\n\n          <h4>3. Sanitize HTML khi cần (vd rich text editor)</h4>\n          <p>Dùng <strong>DOMPurify</strong> để clean HTML user submit, giữ formatting an toàn (b, i, p) bỏ script.</p>\n\n          <h4>4. CSP (Content Security Policy)</h4>\n          <p>Xem 10.5.</p>\n\n          <h4>5. HttpOnly cookie</h4>\n          <p>JS không đọc được session cookie → XSS không lấy được session.</p>\n\n          <h3 id=\"section-14\">Test XSS</h3>\n          <pre data-lang=\"text\"><code># Thử vào form input:\n&lt;script&gt;alert('XSS')&lt;/script&gt;\n&lt;img src=x onerror=alert(1)&gt;\njavascript:alert(1)\n\"&gt;&lt;script&gt;alert(1)&lt;/script&gt;</code></pre>\n        </section>\n\n        <!-- 10.5 -->\n        <section id=\"csp\">\n          <h2 id=\"section-15\">10.5 CSP — Content Security Policy</h2>\n\n          <p>\n            <strong>CSP</strong> = whitelist các origin được phép load resource (script, style, image, font, ...). Nếu inline script không trong whitelist → browser block.\n          </p>\n\n          <pre data-lang=\"http\"><code>Content-Security-Policy:\n  default-src 'self';\n  script-src 'self' https://cdn.jsdelivr.net;\n  style-src 'self' 'unsafe-inline';\n  img-src 'self' data: https:;\n  connect-src 'self' https://api.example.com;\n  frame-ancestors 'none';</code></pre>\n\n          <h3 id=\"section-16\">Directive phổ biến</h3>\n          <ul>\n            <li><code>default-src</code>: fallback cho mọi loại</li>\n            <li><code>script-src</code>: nguồn script được phép</li>\n            <li><code>style-src</code>: nguồn CSS</li>\n            <li><code>img-src</code>: nguồn image</li>\n            <li><code>connect-src</code>: AJAX, WebSocket destination</li>\n            <li><code>frame-ancestors</code>: ai có thể nhúng trang này trong iframe (chống clickjacking)</li>\n          </ul>\n\n          <p>CSP nghiêm: <code>script-src 'self'</code> → chỉ script từ chính domain, không inline, không eval. Phòng XSS hiệu quả.</p>\n\n          <h3 id=\"section-17\">Khó khăn với CSP nghiêm</h3>\n          <ul>\n            <li>Inline <code>&lt;script&gt;...&lt;/script&gt;</code> bị block → cần dùng nonce hoặc hash</li>\n            <li>Inline <code>onclick=\"...\"</code> bị block</li>\n            <li>Eval bị block (mọi <code>eval()</code>, <code>new Function()</code>)</li>\n          </ul>\n\n          <p>Best practice: bắt đầu với <code>Content-Security-Policy-Report-Only</code> để chỉ report, không enforce → fix vi phạm trước khi enable thật.</p>\n        </section>\n\n        <!-- 10.6 -->\n        <section id=\"cdn\">\n          <h2 id=\"section-18\">10.6 CDN — Content Delivery Network</h2>\n\n          <p>\n            <strong>CDN</strong> = mạng server cache distributed toàn cầu. Cache static asset (image, JS, CSS, video) gần user → giảm latency, giảm load lên origin.\n          </p>\n\n          <h3 id=\"section-19\">Cách hoạt động</h3>\n          <div class=\"ascii-art\">\n   User (VN) ────▶ DNS resolve cloudfront.net\n                       │\n                       ▼ (anycast routing)\n                   CDN Edge tại Singapore\n                       │\n                       │ Cache hit? → trả ngay (5ms)\n                       │ Cache miss? → fetch từ origin\n                       │\n                       ▼\n                   Origin server (US, 200ms)\n          </div>\n\n          <h3 id=\"section-20\">2 loại CDN</h3>\n          <ul>\n            <li><strong>Push CDN</strong>: bạn upload asset lên CDN. Phù hợp: nội dung tĩnh, ít thay đổi (images, videos).</li>\n            <li><strong>Pull CDN</strong>: CDN tự fetch từ origin lần đầu, cache lại. Phù hợp: web hiện đại — 99% dùng pull.</li>\n          </ul>\n\n          <h3 id=\"section-21\">Cache control</h3>\n          <p>CDN tôn trọng HTTP <code>Cache-Control</code> header từ origin:</p>\n          <pre data-lang=\"http\"><code>Cache-Control: public, max-age=31536000, immutable\n# CDN cache 1 năm. Phù hợp asset có hash trong URL (vd app.abc123.js)\n\nCache-Control: public, max-age=300\n# Cache 5 phút trên CDN\n\nCache-Control: no-cache\n# Browser revalidate mỗi lần (CDN có thể vẫn cache cho phép 304)</code></pre>\n\n          <h3 id=\"section-22\">Cache busting</h3>\n          <p>Khi deploy version mới, asset cũ vẫn cache trên CDN. Solution: thêm hash vào filename — <code>app.abc123.js</code> → <code>app.def456.js</code>. Webpack/Vite/Next làm tự động.</p>\n\n          <h3 id=\"section-23\">Lợi ích</h3>\n          <ul>\n            <li><strong>Latency thấp</strong> — server gần user</li>\n            <li><strong>Giảm tải origin</strong> — đa số request không đến origin</li>\n            <li><strong>Bandwidth saving</strong> — origin chỉ gửi 1 lần đến CDN, CDN serve nhiều user</li>\n            <li><strong>DDoS mitigation</strong> — Cloudflare tự filter attack traffic</li>\n            <li><strong>TLS termination</strong> — CDN handle TLS, origin có thể HTTP nội bộ</li>\n          </ul>\n\n          <h3 id=\"section-24\">Major CDN</h3>\n          <p>Cloudflare, Akamai, Fastly, AWS CloudFront, Google Cloud CDN, Vercel Edge.</p>\n        </section>\n\n        <!-- 10.7 -->\n        <section id=\"lb\">\n          <h2 id=\"section-25\">10.7 Load Balancer</h2>\n\n          <p>\n            <strong>Load Balancer (LB)</strong> phân phối traffic giữa nhiều server backend → scale + failover.\n          </p>\n\n          <h3 id=\"section-26\">Algorithms</h3>\n          <ul>\n            <li><strong>Round Robin</strong>: server lần lượt — đơn giản, đều</li>\n            <li><strong>Weighted Round Robin</strong>: server mạnh nhận nhiều hơn</li>\n            <li><strong>Least Connections</strong>: gửi đến server đang có ít connection — tốt cho long-lived connection</li>\n            <li><strong>Least Response Time</strong>: gửi đến server respond nhanh nhất</li>\n            <li><strong>IP Hash</strong>: hash(client IP) → cùng client luôn cùng server (sticky session đơn giản)</li>\n            <li><strong>Random</strong>: random — đôi khi tốt vô cùng (paradox)</li>\n            <li><strong>Power of Two Choices</strong>: pick 2 random, chọn cái ít connection hơn — gần optimal</li>\n          </ul>\n\n          <h3 id=\"section-27\">Health Check</h3>\n          <p>LB định kỳ ping backend (vd <code>GET /health</code> mỗi 5s). Server fail check → remove khỏi pool. Khi healthy lại → re-add.</p>\n\n          <h3 id=\"section-28\">Sticky Session (Session Affinity)</h3>\n          <p>Cùng user → cùng backend server (qua cookie hoặc IP hash). Cần khi server lưu state in-memory (vd shopping cart).</p>\n          <p>Tránh nếu có thể — dùng shared state (Redis) thay sticky → dễ scale.</p>\n\n          <h3 id=\"section-29\">L4 vs L7 LB (đã học chương 1)</h3>\n          <ul>\n            <li><strong>L4</strong>: TCP/UDP — nhanh, không HTTP-aware. AWS NLB, HAProxy TCP mode.</li>\n            <li><strong>L7</strong>: HTTP — content-based routing (URL, header). AWS ALB, nginx, HAProxy HTTP mode.</li>\n          </ul>\n\n          <h3 id=\"section-30\">Active-Active vs Active-Passive</h3>\n          <ul>\n            <li><strong>Active-Active</strong>: tất cả backend đang serve traffic — tốt</li>\n            <li><strong>Active-Passive</strong>: 1 active, các backup standby. Failover khi active down. Dùng cho database master-slave.</li>\n          </ul>\n        </section>\n\n        <!-- 10.8 -->\n        <section id=\"proxy\">\n          <h2 id=\"section-31\">10.8 Reverse Proxy vs Forward Proxy</h2>\n\n          <div class=\"compare\">\n            <div class=\"good\">\n              <h4 class=\"text-blue\">Forward Proxy</h4>\n              <p>Đứng <em>trước client</em>. Client gửi request qua proxy → proxy chuyển tới Internet.</p>\n              <p>Use case: corporate firewall, anonymizer (Tor exit node), content filter (school).</p>\n              <pre data-lang=\"text\"><code>Client → Forward Proxy → Internet</code></pre>\n            </div>\n            <div class=\"good\">\n              <h4 class=\"text-violet\">Reverse Proxy</h4>\n              <p>Đứng <em>trước server</em>. Client request đến proxy (tưởng đó là server) → proxy chuyển tới backend thật.</p>\n              <p>Use case: nginx, HAProxy, Cloudflare. Hide backend, LB, TLS termination, caching.</p>\n              <pre data-lang=\"text\"><code>Client → Reverse Proxy → Backend servers</code></pre>\n            </div>\n          </div>\n\n          <p>Sự khác biệt: forward proxy đại diện <em>client</em> ra ngoài; reverse proxy đại diện <em>server</em> với client.</p>\n        </section>\n\n        <!-- 10.9 -->\n        <section id=\"nginx\">\n          <h2 id=\"section-32\">10.9 nginx — Swiss Army knife</h2>\n\n          <p><strong>nginx</strong> = web server + reverse proxy + LB + cache + static file server. Tool quan trọng nhất với backend dev.</p>\n\n          <h3 id=\"section-33\">Reverse proxy đơn giản</h3>\n          <pre data-lang=\"nginx\"><code>server {\n  listen 80;\n  server_name example.com;\n\n  location / {\n    proxy_pass http://localhost:3000;       # forward đến Node app\n    proxy_set_header Host $host;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $scheme;\n  }\n}</code></pre>\n\n          <h3 id=\"section-34\">Load balancer</h3>\n          <pre data-lang=\"nginx\"><code>upstream backend {\n  least_conn;                              # algorithm\n  server 10.0.0.1:3000 weight=3;\n  server 10.0.0.2:3000;\n  server 10.0.0.3:3000 backup;             # standby\n}\n\nserver {\n  listen 80;\n  location / {\n    proxy_pass http://backend;\n  }\n}</code></pre>\n\n          <h3 id=\"section-35\">HTTPS termination + redirect</h3>\n          <pre data-lang=\"nginx\"><code># Redirect HTTP → HTTPS\nserver {\n  listen 80;\n  server_name example.com;\n  return 301 https://$host$request_uri;\n}\n\nserver {\n  listen 443 ssl http2;\n  server_name example.com;\n\n  ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;\n  ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;\n\n  location / { proxy_pass http://localhost:3000; }\n}</code></pre>\n\n          <h3 id=\"section-36\">Static file + cache</h3>\n          <pre data-lang=\"nginx\"><code>location /static/ {\n  alias /var/www/static/;\n  expires 1y;\n  add_header Cache-Control \"public, immutable\";\n  try_files $uri =404;\n}</code></pre>\n\n          <h3 id=\"section-37\">Rate limiting (xem 10.10)</h3>\n          <pre data-lang=\"nginx\"><code>http {\n  limit_req_zone $binary_remote_addr zone=mylimit:10m rate=10r/s;\n\n  server {\n    location /api/ {\n      limit_req zone=mylimit burst=20 nodelay;\n      proxy_pass http://backend;\n    }\n  }\n}</code></pre>\n        </section>\n\n        <!-- 10.10 -->\n        <section id=\"ratelimit\">\n          <h2 id=\"section-38\">10.10 Rate Limiting</h2>\n\n          <p>\n            <strong>Rate Limiting</strong> = giới hạn số request/đơn vị thời gian — chống abuse, DDoS, brute force.\n          </p>\n\n          <h3 id=\"section-39\">Algorithms</h3>\n\n          <h4>1. Fixed Window</h4>\n          <p>Đếm request trong window cố định (vd \"100 req/phút\"). Reset đầu mỗi phút. Đơn giản nhưng \"burst boundary\" (cuối phút này + đầu phút sau có thể spike 200 req trong vài giây).</p>\n\n          <h4>2. Sliding Window Log</h4>\n          <p>Lưu log timestamp mỗi request. Đếm request trong khoảng [now - 1min, now]. Chính xác nhưng tốn memory.</p>\n\n          <h4>3. Sliding Window Counter</h4>\n          <p>Combine fixed window cũ + tỷ lệ window mới. Chính xác hơn fixed, ít memory hơn log.</p>\n\n          <h4>4. Token Bucket</h4>\n          <p>Bucket có capacity N. Mỗi giây refill X token. Mỗi request consume 1 token. Hết token → reject.</p>\n          <pre data-lang=\"text\"><code>capacity = 100, refill = 10/s\nBucket: ●●●●●●●●●●... (max 100)\nRequest → consume token. Hết → 429 Too Many.\nLý tưởng: cho phép burst (dùng hết bucket nhanh) nhưng giới hạn rate dài hạn.</code></pre>\n\n          <h4>5. Leaky Bucket</h4>\n          <p>Request vào queue có capacity. Server xử lý với rate cố định. Queue đầy → reject.</p>\n          <p>Khác token bucket: token bucket cho phép burst, leaky bucket smooth out (rate cố định).</p>\n\n          <h3 id=\"section-40\">Implement với Redis</h3>\n          <pre data-lang=\"javascript\"><code>// Sliding window log với Redis sorted set\nasync function checkLimit(userId, max = 100, windowSec = 60) {\n  const now = Date.now();\n  const windowStart = now - windowSec * 1000;\n  const key = `rate:${userId}`;\n\n  await redis.zremrangebyscore(key, 0, windowStart);     // xoá log cũ\n  const count = await redis.zcard(key);                   // đếm hiện tại\n\n  if (count &gt;= max) return false;                          // rate limited\n\n  await redis.zadd(key, now, `${now}-${Math.random()}`);\n  await redis.expire(key, windowSec);\n  return true;\n}</code></pre>\n\n          <h3 id=\"section-41\">Status code</h3>\n          <p><code>429 Too Many Requests</code> + header <code>Retry-After: 60</code> hoặc <code>X-RateLimit-Remaining: 0</code>.</p>\n        </section>\n\n        <!-- 10.11 -->\n        <section id=\"ddos\">\n          <h2 id=\"section-42\">10.11 DDoS — Distributed Denial of Service</h2>\n\n          <p>\n            Attacker huy động nhiều máy (botnet) gửi request đồng thời → server quá tải → user thật không truy cập được.\n          </p>\n\n          <h3 id=\"section-43\">Loại tấn công</h3>\n          <ul>\n            <li><strong>Volumetric (L3/L4)</strong>: flood network với packet/byte. Vd UDP flood, ICMP flood. Defense: scrubbing center của ISP.</li>\n            <li><strong>Protocol</strong>: SYN flood (consume server connection table), Slowloris (giữ connection mở chậm). Defense: SYN cookies, timeout.</li>\n            <li><strong>Application (L7)</strong>: HTTP flood, request đắt CPU. Defense: rate limit, CAPTCHA, WAF.</li>\n          </ul>\n\n          <h3 id=\"section-44\">Mitigation</h3>\n          <ul>\n            <li><strong>CDN</strong> (Cloudflare, AWS Shield) — anycast hấp thụ traffic + filter</li>\n            <li><strong>Rate limiting</strong> ở edge</li>\n            <li><strong>WAF</strong> (Web Application Firewall) — block bot pattern</li>\n            <li><strong>CAPTCHA</strong> cho request đáng nghi</li>\n            <li><strong>Auto-scale</strong> backend (cẩn thận hết tiền 💸)</li>\n            <li><strong>IP reputation</strong> + blocklist</li>\n          </ul>\n\n          <p>Major DDoS attack 2018: GitHub bị 1.35 Tbps memcached amplification — Akamai cứu được trong 10 phút.</p>\n        </section>\n\n        <!-- Bài tập -->\n        <section id=\"exercises\">\n          <h2 id=\"section-45\">Bài tập</h2>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 1 — CORS debug</div>\n            <p>Tạo Express server không có CORS config. Tạo HTML page khác origin gọi <code>fetch</code>. Quan sát error trong DevTools Console. Thêm <code>cors</code> middleware → fix.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 2 — Preflight</div>\n            <p>Gửi request từ JS có <code>Content-Type: application/json</code> + custom header. Quan sát OPTIONS preflight trong DevTools Network. Server phải response gì?</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 3 — XSS sandbox</div>\n            <p>Tạo HTML page có <code>&lt;div&gt;Hi {name}&lt;/div&gt;</code> với <code>name</code> từ URL query. Test với <code>?name=&lt;script&gt;alert(1)&lt;/script&gt;</code>. Có alert? Sửa: dùng <code>textContent</code>.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 4 — CSP test</div>\n            <p>Set CSP <code>script-src 'self'</code>. Trang có <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> inline → block. Console show error.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 5 — nginx reverse proxy</div>\n            <p>Cài nginx local. Config reverse proxy đến <code>http://localhost:3000</code> (Node app). Test: <code>curl http://localhost</code> → response của Node.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 6 — Rate limit</div>\n            <p>Implement sliding window log với Redis trong Express. Test: gửi 100 request trong 1s, thấy 429.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 7 — CDN cache</div>\n            <p>Deploy site lên Vercel/Netlify (free). DevTools Network: cột \"Server\" thấy CDN edge. Header <code>cf-cache-status: HIT</code> hoặc <code>x-vercel-cache: HIT</code>.</p>\n          </div>\n        </section>\n\n        <!-- Quiz -->\n        <section id=\"quiz\">\n          <div class=\"quiz\">\n            <h3 id=\"section-46\">🧪 Quiz cuối chương</h3>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 1.</strong> Same-Origin Policy — origin = ?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Chỉ host\">Chỉ host</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: scheme + host + port (vd https://example.com:443)\">scheme + host + port (vd https://example.com:443)</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Chỉ scheme\">Chỉ scheme</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: IP address\">IP address</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: scheme + host + port.</strong> https://a.com:443 ≠ http://a.com (scheme khác) ≠ https://api.a.com (host khác).\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 2.</strong> CORS preflight (OPTIONS) trigger khi nào?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Mọi cross-origin request\">Mọi cross-origin request</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Chỉ khi request lỗi\">Chỉ khi request lỗi</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Khi request &quot;non-simple&quot;: method PUT/DELETE/PATCH, custom header, Content-Type JSON\">Khi request \"non-simple\": method PUT/DELETE/PATCH, custom header, Content-Type JSON</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Khi cookies enabled\">Khi cookies enabled</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: non-simple request.</strong> Simple request (GET/HEAD/POST + form/text body) không preflight.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 3.</strong> CORS có chống CSRF không?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Không — CSRF không cần đọc response. Cookie SameSite hoặc CSRF token mới chống được\">Không — CSRF không cần đọc response. Cookie SameSite hoặc CSRF token mới chống được</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Có, hoàn toàn\">Có, hoàn toàn</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Có nếu credentials: include\">Có nếu credentials: include</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Có với HTTPS\">Có với HTTPS</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: không.</strong> CORS chặn JS đọc response, nhưng request vẫn đến server. CSRF lợi dụng \"request gửi được\" → cần SameSite cookie hoặc CSRF token.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 4.</strong> Cách HIỆU QUẢ NHẤT chống CSRF trong app modern?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: HTTPS\">HTTPS</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Captcha\">Captcha</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: SameSite=Lax cookie (default Chrome 80+) + CSRF token cho form quan trọng\">SameSite=Lax cookie (default Chrome 80+) + CSRF token cho form quan trọng</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Block cross-origin IP\">Block cross-origin IP</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: SameSite cookie + CSRF token.</strong> SameSite Lax đã fix nhiều CSRF tự động. Token cho an toàn hơn.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 5.</strong> XSS phòng tránh chính bằng?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Encryption\">Encryption</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Output escaping (escape HTML khi render user input) + HttpOnly cookie + CSP\">Output escaping (escape HTML khi render user input) + HttpOnly cookie + CSP</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: HTTPS\">HTTPS</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Same-Origin Policy\">Same-Origin Policy</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: escape + HttpOnly + CSP.</strong> Modern framework (React, Vue) escape mặc định.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 6.</strong> Reverse Proxy khác Forward Proxy?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cùng nghĩa\">Cùng nghĩa</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Reverse nhanh hơn\">Reverse nhanh hơn</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Forward đứng trước client (đại diện client ra ngoài); Reverse đứng trước server (đại diện server với client)\">Forward đứng trước client (đại diện client ra ngoài); Reverse đứng trước server (đại diện server với client)</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Forward dùng HTTP, Reverse dùng HTTPS\">Forward dùng HTTP, Reverse dùng HTTPS</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: phía client vs phía server.</strong> nginx, Cloudflare = reverse proxy. Tor exit, corporate firewall = forward.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 7.</strong> Sticky session là?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Session không expire\">Session không expire</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: LB gửi cùng client đến cùng backend (qua cookie/IP hash) — cần khi server lưu state in-memory\">LB gửi cùng client đến cùng backend (qua cookie/IP hash) — cần khi server lưu state in-memory</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cookie HttpOnly\">Cookie HttpOnly</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Refresh token\">Refresh token</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: cùng client → cùng backend.</strong> Tránh nếu có thể (dùng shared state Redis) — sticky khó scale.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 8.</strong> Token Bucket vs Leaky Bucket?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Token Bucket cho phép burst (dùng hết bucket nhanh); Leaky Bucket smooth rate cố định\">Token Bucket cho phép burst (dùng hết bucket nhanh); Leaky Bucket smooth rate cố định</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hai cái giống nhau\">Hai cái giống nhau</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Leaky Bucket nhanh hơn\">Leaky Bucket nhanh hơn</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Token Bucket chỉ cho TCP\">Token Bucket chỉ cho TCP</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: Token = burst OK, Leaky = smooth.</strong> Token bucket phổ biến hơn vì cho phép spike traffic ngắn.\n              </p>\n            </div>\n          </div>\n        </section>\n\n        <section>\n          <h2 id=\"section-47\">Tổng kết chương 10 — và toàn bộ giáo trình</h2>\n          <ul>\n            <li>✅ <strong>Same-Origin Policy</strong>: nguyên tắc bảo mật cốt lõi browser; origin = scheme+host+port</li>\n            <li>✅ <strong>CORS</strong>: server \"cho phép\" origin khác đọc response; preflight OPTIONS cho non-simple request</li>\n            <li>✅ <strong>CSRF</strong>: lợi dụng cookie auto-gửi; phòng = SameSite cookie + CSRF token</li>\n            <li>✅ <strong>XSS</strong>: chèn JS vào trang; phòng = output escaping + HttpOnly + CSP</li>\n            <li>✅ <strong>CSP</strong>: whitelist origin được phép load resource</li>\n            <li>✅ <strong>CDN</strong>: cache distributed; pull CDN phổ biến; cache busting với hash filename</li>\n            <li>✅ <strong>Load Balancer</strong>: round-robin/least-conn/IP hash; health check; sticky session; L4 vs L7</li>\n            <li>✅ <strong>Reverse Proxy</strong> (nginx, Cloudflare) vs <strong>Forward Proxy</strong></li>\n            <li>✅ <strong>nginx</strong>: web server + reverse proxy + LB + cache + TLS termination</li>\n            <li>✅ <strong>Rate Limiting</strong>: fixed/sliding window, token/leaky bucket; status 429</li>\n            <li>✅ <strong>DDoS</strong>: volumetric/protocol/application; mitigate qua CDN, WAF, rate limit</li>\n          </ul>\n\n          <div class=\"callout tip\">\n            <div class=\"callout-title\">🎓 Kết thúc giáo trình Networking Mastery</div>\n            <p>\n              Bạn đã đi qua 10 chương — từ OSI/TCP-IP đến CDN/Load Balancer. Cùng với DSA + OS, bạn đã có 3/6 trụ cột nền tảng IT.\n              Còn lại: <strong>Database, OOP/Design Patterns, System Design</strong>.\n            </p>\n            <p>\n              Đề xuất thực hành sau Networking:\n            </p>\n            <ul>\n              <li>Cài <strong>Wireshark</strong> + <strong>nginx</strong> + <strong>Cloudflare</strong> account (free) — chơi với chúng</li>\n              <li>Đọc <em>High Performance Browser Networking</em> (Ilya Grigorik, free)</li>\n              <li>Build mini project: web app HTTPS + nginx reverse proxy + Cloudflare CDN + JWT auth</li>\n              <li>Thử CTF hoặc HackTheBox cho web security thực hành</li>\n            </ul>\n            <p><strong>Chúc bạn thành công ở mọi vòng phỏng vấn backend / DevOps / SRE!</strong></p>\n          </div>\n        </section>\n\n      ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "10.1 Same-Origin Policy (SOP)",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "Origin = scheme + host + port",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "Tại sao cần SOP?",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "10.2 CORS — Cross-Origin Resource Sharing",
+      "depth": 2
+    },
+    {
+      "id": "section-5",
+      "text": "Simple request — chỉ check response headers",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "Preflight — OPTIONS request",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "Credentials (cookies)",
+      "depth": 3
+    },
+    {
+      "id": "section-8",
+      "text": "CORS error phổ biến",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "10.3 CSRF — Cross-Site Request Forgery",
+      "depth": 2
+    },
+    {
+      "id": "section-10",
+      "text": "Phòng tránh CSRF",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "10.4 XSS — Cross-Site Scripting",
+      "depth": 2
+    },
+    {
+      "id": "section-12",
+      "text": "3 loại XSS",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "Phòng tránh XSS",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "Test XSS",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "10.5 CSP — Content Security Policy",
+      "depth": 2
+    },
+    {
+      "id": "section-16",
+      "text": "Directive phổ biến",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "Khó khăn với CSP nghiêm",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "10.6 CDN — Content Delivery Network",
+      "depth": 2
+    },
+    {
+      "id": "section-19",
+      "text": "Cách hoạt động",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "2 loại CDN",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "Cache control",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "Cache busting",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "Lợi ích",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "Major CDN",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "10.7 Load Balancer",
+      "depth": 2
+    },
+    {
+      "id": "section-26",
+      "text": "Algorithms",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "Health Check",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "Sticky Session (Session Affinity)",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "L4 vs L7 LB (đã học chương 1)",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "Active-Active vs Active-Passive",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "10.8 Reverse Proxy vs Forward Proxy",
+      "depth": 2
+    },
+    {
+      "id": "section-32",
+      "text": "10.9 nginx — Swiss Army knife",
+      "depth": 2
+    },
+    {
+      "id": "section-33",
+      "text": "Reverse proxy đơn giản",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "Load balancer",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "HTTPS termination + redirect",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "Static file + cache",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "Rate limiting (xem 10.10)",
+      "depth": 3
+    },
+    {
+      "id": "section-38",
+      "text": "10.10 Rate Limiting",
+      "depth": 2
+    },
+    {
+      "id": "section-39",
+      "text": "Algorithms",
+      "depth": 3
+    },
+    {
+      "id": "section-40",
+      "text": "Implement với Redis",
+      "depth": 3
+    },
+    {
+      "id": "section-41",
+      "text": "Status code",
+      "depth": 3
+    },
+    {
+      "id": "section-42",
+      "text": "10.11 DDoS — Distributed Denial of Service",
+      "depth": 2
+    },
+    {
+      "id": "section-43",
+      "text": "Loại tấn công",
+      "depth": 3
+    },
+    {
+      "id": "section-44",
+      "text": "Mitigation",
+      "depth": 3
+    },
+    {
+      "id": "section-45",
+      "text": "Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-46",
+      "text": "🧪 Quiz cuối chương",
+      "depth": 3
+    },
+    {
+      "id": "section-47",
+      "text": "Tổng kết chương 10 — và toàn bộ giáo trình",
+      "depth": 2
+    }
+  ],
+  "source": "Networking/chuong/chuong10.html",
+  "sourceHash": "74fa6933eab6a78e848f3ecac782f80386feb5feae98b6be7d5b72ffd0e460ec",
+  "readingMinutes": 12
+}

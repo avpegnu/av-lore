@@ -1,0 +1,210 @@
+{
+  "id": "database--chapter-10",
+  "track": "database",
+  "trackTitle": "Database Engineering",
+  "slug": "chapter-10",
+  "order": 10,
+  "title": "Replication & Sharding",
+  "description": "Khi 1 node Postgres không đủ. Replication cho HA + read scale. Sharding để chia data. Consistent hashing. Failover đúng cách.",
+  "html": "\n\n      <section id=\"scale\">\n        <h2 id=\"section-1\">1. Scale theo chiều dọc vs ngang</h2>\n\n        <div class=\"compare\">\n          <div>\n            <h4>Vertical scaling (scale up)</h4>\n            <p>Mua server mạnh hơn — CPU nhiều core hơn, RAM nhiều hơn, NVMe nhanh hơn.</p>\n            <ul>\n              <li><strong>Ưu</strong>: đơn giản, không thay đổi app, không trade-off CAP.</li>\n              <li><strong>Nhược</strong>: trần (server lớn nhất ~1TB RAM), giá phi tuyến (server 2× mạnh có thể đắt 5×), single point of failure.</li>\n            </ul>\n            <p><em>Postgres 1 node có thể xử lý hàng terabyte data + 50k QPS — đừng vội scale ngang trước khi vertical đến giới hạn.</em></p>\n          </div>\n          <div>\n            <h4>Horizontal scaling (scale out)</h4>\n            <p>Thêm nhiều server, chia tải.</p>\n            <ul>\n              <li><strong>Ưu</strong>: scale gần như vô hạn (Google quản tỉ tỉ row), HA tự nhiên.</li>\n              <li><strong>Nhược</strong>: phức tạp (replication, sharding, distributed transaction), CAP trade-off, app phải biết shard.</li>\n            </ul>\n          </div>\n        </div>\n\n        <p>Thứ tự thực dụng: <strong>Vertical → Read Replica → Caching → Sharding</strong>. Đa số app dừng ở bước 2-3.</p>\n      </section>\n\n      <section id=\"repl-basics\">\n        <h2 id=\"section-2\">2. Replication — sao chép dữ liệu</h2>\n\n        <p>Mục đích chính:</p>\n        <ul>\n          <li><strong>High Availability (HA)</strong> — primary chết, promote replica làm primary mới.</li>\n          <li><strong>Read scaling</strong> — phân tán read sang nhiều replica.</li>\n          <li><strong>Backup live</strong> — replica có thể dùng làm backup không cản primary.</li>\n          <li><strong>Geo-distribution</strong> — replica ở data center xa user → low latency.</li>\n        </ul>\n\n        <h3 id=\"section-3\">2.1. Cách Postgres replicate</h3>\n        <p>Postgres dùng <strong>WAL streaming</strong>:</p>\n        <ol>\n          <li>Primary ghi mọi thay đổi vào WAL (như đã học Ch6).</li>\n          <li>Replica connect TCP, đọc WAL stream.</li>\n          <li>Replica apply WAL vào data file local → state đồng bộ.</li>\n        </ol>\n\n<pre><code class=\"language-bash\"># postgresql.conf trên primary:\nwal_level = replica           # hoặc 'logical' để hỗ trợ logical replication\nmax_wal_senders = 10\narchive_mode = on             # archive WAL cho PITR\narchive_command = 'cp %p /archive/%f'\n\n# pg_hba.conf:\nhost  replication  replicator  10.0.0.0/8  scram-sha-256\n\n# Trên replica, copy base backup từ primary:\npg_basebackup -h primary-host -D /var/lib/pg/data -U replicator -X stream -P\n\n# postgresql.conf trên replica:\nprimary_conninfo = 'host=primary-host user=replicator password=...'\nhot_standby = on              # cho phép read trên replica</code></pre>\n\n        <h3 id=\"section-4\">2.2. Logical vs Physical Replication</h3>\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th></th><th>Physical (streaming)</th><th>Logical</th></tr></thead>\n          <tbody>\n            <tr><td>Cách hoạt động</td><td>Replicate WAL bytes y nguyên</td><td>Replicate \"changes\" qua publication/subscription</td></tr>\n            <tr><td>Granularity</td><td>Toàn DB</td><td>Bảng/schema cụ thể</td></tr>\n            <tr><td>Cross-version</td><td>Không (cần cùng version)</td><td>Có (Postgres 12 → 16)</td></tr>\n            <tr><td>Read-only replica</td><td>Yes (hot standby)</td><td>Replica có thể write</td></tr>\n            <tr><td>Use case</td><td>HA, full read scale</td><td>Migration, multi-region partial, ETL</td></tr>\n          </tbody>\n        </table></div>\n      </section>\n\n      <section id=\"topologies\">\n        <h2 id=\"section-5\">3. Replication Topologies</h2>\n\n        <h3 id=\"section-6\">3.1. Primary-Replica (Master-Slave)</h3>\n\n        <div class=\"ascii\">         Writes\n            │\n            ▼\n        ┌────────┐\n        │PRIMARY │ ←── đọc + ghi\n        └───┬────┘\n            │ WAL\n       ┌────┴────────┐\n       ▼             ▼\n  ┌──────┐      ┌──────┐\n  │REPLICA│      │REPLICA│  ←── chỉ đọc\n  └──────┘      └──────┘</div>\n\n        <p>Phổ biến nhất. Đơn giản, đa số use case OK.</p>\n\n        <h3 id=\"section-7\">3.2. Cascading Replication</h3>\n\n        <div class=\"ascii\">  PRIMARY\n     │\n     ▼\n  REPLICA-A  (intermediate)\n     │\n     ▼\n  REPLICA-B  (replicate from A, không từ primary)</div>\n\n        <p>Giảm tải WAL stream trên primary khi có nhiều replica. Postgres 9.2+ hỗ trợ.</p>\n\n        <h3 id=\"section-8\">3.3. Multi-Region</h3>\n\n        <div class=\"ascii\">           [Region: APAC]\n        ┌──────────────┐\n   ←─── │ PRIMARY      │ ←── writes\n        └──────┬───────┘\n               │ async WAL\n        ┌──────┼─────────────────┐\n        ▼      ▼                  ▼\n   [Region: US]  [Region: EU]\n   ┌──────────┐ ┌──────────┐\n   │ REPLICA  │ │ REPLICA  │  ←── reads gần user\n   └──────────┘ └──────────┘</div>\n      </section>\n\n      <section id=\"modes\">\n        <h2 id=\"section-9\">4. Sync / Async / Semi-Sync</h2>\n\n        <div class=\"ascii\">  ─── ASYNC ──────────────────────────────────────────\n     Client          Primary           Replica\n       │ COMMIT         │                  │\n       │───────────────►│                  │\n       │                │ ACK COMMIT       │\n       │◄───────────────│                  │\n       │                │ ──── WAL ───────►│\n                       (sau)\n     Pros: low latency\n     Cons: nếu primary crash trước replicate → mất data\n\n  ─── SYNC ───────────────────────────────────────────\n     Client          Primary           Replica\n       │ COMMIT         │                  │\n       │───────────────►│                  │\n       │                │ ──── WAL ───────►│\n       │                │                  │ FSYNC\n       │                │ ◄────── ACK ─────│\n       │ ACK COMMIT     │                  │\n       │◄───────────────│                  │\n     Pros: 0 data loss khi primary crash (replica có data)\n     Cons: latency tăng (round-trip + fsync replica)\n\n  ─── SEMI-SYNC ───────────────────────────────────────\n     Như SYNC nhưng chỉ chờ ACK đến WAL nhận, không chờ fsync.</div>\n\n        <h3 id=\"section-10\">4.1. Postgres setup</h3>\n<pre><code class=\"language-ini\"># postgresql.conf trên primary:\n\n# Async (default) — không cần config gì thêm\n\n# Sync — chờ ít nhất 1 replica ack:\nsynchronous_standby_names = 'FIRST 1 (replica1, replica2)'\nsynchronous_commit = on\n\n# Quorum: chờ 2 trong 3 replica:\nsynchronous_standby_names = 'ANY 2 (replica1, replica2, replica3)'</code></pre>\n\n        <h3 id=\"section-11\">4.2. Trade-off</h3>\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th></th><th>Async</th><th>Sync</th></tr></thead>\n          <tbody>\n            <tr><td>Latency</td><td>Thấp</td><td>Cao (chờ replica)</td></tr>\n            <tr><td>Throughput</td><td>Cao</td><td>Giới hạn bởi replica chậm nhất</td></tr>\n            <tr><td>Data loss khi primary crash</td><td>Có thể (RPO &gt; 0)</td><td>Không (RPO = 0)</td></tr>\n            <tr><td>Khi nào dùng</td><td>Web app thường</td><td>Tài chính, đặt vé</td></tr>\n          </tbody>\n        </table></div>\n      </section>\n\n      <section id=\"read-replica\">\n        <h2 id=\"section-12\">5. Read Replicas — sử dụng đúng</h2>\n\n        <p>App route read sang replica, write sang primary:</p>\n\n<pre><code class=\"language-typescript\">// Pattern thực dụng (PgBouncer, ProxySQL, hoặc app-level):\nconst writeDb = new Pool({ host: 'primary-host', ... });\nconst readDb  = new Pool({ host: 'replica-host', ... });\n\nasync function getUser(id) {\n  return await readDb.query('SELECT * FROM users WHERE id = $1', [id]);\n}\n\nasync function updateUser(id, data) {\n  return await writeDb.query('UPDATE users SET ... WHERE id = $1', [id, ...]);\n}</code></pre>\n\n        <h3 id=\"section-13\">5.1. Replication Lag — vấn đề thực tế</h3>\n        <p>Replica luôn chậm hơn primary vài ms đến vài giây (tùy load). Async lag có thể giây/phút khi primary cao tải.</p>\n\n<pre><code class=\"language-sql\">-- Trên replica, kiểm tra lag:\nSELECT now() - pg_last_xact_replay_timestamp() AS lag;\n-- → INTERVAL '00:00:00.450'  (450ms)</code></pre>\n\n        <h3 id=\"section-14\">5.2. Read-your-writes problem</h3>\n        <p>User POST /comment, app ghi primary thành công, redirect → GET /post/X. Read replica chưa kịp apply → user thấy comment chưa có. Bug UX.</p>\n\n        <p>Cách giải:</p>\n        <ul>\n          <li><strong>Sticky session</strong> — sau write, route N giây tiếp theo của session đó về primary.</li>\n          <li><strong>Replication lag aware</strong> — query \"có lag &lt; 100ms?\" trước, nếu cao thì fall back primary.</li>\n          <li><strong>Synchronous replication</strong> — đảm bảo không lag → đắt.</li>\n          <li><strong>Cache write trong session</strong> — UI optimistic.</li>\n        </ul>\n\n        <h3 id=\"section-15\">5.3. Stale read tolerance</h3>\n        <p>Phân loại read theo \"tolerance lag\":</p>\n        <ul>\n          <li><em>OK stale 1 phút</em>: dashboard, recommendation, analytics → replica.</li>\n          <li><em>OK stale &lt; 1s</em>: feed, profile → replica.</li>\n          <li><em>NEED fresh</em>: balance, inventory check trước checkout, \"your order\" page → primary.</li>\n        </ul>\n      </section>\n\n      <section id=\"failover\">\n        <h2 id=\"section-16\">6. Failover — primary chết, làm gì?</h2>\n\n        <h3 id=\"section-17\">6.1. Manual failover</h3>\n<pre><code class=\"language-bash\"># Trên replica đã chọn:\npg_ctl promote -D /var/lib/postgresql/data\n# Replica trở thành primary mới, chấp nhận writes.\n\n# App đổi connection string sang IP của primary mới\n# Replica khác cần re-config để follow primary mới</code></pre>\n\n        <h3 id=\"section-18\">6.2. Automatic failover — Patroni / Stolon / pg_auto_failover</h3>\n        <p>Tools này tự phát hiện primary down (qua etcd/consul), promote replica, update DNS/HAProxy. Toàn bộ ~15-60 giây.</p>\n\n        <div class=\"ascii\">  ┌─────────────────────────────────────┐\n  │  Patroni cluster                    │\n  │                                      │\n  │   ┌────────────┐                    │\n  │   │   etcd     │ ←── consensus      │\n  │   └────────────┘                    │\n  │      ▲      ▲                       │\n  │      │      │ leader election       │\n  │      │      │                       │\n  │   ┌──┴──┐ ┌─┴────┐ ┌──────┐        │\n  │   │ pri │ │ rep1 │ │ rep2 │        │\n  │   └─────┘ └──────┘ └──────┘        │\n  └─────────────────────────────────────┘\n              │\n              ▼\n        ┌──────────┐\n        │ HAProxy  │ ←── route writes to current primary\n        └──────────┘</div>\n\n        <h3 id=\"section-19\">6.3. Split-brain — bug nguy hiểm</h3>\n        <p>Nếu network partition giữa primary và monitor → 2 node nghĩ mình là primary → cả 2 nhận writes → diverge.</p>\n        <p>Cách giải: <strong>fencing</strong> — kill primary cũ trước khi promote. Hoặc dùng <strong>quorum-based</strong> consensus như Raft (Patroni dùng etcd Raft).</p>\n\n        <h3 id=\"section-20\">6.4. RTO &amp; RPO</h3>\n        <ul>\n          <li><strong>RTO</strong> (Recovery Time Objective) — bao lâu để hệ trở lại: failover Patroni ~30s, manual ~5-15 phút, restore từ backup ~giờ.</li>\n          <li><strong>RPO</strong> (Recovery Point Objective) — bao nhiêu data có thể mất: sync replication = 0, async = vài giây, backup hourly = 1 giờ.</li>\n        </ul>\n      </section>\n\n      <section id=\"multi-master\">\n        <h2 id=\"section-21\">7. Multi-Master / Active-Active</h2>\n        <p>Nhiều node cùng chấp nhận writes. Phức tạp hơn nhiều primary-replica vì cần resolve conflict.</p>\n\n        <ul>\n          <li><strong>BDR (Bi-Directional Replication)</strong> trên Postgres — commercial.</li>\n          <li><strong>Cassandra, DynamoDB</strong> — multi-master native.</li>\n          <li><strong>CockroachDB, Spanner</strong> — distributed, mỗi node nhận write nhưng có consensus protocol.</li>\n        </ul>\n\n        <h3 id=\"section-22\">7.1. Conflict resolution strategies</h3>\n        <ul>\n          <li><strong>Last-Write-Wins (LWW)</strong> — timestamp lớn nhất thắng. Đơn giản, có thể mất data.</li>\n          <li><strong>Vector clock</strong> — theo dõi version đa node, app tự merge.</li>\n          <li><strong>CRDT</strong> (Conflict-free Replicated Data Type) — kiểu dữ liệu tự merge tự động (Counter, OR-Set).</li>\n          <li><strong>Quorum write</strong> — chờ majority ack trước khi commit.</li>\n        </ul>\n\n        <p>Kinh nghiệm: <strong>tránh multi-master khi có thể</strong>. 99% app không cần. Multi-region read replicas + 1 primary đủ.</p>\n      </section>\n\n      <section id=\"shard-basics\">\n        <h2 id=\"section-23\">8. Sharding — chia dữ liệu</h2>\n        <p>Sharding = chia bảng thành nhiều phần (<em>shard</em>) lưu trên các DB khác nhau. Khác replication: replica có toàn bộ data, shard chỉ có 1 phần.</p>\n\n        <div class=\"ascii\">      Trước (monolithic):\n      ┌─────────────────────┐\n      │   1 PostgreSQL      │\n      │   1 tỉ users        │\n      │   500 GB            │\n      └─────────────────────┘\n\n      Sau (sharded):\n      ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐\n      │ Shard 1  │ │ Shard 2  │ │ Shard 3  │ │ Shard 4  │\n      │ 250M user│ │ 250M user│ │ 250M user│ │ 250M user│\n      │ 125 GB   │ │ 125 GB   │ │ 125 GB   │ │ 125 GB   │\n      └──────────┘ └──────────┘ └──────────┘ └──────────┘\n            ▲           ▲           ▲           ▲\n            └───────────┴───────────┴───────────┘\n                        │\n                  ┌───────────┐\n                  │ Shard map │  ← user_id → shard\n                  └───────────┘</div>\n\n        <h3 id=\"section-24\">8.1. Khi nào sharding?</h3>\n        <ul>\n          <li>Bảng &gt; 1TB và không thể vertical scale thêm.</li>\n          <li>Write QPS &gt; khả năng 1 node.</li>\n          <li>RAM cần để cache hot data &gt; server lớn nhất.</li>\n        </ul>\n        <p>Trước đó, hãy thử: index, partition (intra-DB), read replica, cache.</p>\n\n        <h3 id=\"section-25\">8.2. Trade-off</h3>\n        <p>Khi sharding:</p>\n        <ul>\n          <li>JOIN cross-shard cực phức tạp / chậm.</li>\n          <li>Distributed transaction (2PC) chậm và có thể kẹt.</li>\n          <li>Aggregate query phải scatter-gather.</li>\n          <li>App phải biết shard map.</li>\n          <li>Backup/restore phức tạp hơn.</li>\n        </ul>\n      </section>\n\n      <section id=\"shard-strategies\">\n        <h2 id=\"section-26\">9. Shard Strategies — 3 kiểu chính</h2>\n\n        <h3 id=\"section-27\">9.1. Range Sharding</h3>\n        <p>Chia theo khoảng giá trị key:</p>\n<pre><code>Shard 1: user_id 1 → 250M\nShard 2: user_id 250M → 500M\nShard 3: user_id 500M → 750M\nShard 4: user_id 750M → 1B</code></pre>\n        <p><strong>Ưu</strong>: range query nhanh (scan trong shard). <strong>Nhược</strong>: hot shard nếu data skew (user mới luôn vào shard cuối).</p>\n\n        <h3 id=\"section-28\">9.2. Hash Sharding</h3>\n<pre><code>shard_id = hash(user_id) % N\n\nShard 1: user_id mà hash(id) % 4 == 0\nShard 2: hash(id) % 4 == 1\n...</code></pre>\n        <p><strong>Ưu</strong>: phân bố đều. <strong>Nhược</strong>: range query khó (phải scatter qua mọi shard); resharding khi N đổi.</p>\n\n        <h3 id=\"section-29\">9.3. Directory-based</h3>\n        <p>Bảng tra cứu (lookup table) ánh xạ key → shard:</p>\n<pre><code>shard_map:\n| key       | shard_id |\n| user:5    | shard-2  |\n| user:99   | shard-1  |\n| user:200  | shard-3  |</code></pre>\n        <p><strong>Ưu</strong>: linh hoạt nhất, dễ migrate user. <strong>Nhược</strong>: thêm 1 lookup mỗi query, lookup là single-point-of-failure → cache.</p>\n\n        <h3 id=\"section-30\">9.4. Geographic / Tenant-based</h3>\n        <ul>\n          <li>Chia theo region: shard EU, shard US, shard APAC.</li>\n          <li>Chia theo tenant (multi-tenant SaaS): mỗi customer 1 shard.</li>\n        </ul>\n      </section>\n\n      <section id=\"consistent\">\n        <h2 id=\"section-31\">10. Consistent Hashing — giảm đau khi resharding</h2>\n        <p>Vấn đề với <code>hash(key) % N</code>: đổi N (thêm/bớt shard) → 90% data phải di chuyển.</p>\n\n        <p>Consistent hashing giải bằng <strong>vòng tròn hash</strong>:</p>\n\n        <div class=\"ascii\">                    ┌──── hash space (0 → 2^32) ────┐\n                    │                                │\n                    │           ●N1 (10°)            │\n                    │                                │\n                    │   ●N4                          │\n                    │  (340°)                ●N2     │\n                    │                       (90°)    │\n                    │                                │\n                    │   K (200°) ─→ tìm node kế      │\n                    │              tiếp theo: N3     │\n                    │                                │\n                    │           ●N3 (210°)           │\n                    │                                │\n                    └────────────────────────────────┘\n\n  Mỗi key cũng map vào hash space.\n  Key thuộc shard \"kế tiếp\" (clockwise).</div>\n\n        <h3 id=\"section-32\">10.1. Lợi ích</h3>\n        <ul>\n          <li>Thêm node mới → chỉ ~1/N data di chuyển (không phải 90%).</li>\n          <li>Bớt node → chỉ 1/N data tái phân phối.</li>\n        </ul>\n\n        <h3 id=\"section-33\">10.2. Virtual nodes (vnodes)</h3>\n        <p>Vấn đề: với N nhỏ, phân bố không đều. Giải bằng <strong>virtual nodes</strong> — mỗi node thật map vào nhiều điểm trên vòng. Cassandra mặc định 256 vnode/node.</p>\n\n        <p>DynamoDB, Redis Cluster, Cassandra, Riak đều dùng consistent hashing.</p>\n      </section>\n\n      <section id=\"reshard\">\n        <h2 id=\"section-34\">11. Resharding — khi N đổi</h2>\n        <p>Resharding là nghiệp vụ phức tạp nhất. Lý do cần:</p>\n        <ul>\n          <li>Thêm shard vì data tăng.</li>\n          <li>Bớt shard vì chi phí.</li>\n          <li>Hot shard cần split.</li>\n          <li>Tenant lớn cần shard riêng (split off).</li>\n        </ul>\n\n        <h3 id=\"section-35\">11.1. Approach: split &amp; migrate online</h3>\n        <ol class=\"steps\">\n          <li>Setup new shard (empty).</li>\n          <li>Bật <strong>dual-write</strong>: app ghi cả old shard và new shard cho key thuộc range mới.</li>\n          <li>Backfill old data: copy old → new (bg job).</li>\n          <li>Verify data parity (checksum).</li>\n          <li>Cut over reads: app đọc new shard.</li>\n          <li>Tắt writes vào old shard cho key đó.</li>\n          <li>Cleanup old shard data.</li>\n        </ol>\n\n        <p>Quá trình có thể mất ngày/tuần cho TB data. Mỗi bước có rủi ro.</p>\n\n        <h3 id=\"section-36\">11.2. Pre-sharding</h3>\n        <p>Mẹo: ngay từ đầu, tạo <strong>nhiều shard logical</strong> (vd: 4096 shard) trên ít node thật. Khi cần scale, di chuyển shard logical sang node mới — không cần đổi shard map (chỉ đổi shard → node mapping).</p>\n\n        <p>Citus (Postgres extension), Vitess (MySQL), MongoDB sharding đều dùng pattern này.</p>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-37\">12. Bài tập</h2>\n\n        <ol>\n          <li>Setup Postgres primary + 1 replica với streaming replication trên Docker. Demo write trên primary, read trên replica.</li>\n          <li>Mô phỏng replication lag bằng <code>SELECT pg_sleep(...)</code>. Đo lag qua <code>pg_last_xact_replay_timestamp()</code>.</li>\n          <li>Trình bày plan failover cho hệ Postgres + 2 replica. Chọn tool (Patroni / pg_auto_failover) và lý giải.</li>\n          <li>Cho 100M user. Đề xuất chiến lược shard + count shard ban đầu. Tại sao chọn hash thay vì range?</li>\n          <li>Vấn đề \"celebrity user\" trong Twitter (1 user 100M follower) gây hot shard. Giải pháp?</li>\n          <li>Khi nào tách 1 monolithic Postgres ra microservice DB (database per service)? Khi nào KHÔNG?</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-38\">13. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-39\">Quiz cuối Chương 10</h3>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Sự khác biệt chính giữa Replication và Sharding:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cả hai giống nhau\">Cả hai giống nhau</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Replication chỉ cho NoSQL\">Replication chỉ cho NoSQL</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Replication: copy toàn bộ data sang nhiều node. Sharding: chia data, mỗi node giữ 1 phần\">Replication: copy toàn bộ data sang nhiều node. Sharding: chia data, mỗi node giữ 1 phần</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Sharding tốt hơn replication\">Sharding tốt hơn replication</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Replication giải HA + read scale. Sharding giải dung lượng + write scale. Trong production lớn thường kết hợp: mỗi shard có nhiều replica.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Async replication trade-off:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Latency cao\">Latency cao</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Latency thấp nhưng có thể mất vài giây gần nhất nếu primary crash\">Latency thấp nhưng có thể mất vài giây gần nhất nếu primary crash</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Bắt buộc fsync replica\">Bắt buộc fsync replica</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Mạnh hơn sync\">Mạnh hơn sync</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Async không chờ replica → primary commit nhanh, replica lag vài ms tới giây. Nếu primary crash + replica chưa nhận transaction cuối → data đó mất. RPO &gt; 0.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">\"Read your own writes\" với async replica đối mặt với:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Index corruption\">Index corruption</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Deadlock\">Deadlock</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Sync block\">Sync block</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: User vừa post nhưng read replica chưa apply → không thấy bài của chính mình\">User vừa post nhưng read replica chưa apply → không thấy bài của chính mình</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Phổ biến với multi-replica setup. Giải bằng sticky session sau write (route về primary N giây) hoặc sync replication cho path nóng.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Hash sharding với <code>hash(id) % N</code> có vấn đề gì khi đổi N?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: ~90% data phải di chuyển — consistent hashing giải vấn đề này\">~90% data phải di chuyển — consistent hashing giải vấn đề này</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hash collision tăng\">Hash collision tăng</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Index hỏng\">Index hỏng</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Replication chậm\">Replication chậm</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Modulo N với N đổi → key % N_new khác key % N_old → đa số data phải re-shard. Consistent hashing dùng vòng tròn → chỉ ~1/N data di chuyển khi thêm/bớt node.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Range sharding pitfall lớn nhất:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Chậm\">Chậm</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tốn dung lượng\">Tốn dung lượng</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Hot shard khi data skew (vd: user mới luôn vào shard cuối, traffic tập trung)\">Hot shard khi data skew (vd: user mới luôn vào shard cuối, traffic tập trung)</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không hỗ trợ JOIN\">Không hỗ trợ JOIN</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Range sharding tốt cho range query nhưng nếu data có \"thiên hướng\" (mới hơn = hot), shard chứa range đó bị quá tải. Dùng hash sharding hoặc composite (region + id) để tránh.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Split-brain trong replication là gì?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: DB chia làm 2 schema\">DB chia làm 2 schema</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hai node cùng nghĩ mình là primary do network partition → cả hai nhận writes → data diverge\">Hai node cùng nghĩ mình là primary do network partition → cả hai nhận writes → data diverge</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: App có 2 connection pool\">App có 2 connection pool</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Index bị partition\">Index bị partition</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Khi network giữa primary và monitor đứt, monitor thấy primary \"chết\" và promote replica → 2 primary. Phòng tránh bằng quorum consensus (Raft/Paxos qua etcd) và fencing (kill primary cũ trước promote).</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Vấn đề lớn nhất sau khi shard:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Backup chậm\">Backup chậm</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Index thiếu\">Index thiếu</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: DB tốn nhiều RAM\">DB tốn nhiều RAM</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: JOIN cross-shard cực phức tạp; distributed transaction chậm; aggregate phải scatter-gather\">JOIN cross-shard cực phức tạp; distributed transaction chậm; aggregate phải scatter-gather</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Sharding hy sinh nhiều tiện lợi của RDBMS. JOIN giữa 2 bảng ở 2 shard khác nhau cực khó (thường app tự assemble hoặc denormalize). 2PC distributed tx chậm. Scatter-gather query mọi shard mới ra kết quả. Đó là lý do delay sharding càng lâu càng tốt.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Pre-sharding (4096 shard logical trên ít node thật) có lợi gì?</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Khi scale up node, chỉ cần di chuyển shard logical, không re-shard data\">Khi scale up node, chỉ cần di chuyển shard logical, không re-shard data</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Giảm dung lượng\">Giảm dung lượng</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Nhanh hơn\">Nhanh hơn</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Tự động backup\">Tự động backup</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Citus, Vitess, MongoDB dùng pattern này. Shard map ánh xạ key → shard logical (cố định, hash). Mỗi shard logical → 1 node thật (đổi được). Khi tăng node, chỉ migrate shard logical, không động tới key→shard mapping.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 10. Tiếp theo: <a href=\"/learn/database/chapter-11/\"><strong>Chương 11 — Caching, Search, OLTP vs OLAP →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Scale theo chiều dọc vs ngang",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "2. Replication — sao chép dữ liệu",
+      "depth": 2
+    },
+    {
+      "id": "section-3",
+      "text": "2.1. Cách Postgres replicate",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "2.2. Logical vs Physical Replication",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "3. Replication Topologies",
+      "depth": 2
+    },
+    {
+      "id": "section-6",
+      "text": "3.1. Primary-Replica (Master-Slave)",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "3.2. Cascading Replication",
+      "depth": 3
+    },
+    {
+      "id": "section-8",
+      "text": "3.3. Multi-Region",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "4. Sync / Async / Semi-Sync",
+      "depth": 2
+    },
+    {
+      "id": "section-10",
+      "text": "4.1. Postgres setup",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "4.2. Trade-off",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "5. Read Replicas — sử dụng đúng",
+      "depth": 2
+    },
+    {
+      "id": "section-13",
+      "text": "5.1. Replication Lag — vấn đề thực tế",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "5.2. Read-your-writes problem",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "5.3. Stale read tolerance",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "6. Failover — primary chết, làm gì?",
+      "depth": 2
+    },
+    {
+      "id": "section-17",
+      "text": "6.1. Manual failover",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "6.2. Automatic failover — Patroni / Stolon / pg_auto_failover",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "6.3. Split-brain — bug nguy hiểm",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "6.4. RTO & RPO",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "7. Multi-Master / Active-Active",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "7.1. Conflict resolution strategies",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "8. Sharding — chia dữ liệu",
+      "depth": 2
+    },
+    {
+      "id": "section-24",
+      "text": "8.1. Khi nào sharding?",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "8.2. Trade-off",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "9. Shard Strategies — 3 kiểu chính",
+      "depth": 2
+    },
+    {
+      "id": "section-27",
+      "text": "9.1. Range Sharding",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "9.2. Hash Sharding",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "9.3. Directory-based",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "9.4. Geographic / Tenant-based",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "10. Consistent Hashing — giảm đau khi resharding",
+      "depth": 2
+    },
+    {
+      "id": "section-32",
+      "text": "10.1. Lợi ích",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "10.2. Virtual nodes (vnodes)",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "11. Resharding — khi N đổi",
+      "depth": 2
+    },
+    {
+      "id": "section-35",
+      "text": "11.1. Approach: split & migrate online",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "11.2. Pre-sharding",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "12. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-38",
+      "text": "13. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-39",
+      "text": "Quiz cuối Chương 10",
+      "depth": 3
+    }
+  ],
+  "source": "Database/chuong/chuong10.html",
+  "sourceHash": "eb4d7f062f472c6364298d3f3645c4f44a77df3c27b15d00af62a878c663d1cf",
+  "readingMinutes": 11
+}

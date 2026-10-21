@@ -1,0 +1,210 @@
+{
+  "id": "networking--chapter-09",
+  "track": "networking",
+  "trackTitle": "Networking",
+  "slug": "chapter-09",
+  "order": 9,
+  "title": "Cookies, Sessions,JWT, OAuth",
+  "description": "Authentication & Authorization. Phỏng vấn backend gần 100% sẽ hỏi: \"Session vs JWT khác nhau?\", \"OAuth flow?\", \"JWT lưu ở localStorage hay cookie?\". Học chương này, bạn nắm 4 cơ chế phổ biến + biết khi nào dùng cái nào.",
+  "html": "\n\n        <!-- 9.1 -->\n        <section id=\"authn-vs-authz\">\n          <h2 id=\"section-1\">9.1 Authentication vs Authorization</h2>\n\n          <div class=\"compare\">\n            <div class=\"good\">\n              <h4 class=\"text-blue\">Authentication (AuthN)</h4>\n              <p>\"Bạn là ai?\" — verify identity (login với username/password, biometric, ...)</p>\n            </div>\n            <div class=\"good\">\n              <h4 class=\"text-violet\">Authorization (AuthZ)</h4>\n              <p>\"Bạn được phép làm gì?\" — check permission (admin? owner of this resource?)</p>\n            </div>\n          </div>\n\n          <p>Status code phân biệt: <code>401 Unauthorized</code> = AuthN fail (chưa login). <code>403 Forbidden</code> = AuthZ fail (đã login nhưng không có quyền).</p>\n        </section>\n\n        <!-- 9.2 -->\n        <section id=\"cookie\">\n          <h2 id=\"section-2\">9.2 Cookie — cơ chế \"stateful\" của HTTP</h2>\n\n          <p>HTTP stateless. Cookie giải quyết bằng cách: server <code>Set-Cookie</code> trong response → browser lưu → mỗi request tiếp theo gửi lại trong <code>Cookie</code> header.</p>\n\n          <pre data-lang=\"http\"><code># Server\nSet-Cookie: session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax\n\n# Browser tự động ở mọi request tiếp theo\nCookie: session=abc123</code></pre>\n\n          <h3 id=\"section-3\">Cookie attributes — phải hiểu</h3>\n          <div class=\"table-scroll\"><table>\n            <thead><tr><th>Attribute</th><th>Mục đích</th></tr></thead>\n            <tbody>\n              <tr><td><code>Path</code></td><td>Cookie chỉ gửi cho URL match path (vd /admin)</td></tr>\n              <tr><td><code>Domain</code></td><td>Cookie gửi cho domain nào (vd .example.com cho subdomain)</td></tr>\n              <tr><td><code>Expires</code> / <code>Max-Age</code></td><td>Hạn sử dụng. Không có → session cookie (xoá khi đóng browser)</td></tr>\n              <tr><td><code>Secure</code></td><td>Chỉ gửi qua HTTPS, không HTTP plain</td></tr>\n              <tr><td><code>HttpOnly</code></td><td>JS không đọc được (<code>document.cookie</code>) — chống XSS đánh cắp</td></tr>\n              <tr><td><code>SameSite</code></td><td>Strict / Lax / None — chống CSRF (xem 9.9)</td></tr>\n            </tbody>\n          </table></div>\n\n          <h3 id=\"section-4\">SameSite — quan trọng</h3>\n          <ul>\n            <li><strong>Strict</strong>: cookie không gửi cross-site (vd click link từ Gmail sang bank)</li>\n            <li><strong>Lax</strong> (default modern): không gửi với POST cross-site, nhưng gửi với GET top-level navigation</li>\n            <li><strong>None</strong>: gửi mọi request — bắt buộc kèm Secure</li>\n          </ul>\n\n          <p>Default Chrome 80+ là <code>Lax</code> nếu không specify → fix nhiều CSRF vulnerability tự động.</p>\n        </section>\n\n        <!-- 9.3 -->\n        <section id=\"session\">\n          <h2 id=\"section-5\">9.3 Session-based Authentication</h2>\n\n          <p>Cách truyền thống — server lưu state.</p>\n\n          <h3 id=\"section-6\">Flow</h3>\n          <ol>\n            <li>User login với username + password → server verify</li>\n            <li>Server tạo <strong>session ID</strong> (random string), lưu vào DB/Redis: <code>session_id → user_id</code></li>\n            <li>Server gửi <code>Set-Cookie: session=&lt;session_id&gt;; HttpOnly; Secure</code></li>\n            <li>Mỗi request tiếp theo, browser gửi cookie</li>\n            <li>Server đọc session_id → lookup DB → biết user là ai</li>\n            <li>Logout: server xoá session khỏi DB → cookie cũ không còn valid</li>\n          </ol>\n\n          <div class=\"ascii-art\">\n   Browser                              Server               Session Store (Redis/DB)\n   ───────                              ──────               ────────────────────────\n   POST /login {user, pass} ──────────▶\n                                        Verify pass ✓\n                                        Tạo session_id ─────▶ Store: id123 → user42\n                                                              (TTL 24h)\n                  ◀─── Set-Cookie: session=id123 ───\n                  (HttpOnly, Secure, SameSite=Lax)\n\n   GET /profile  ────────────────────▶\n   Cookie: session=id123                Lookup id123 ───────▶ Returns: user42\n                                        Load user42\n                  ◀─── 200 OK profile ────\n\n   POST /logout  ────────────────────▶  Delete id123 ───────▶ Removed\n                  ◀─── Set-Cookie: session=; Max-Age=0 ───\n          </div>\n\n          <h3 id=\"section-7\">Đặc điểm</h3>\n          <ul>\n            <li><strong>Stateful</strong>: server lưu session → cần Redis/DB</li>\n            <li><strong>Logout dễ</strong>: xoá session record → cookie cũ không dùng được</li>\n            <li><strong>Scaling</strong>: cần shared session store giữa các server (sticky session hoặc Redis)</li>\n            <li><strong>Cookie tự gửi</strong>: browser lo, dev không phải code</li>\n          </ul>\n        </section>\n\n        <!-- 9.4 -->\n        <section id=\"jwt\">\n          <h2 id=\"section-8\">9.4 JWT — JSON Web Token</h2>\n\n          <p>\n            <strong>JWT</strong> (RFC 7519) — token chứa <em>thông tin user</em> + <em>chữ ký</em>. Server không cần lookup DB — verify chữ ký là tin được.\n          </p>\n\n          <h3 id=\"section-9\">Cấu trúc</h3>\n          <pre data-lang=\"text\"><code>eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 . eyJzdWIiOiI0MiIsIm5hbWUiOiJBbGljZSIsImV4cCI6MTcwOX0 . dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk\n   ↑                                       ↑                                                              ↑\n   Header (base64url JSON)                  Payload (base64url JSON)                                       Signature\n          </code></pre>\n\n          <p>3 phần ngăn cách bởi <code>.</code>. Header và payload là JSON base64url-encoded — <strong>đọc được, KHÔNG mã hoá</strong>. Signature ngăn tampering.</p>\n\n          <pre data-lang=\"json\"><code>// Header\n{\n  \"alg\": \"HS256\",\n  \"typ\": \"JWT\"\n}\n\n// Payload (claims)\n{\n  \"sub\": \"42\",            // subject (user ID)\n  \"name\": \"Alice\",\n  \"role\": \"admin\",\n  \"iat\": 1700000000,      // issued at\n  \"exp\": 1700003600       // expires at (1 hour later)\n}\n\n// Signature = HMACSHA256(base64(header) + \".\" + base64(payload), secret)</code></pre>\n\n          <h3 id=\"section-10\">Verify</h3>\n          <p>Server có cùng secret. Recompute signature từ header.payload + secret. Nếu match → token chưa bị sửa, claims là thật.</p>\n\n          <h3 id=\"section-11\">Algorithms</h3>\n          <ul>\n            <li><strong>HS256</strong> (HMAC + SHA-256): symmetric — cùng secret cho ký và verify. Nhanh, đơn giản.</li>\n            <li><strong>RS256</strong> (RSA + SHA-256): asymmetric — private key ký, public key verify. Tốt cho microservice (chỉ auth service có private key).</li>\n            <li><strong>ES256</strong> (ECDSA): tương tự RS256 nhưng key nhỏ hơn, nhanh hơn.</li>\n          </ul>\n\n          <h3 id=\"section-12\">Lưu ý</h3>\n          <ul>\n            <li><strong>Không bỏ secret nhỏ vào JWT</strong> (vì payload đọc được)</li>\n            <li><strong>Phải set <code>exp</code></strong> — JWT không tự revoke được, nếu không expire sẽ \"sống mãi\"</li>\n            <li><strong>Verify alg</strong> — đừng accept <code>alg: none</code> (lỗ hổng kinh điển)</li>\n          </ul>\n\n          <h3 id=\"section-13\">Code Node.js</h3>\n          <pre data-lang=\"javascript\"><code>const jwt = require('jsonwebtoken');\n\n// Sign\nconst token = jwt.sign(\n  { sub: 42, name: 'Alice', role: 'admin' },\n  process.env.JWT_SECRET,\n  { expiresIn: '1h', algorithm: 'HS256' }\n);\n\n// Verify\ntry {\n  const payload = jwt.verify(token, process.env.JWT_SECRET);\n  console.log(payload.sub);\n} catch (err) {\n  if (err.name === 'TokenExpiredError') { /* refresh */ }\n  if (err.name === 'JsonWebTokenError') { /* invalid */ }\n}</code></pre>\n        </section>\n\n        <!-- 9.5 -->\n        <section id=\"session-vs-jwt\">\n          <h2 id=\"section-14\">9.5 Session vs JWT — câu phỏng vấn kinh điển</h2>\n\n          <div class=\"table-scroll\"><table>\n            <thead>\n              <tr><th>Tiêu chí</th><th>Session</th><th>JWT</th></tr>\n            </thead>\n            <tbody>\n              <tr><td>State</td><td>Stateful (server lưu)</td><td>Stateless (server không cần lưu)</td></tr>\n              <tr><td>Lookup mỗi request</td><td>Có (DB/Redis)</td><td>Không (chỉ verify signature)</td></tr>\n              <tr><td>Logout</td><td>Dễ (xoá session)</td><td>Khó (token vẫn valid đến exp)</td></tr>\n              <tr><td>Revoke 1 user</td><td>Dễ</td><td>Cần blocklist hoặc đổi secret</td></tr>\n              <tr><td>Scale</td><td>Cần shared store</td><td>Không cần — verify cục bộ</td></tr>\n              <tr><td>Microservice</td><td>Phức tạp (chia sẻ session)</td><td>Tốt (verify với public key)</td></tr>\n              <tr><td>Mobile/native client</td><td>Cookie không tự gửi</td><td>Header Authorization dễ</td></tr>\n              <tr><td>Token size</td><td>Nhỏ (chỉ session ID)</td><td>Lớn hơn (chứa claims)</td></tr>\n            </tbody>\n          </table></div>\n\n          <h3 id=\"section-15\">Khi nào Session?</h3>\n          <ul>\n            <li>Web app đơn giản, monolith</li>\n            <li>Cần revoke ngay lập tức (banking, admin tool)</li>\n            <li>Có sẵn Redis/DB</li>\n          </ul>\n\n          <h3 id=\"section-16\">Khi nào JWT?</h3>\n          <ul>\n            <li>Microservice — auth service ký, các service khác verify với public key</li>\n            <li>Mobile app, SPA — không cookie</li>\n            <li>Cross-domain auth (SSO partial)</li>\n            <li>Stateless API — không muốn DB lookup mỗi request</li>\n          </ul>\n\n          <div class=\"callout warning\">\n            <div class=\"callout-title\">⚠️ JWT KHÔNG phải session thay thế tự động</div>\n            <p>JWT phổ biến nhưng có nhiều pitfall: revoke khó, lưu trữ nguy hiểm (XSS lấy được), size lớn, cần manage secret.\n            Nhiều project dùng JWT chỉ vì \"trendy\" — thực ra session đủ tốt.</p>\n          </div>\n\n          <h3 id=\"section-17\">JWT lưu ở đâu?</h3>\n          <ul>\n            <li><strong>Cookie HttpOnly + Secure + SameSite</strong>: an toàn nhất, JS không lấy được, browser tự gửi. Nhưng vẫn có CSRF risk (giảm với SameSite).</li>\n            <li><strong>localStorage</strong>: tiện nhưng <em>XSS lấy được</em> → nguy hiểm. Tránh.</li>\n            <li><strong>In-memory</strong>: an toàn nhất nhưng mất khi reload trang.</li>\n          </ul>\n        </section>\n\n        <!-- 9.6 -->\n        <section id=\"tokens\">\n          <h2 id=\"section-18\">9.6 Access Token + Refresh Token</h2>\n\n          <p>JWT exp ngắn (15 phút) thì user phải login lại liên tục. Exp dài (30 ngày) thì nguy hiểm khi lộ. Giải pháp: <strong>2 token</strong>.</p>\n\n          <ul>\n            <li><strong>Access token</strong> (JWT): exp ngắn (15-60 phút), gửi mỗi API request</li>\n            <li><strong>Refresh token</strong>: exp dài (7-30 ngày), chỉ dùng để lấy access token mới. Lưu DB (có thể revoke).</li>\n          </ul>\n\n          <h3 id=\"section-19\">Flow</h3>\n          <ol>\n            <li>Login → server trả access (15m) + refresh (7d)</li>\n            <li>App gọi API với access token</li>\n            <li>Access expired → app dùng refresh token gọi /refresh → nhận access token mới</li>\n            <li>Refresh expired hoặc revoked → user phải login lại</li>\n          </ol>\n\n          <h3 id=\"section-20\">Refresh token rotation</h3>\n          <p>Tăng security: mỗi lần dùng refresh token, server cấp refresh token MỚI và invalidate cái cũ. Nếu attacker steal refresh + dùng → user dùng → server thấy 2 lần dùng cùng refresh → biết bị compromise → revoke tất cả.</p>\n        </section>\n\n        <!-- 9.7 -->\n        <section id=\"oauth\">\n          <h2 id=\"section-21\">9.7 OAuth 2.0 — login bằng Google/Facebook</h2>\n\n          <p>\n            <strong>OAuth 2.0</strong> (RFC 6749) — protocol cho user của 1 service (Google) cấp quyền cho 1 service khác (your app)\n            mà không cần share password.\n          </p>\n\n          <h3 id=\"section-22\">4 actor</h3>\n          <ul>\n            <li><strong>Resource Owner</strong>: user (bạn)</li>\n            <li><strong>Client</strong>: app muốn truy cập data (vd Spotify)</li>\n            <li><strong>Authorization Server</strong>: nơi user login (Google)</li>\n            <li><strong>Resource Server</strong>: API có data (Google Drive API)</li>\n          </ul>\n\n          <h3 id=\"section-23\">Authorization Code Flow (recommended)</h3>\n\n          <div class=\"ascii-art\">\n   User → Click \"Login with Google\" trên Spotify\n                         │\n                         ▼\n   Spotify → Redirect user đến Google login page\n            ?client_id=spotify\n            &amp;redirect_uri=https://spotify.com/callback\n            &amp;scope=email profile\n            &amp;response_type=code\n                         │\n                         ▼\n   User → Login Google + click \"Allow Spotify\"\n                         │\n                         ▼\n   Google → Redirect về spotify.com/callback?code=AUTH_CODE\n                         │\n                         ▼\n   Spotify backend → POST /token đến Google\n                     {\n                       client_id: \"spotify\",\n                       client_secret: \"xyz\",\n                       code: \"AUTH_CODE\",\n                       redirect_uri: \"...\"\n                     }\n                         │\n                         ▼\n   Google → trả access_token + refresh_token + (id_token nếu OIDC)\n                         │\n                         ▼\n   Spotify → dùng access_token gọi Google API\n            GET /userinfo\n            Authorization: Bearer ACCESS_TOKEN\n          </div>\n\n          <h3 id=\"section-24\">Tại sao 2 bước (auth code + token)?</h3>\n          <p>\n            Authorization code đi qua URL của user (qua browser) — không an toàn để gửi trực tiếp access_token. Code chỉ dùng 1 lần, đổi lấy token qua server-to-server (có client_secret) → an toàn hơn.\n          </p>\n\n          <h3 id=\"section-25\">PKCE — cho mobile/SPA</h3>\n          <p>\n            Mobile/SPA không thể giữ <code>client_secret</code> bí mật (decompile được). PKCE (Proof Key for Code Exchange) thêm <code>code_verifier</code>:\n          </p>\n          <ol>\n            <li>Client tạo random <code>code_verifier</code>, hash thành <code>code_challenge</code></li>\n            <li>Gửi <code>code_challenge</code> trong auth request</li>\n            <li>Khi đổi code → token, gửi <code>code_verifier</code> gốc → server verify hash khớp</li>\n          </ol>\n          <p>Đảm bảo: chỉ client thật sự khởi tạo flow mới đổi được code → token.</p>\n\n          <h3 id=\"section-26\">Scope</h3>\n          <p>Định danh quyền cụ thể: <code>email</code>, <code>profile</code>, <code>https://www.googleapis.com/auth/calendar.readonly</code>. User see và approve scope.</p>\n\n          <h3 id=\"section-27\">Other grant types (less used)</h3>\n          <ul>\n            <li><strong>Client Credentials</strong>: server-to-server, không có user</li>\n            <li><strong>Implicit</strong>: cho SPA (deprecated, dùng Auth Code + PKCE)</li>\n            <li><strong>Resource Owner Password</strong>: app trực tiếp lấy password (nguy hiểm, deprecated)</li>\n            <li><strong>Device Code</strong>: cho TV, console (vd login Netflix trên TV bằng cách quét QR trên phone)</li>\n          </ul>\n        </section>\n\n        <!-- 9.8 -->\n        <section id=\"oidc\">\n          <h2 id=\"section-28\">9.8 OpenID Connect (OIDC) — auth trên OAuth</h2>\n\n          <p>\n            OAuth 2.0 là <strong>authorization</strong> (cấp quyền truy cập API) — không phải authentication. Nhưng nhiều người dùng OAuth làm \"Login with Google\" — về mặt kỹ thuật là sai.\n          </p>\n\n          <p>\n            <strong>OpenID Connect</strong> = layer authentication trên OAuth. Thêm <code>id_token</code> (JWT chứa user info) vào response.\n          </p>\n\n          <pre data-lang=\"javascript\"><code>// id_token là JWT decode được:\n{\n  \"iss\": \"https://accounts.google.com\",\n  \"sub\": \"12345\",\n  \"email\": \"alice@gmail.com\",\n  \"name\": \"Alice\",\n  \"picture\": \"https://...\",\n  \"iat\": ...,\n  \"exp\": ...\n}</code></pre>\n\n          <p>\"Login with Google\" trên app web = OIDC. Nhận <code>id_token</code> → biết user là ai → tạo session/JWT của riêng app.</p>\n        </section>\n\n        <!-- 9.9 -->\n        <section id=\"attacks\">\n          <h2 id=\"section-29\">9.9 Common Auth Attacks</h2>\n\n          <h3 id=\"section-30\">1. Token Theft — XSS</h3>\n          <p>Nếu JWT lưu localStorage, attacker tiêm script đọc <code>localStorage.token</code> → gửi server attacker. <strong>Fix:</strong> cookie HttpOnly + CSP.</p>\n\n          <h3 id=\"section-31\">2. CSRF (Cross-Site Request Forgery)</h3>\n          <p>Attacker tạo trang ác chứa <code>&lt;form action=\"https://bank.com/transfer\" method=\"POST\"&gt;</code>. User đã login bank, click form → browser tự gửi cookie session bank → tiền bị chuyển. <strong>Fix:</strong> SameSite cookie, CSRF token. Sẽ học sâu chương 10.</p>\n\n          <h3 id=\"section-32\">3. Replay Attack</h3>\n          <p>Attacker bắt được token, gửi lại sau. <strong>Fix:</strong> exp ngắn, nonce, IP binding.</p>\n\n          <h3 id=\"section-33\">4. JWT alg=none</h3>\n          <p>Bug kinh điển: lib parse JWT mà chấp nhận <code>alg: none</code> (không signature). Attacker chỉnh payload → server tin. <strong>Fix:</strong> verify alg whitelist.</p>\n\n          <h3 id=\"section-34\">5. JWT key confusion</h3>\n          <p>Bug: lib dùng RS256 (asymmetric) nhưng config secret string → attacker dùng public key làm HS256 secret để forge. <strong>Fix:</strong> hardcode alg expected.</p>\n\n          <h3 id=\"section-35\">6. Session fixation</h3>\n          <p>Attacker dụ user login với session ID attacker biết trước → sau khi login attacker dùng cùng session ID. <strong>Fix:</strong> rotate session ID sau login.</p>\n\n          <h3 id=\"section-36\">7. Brute force / credential stuffing</h3>\n          <p>Thử password phổ biến, hoặc dùng password leak từ site khác. <strong>Fix:</strong> rate limit, MFA, captcha, hash bcrypt/argon2.</p>\n        </section>\n\n        <!-- Bài tập -->\n        <section id=\"exercises\">\n          <h2 id=\"section-37\">Bài tập</h2>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 1 — Cookie inspection</div>\n            <p>Login vào 1 site bạn dùng. Mở DevTools → Application → Cookies. Liệt kê: domain, expires, HttpOnly, Secure, SameSite của các cookie session.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 2 — Decode JWT</div>\n            <p>Nếu site dùng JWT, copy token, paste vào jwt.io decoder. Đọc payload. Có nhạy cảm không?</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 3 — Session vs JWT scenarios</div>\n            <p>Mỗi case sau, dùng Session hay JWT? Tại sao?\n            (a) Banking app — admin có thể disable user ngay;\n            (b) Mobile game multiplayer;\n            (c) Internal tool monolith Rails;\n            (d) Microservice authn shared giữa 10 services;\n            (e) Public API ai cũng dùng được key.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 4 — OAuth flow tay</div>\n            <p>Đăng ký 1 OAuth app trên GitHub Developer Settings. Implement Authorization Code flow đầu cuối: redirect → callback → trao đổi code → gọi user API.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 5 — Refresh token rotation</div>\n            <p>Thiết kế DB schema cho refresh token với rotation. Mỗi refresh token có: id, user_id, expires_at, replaced_by.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 6 — Logout của JWT</div>\n            <p>JWT stateless → khó logout. Đề xuất 3 cách giải quyết: (a) blacklist; (b) ngắn hạn + refresh; (c) đổi secret.</p>\n          </div>\n        </section>\n\n        <!-- Quiz -->\n        <section id=\"quiz\">\n          <div class=\"quiz\">\n            <h3 id=\"section-38\">🧪 Quiz cuối chương</h3>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 1.</strong> Cookie attribute <code>HttpOnly</code> để?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Chỉ gửi qua HTTP, không HTTPS\">Chỉ gửi qua HTTP, không HTTPS</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cookie chỉ valid 1 lần\">Cookie chỉ valid 1 lần</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: JavaScript KHÔNG đọc được cookie (qua document.cookie) — chống XSS đánh cắp\">JavaScript KHÔNG đọc được cookie (qua document.cookie) — chống XSS đánh cắp</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cookie không dùng được trên mobile\">Cookie không dùng được trên mobile</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: chống JS đọc.</strong> XSS không thể lấy session cookie nếu HttpOnly. Best practice cho session.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 2.</strong> SameSite cookie attribute để?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cookie chỉ gửi cùng IP\">Cookie chỉ gửi cùng IP</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Chống CSRF — Strict không gửi cross-site, Lax chỉ gửi với GET top-nav, None gửi mọi nơi (cần Secure)\">Chống CSRF — Strict không gửi cross-site, Lax chỉ gửi với GET top-nav, None gửi mọi nơi (cần Secure)</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cookie giữa nhiều subdomain\">Cookie giữa nhiều subdomain</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Tăng tốc\">Tăng tốc</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: chống CSRF.</strong> Default Lax từ Chrome 80+ → fix nhiều CSRF tự động.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 3.</strong> Khác biệt chính Session vs JWT?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Session stateful (server lưu); JWT stateless (claims trong token, verify signature)\">Session stateful (server lưu); JWT stateless (claims trong token, verify signature)</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Session dùng cookie, JWT không\">Session dùng cookie, JWT không</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: JWT nhanh hơn\">JWT nhanh hơn</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: JWT chỉ cho mobile\">JWT chỉ cho mobile</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: stateful vs stateless.</strong> Session cần DB lookup, JWT verify cục bộ.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 4.</strong> JWT signature dùng để?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Mã hoá payload\">Mã hoá payload</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Compress token\">Compress token</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Đảm bảo token không bị tamper — verify signature → tin payload là server gốc đã ký\">Đảm bảo token không bị tamper — verify signature → tin payload là server gốc đã ký</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Định danh user\">Định danh user</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: chống tamper.</strong> Payload đọc được (base64), signature đảm bảo không sửa.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 5.</strong> JWT lưu ở đâu là an toàn nhất?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cookie HttpOnly + Secure + SameSite — JS không đọc được, browser tự gửi\">Cookie HttpOnly + Secure + SameSite — JS không đọc được, browser tự gửi</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: localStorage\">localStorage</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: sessionStorage\">sessionStorage</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: URL query param\">URL query param</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: HttpOnly cookie.</strong> localStorage có XSS risk. URL leak vào log/referer.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 6.</strong> Refresh token để làm gì?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Refresh trang web\">Refresh trang web</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Lấy access token mới khi access expired — không phải login lại; có thể revoke server-side\">Lấy access token mới khi access expired — không phải login lại; có thể revoke server-side</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Mã hoá access token\">Mã hoá access token</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Compress data\">Compress data</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: lấy access mới.</strong> Access ngắn hạn (15m) → security; refresh dài hạn (7d) → UX. Refresh lưu DB → revoke được.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 7.</strong> OAuth 2.0 Authorization Code flow tại sao 2 bước?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Để chậm hơn\">Để chậm hơn</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Spec yêu cầu\">Spec yêu cầu</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Auth code đi qua browser (URL); code đổi token qua server-to-server với client_secret → an toàn hơn gửi token trực tiếp\">Auth code đi qua browser (URL); code đổi token qua server-to-server với client_secret → an toàn hơn gửi token trực tiếp</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Vì backwards compat\">Vì backwards compat</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: bảo mật.</strong> Code chỉ dùng 1 lần, đổi qua HTTPS server-to-server.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 8.</strong> \"Login with Google\" thực ra là OAuth hay OIDC?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: OIDC (OpenID Connect) — layer authentication trên OAuth, trả id_token chứa user info\">OIDC (OpenID Connect) — layer authentication trên OAuth, trả id_token chứa user info</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: OAuth thuần\">OAuth thuần</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: SAML\">SAML</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: LDAP\">LDAP</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: OIDC.</strong> OAuth là authorization, OIDC mới là authentication. Nhiều người gọi nhầm.\n              </p>\n            </div>\n          </div>\n        </section>\n\n        <section>\n          <h2 id=\"section-39\">Tổng kết chương 9</h2>\n          <ul>\n            <li>✅ <strong>AuthN</strong> = ai bạn? <strong>AuthZ</strong> = bạn được làm gì? Status 401 vs 403</li>\n            <li>✅ <strong>Cookie</strong> attributes: HttpOnly (chống XSS), Secure (HTTPS), SameSite (chống CSRF)</li>\n            <li>✅ <strong>Session</strong>: stateful, server lưu session ID → user; logout dễ; cần shared store</li>\n            <li>✅ <strong>JWT</strong>: stateless, header.payload.signature; verify signature đủ; logout/revoke khó</li>\n            <li>✅ Session vs JWT: chọn theo nhu cầu (revoke, microservice, mobile)</li>\n            <li>✅ <strong>Access + Refresh token</strong> + rotation = balance security/UX</li>\n            <li>✅ <strong>OAuth 2.0</strong>: authorization (cấp quyền API). Authorization Code flow chuẩn; PKCE cho mobile/SPA</li>\n            <li>✅ <strong>OIDC</strong> = OAuth + id_token cho authentication (\"Login with Google\")</li>\n            <li>✅ Common attacks: XSS theft, CSRF, replay, JWT alg=none, key confusion, session fixation</li>\n            <li>✅ Best practice: cookie HttpOnly + Secure + SameSite + bcrypt/argon2 password + rate limit + MFA</li>\n          </ul>\n        </section>\n\n      ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "9.1 Authentication vs Authorization",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "9.2 Cookie — cơ chế \"stateful\" của HTTP",
+      "depth": 2
+    },
+    {
+      "id": "section-3",
+      "text": "Cookie attributes — phải hiểu",
+      "depth": 3
+    },
+    {
+      "id": "section-4",
+      "text": "SameSite — quan trọng",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "9.3 Session-based Authentication",
+      "depth": 2
+    },
+    {
+      "id": "section-6",
+      "text": "Flow",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "Đặc điểm",
+      "depth": 3
+    },
+    {
+      "id": "section-8",
+      "text": "9.4 JWT — JSON Web Token",
+      "depth": 2
+    },
+    {
+      "id": "section-9",
+      "text": "Cấu trúc",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "Verify",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "Algorithms",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "Lưu ý",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "Code Node.js",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "9.5 Session vs JWT — câu phỏng vấn kinh điển",
+      "depth": 2
+    },
+    {
+      "id": "section-15",
+      "text": "Khi nào Session?",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "Khi nào JWT?",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "JWT lưu ở đâu?",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "9.6 Access Token + Refresh Token",
+      "depth": 2
+    },
+    {
+      "id": "section-19",
+      "text": "Flow",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "Refresh token rotation",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "9.7 OAuth 2.0 — login bằng Google/Facebook",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "4 actor",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "Authorization Code Flow (recommended)",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "Tại sao 2 bước (auth code + token)?",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "PKCE — cho mobile/SPA",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "Scope",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "Other grant types (less used)",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "9.8 OpenID Connect (OIDC) — auth trên OAuth",
+      "depth": 2
+    },
+    {
+      "id": "section-29",
+      "text": "9.9 Common Auth Attacks",
+      "depth": 2
+    },
+    {
+      "id": "section-30",
+      "text": "1. Token Theft — XSS",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "2. CSRF (Cross-Site Request Forgery)",
+      "depth": 3
+    },
+    {
+      "id": "section-32",
+      "text": "3. Replay Attack",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "4. JWT alg=none",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "5. JWT key confusion",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "6. Session fixation",
+      "depth": 3
+    },
+    {
+      "id": "section-36",
+      "text": "7. Brute force / credential stuffing",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-38",
+      "text": "🧪 Quiz cuối chương",
+      "depth": 3
+    },
+    {
+      "id": "section-39",
+      "text": "Tổng kết chương 9",
+      "depth": 2
+    }
+  ],
+  "source": "Networking/chuong/chuong9.html",
+  "sourceHash": "36dddbca81059461a3cc8866b5cbbd79e985fca693e49eda56b5749eb956084f",
+  "readingMinutes": 10
+}

@@ -1,0 +1,230 @@
+{
+  "id": "system-design--chapter-02",
+  "track": "system-design",
+  "trackTitle": "System Design",
+  "slug": "chapter-02",
+  "order": 2,
+  "title": "Load Balancer & Reverse Proxy",
+  "description": "L4 vs L7, các thuật toán phân tải, health check, sticky session, nginx/HAProxy/cloud LB, và Global Load Balancing.",
+  "html": "\n\n      <section id=\"what\">\n        <h2 id=\"section-1\">1. Load Balancer là gì?</h2>\n        <p>\n          <strong>Load Balancer (LB)</strong> phân phối incoming traffic giữa nhiều server backend. Component này là trái tim của horizontal scaling — không có LB, scale ngang không khả thi.\n        </p>\n\n        <p>5 chức năng chính:</p>\n        <ol>\n          <li><strong>Distribute load</strong> — chia request giữa các backend.</li>\n          <li><strong>Health check</strong> — phát hiện backend chết, không gửi traffic đến.</li>\n          <li><strong>SSL termination</strong> — handle TLS, backend nhận HTTP plain.</li>\n          <li><strong>Failover</strong> — khi backend chết, chuyển traffic sang backend khác trong giây.</li>\n          <li><strong>Smart routing</strong> — route theo URL, header, geo, A/B test.</li>\n        </ol>\n\n        <h3 id=\"section-2\">1.1. Vị trí trong kiến trúc</h3>\n\n        <div class=\"ascii\">         Client / User\n              │\n              ▼\n       ┌──────────────┐\n       │     DNS      │  ← global routing (latency, geo)\n       └──────┬───────┘\n              │\n              ▼\n       ┌──────────────┐\n       │   CDN edge   │  ← cache static, SSL termination\n       └──────┬───────┘\n              │\n              ▼\n       ┌──────────────┐\n       │ Load Balancer│  ← phân phối tải đến backend\n       │   (L4 or L7) │\n       └──────┬───────┘\n              │\n       ┌──────┴──────┬──────────┬──────────┐\n       ▼             ▼          ▼          ▼\n   ┌────────┐  ┌────────┐ ┌────────┐ ┌────────┐\n   │Backend1│  │Backend2│ │Backend3│ │Backend4│\n   └────────┘  └────────┘ └────────┘ └────────┘</div>\n      </section>\n\n      <section id=\"layers\">\n        <h2 id=\"section-3\">2. L4 vs L7 — hai tầng phân tải</h2>\n\n        <p>\"L4\" và \"L7\" tham chiếu OSI layers (đã học ở Networking):</p>\n\n        <div class=\"compare\">\n          <div>\n            <h4>L4 Load Balancer (Transport)</h4>\n            <p>Phân tải dựa trên thông tin TCP/UDP — IP và port nguồn/đích. KHÔNG hiểu HTTP.</p>\n            <ul>\n              <li><strong>Ưu</strong>: cực nhanh, ít CPU, latency thấp; xử lý mọi protocol (HTTP, gRPC, WebSocket, custom TCP, UDP).</li>\n              <li><strong>Nhược</strong>: không thể route theo URL/header; không SSL termination tự nhiên (chỉ pass-through).</li>\n              <li><strong>Ví dụ</strong>: AWS NLB, HAProxy mode TCP, nginx stream module.</li>\n              <li><strong>Khi dùng</strong>: traffic non-HTTP (database proxy, gaming server, MQ); cần latency tối thiểu.</li>\n            </ul>\n          </div>\n          <div>\n            <h4>L7 Load Balancer (Application)</h4>\n            <p>Phân tải dựa trên HTTP — URL path, header, cookie, body. Hiểu HTTP/HTTPS/HTTP2/gRPC.</p>\n            <ul>\n              <li><strong>Ưu</strong>: smart routing (path, host, header), SSL termination, response caching, content modification, request retry, websocket upgrade.</li>\n              <li><strong>Nhược</strong>: chậm hơn L4 (parse HTTP), tốn CPU hơn.</li>\n              <li><strong>Ví dụ</strong>: AWS ALB, nginx, HAProxy mode HTTP, Envoy, Traefik, Kong.</li>\n              <li><strong>Khi dùng</strong>: web app, API; cần routing thông minh.</li>\n            </ul>\n          </div>\n        </div>\n\n        <h3 id=\"section-4\">2.1. Có thể dùng cả hai</h3>\n        <p>Pattern phổ biến: <strong>L4 ở edge → L7 phía sau</strong>. NLB nhận TLS terminate ở ALB phía sau cho phân tải HTTP-aware.</p>\n\n        <h3 id=\"section-5\">2.2. SSL termination</h3>\n\n<pre><code>  Client ──HTTPS──► [LB] ──HTTP──► Backend\n                     ▲\n            SSL terminate ở đây\n            (LB cầm cert, decrypt, forward)</code></pre>\n\n        <p>Lợi: backend không tốn CPU encrypt/decrypt; quản lý cert ở 1 chỗ. Bảo mật: traffic LB→backend nội bộ thường an toàn (private network), nếu cần extra: SSL re-encryption (mTLS) tại LB.</p>\n      </section>\n\n      <section id=\"algos\">\n        <h2 id=\"section-6\">3. Thuật toán phân tải</h2>\n\n        <h3 id=\"section-7\">3.1. Round Robin</h3>\n        <p>Quay vòng đều: req1 → server A, req2 → B, req3 → C, req4 → A...</p>\n        <p><strong>Ưu</strong>: đơn giản, fair khi server đồng nhất.</p>\n        <p><strong>Nhược</strong>: bỏ qua load thực tế. Server đang xử lý request \"nặng\" vẫn nhận thêm.</p>\n\n        <h3 id=\"section-8\">3.2. Weighted Round Robin</h3>\n        <p>Mỗi server có weight, chia tỉ lệ. Server A weight 3, B weight 1 → A nhận 75% traffic.</p>\n        <p><strong>Khi dùng</strong>: server có cấu hình khác nhau (mix giữa generation hardware), canary deploy.</p>\n\n        <h3 id=\"section-9\">3.3. Least Connections</h3>\n        <p>Chọn server đang có ít active connection nhất.</p>\n        <p><strong>Ưu</strong>: phản ánh load thực tế tốt hơn round robin.</p>\n        <p><strong>Phù hợp</strong>: long-lived connection (WebSocket, long polling, streaming).</p>\n\n        <h3 id=\"section-10\">3.4. Least Response Time</h3>\n        <p>Chọn server có latency average thấp nhất + ít connection.</p>\n        <p>Phức tạp hơn least conn; HAProxy có sẵn.</p>\n\n        <h3 id=\"section-11\">3.5. IP Hash / Source IP Hashing</h3>\n        <p>Hash IP client → cùng IP luôn route đến cùng server. Dùng cho sticky session đơn giản.</p>\n        <p><strong>Vấn đề</strong>: nhiều user share IP (NAT corporate, mobile carrier) → uneven distribution.</p>\n\n        <h3 id=\"section-12\">3.6. Consistent Hashing</h3>\n        <p>Đã học ở Database (Ch10). Hash key (IP / userId / cache key) lên vòng tròn, mỗi server \"sở hữu\" 1 đoạn cung. Thêm/bớt server → chỉ ~1/N traffic redistribute.</p>\n\n        <p>Dùng cho: cache cluster (CloudFront, Memcached cluster), sharded service.</p>\n\n        <h3 id=\"section-13\">3.7. Random + Power of Two Choices</h3>\n        <p>Pick 2 server random, chọn cái load thấp hơn. Đơn giản, gần optimal:</p>\n\n<pre><code class=\"language-typescript\">function pickBackend(backends: Backend[]) {\n  const a = backends[Math.floor(Math.random() * backends.length)];\n  const b = backends[Math.floor(Math.random() * backends.length)];\n  return a.activeConnections &lt; b.activeConnections ? a : b;\n}</code></pre>\n\n        <p>Performance: với power-of-two-choices, max load expected là log(log(N)) thay vì log(N) như round robin. Used trong haproxy-2-choice mode, NetflixZuul.</p>\n\n        <h3 id=\"section-14\">3.8. So sánh thuật toán</h3>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Algorithm</th><th>Khi tốt</th><th>Hạn chế</th></tr></thead>\n          <tbody>\n            <tr><td>Round Robin</td><td>Server đồng nhất, request nhẹ tương đương nhau</td><td>Bỏ qua load thực</td></tr>\n            <tr><td>Weighted RR</td><td>Server khác cấu hình, canary</td><td>Vẫn không nhìn load thực</td></tr>\n            <tr><td>Least Connections</td><td>WebSocket, long polling, streaming</td><td>Cần track state global</td></tr>\n            <tr><td>IP Hash</td><td>Sticky đơn giản</td><td>NAT skew distribution</td></tr>\n            <tr><td>Consistent Hash</td><td>Cache cluster, sharded service</td><td>Phức tạp implement</td></tr>\n            <tr><td>P2C Random</td><td>Distributed, không cần state global</td><td>Random nhưng đủ tốt</td></tr>\n          </tbody>\n        </table></div>\n\n        <div class=\"callout callout-tip\">\n          <span class=\"callout-title\">Default thực dụng</span>\n          Mặc định: <strong>Round Robin</strong> hoặc <strong>Least Connections</strong>. 90% case đủ. Chỉ chọn khác khi có lý do cụ thể (consistent hash cho cache; weighted cho canary).\n        </div>\n      </section>\n\n      <section id=\"health\">\n        <h2 id=\"section-15\">4. Health Check — phát hiện server chết</h2>\n\n        <p>LB liên tục ping backend. Backend không response → đánh dấu unhealthy → ngừng route traffic.</p>\n\n        <h3 id=\"section-16\">4.1. Active vs Passive</h3>\n        <ul>\n          <li><strong>Active health check</strong> — LB chủ động ping định kỳ (mỗi 5-30s) đến endpoint <code>/health</code>. Phổ biến nhất.</li>\n          <li><strong>Passive health check</strong> — LB monitor real traffic, mark unhealthy khi error rate cao. Tiết kiệm tài nguyên hơn.</li>\n        </ul>\n\n        <h3 id=\"section-17\">4.2. Endpoint /health design</h3>\n\n<pre><code class=\"language-typescript\">// Liveness — chỉ check process còn sống\napp.get('/health/live', (req, res) =&gt; {\n  res.status(200).json({ status: 'ok' });\n});\n\n// Readiness — sẵn sàng nhận traffic? (DB connect OK, cache warm)\napp.get('/health/ready', async (req, res) =&gt; {\n  try {\n    await db.query('SELECT 1');\n    await redis.ping();\n    res.status(200).json({ status: 'ready' });\n  } catch (e) {\n    res.status(503).json({ status: 'not ready', error: e.message });\n  }\n});</code></pre>\n\n        <p>Phân biệt:</p>\n        <ul>\n          <li><strong>Liveness</strong> — process có chạy không? Fail → restart (Kubernetes).</li>\n          <li><strong>Readiness</strong> — sẵn sàng nhận traffic? Fail → tạm thời không gửi traffic, KHÔNG restart.</li>\n        </ul>\n\n        <h3 id=\"section-18\">4.3. Threshold</h3>\n        <p>Tránh \"flapping\" (lúc up lúc down):</p>\n        <ul>\n          <li>Mark unhealthy: cần 2-3 fail liên tiếp.</li>\n          <li>Mark healthy lại: cần 2-3 success liên tiếp.</li>\n        </ul>\n\n        <h3 id=\"section-19\">4.4. Cascading failure</h3>\n        <p>Vấn đề: khi 1 server unhealthy, LB chuyển traffic sang server còn lại → server còn lại quá tải → cũng unhealthy → toàn bộ chết.</p>\n\n        <p>Phòng tránh:</p>\n        <ul>\n          <li><strong>Capacity dư</strong> — vận hành dưới 80% (đã học Ch1).</li>\n          <li><strong>Circuit breaker</strong> — cắt traffic đến server problematic chứ không \"xóa\".</li>\n          <li><strong>Slow start</strong> — server mới khôi phục nhận traffic từ từ, không 100% ngay.</li>\n        </ul>\n      </section>\n\n      <section id=\"sticky\">\n        <h2 id=\"section-20\">5. Sticky Session</h2>\n\n        <p>Pattern: cùng user luôn route đến cùng backend.</p>\n\n        <h3 id=\"section-21\">5.1. Cách triển khai</h3>\n        <ul>\n          <li><strong>Cookie-based</strong> — LB set cookie chứa server ID. Request kế tiếp có cookie → route đến đúng server.</li>\n          <li><strong>IP Hash</strong> — đã nói ở 3.5.</li>\n        </ul>\n\n        <h3 id=\"section-22\">5.2. Khi nào cần?</h3>\n        <p>Hiện đại: <strong>tránh sticky session</strong> nếu có thể. Pattern stateless tốt hơn nhiều:</p>\n        <ul>\n          <li>Session ở Redis/DB shared.</li>\n          <li>Ai vào đâu cũng được — cluster horizontal scale tự nhiên.</li>\n        </ul>\n\n        <p>Sticky chỉ cần khi:</p>\n        <ul>\n          <li>Migrate legacy app stateful.</li>\n          <li>WebSocket — connection lâu, switch server giữa chừng phức tạp.</li>\n          <li>In-memory state cho specific session (live game state).</li>\n        </ul>\n\n        <h3 id=\"section-23\">5.3. Vấn đề sticky session</h3>\n        <ul>\n          <li><strong>Uneven load</strong> — user heavy hit cùng server.</li>\n          <li><strong>Server chết = session chết</strong> — fall back đến server khác mất state.</li>\n          <li><strong>Khó scale</strong> — auto-scale không hiệu quả nếu mỗi user \"neo\" vào 1 server.</li>\n        </ul>\n\n        <p>Thực dụng: dùng JWT (stateless) cho auth → không cần sticky cho HTTP nhúng. Cho WebSocket: connection-pinning OK vì đã established.</p>\n      </section>\n\n      <section id=\"proxy\">\n        <h2 id=\"section-24\">6. Reverse Proxy vs Load Balancer</h2>\n\n        <p>Hai khái niệm thường nhầm lẫn:</p>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th></th><th>Load Balancer</th><th>Reverse Proxy</th></tr></thead>\n          <tbody>\n            <tr><td>Định nghĩa</td><td>Phân phối traffic giữa nhiều backend</td><td>Đứng trước backend, nhận request thay backend</td></tr>\n            <tr><td>Yêu cầu nhiều backend?</td><td>Có (≥ 2)</td><td>Không (có thể 1)</td></tr>\n            <tr><td>Chức năng</td><td>Distribute, health check, failover</td><td>Caching, SSL termination, compression, request modification, security</td></tr>\n            <tr><td>Ví dụ</td><td>AWS ALB/NLB, F5</td><td>nginx, Varnish, CloudFlare</td></tr>\n            <tr><td>Mối quan hệ</td><td colspan=\"2\">nginx có thể là CẢ HAI — reverse proxy + load balancer</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>Trong thực tế: nginx/Envoy thường vừa làm reverse proxy vừa làm L7 load balancer. Cùng 1 instance, cùng config.</p>\n\n        <h3 id=\"section-25\">6.1. Forward Proxy vs Reverse Proxy</h3>\n        <ul>\n          <li><strong>Forward Proxy</strong> — đứng trước CLIENT, ẩn client với server (như corporate proxy, VPN).</li>\n          <li><strong>Reverse Proxy</strong> — đứng trước SERVER, ẩn server với client.</li>\n        </ul>\n\n        <div class=\"ascii\">  FORWARD:    Client ──► [Forward Proxy] ──► Server\n              (ẩn client với server)\n\n  REVERSE:    Client ──► [Reverse Proxy] ──► Server\n              (ẩn server với client)</div>\n      </section>\n\n      <section id=\"nginx\">\n        <h2 id=\"section-26\">7. nginx, HAProxy, Envoy — công cụ phổ biến</h2>\n\n        <h3 id=\"section-27\">7.1. nginx</h3>\n        <p>Reverse proxy + L7 LB phổ biến nhất. Event-driven (master/worker), C, cực nhanh.</p>\n\n<pre><code class=\"language-nginx\"># /etc/nginx/nginx.conf — basic LB setup\nupstream backend {\n    least_conn;                                # algorithm\n    server backend1.example.com:8080 weight=3;\n    server backend2.example.com:8080 weight=1;\n    server backend3.example.com:8080 backup;   # chỉ dùng khi cả 2 trên fail\n}\n\nserver {\n    listen 443 ssl http2;\n    server_name api.example.com;\n\n    ssl_certificate     /etc/ssl/cert.pem;\n    ssl_certificate_key /etc/ssl/key.pem;\n\n    location / {\n        proxy_pass http://backend;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n\n        proxy_connect_timeout 5s;\n        proxy_read_timeout 30s;\n    }\n\n    location /static {\n        proxy_pass http://backend;\n        proxy_cache static_cache;\n        proxy_cache_valid 200 1d;            # cache response 200 trong 1 ngày\n        add_header X-Cache-Status $upstream_cache_status;\n    }\n\n    location /health {\n        return 200 \"OK\";\n        access_log off;\n    }\n}</code></pre>\n\n        <h3 id=\"section-28\">7.2. HAProxy</h3>\n        <p>L4 + L7 LB, từ 2001. Đặc biệt mạnh cho TCP balancing, statistics phong phú.</p>\n\n<pre><code class=\"language-haproxy\">frontend http-in\n    bind *:80\n    default_backend webservers\n\nbackend webservers\n    balance leastconn\n    option httpchk GET /health\n    server web1 10.0.0.1:8080 check inter 2000 rise 2 fall 3\n    server web2 10.0.0.2:8080 check inter 2000 rise 2 fall 3\n    server web3 10.0.0.3:8080 check inter 2000 rise 2 fall 3 weight 50</code></pre>\n\n        <h3 id=\"section-29\">7.3. Envoy / Istio</h3>\n        <p>Envoy = Lyft 2016, được CNCF. Modern data plane: gRPC native, observability tốt, hot reload không downtime.</p>\n        <p>Istio dùng Envoy làm sidecar trong service mesh — sẽ học Ch6.</p>\n\n        <h3 id=\"section-30\">7.4. Cloud LB</h3>\n        <ul>\n          <li><strong>AWS ELB</strong> — Classic LB (deprecated), <strong>ALB</strong> (L7), <strong>NLB</strong> (L4 ultra-fast), <strong>GLB</strong> (Global Accelerator).</li>\n          <li><strong>GCP</strong> — Cloud Load Balancer (global anycast).</li>\n          <li><strong>Cloudflare</strong> — Load Balancing trên edge.</li>\n          <li><strong>F5 / Citrix NetScaler</strong> — hardware enterprise, đắt.</li>\n        </ul>\n\n        <p>Cloud managed LB tự autoscale, multi-AZ HA built-in. Trừ khi có lý do đặc biệt, dùng managed cho tiết kiệm vận hành.</p>\n      </section>\n\n      <section id=\"global\">\n        <h2 id=\"section-31\">8. Global Load Balancing</h2>\n\n        <p>Load Balancer thông thường = trong 1 region. Khi user toàn cầu, cần Global LB để route đến region gần nhất.</p>\n\n        <h3 id=\"section-32\">8.1. DNS-based</h3>\n        <p>Cách đơn giản: DNS resolve <code>api.example.com</code> trả IP khác nhau theo geo.</p>\n        <ul>\n          <li>User VN → IP của data center Singapore.</li>\n          <li>User EU → IP của data center Frankfurt.</li>\n          <li>User US → IP của data center Virginia.</li>\n        </ul>\n\n        <p>Tools: AWS Route 53 (geolocation routing), Cloudflare Load Balancing (DNS-based).</p>\n\n        <p><strong>Vấn đề</strong>: TTL DNS gây lag — failover region mất thời gian (TTL thường 5min).</p>\n\n        <h3 id=\"section-33\">8.2. Anycast</h3>\n        <p>Cùng 1 IP công khai, nhưng được announce từ nhiều địa điểm địa lý qua BGP. Internet tự route đến địa điểm gần nhất.</p>\n\n        <p>Cloudflare, Google, AWS Global Accelerator dùng Anycast. Failover dưới giây — khi 1 region down, BGP tự withdraw route, traffic chuyển đến region khác.</p>\n\n        <h3 id=\"section-34\">8.3. CDN — Global LB cho static</h3>\n        <p>CDN (CloudFront, Cloudflare, Fastly) là Global LB cho content cacheable. Sẽ chi tiết Ch7.</p>\n      </section>\n\n      <section id=\"patterns\">\n        <h2 id=\"section-35\">9. Patterns thực tế</h2>\n\n        <h3 id=\"section-36\">9.1. Multi-tier LB</h3>\n        <div class=\"ascii\">  Internet\n     │\n     ▼\n  ┌─────────────────────┐\n  │ Cloudflare (Anycast)│  Global routing, DDoS protection, CDN\n  └──────────┬──────────┘\n             │\n             ▼\n  ┌─────────────────────┐\n  │ AWS NLB (L4)        │  TLS pass-through, ultra-fast\n  └──────────┬──────────┘\n             │\n             ▼\n  ┌─────────────────────┐\n  │ nginx (L7)          │  Smart routing, SSL termination, caching\n  └──────────┬──────────┘\n             │\n       ┌─────┴─────┐\n       ▼           ▼\n   ┌──────┐   ┌──────┐\n   │ App  │   │ App  │\n   └──────┘   └──────┘</div>\n\n        <p>Mỗi tầng giải 1 vấn đề: edge (CDN/DDoS) → ingress (TLS, fast) → app routing (smart) → backend.</p>\n\n        <h3 id=\"section-37\">9.2. Blue-Green Deployment</h3>\n        <p>2 environment giống nhau:</p>\n        <ul>\n          <li><strong>Blue</strong> — production hiện tại.</li>\n          <li><strong>Green</strong> — version mới deploy.</li>\n        </ul>\n        <p>Test green xong, switch LB từ blue → green. Sự cố? Switch back ngay.</p>\n\n        <h3 id=\"section-38\">9.3. Canary Deployment</h3>\n        <p>Route 5% traffic đến version mới, 95% version cũ. Theo dõi metrics. OK → tăng dần đến 100%.</p>\n\n<pre><code class=\"language-nginx\"># Canary với weight:\nupstream app {\n    server v1.app.local weight=95;\n    server v2.app.local weight=5;\n}</code></pre>\n\n        <h3 id=\"section-39\">9.4. A/B Testing</h3>\n        <p>Tương tự canary nhưng split theo user (cookie/userId hash) để cùng user luôn thấy version giống nhau:</p>\n\n<pre><code class=\"language-nginx\">map $cookie_user_id $backend_version {\n    default          v1;\n    \"~*[0-9a-f]$\"    v2;   # user_id ending in 0-9a-f → v2 (50%)\n}</code></pre>\n\n        <h3 id=\"section-40\">9.5. Geographic routing với fallback</h3>\n        <p>Route theo geo, nhưng nếu region gần down → fallback sang region khác:</p>\n        <ul>\n          <li>Primary: VN user → ap-southeast-1.</li>\n          <li>Fallback: ap-southeast-1 down → ap-northeast-1.</li>\n        </ul>\n\n        <p>AWS Route 53 health check + geo routing làm tự động.</p>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-41\">10. Bài tập</h2>\n\n        <ol>\n          <li>So sánh L4 vs L7: cho 3 use case, mỗi cái nói nên dùng L4 hay L7 và lý do.\n            <ul>\n              <li>(a) Database proxy cho 100 connection postgres</li>\n              <li>(b) Web app với routing /api/v1, /api/v2 đến backend khác</li>\n              <li>(c) Game server real-time UDP</li>\n            </ul>\n          </li>\n\n          <li>Setup nginx local làm reverse proxy + LB cho 3 Node.js app instance. Test với <code>ab</code> hoặc <code>k6</code>.</li>\n\n          <li>Implement health check cho 1 service: <code>/health/live</code> + <code>/health/ready</code>. Trong ready: check DB, Redis. Đảm bảo trả 503 khi DB down.</li>\n\n          <li>Phân biệt thuật toán cho 3 scenario:\n            <ul>\n              <li>WebSocket app (connection lâu).</li>\n              <li>Cache cluster với 4 node Redis.</li>\n              <li>Stateless API CRUD bình thường.</li>\n            </ul>\n          </li>\n\n          <li>Setup Cloudflare DNS với load balancing: 2 region (US, EU), health check tự động fail over.</li>\n\n          <li>Implement canary deployment với nginx: 5% traffic v2, 95% v1. Sau 1h mà không có error rate tăng → bump v2 lên 25%.</li>\n\n          <li>Vì sao nên tránh sticky session khi có thể? Cho 2 alternative cụ thể.</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-42\">11. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-43\">Quiz cuối Chương 2</h3>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">L4 vs L7 Load Balancer khác chính ở:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: L4 chậm hơn\">L4 chậm hơn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: L4 phân tải dựa IP/port (transport layer); L7 hiểu HTTP — route theo URL/header/cookie, SSL termination, caching\">L4 phân tải dựa IP/port (transport layer); L7 hiểu HTTP — route theo URL/header/cookie, SSL termination, caching</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: L7 chỉ cho TCP\">L7 chỉ cho TCP</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: L4 không có SSL\">L4 không có SSL</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">L4 cực nhanh, không hiểu HTTP. L7 chậm hơn nhưng smart: route /api/v1 đến backend1, /api/v2 đến backend2; cache static; SSL terminate. Pattern phổ biến: NLB (L4) + ALB/nginx (L7) phía sau.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Least Connections phù hợp NHẤT cho:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Server đồng nhất, request CPU-bound\">Server đồng nhất, request CPU-bound</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: CDN edge\">CDN edge</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: WebSocket / long polling — connection lâu, đếm conn phản ánh load thực tốt hơn round robin\">WebSocket / long polling — connection lâu, đếm conn phản ánh load thực tốt hơn round robin</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Static asset\">Static asset</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">WebSocket connection mở 30 phút - vài giờ. Round robin → server vào sau nhận ít connection nhưng vẫn được round robin → uneven. Least conn nhìn vào connection thực, distribute đều hơn.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Liveness probe vs Readiness probe:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cùng nghĩa\">Cùng nghĩa</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cả hai dùng cho load balancing\">Cả hai dùng cho load balancing</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Liveness check connection, Readiness check disk\">Liveness check connection, Readiness check disk</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Liveness: process còn chạy không (fail → restart). Readiness: sẵn sàng nhận traffic không (fail → tạm cách ly khỏi LB, không restart)\">Liveness: process còn chạy không (fail → restart). Readiness: sẵn sàng nhận traffic không (fail → tạm cách ly khỏi LB, không restart)</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Liveness fail → kill và restart container (Kubernetes). Readiness fail → tạm xóa khỏi LB pool nhưng không restart (vd: warming cache, đang reconnect DB). Cùng app nhưng 2 endpoint khác.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Sticky session nên TRÁNH khi có thể vì:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Uneven load, server chết = mất session, khó autoscale; nên lưu session ở Redis/DB shared\">Uneven load, server chết = mất session, khó autoscale; nên lưu session ở Redis/DB shared</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Quá nhanh\">Quá nhanh</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tốn ít RAM\">Tốn ít RAM</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cần Java\">Cần Java</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Sticky \"neo\" user vào server cụ thể → user heavy đẩy server đó quá tải; server crash → user mất session; autoscale không hiệu quả vì không thể đơn giản tăng node. Stateless với JWT hoặc session ở Redis là cách tốt hơn.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Consistent hashing thường dùng cho:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Sticky session HTTP\">Sticky session HTTP</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Round robin\">Round robin</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cache cluster (memcached/Redis sharded) — thêm/bớt node chỉ ~1/N traffic redistribute\">Cache cluster (memcached/Redis sharded) — thêm/bớt node chỉ ~1/N traffic redistribute</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Health check\">Health check</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Cache cluster với hash(key) % N → đổi N → 90% key remap → cache miss storm. Consistent hashing với vòng tròn → chỉ 1/N key đổi node. Cassandra, DynamoDB, Memcached client lib đều dùng pattern này.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">Anycast routing:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cùng tên, IP khác mỗi region\">Cùng tên, IP khác mỗi region</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cùng IP công khai announce từ nhiều địa điểm qua BGP, Internet tự route đến nơi gần nhất; failover dưới giây\">Cùng IP công khai announce từ nhiều địa điểm qua BGP, Internet tự route đến nơi gần nhất; failover dưới giây</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Multi-cast UDP\">Multi-cast UDP</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: VPN\">VPN</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Cloudflare, Google DNS (8.8.8.8), AWS Global Accelerator dùng Anycast. Một IP, nhiều POP. Khi 1 POP down, BGP withdraw route, traffic flow đến POP khác — không cần thay đổi DNS, không có TTL lag.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Cascading failure trong LB cluster:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: LB chậm\">LB chậm</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Sticky session crash\">Sticky session crash</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: DNS sai\">DNS sai</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: 1 server unhealthy → traffic chuyển sang server còn lại → quá tải → cũng unhealthy → toàn cụm chết. Phòng tránh: capacity dư, circuit breaker, slow start\">1 server unhealthy → traffic chuyển sang server còn lại → quá tải → cũng unhealthy → toàn cụm chết. Phòng tránh: capacity dư, circuit breaker, slow start</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Cluster 3 node 60% utilization. 1 node chết → traffic 60% × 1.5 = 90% mỗi node còn lại. Spike đơn giản → quá tải, crash dây chuyền. Vận hành dưới 80% capacity, slow start cho server mới recover, circuit breaker cắt traffic problem service.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">Reverse Proxy vs Load Balancer:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: LB phân tải nhiều backend; Reverse Proxy đứng trước backend (có thể 1) làm caching/SSL/security; nginx/Envoy làm cả 2\">LB phân tải nhiều backend; Reverse Proxy đứng trước backend (có thể 1) làm caching/SSL/security; nginx/Envoy làm cả 2</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Hai cái giống hệt\">Hai cái giống hệt</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Reverse Proxy chỉ cho web\">Reverse Proxy chỉ cho web</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: LB không có SSL\">LB không có SSL</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">LB cần ≥ 2 backend, focus distribute. Reverse Proxy có thể 1 backend, focus caching/SSL/security/compression/header modification. Trong thực tế, nginx/Envoy đảm nhiệm cả 2 vai trò trong 1 instance.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 2. Tiếp theo: <a href=\"/learn/system-design/chapter-03/\"><strong>Chương 3 — Caching Strategies →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Load Balancer là gì?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "1.1. Vị trí trong kiến trúc",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "2. L4 vs L7 — hai tầng phân tải",
+      "depth": 2
+    },
+    {
+      "id": "section-4",
+      "text": "2.1. Có thể dùng cả hai",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "2.2. SSL termination",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "3. Thuật toán phân tải",
+      "depth": 2
+    },
+    {
+      "id": "section-7",
+      "text": "3.1. Round Robin",
+      "depth": 3
+    },
+    {
+      "id": "section-8",
+      "text": "3.2. Weighted Round Robin",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "3.3. Least Connections",
+      "depth": 3
+    },
+    {
+      "id": "section-10",
+      "text": "3.4. Least Response Time",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "3.5. IP Hash / Source IP Hashing",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "3.6. Consistent Hashing",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "3.7. Random + Power of Two Choices",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "3.8. So sánh thuật toán",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "4. Health Check — phát hiện server chết",
+      "depth": 2
+    },
+    {
+      "id": "section-16",
+      "text": "4.1. Active vs Passive",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "4.2. Endpoint /health design",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "4.3. Threshold",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "4.4. Cascading failure",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "5. Sticky Session",
+      "depth": 2
+    },
+    {
+      "id": "section-21",
+      "text": "5.1. Cách triển khai",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "5.2. Khi nào cần?",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "5.3. Vấn đề sticky session",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "6. Reverse Proxy vs Load Balancer",
+      "depth": 2
+    },
+    {
+      "id": "section-25",
+      "text": "6.1. Forward Proxy vs Reverse Proxy",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "7. nginx, HAProxy, Envoy — công cụ phổ biến",
+      "depth": 2
+    },
+    {
+      "id": "section-27",
+      "text": "7.1. nginx",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "7.2. HAProxy",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "7.3. Envoy / Istio",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "7.4. Cloud LB",
+      "depth": 3
+    },
+    {
+      "id": "section-31",
+      "text": "8. Global Load Balancing",
+      "depth": 2
+    },
+    {
+      "id": "section-32",
+      "text": "8.1. DNS-based",
+      "depth": 3
+    },
+    {
+      "id": "section-33",
+      "text": "8.2. Anycast",
+      "depth": 3
+    },
+    {
+      "id": "section-34",
+      "text": "8.3. CDN — Global LB cho static",
+      "depth": 3
+    },
+    {
+      "id": "section-35",
+      "text": "9. Patterns thực tế",
+      "depth": 2
+    },
+    {
+      "id": "section-36",
+      "text": "9.1. Multi-tier LB",
+      "depth": 3
+    },
+    {
+      "id": "section-37",
+      "text": "9.2. Blue-Green Deployment",
+      "depth": 3
+    },
+    {
+      "id": "section-38",
+      "text": "9.3. Canary Deployment",
+      "depth": 3
+    },
+    {
+      "id": "section-39",
+      "text": "9.4. A/B Testing",
+      "depth": 3
+    },
+    {
+      "id": "section-40",
+      "text": "9.5. Geographic routing với fallback",
+      "depth": 3
+    },
+    {
+      "id": "section-41",
+      "text": "10. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-42",
+      "text": "11. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-43",
+      "text": "Quiz cuối Chương 2",
+      "depth": 3
+    }
+  ],
+  "source": "SystemDesign/chuong/chuong2.html",
+  "sourceHash": "c20bfa1bbf3daa46e70b4545cf7cb8765763d115551e0868edd46728c51e0671",
+  "readingMinutes": 12
+}

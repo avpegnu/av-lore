@@ -1,0 +1,180 @@
+{
+  "id": "database--chapter-09",
+  "track": "database",
+  "trackTitle": "Database Engineering",
+  "slug": "chapter-09",
+  "order": 9,
+  "title": "NoSQL — KV, Document, Wide-column, Graph",
+  "description": "CAP/PACELC, BASE vs ACID, eventual consistency. 4 họ NoSQL với DB tiêu biểu (Redis, MongoDB, Cassandra, Neo4j) và khi nào chọn cái nào.",
+  "html": "\n\n      <section id=\"why\">\n        <h2 id=\"section-1\">1. Vì sao có NoSQL?</h2>\n        <p>Đầu thế kỷ 21, Google, Amazon, Facebook gặp vấn đề: dữ liệu lên hàng petabyte, request hàng triệu/giây — RDBMS truyền thống <em>không scale ngang được</em> vì:</p>\n        <ul>\n          <li>JOIN tốn nhiều round-trip cross-node.</li>\n          <li>Distributed transaction (2PC) cực chậm và dễ kẹt.</li>\n          <li>Schema rigid, hard to migrate trên cluster lớn.</li>\n        </ul>\n\n        <p>2 paper huyền thoại đặt nền móng NoSQL:</p>\n        <ul>\n          <li><strong>Google Bigtable (2006)</strong> — sparse distributed map, column-family. Tổ tiên Cassandra, HBase.</li>\n          <li><strong>Amazon Dynamo (2007)</strong> — eventual consistency, consistent hashing, vector clock. Tổ tiên DynamoDB, Cassandra, Riak.</li>\n        </ul>\n\n        <p>NoSQL không phải \"không SQL\" — mà là \"Not Only SQL\". Hy sinh một số tính chất ACID/JOIN đổi lấy <strong>scale ngang</strong> và <strong>linh hoạt schema</strong>.</p>\n\n        <h3 id=\"section-2\">1.1. Bài học sau 15 năm hype</h3>\n        <p>Hiện tại (2026), nhiều dự án quay lại Postgres làm \"default\", chỉ dùng NoSQL cho các use case cụ thể: cache (Redis), search (Elasticsearch), time-series (Prometheus), log (ClickHouse). Đừng theo trend, theo workload.</p>\n      </section>\n\n      <section id=\"cap\">\n        <h2 id=\"section-3\">2. CAP Theorem &amp; PACELC</h2>\n        <p>Eric Brewer (2000): trong hệ phân tán, khi xảy ra <strong>Network Partition (P)</strong>, bạn buộc phải hy sinh hoặc <strong>Consistency (C)</strong> hoặc <strong>Availability (A)</strong>.</p>\n\n        <ul>\n          <li><strong>C</strong> — mọi node trả về cùng dữ liệu mới nhất (linearizability).</li>\n          <li><strong>A</strong> — mọi request đều nhận response (không lỗi, không timeout).</li>\n          <li><strong>P</strong> — hệ vẫn hoạt động khi network giữa các node bị đứt.</li>\n        </ul>\n\n        <div class=\"ascii\">  Khi network partition xảy ra:\n\n  ┌──────────────┐         ┌──────────────┐\n  │  Node A      │   ╳╳╳   │  Node B      │\n  │  (data v1)   │ &lt;-----&gt;  │  (data v1)   │\n  └──────────────┘         └──────────────┘\n        │                          │\n   client ghi v2                  client đọc\n\n  CHỌN 1:\n  CP (Consistency): Node B từ chối phục vụ vì không chắc data mới nhất → mất A\n  AP (Availability): Node B vẫn trả v1 (có thể stale) → mất C</div>\n\n        <h3 id=\"section-4\">2.1. CAP nhầm lẫn phổ biến</h3>\n        <p>\"Postgres là CA\" — SAI. Postgres single-node không phải hệ phân tán, không có P xảy ra. CAP chỉ áp dụng <em>khi P xảy ra</em>.</p>\n\n        <h3 id=\"section-5\">2.2. PACELC — bổ sung của Daniel Abadi</h3>\n        <p>PACELC = \"If Partition, A or C; Else Latency or Consistency\".</p>\n        <p>Ngay cả khi không partition, bạn vẫn phải đánh đổi giữa <strong>latency</strong> (trả nhanh từ replica gần) và <strong>consistency</strong> (chờ leader xác nhận).</p>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>System</th><th>Khi P</th><th>Khi không P</th></tr></thead>\n          <tbody>\n            <tr><td>Postgres (single)</td><td>—</td><td>EC (consistency over latency)</td></tr>\n            <tr><td>MongoDB (replica set)</td><td>PC</td><td>EC (đọc từ primary)</td></tr>\n            <tr><td>Cassandra</td><td>PA</td><td>EL (đọc replica gần)</td></tr>\n            <tr><td>DynamoDB</td><td>PA</td><td>EL (default)</td></tr>\n            <tr><td>Spanner</td><td>PC</td><td>EC</td></tr>\n          </tbody>\n        </table></div>\n      </section>\n\n      <section id=\"base\">\n        <h2 id=\"section-6\">3. BASE — đối lập của ACID</h2>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>ACID</th><th>BASE</th></tr></thead>\n          <tbody>\n            <tr><td><strong>A</strong>tomicity</td><td><strong>B</strong>asically Available — luôn có response (có thể stale)</td></tr>\n            <tr><td><strong>C</strong>onsistency</td><td><strong>S</strong>oft state — state có thể đổi do background sync</td></tr>\n            <tr><td><strong>I</strong>solation</td><td><strong>E</strong>ventual consistency — sẽ nhất quán cuối cùng</td></tr>\n            <tr><td><strong>D</strong>urability</td><td>—</td></tr>\n          </tbody>\n        </table></div>\n\n        <p>BASE phù hợp với:</p>\n        <ul>\n          <li>Mạng xã hội — like, comment count delay vài giây OK.</li>\n          <li>IoT data, log, analytics — eventual aggregation.</li>\n          <li>Catalog browsing — view sản phẩm có thể stale 1s.</li>\n        </ul>\n\n        <p>KHÔNG phù hợp:</p>\n        <ul>\n          <li>Tài chính — chuyển tiền phải atomic.</li>\n          <li>Booking — không thể bán 2 vé cho 1 ghế.</li>\n          <li>Inventory hot — không thể \"cuối cùng đồng bộ\" khi chỉ còn 1 item.</li>\n        </ul>\n      </section>\n\n      <section id=\"eventual\">\n        <h2 id=\"section-7\">4. Eventual Consistency — các mức</h2>\n\n        <ul>\n          <li><strong>Strong</strong> — sau write, mọi read tiếp theo (any node) thấy giá trị mới. Cao nhất, chậm nhất.</li>\n          <li><strong>Read-your-writes</strong> — user thấy chính ghi của mình ngay lập tức (qua sticky session hoặc primary read).</li>\n          <li><strong>Monotonic reads</strong> — không bao giờ \"lùi thời gian\" — đã thấy v2, không thấy lại v1.</li>\n          <li><strong>Causal</strong> — quan hệ nhân quả được preserve (B trả lời A → mọi ai thấy B cũng thấy A).</li>\n          <li><strong>Eventual</strong> — cuối cùng (sau finite delay) tất cả replica giống nhau.</li>\n        </ul>\n\n        <h3 id=\"section-8\">4.1. Quorum read/write</h3>\n        <p>Hệ Dynamo-style cho phép tune R + W trong N replica:</p>\n        <ul>\n          <li><strong>R + W &gt; N</strong> — strong consistency (read overlap với write).</li>\n          <li><strong>R = 1, W = N</strong> — fast read, slow write.</li>\n          <li><strong>R = N, W = 1</strong> — fast write, slow read.</li>\n          <li><strong>R + W ≤ N</strong> — eventual consistency.</li>\n        </ul>\n\n        <p>Ví dụ N=3, R=W=2 → strong (R+W=4 &gt; N=3). Đa số production Cassandra dùng config này.</p>\n      </section>\n\n      <section id=\"kv\">\n        <h2 id=\"section-9\">5. Key-Value Store — Redis là vua</h2>\n\n        <p>Mô hình đơn giản nhất: <code>SET key value</code> / <code>GET key</code>. Hash table phân tán.</p>\n\n        <h3 id=\"section-10\">5.1. Đại diện</h3>\n        <ul>\n          <li><strong>Redis</strong> — in-memory, single-thread, latency &lt;1ms.</li>\n          <li><strong>Memcached</strong> — in-memory đơn giản, multi-thread.</li>\n          <li><strong>DynamoDB</strong> — managed, auto-scale, serverless pay-per-request.</li>\n          <li><strong>Riak</strong> — Dynamo-style, tunable consistency.</li>\n        </ul>\n\n        <h3 id=\"section-11\">5.2. Redis — không chỉ KV</h3>\n        <p>Redis hỗ trợ nhiều data structure phức tạp:</p>\n\n<pre><code class=\"language-bash\"># String\nSET user:1:email \"a@x.com\"\nGET user:1:email\nINCR user:1:visits          # atomic counter\n\n# Hash (object)\nHSET user:1 email \"a@x.com\" name \"Alice\" age 30\nHGETALL user:1\nHINCRBY user:1 age 1\n\n# List (queue/stack)\nLPUSH queue:jobs \"job-data\"\nRPOP  queue:jobs            # FIFO\nBLPOP queue:jobs 5          # block 5s\n\n# Set\nSADD friends:1 5 6 7\nSINTER friends:1 friends:2  # bạn chung\n\n# Sorted Set (leaderboard)\nZADD leaderboard 1500 user1 1200 user2 1800 user3\nZREVRANGE leaderboard 0 9 WITHSCORES   # top 10\n\n# Stream (log)\nXADD events * type click user 5\nXREAD STREAMS events $       # tail\n\n# Pub/Sub\nSUBSCRIBE channel:news\nPUBLISH channel:news \"hello\"\n\n# TTL\nSET session:abc \"userid:5\" EX 3600   # tự xóa sau 1h\nEXPIRE session:abc 7200</code></pre>\n\n        <h3 id=\"section-12\">5.3. Use cases</h3>\n        <ul>\n          <li>Session store (web).</li>\n          <li>Cache (cache-aside, write-through).</li>\n          <li>Rate limiter (sliding window qua Sorted Set).</li>\n          <li>Leaderboard / ranking (Sorted Set).</li>\n          <li>Job queue đơn giản (List + BLPOP).</li>\n          <li>Real-time notifications (Pub/Sub, Streams).</li>\n          <li>Geo (GEO commands).</li>\n        </ul>\n\n        <h3 id=\"section-13\">5.4. Persistence</h3>\n        <p>Redis có 2 chế độ:</p>\n        <ul>\n          <li><strong>RDB snapshot</strong> — dump RAM ra disk định kỳ. Có thể mất N giây cuối nếu crash.</li>\n          <li><strong>AOF (Append-Only File)</strong> — ghi mỗi lệnh write vào log. An toàn hơn nhưng chậm hơn.</li>\n        </ul>\n        <p>Production thường bật cả hai.</p>\n      </section>\n\n      <section id=\"doc\">\n        <h2 id=\"section-14\">6. Document — MongoDB</h2>\n        <p>Lưu document JSON/BSON. Mỗi document có thể có schema khác nhau (schemaless).</p>\n\n<pre><code class=\"language-javascript\">// MongoDB document\n{\n  _id: ObjectId(\"...\"),\n  email: \"alice@x.com\",\n  name: \"Alice\",\n  addresses: [\n    { type: \"home\",    city: \"HCM\", street: \"...\" },\n    { type: \"office\",  city: \"HN\",  street: \"...\" }\n  ],\n  preferences: {\n    theme: \"dark\",\n    notifications: { email: true, push: false }\n  },\n  tags: [\"vip\", \"early-adopter\"]\n}</code></pre>\n\n        <h3 id=\"section-15\">6.1. Cú pháp cơ bản</h3>\n<pre><code class=\"language-javascript\">// Insert\ndb.users.insertOne({ email: \"a@x\", name: \"Alice\" });\ndb.users.insertMany([...]);\n\n// Find\ndb.users.find({ email: \"a@x\" });\ndb.users.find({ age: { $gt: 18 } });\ndb.users.find({ \"addresses.city\": \"HCM\" });   // dot notation\n\n// Update\ndb.users.updateOne(\n  { _id: ... },\n  { $set: { name: \"Alice S\" }, $inc: { visits: 1 } }\n);\ndb.users.updateOne(\n  { _id: ... },\n  { $push: { tags: \"premium\" } }\n);\n\n// Aggregate (pipeline)\ndb.orders.aggregate([\n  { $match: { status: \"paid\" } },\n  { $group: { _id: \"$user_id\", total: { $sum: \"$amount\" } } },\n  { $sort: { total: -1 } },\n  { $limit: 10 }\n]);\n\n// Index\ndb.users.createIndex({ email: 1 });\ndb.users.createIndex({ \"addresses.city\": 1 });\ndb.users.createIndex({ name: \"text\" });        // full-text</code></pre>\n\n        <h3 id=\"section-16\">6.2. Khi nào dùng MongoDB tốt?</h3>\n        <ul>\n          <li>Dữ liệu có cấu trúc nested phức tạp, schema thay đổi nhanh.</li>\n          <li>Document tự chứa (1 record = 1 doc, ít cần JOIN).</li>\n          <li>Workload write-heavy, scale ngang.</li>\n          <li>Catalog, content management, IoT.</li>\n        </ul>\n\n        <h3 id=\"section-17\">6.3. MongoDB pitfalls</h3>\n        <ul>\n          <li>JOIN qua <code>$lookup</code> chậm hơn nhiều SQL JOIN.</li>\n          <li>Multi-document transaction từ 4.0 mới có, có overhead.</li>\n          <li>Schema \"linh hoạt\" → app code phải tự validate. Dễ data lệch.</li>\n          <li>16MB document size limit.</li>\n        </ul>\n\n        <p>Postgres + cột JSONB <strong>thường thay thế được MongoDB</strong> với phần lớn use case, mà có thêm SQL + ACID.</p>\n      </section>\n\n      <section id=\"wide\">\n        <h2 id=\"section-18\">7. Wide-column — Cassandra &amp; Bigtable</h2>\n        <p>Mô hình: hàng tỉ row × hàng triệu cột (sparse). Mỗi row có thể có cột khác nhau. Tối ưu cho <strong>write throughput</strong> cực cao.</p>\n\n        <h3 id=\"section-19\">7.1. Cassandra cơ bản</h3>\n<pre><code class=\"language-sql\">-- CQL (Cassandra Query Language) — giống SQL nhưng hạn chế:\nCREATE KEYSPACE shop WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};\n\nCREATE TABLE orders (\n  user_id UUID,\n  order_id TIMEUUID,\n  total decimal,\n  status text,\n  PRIMARY KEY (user_id, order_id)    -- partition_key, clustering_key\n) WITH CLUSTERING ORDER BY (order_id DESC);\n\nINSERT INTO orders (user_id, order_id, total, status)\nVALUES (..., now(), 100.00, 'paid');\n\nSELECT * FROM orders WHERE user_id = ? LIMIT 20;\n-- ❌ Không có WHERE on non-PK cột (không có index thông thường)\n-- ❌ Không có JOIN\n-- ❌ Không có IN trên partition key</code></pre>\n\n        <h3 id=\"section-20\">7.2. Đặc điểm</h3>\n        <ul>\n          <li><strong>Partition key</strong> quyết định node nào lưu row → mọi query nóng phải có partition key.</li>\n          <li><strong>Clustering key</strong> sắp xếp trong partition.</li>\n          <li>Schema \"thiết kế quanh query\" — không phải quanh entity (như SQL).</li>\n          <li>Hỗ trợ scale từ 3 đến 1000+ node, replica đa data-center.</li>\n          <li>Tunable consistency: ONE / QUORUM / ALL.</li>\n        </ul>\n\n        <h3 id=\"section-21\">7.3. Use cases</h3>\n        <ul>\n          <li>Time-series: log, metrics, sensor data.</li>\n          <li>Activity feed (Twitter user timeline lưu trong Cassandra).</li>\n          <li>Messaging (Discord chat history dùng Cassandra/ScyllaDB).</li>\n          <li>Multi-region với latency thấp.</li>\n        </ul>\n\n        <h3 id=\"section-22\">7.4. Bigtable / HBase</h3>\n        <p>Tương tự Cassandra nhưng strong consistency (CP). Dùng nội bộ Google (Search index, Maps), GCP exposed như Bigtable.</p>\n\n        <h3 id=\"section-23\">7.5. ScyllaDB</h3>\n        <p>Cassandra-compatible, viết bằng C++ (thay Java) → 10× throughput. Đang được nhiều team migrate sang.</p>\n      </section>\n\n      <section id=\"graph\">\n        <h2 id=\"section-24\">8. Graph DB — Neo4j</h2>\n        <p>Lưu nodes + edges (quan hệ). Tối ưu cho truy vấn quan hệ <strong>nhiều hop</strong>.</p>\n\n        <h3 id=\"section-25\">8.1. Cypher query language</h3>\n<pre><code class=\"language-cypher\">// Tạo\nCREATE (alice:User {name:'Alice', age:30})\nCREATE (bob:User {name:'Bob', age:28})\nCREATE (alice)-[:FOLLOWS]-&gt;(bob)\n\n// Truy vấn: bạn của bạn (2 hop)\nMATCH (me:User {name:'Alice'})-[:FOLLOWS]-&gt;(friend)-[:FOLLOWS]-&gt;(fof)\nWHERE NOT (me)-[:FOLLOWS]-&gt;(fof) AND me &lt;&gt; fof\nRETURN fof.name, COUNT(friend) AS mutuals\nORDER BY mutuals DESC LIMIT 10\n\n// Đường ngắn nhất:\nMATCH p = shortestPath((a:User {name:'Alice'})-[:FOLLOWS*]-(b:User {name:'Zoe'}))\nRETURN p</code></pre>\n\n        <h3 id=\"section-26\">8.2. Use cases</h3>\n        <ul>\n          <li>Social network — bạn của bạn, recommendation.</li>\n          <li>Fraud detection — phát hiện chuỗi giao dịch bất thường.</li>\n          <li>Knowledge graph — Wikipedia, Wolfram Alpha.</li>\n          <li>Network/dependency analysis.</li>\n        </ul>\n\n        <h3 id=\"section-27\">8.3. Vì sao SQL không đủ?</h3>\n        <p>Truy vấn 5-hop trong SQL = 5 self-JOIN. Trên 1 tỉ row, cực chậm. Graph DB lưu edges adjacent → traversal O(neighbors), không O(table-size).</p>\n\n        <h3 id=\"section-28\">8.4. Đại diện khác</h3>\n        <ul>\n          <li>Amazon Neptune — managed graph (Gremlin, SPARQL).</li>\n          <li>Dgraph — distributed, GraphQL native.</li>\n          <li>JanusGraph — open-source, dùng HBase/Cassandra làm storage.</li>\n          <li>Postgres + extension <code>ltree</code> / Apache AGE — Cypher trong Postgres.</li>\n        </ul>\n      </section>\n\n      <section id=\"newsql\">\n        <h2 id=\"section-29\">9. NewSQL — vừa SQL vừa Distributed</h2>\n        <p>\"Có cách nào của cả 2 thế giới không?\" — đáp: NewSQL.</p>\n        <ul>\n          <li><strong>Google Spanner</strong> — globally distributed SQL với strong consistency. Dùng TrueTime (atomic clocks + GPS) đảm bảo external consistency.</li>\n          <li><strong>CockroachDB</strong> — Spanner-inspired open-source. Postgres-compatible.</li>\n          <li><strong>YugabyteDB</strong> — Postgres-compatible distributed. Có cả KV layer (DocDB).</li>\n          <li><strong>TiDB</strong> — MySQL-compatible distributed.</li>\n        </ul>\n\n        <p>Đánh đổi: latency cao hơn single-node Postgres do phải consensus (Raft/Paxos). Dùng khi cần multi-region SQL với strong consistency.</p>\n      </section>\n\n      <section id=\"choose\">\n        <h2 id=\"section-30\">10. Khi nào chọn cái nào?</h2>\n\n        <div class=\"table-scroll\"><table>\n          <thead><tr><th>Tình huống</th><th>Chọn</th></tr></thead>\n          <tbody>\n            <tr><td>App CRUD bình thường, cần JOIN, ACID</td><td>Postgres / MySQL</td></tr>\n            <tr><td>Cache, session, rate limit, leaderboard</td><td>Redis</td></tr>\n            <tr><td>Schema nested phức tạp, schema-flex</td><td>MongoDB hoặc Postgres + JSONB</td></tr>\n            <tr><td>Time-series, log, IoT, write-heavy &gt; 100k/s</td><td>Cassandra / ScyllaDB / TimescaleDB</td></tr>\n            <tr><td>Full-text search</td><td>Elasticsearch / Postgres tsvector + GIN</td></tr>\n            <tr><td>Quan hệ nhiều hop (friends-of-friends, fraud)</td><td>Neo4j / Postgres + AGE</td></tr>\n            <tr><td>Multi-region SQL với strong consistency</td><td>Spanner / CockroachDB</td></tr>\n            <tr><td>Analytics OLAP (TB-PB scan)</td><td>BigQuery / Snowflake / ClickHouse</td></tr>\n            <tr><td>AI embeddings vector search</td><td>Pinecone / pgvector / Weaviate</td></tr>\n            <tr><td>Object storage, file lớn</td><td>S3 / GCS / Azure Blob — KHÔNG DB</td></tr>\n          </tbody>\n        </table></div>\n\n        <div class=\"callout callout-tip\">\n          <span class=\"callout-title\">Quy tắc thực dụng (2026)</span>\n          <strong>Default: Postgres.</strong> Nó làm được 95% case (kể cả JSONB, full-text, geometry, time-series qua TimescaleDB extension). Khi profiling chỉ ra Postgres không đủ cho 1 use case cụ thể, bổ sung đúng tool cho use case đó (Redis cache, Elasticsearch search, ClickHouse analytics) — KHÔNG thay thế Postgres bằng MongoDB toàn cục.\n        </div>\n      </section>\n\n      <section id=\"exercises\">\n        <h2 id=\"section-31\">11. Bài tập</h2>\n\n        <ol>\n          <li>Cài Redis local. Implement rate limiter \"10 request/phút mỗi user\" qua Sorted Set + ZADD/ZREMRANGEBYSCORE.</li>\n          <li>Cài MongoDB. Tạo collection products với nested categories, viết aggregate query top-10 sản phẩm bán chạy mỗi category.</li>\n          <li>Phân tích: Twitter timeline nên dùng DB nào? (Postgres cho user/profile, Redis cache, Cassandra cho timeline storage). Vì sao?</li>\n          <li>Trình bày CAP cho 3 hệ: Postgres single, MongoDB replica, Cassandra. Khi network partition, mỗi hệ ưu tiên gì?</li>\n          <li>Khi nào BẠN sẽ dùng Graph DB thay vì Postgres recursive CTE?</li>\n          <li>So sánh Postgres JSONB vs MongoDB document. Khi nào nên chọn cái nào?</li>\n        </ol>\n      </section>\n\n      <section id=\"quiz\">\n        <h2 id=\"section-32\">12. Quiz</h2>\n        <div class=\"quiz\">\n          <h3 id=\"section-33\">Quiz cuối Chương 9</h3>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">CAP theorem nói:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Hệ phân tán không thể có cả 3: C, A, P\">Hệ phân tán không thể có cả 3: C, A, P</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Khi P xảy ra, phải hy sinh hoặc C hoặc A\">Khi P xảy ra, phải hy sinh hoặc C hoặc A</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: P là tùy chọn\">P là tùy chọn</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Mọi DB đều CP\">Mọi DB đều CP</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">CAP chính xác: khi network partition xảy ra (P), không thể đồng thời có cả C và A. P trong thực tế là bắt buộc — network sẽ partition. Vì vậy thực ra phải chọn CP hoặc AP. Lúc không partition, cả hai có thể có C+A.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Cassandra là hệ:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: CP (sacrifice availability)\">CP (sacrifice availability)</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: CA (no partition)\">CA (no partition)</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: AP (eventual consistency, ưu tiên availability)\">AP (eventual consistency, ưu tiên availability)</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không phân tán\">Không phân tán</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Cassandra Dynamo-style — khi partition, mỗi node vẫn phục vụ bằng dữ liệu local (có thể stale). Eventual consistency. Tunable: dùng QUORUM read+write có thể đạt strong tạm thời khi không partition, nhưng default AP.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">Redis Sorted Set phù hợp nhất với:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cache LRU\">Cache LRU</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Distributed lock\">Distributed lock</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Session\">Session</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Leaderboard / rate limiter sliding window\">Leaderboard / rate limiter sliding window</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Sorted Set có score → lookup top-N theo score O(log N). Pattern leaderboard kinh điển. Rate limiter cũng dùng score = timestamp, ZREMRANGEBYSCORE xóa expired entries.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">MongoDB đặc biệt phù hợp khi:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Schema document nested phức tạp, ít cần JOIN cross-collection\">Schema document nested phức tạp, ít cần JOIN cross-collection</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Tài chính cần ACID mạnh\">Tài chính cần ACID mạnh</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Báo cáo BI\">Báo cáo BI</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Cache\">Cache</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">MongoDB tốt khi document tự chứa (1 doc = 1 record đầy đủ), schema động, ít JOIN. JOIN qua $lookup chậm. Nếu data quan hệ phức tạp → SQL tốt hơn. Cache → Redis. Tài chính → SQL ACID.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n            <p class=\"q-text\">Graph DB so với SQL recursive CTE:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Luôn nhanh hơn\">Luôn nhanh hơn</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Luôn chậm hơn\">Luôn chậm hơn</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Nhanh hơn nhiều khi traversal sâu (5+ hop) trên đồ thị lớn; tương đương khi 1-2 hop\">Nhanh hơn nhiều khi traversal sâu (5+ hop) trên đồ thị lớn; tương đương khi 1-2 hop</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không khác\">Không khác</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Graph DB lưu adjacency list trực tiếp → traversal O(neighbors), không O(rows). 1-2 hop SQL recursive CTE đủ. 5+ hop trên đồ thị triệu nodes — Graph DB nhanh hơn 100-1000×.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n            <p class=\"q-text\">N=3 replica, R=2, W=2 → consistency:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Eventual\">Eventual</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Strong (R+W=4 > N=3, read overlap với write)\">Strong (R+W=4 &gt; N=3, read overlap với write)</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Weak\">Weak</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không xác định\">Không xác định</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Nếu R+W &gt; N, tập read và tập write phải overlap ít nhất 1 node → đảm bảo read nhìn thấy ghi gần nhất → strong consistency. Cassandra QUORUM = (RF/2) + 1 = 2 với RF=3.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"3\" data-quiz-correct=\"3\">\n            <p class=\"q-text\">\"Default: Postgres\" trong 2026 nghĩa là:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Postgres giải quyết mọi vấn đề\">Postgres giải quyết mọi vấn đề</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: NoSQL đã chết\">NoSQL đã chết</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Không cần MongoDB nữa\">Không cần MongoDB nữa</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Bắt đầu mọi dự án bằng Postgres; thêm Redis/ES/Cassandra cho use case cụ thể khi profiling cần\">Bắt đầu mọi dự án bằng Postgres; thêm Redis/ES/Cassandra cho use case cụ thể khi profiling cần</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">Postgres làm được 95% case. JSONB thay MongoDB, tsvector+GIN thay Elasticsearch nhẹ, partitioning thay Cassandra cho scale vừa, pgvector thay Pinecone. Không có \"1 DB cho tất cả\" — nhưng \"Postgres trước, NoSQL sau\" tránh over-engineer.</div>\n          </div>\n\n          <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n            <p class=\"q-text\">CockroachDB / Spanner thuộc loại:</p>\n            <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n              <li class=\"quiz-option\" data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: NewSQL — distributed + SQL + ACID\">NewSQL — distributed + SQL + ACID</li>\n              <li class=\"quiz-option\" data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Document DB\">Document DB</li>\n              <li class=\"quiz-option\" data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Wide-column\">Wide-column</li>\n              <li class=\"quiz-option\" data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Graph DB\">Graph DB</li>\n            </ul>\n            <div class=\"quiz-explain\" hidden=\"\">NewSQL = nhánh mới: scale ngang như NoSQL, đảm bảo ACID + SQL như RDBMS. Đánh đổi: latency cao hơn single-node do consensus. Dùng cho multi-region SQL strong consistency.</div>\n          </div>\n\n        </div>\n      </section>\n\n      <p>\n        Hoàn thành Chương 9. Tiếp theo: <a href=\"/learn/database/chapter-10/\"><strong>Chương 10 — Replication &amp; Sharding →</strong></a>\n      </p>\n\n    ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "1. Vì sao có NoSQL?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "1.1. Bài học sau 15 năm hype",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "2. CAP Theorem & PACELC",
+      "depth": 2
+    },
+    {
+      "id": "section-4",
+      "text": "2.1. CAP nhầm lẫn phổ biến",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "2.2. PACELC — bổ sung của Daniel Abadi",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "3. BASE — đối lập của ACID",
+      "depth": 2
+    },
+    {
+      "id": "section-7",
+      "text": "4. Eventual Consistency — các mức",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "4.1. Quorum read/write",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "5. Key-Value Store — Redis là vua",
+      "depth": 2
+    },
+    {
+      "id": "section-10",
+      "text": "5.1. Đại diện",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "5.2. Redis — không chỉ KV",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "5.3. Use cases",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "5.4. Persistence",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "6. Document — MongoDB",
+      "depth": 2
+    },
+    {
+      "id": "section-15",
+      "text": "6.1. Cú pháp cơ bản",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "6.2. Khi nào dùng MongoDB tốt?",
+      "depth": 3
+    },
+    {
+      "id": "section-17",
+      "text": "6.3. MongoDB pitfalls",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "7. Wide-column — Cassandra & Bigtable",
+      "depth": 2
+    },
+    {
+      "id": "section-19",
+      "text": "7.1. Cassandra cơ bản",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "7.2. Đặc điểm",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "7.3. Use cases",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "7.4. Bigtable / HBase",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "7.5. ScyllaDB",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "8. Graph DB — Neo4j",
+      "depth": 2
+    },
+    {
+      "id": "section-25",
+      "text": "8.1. Cypher query language",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "8.2. Use cases",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "8.3. Vì sao SQL không đủ?",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "8.4. Đại diện khác",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "9. NewSQL — vừa SQL vừa Distributed",
+      "depth": 2
+    },
+    {
+      "id": "section-30",
+      "text": "10. Khi nào chọn cái nào?",
+      "depth": 2
+    },
+    {
+      "id": "section-31",
+      "text": "11. Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-32",
+      "text": "12. Quiz",
+      "depth": 2
+    },
+    {
+      "id": "section-33",
+      "text": "Quiz cuối Chương 9",
+      "depth": 3
+    }
+  ],
+  "source": "Database/chuong/chuong9.html",
+  "sourceHash": "20bf31a3a52ae3d90bc97cba7a09c25252c1e7c5f673e99223cf814a9927ec3f",
+  "readingMinutes": 11
+}

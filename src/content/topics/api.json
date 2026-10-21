@@ -1,0 +1,175 @@
+{
+  "id": "api",
+  "title": "API, realtime & webhook",
+  "group": "03 · Backend & API",
+  "description": "Thiết kế hợp đồng dễ dùng, an toàn khi retry và tương thích khi thay đổi.",
+  "sources": [
+    {
+      "title": "HTTP semantics RFC 9110",
+      "url": "https://www.rfc-editor.org/rfc/rfc9110.html"
+    },
+    {
+      "title": "OpenAPI",
+      "url": "https://spec.openapis.org/oas/latest.html"
+    }
+  ],
+  "imageRefs": [
+    "A04",
+    "D04",
+    "D12",
+    "F04",
+    "F16"
+  ],
+  "prerequisites": [
+    "backend",
+    "network"
+  ],
+  "notes": [
+    {
+      "id": "contract",
+      "title": "Resource, hợp đồng và versioning",
+      "body": [
+        "Thiết kế API bắt đầu từ use case, tài nguyên, quyền, input/output và lỗi. Dùng đường dẫn/method nhất quán, không biến mọi thao tác thành GET. REST là architectural style, không đồng nghĩa chỉ JSON CRUD. GraphQL cho client chọn dữ liệu nhưng cần giới hạn query; gRPC dùng hợp đồng/service và phù hợp nhiều giao tiếp nội bộ.",
+        "OpenAPI mô tả hợp đồng để review, tạo client và test. Thêm field thường dễ tương thích hơn đổi kiểu/xóa field; phải xét client có parse chặt hay không."
+      ],
+      "example": "GET /orders?status=paid&limit=20\nPOST /orders\nGET /orders/{id}\n# Response cần quy ước time zone, tiền tệ và nullable fields.",
+      "pitfall": "",
+      "exercise": "Thiết kế API hủy đơn có điều kiện trạng thái và response khi đơn đã giao."
+    },
+    {
+      "id": "pagination",
+      "title": "Pagination, filtering và thứ tự ổn định",
+      "body": [
+        "Offset dễ triển khai và nhảy trang nhưng offset lớn có thể tốn chi phí; dữ liệu thay đổi khiến trùng/bỏ sót giữa trang. Cursor dựa trên vị trí theo sort key, cần tie-breaker ổn định như (created_at, id). Cursor nên opaque ở hợp đồng client, có validation và không phải bằng chứng được quyền đọc."
+      ],
+      "example": "SELECT id, created_at FROM orders\nWHERE (created_at, id) < ($1, $2)\nORDER BY created_at DESC, id DESC\nLIMIT 20; -- PostgreSQL, cursor theo cặp khóa",
+      "pitfall": "ORDER BY created_at đơn lẻ không ổn định khi nhiều hàng trùng timestamp.",
+      "exercise": "Thiết kế cursor cho danh sách có lọc theo tenant và status."
+    },
+    {
+      "id": "idempotency",
+      "title": "Idempotency key và chống xử lý trùng",
+      "body": [
+        "POST quan trọng như thanh toán cần một key đại diện một ý định nghiệp vụ. Server lưu key cùng fingerprint input, trạng thái và kết quả trong phạm vi user/operation. Cần ràng buộc unique và phối hợp transaction để hai request đồng thời không cùng thực hiện.",
+        "Key lặp với payload khác nên bị từ chối theo hợp đồng. Thời gian giữ key, trạng thái đang xử lý và cách phục hồi sau crash phải được xác định. Cache response đơn thuần ở RAM của một instance không đủ cho nhiều replica."
+      ],
+      "example": "",
+      "pitfall": "",
+      "exercise": "Mô phỏng hai request cùng key đến hai replica đồng thời.",
+      "diagram": {
+        "type": "flow",
+        "title": "Retry cùng một ý định",
+        "nodes": [
+          "Nhận key + payload",
+          "Claim key bằng unique constraint",
+          "Thực hiện + lưu kết quả",
+          "Retry đọc lại kết quả đã lưu"
+        ],
+        "caption": "Tác dụng phụ tới hệ bên ngoài cần cơ chế idempotency/outbox tương ứng; không chỉ khóa trong process."
+      }
+    },
+    {
+      "id": "realtime",
+      "title": "Polling, SSE, WebSocket và webhook",
+      "body": [
+        "Polling đơn giản nhưng có độ trễ/chi phí request; SSE là stream server→client trên HTTP; WebSocket hỗ trợ hai chiều. Cả hai cần quản lý reconnect, auth, heartbeat và cách lấy lại sự kiện bỏ lỡ.",
+        "Webhook là server gọi endpoint của bên khác khi có sự kiện. Xác minh signature trên raw payload theo hợp đồng, kiểm tra timestamp/replay, deduplicate event ID và xử lý nhanh hoặc đưa vào queue. Retry là bình thường, không có bảo đảm chỉ giao một lần."
+      ],
+      "example": "",
+      "pitfall": "Webhook đến trễ hoặc sai thứ tự; không áp trạng thái cũ đè trạng thái mới mà không kiểm tra.",
+      "exercise": "Thiết kế nhận webhook payment trùng, đến trước response checkout và đến sai thứ tự."
+    }
+  ],
+  "questions": [
+    {
+      "id": "rest",
+      "question": "REST có bắt buộc dùng JSON không?",
+      "answer": "Không. REST mô tả ràng buộc kiến trúc và representation có thể dùng nhiều định dạng.",
+      "explanation": "Một API JSON dùng HTTP chưa tự đáp ứng mọi ràng buộc REST.",
+      "followUp": "Uniform interface mang lợi ích gì?",
+      "note": "contract",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "graphql",
+      "question": "Khi nào GraphQL có ích?",
+      "answer": "Khi client có nhu cầu dữ liệu đa dạng và cần chọn shape hợp đồng rõ.",
+      "explanation": "Cần xử lý authorization theo field/resource, query cost, caching và N+1.",
+      "followUp": "Bạn giới hạn query quá sâu thế nào?",
+      "note": "contract",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "grpc",
+      "question": "Khi nào cân nhắc gRPC?",
+      "answer": "Khi cần contract rõ, code generation hoặc streaming theo nhu cầu hệ thống.",
+      "explanation": "Cân nhắc môi trường client, proxy, debugging và compatibility; không mặc định nhanh hơn trong mọi workload.",
+      "followUp": "Thay field protobuf cần chú ý gì?",
+      "note": "contract",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "cursor",
+      "question": "Cursor pagination tốt hơn offset ở đâu?",
+      "answer": "Có thể tránh scan offset lớn và ổn định hơn khi duyệt dữ liệu thay đổi theo sort phù hợp.",
+      "explanation": "Cần index và tie-breaker; không tự hỗ trợ nhảy tới trang bất kỳ.",
+      "followUp": "Vì sao chỉ timestamp chưa đủ?",
+      "note": "pagination",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "idempotent",
+      "question": "Idempotency key cần lưu những gì?",
+      "answer": "Phạm vi key, fingerprint input, trạng thái và kết quả với cơ chế claim nguyên tử.",
+      "explanation": "Hai replica phải dùng nguồn phối hợp chung; quy định TTL và xử lý pending.",
+      "followUp": "Payload khác nhưng cùng key nên trả gì?",
+      "note": "idempotency",
+      "level": "Đào sâu"
+    },
+    {
+      "id": "retry",
+      "question": "Client timeout có nên tạo key thanh toán mới không?",
+      "answer": "Không nếu vẫn là cùng ý định thanh toán cần kiểm tra/lặp an toàn.",
+      "explanation": "Key mới có thể tạo giao dịch mới dù giao dịch cũ đã thành công.",
+      "followUp": "Bạn cung cấp endpoint kiểm tra trạng thái thế nào?",
+      "note": "idempotency",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "sse",
+      "question": "SSE và WebSocket chọn thế nào?",
+      "answer": "SSE phù hợp luồng một chiều server→client; WebSocket khi cần hai chiều theo yêu cầu.",
+      "explanation": "Cần xét hạ tầng proxy, auth, reconnect, ordering và load.",
+      "followUp": "Thông báo cập nhật trạng thái đơn có cần WebSocket không?",
+      "note": "realtime",
+      "level": "Cơ bản"
+    },
+    {
+      "id": "webhook",
+      "question": "Xử lý webhook trùng thế nào?",
+      "answer": "Xác minh nguồn, deduplicate event ID và áp nghiệp vụ idempotent.",
+      "explanation": "Lưu event/ý định trong transaction phù hợp rồi ACK theo hợp đồng; không chỉ Set trong RAM.",
+      "followUp": "Nếu xử lý xong nhưng response ACK bị mất thì sao?",
+      "note": "realtime",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "version",
+      "question": "Thêm field vào response có luôn backward compatible không?",
+      "answer": "Không tuyệt đối; client parse chặt, signature hoặc validation có thể bị ảnh hưởng.",
+      "explanation": "Hợp đồng và consumer tests quyết định; tránh thay semantics âm thầm.",
+      "followUp": "Đổi nullable thành required thì sao?",
+      "note": "contract",
+      "level": "Vận dụng"
+    },
+    {
+      "id": "ordering",
+      "question": "Webhook sự kiện cũ tới sau sự kiện mới thì xử lý sao?",
+      "answer": "Dùng version/state transition hợp lệ hoặc truy vấn trạng thái chuẩn trước khi cập nhật.",
+      "explanation": "Timestamp đơn lẻ có thể không đủ do clock/skew và semantics provider.",
+      "followUp": "Bạn ngăn paid bị ghi đè về pending thế nào?",
+      "note": "realtime",
+      "level": "Đào sâu"
+    }
+  ]
+}

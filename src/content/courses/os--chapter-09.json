@@ -1,0 +1,160 @@
+{
+  "id": "os--chapter-09",
+  "track": "os",
+  "trackTitle": "Operating Systems",
+  "slug": "chapter-09",
+  "order": 9,
+  "title": "Paging& Page Replacement",
+  "description": "Khi RAM hết chỗ, đẩy page nào ra disk? Đây là chương về page fault, TLB, page replacement algorithms (FIFO, LRU, Clock, Optimal). Hiểu chương này, bạn liên hệ trực tiếp tới CPU cache (L1/L2/L3) — cùng nguyên lý cách 1 tầng.",
+  "html": "\n\n        <!-- 9.1 -->\n        <section id=\"fault\">\n          <h2 id=\"section-1\">9.1 Page Fault — hành trình 1 byte</h2>\n\n          <p>Khi process truy cập 1 virtual address, MMU tra page table:</p>\n          <ul>\n            <li>Nếu PTE có <strong>present bit = 1</strong>: page có trong RAM → dịch sang physical address, đọc → xong</li>\n            <li>Nếu present bit = 0: <strong>Page Fault</strong> → CPU trap vào kernel</li>\n          </ul>\n\n          <h3 id=\"section-2\">Kernel xử lý page fault</h3>\n          <ol>\n            <li>Kernel kiểm tra: VA này có hợp lệ không?\n              <ul>\n                <li>Không hợp lệ (vd dereference NULL) → gửi <code>SIGSEGV</code> → process thường chết</li>\n                <li>Hợp lệ → tiếp</li>\n              </ul>\n            </li>\n            <li>Tìm physical frame trống trong RAM. Nếu hết → page replacement (xem 9.4)</li>\n            <li>Đọc nội dung page từ disk (hoặc zero-fill nếu là anon page mới)</li>\n            <li>Update PTE: present = 1, frame number = frame mới chọn</li>\n            <li>Resume instruction bị fail — bây giờ chạy bình thường</li>\n          </ol>\n\n          <p>Toàn bộ quá trình diễn ra trong vài microsecond đến vài millisecond (nếu phải đọc từ disk).</p>\n        </section>\n\n        <!-- 9.2 -->\n        <section id=\"major-minor\">\n          <h2 id=\"section-3\">9.2 Major vs Minor Page Fault</h2>\n\n          <div class=\"compare\">\n            <div class=\"good\">\n              <h4 class=\"text-green\">Minor Fault</h4>\n              <ul>\n                <li>Page có trong RAM, chỉ thiếu PTE entry</li>\n                <li>Vd: page được share giữa 2 process, lần đầu process A truy cập → minor fault, kernel chỉ cần update page table</li>\n                <li>Cũng xảy ra với CoW: lần đầu ghi vào shared page, kernel copy page rồi update</li>\n                <li>Cost: ~vài microsecond (không IO)</li>\n              </ul>\n            </div>\n            <div class=\"bad\">\n              <h4 class=\"text-amber\">Major Fault</h4>\n              <ul>\n                <li>Page chưa có trong RAM — phải đọc từ disk (swap hoặc file)</li>\n                <li>Cost: <strong>~ms</strong> (HDD) hoặc ~100µs (SSD) — chậm hơn minor 1000x</li>\n                <li>Major fault nhiều = thrashing (xem 9.10)</li>\n              </ul>\n            </div>\n          </div>\n\n          <pre data-lang=\"bash\"><code># Đếm major/minor fault của process\nps -o min_flt,maj_flt,comm\n# min_flt   maj_flt COMMAND\n#   12345         3 bash     ← minor nhiều, major ít = lành mạnh\n#  123456     78901 some_app  ← major cao = thrashing</code></pre>\n        </section>\n\n        <!-- 9.3 -->\n        <section id=\"tlb\">\n          <h2 id=\"section-4\">9.3 TLB — Translation Lookaside Buffer</h2>\n\n          <p>\n            Mỗi instruction memory access đều cần dịch VA → PA qua page table. Multi-level page table = 4 memory access mỗi lần dịch → quá chậm.\n          </p>\n\n          <p>\n            <strong>TLB</strong> = cache nhỏ nằm trong MMU, lưu kết quả dịch gần đây. Hit TLB → 1 cycle. Miss TLB → vài chục cycle.\n          </p>\n\n          <pre data-lang=\"text\"><code>     CPU virtual address ──▶ TLB ──┬─▶ HIT  → physical address (1 cycle)\n                                    │\n                                    └─▶ MISS → page table walk (4 levels)\n                                              → update TLB\n                                              → physical address</code></pre>\n\n          <h3 id=\"section-5\">TLB size</h3>\n          <ul>\n            <li>L1 TLB: ~64 entries — gần CPU, 1 cycle</li>\n            <li>L2 TLB: ~1500 entries — chậm hơn nhưng lớn</li>\n            <li>Mỗi entry cover 1 page (4KB), nên L1 TLB cover ~256KB working set</li>\n          </ul>\n\n          <h3 id=\"section-6\">TLB shootdown</h3>\n          <p>\n            Khi context switch giữa process A và B, TLB chứa entry của A vô nghĩa (PA của B khác). Cần \"flush\" hoặc tag entry với ASID (Address Space ID).\n          </p>\n\n          <h3 id=\"section-7\">Huge Pages giúp giảm TLB miss</h3>\n          <p>\n            1 entry TLB cover 1 page. Nếu page = 2MB thay vì 4KB, cover 500x nhiều hơn → ít TLB miss. Database, JVM dùng huge pages.\n          </p>\n\n          <pre data-lang=\"bash\"><code># Linux: enable transparent huge pages\ncat /sys/kernel/mm/transparent_hugepage/enabled\n# always madvise [never]</code></pre>\n        </section>\n\n        <!-- 9.4 -->\n        <section id=\"replacement\">\n          <h2 id=\"section-8\">9.4 Bài toán Page Replacement</h2>\n\n          <p>\n            Khi page fault xảy ra mà <strong>RAM đã hết frame trống</strong>, kernel phải \"đẩy\" 1 page hiện có ra disk (swap out) để lấy chỗ cho page mới.\n            Câu hỏi: <strong>đẩy page nào?</strong>\n          </p>\n\n          <p>Đó là bài toán page replacement. Mục tiêu: <em>chọn page ít có khả năng được dùng lại sớm nhất</em>.</p>\n\n          <p>Để đo hiệu quả, dùng metric: <strong>page fault rate</strong> với một dãy reference (chuỗi page truy cập).</p>\n        </section>\n\n        <!-- 9.5 -->\n        <section id=\"fifo\">\n          <h2 id=\"section-9\">9.5 FIFO — và Belady's Anomaly</h2>\n\n          <p>\n            Đẩy ra page <strong>vào RAM lâu nhất</strong> (dù vẫn đang được dùng).\n          </p>\n\n          <pre data-lang=\"text\"><code>Reference: 1 2 3 4 1 2 5 1 2 3 4 5\nFrames=3:\n\nStep  1   2   3   4   1   2   5   1   2   3   4   5\nF1    1   1   1   4   4   4   5   5   5   5   5   5\nF2        2   2   2   1   1   1   1   1   3   3   3\nF3            3   3   3   2   2   2   2   2   4   4\nFault X   X   X   X   X   X   X           X   X\n                                  (1,2 đã có)\n9 page faults</code></pre>\n\n          <h3 id=\"section-10\">Belady's Anomaly</h3>\n          <p>\n            Trực giác: tăng số frame thì page fault giảm. <strong>Nhưng FIFO không có tính chất này!</strong>\n            Có dãy mà thêm frame lại làm <em>tăng</em> page fault. Belady (1969) chứng minh.\n          </p>\n\n          <pre data-lang=\"text\"><code>Reference: 1 2 3 4 1 2 5 1 2 3 4 5\nFrames=3: 9 faults\nFrames=4: 10 faults  ← TĂNG khi tăng frame!</code></pre>\n\n          <p>Belady's anomaly là dấu hiệu thuật toán không tốt. LRU không có anomaly này.</p>\n        </section>\n\n        <!-- 9.6 -->\n        <section id=\"lru\">\n          <h2 id=\"section-11\">9.6 LRU — Least Recently Used</h2>\n\n          <p>Đẩy page <strong>lâu nhất chưa được dùng</strong> (dùng gần đây nhất → giữ lại). Dựa trên locality of reference.</p>\n\n          <pre data-lang=\"text\"><code>Reference: 1 2 3 4 1 2 5 1 2 3 4 5\nFrames=3:\n\nStep  1   2   3   4   1   2   5   1   2   3   4   5\nF1    1   1   1   4   4   4   5   5   5   3   3   3\nF2        2   2   2   1   1   1   1   1   1   4   4\nF3            3   3   3   2   2   2   2   2   2   5\nFault X   X   X   X   X   X   X           X   X   X\n10 page faults\n\n(LRU đôi khi nhiều fault hơn FIFO trên dãy ngắn,\n nhưng không có Belady's Anomaly và tốt hơn average)</code></pre>\n\n          <h3 id=\"section-12\">Cài đặt LRU</h3>\n\n          <ul>\n            <li><strong>Linked list</strong>: mỗi truy cập → di chuyển page lên đầu. Đẩy: lấy cuối list. O(1) move, O(1) evict — nhưng cần update mỗi access → tốn quá. Dùng cho cache application-level (Redis, LRUCache library).</li>\n            <li><strong>Page table accessed bit</strong>: hardware set bit khi page accessed. Kernel scan định kỳ — xấp xỉ LRU.</li>\n            <li>Linux dùng <strong>2 list LRU</strong>: active + inactive — gần đúng LRU với cost thấp.</li>\n          </ul>\n\n          <p>\"True LRU\" trong page replacement quá đắt — dùng xấp xỉ qua Clock algorithm.</p>\n        </section>\n\n        <!-- 9.7 -->\n        <section id=\"clock\">\n          <h2 id=\"section-13\">9.7 Clock (Second Chance)</h2>\n\n          <p>\n            Xấp xỉ LRU rẻ hơn nhiều. Sắp các page thành <em>vòng tròn</em>, có 1 con trỏ \"kim đồng hồ\".\n            Mỗi PTE có <strong>R bit</strong> (reference / accessed), hardware tự set khi truy cập.\n          </p>\n\n          <h3 id=\"section-14\">Khi cần evict</h3>\n          <ol>\n            <li>Kim trỏ vào page hiện tại</li>\n            <li>Nếu R = 0 → evict page này, kim tiến 1</li>\n            <li>Nếu R = 1 → set R = 0, \"tha thứ\" lần này, kim tiến 1, lặp</li>\n          </ol>\n\n          <p>Page đang dùng thường xuyên có R = 1 → tha. Page lâu không dùng có R = 0 → evict. Xấp xỉ LRU.</p>\n\n          <h3 id=\"section-15\">Linux thực tế</h3>\n          <p>\n            Linux dùng biến thể \"two-handed clock\" + active/inactive list. Phức tạp hơn pure clock nhưng cùng triết lý.\n          </p>\n        </section>\n\n        <!-- 9.8 -->\n        <section id=\"optimal\">\n          <h2 id=\"section-16\">9.8 Optimal (Belady's Algorithm) — không thể implement</h2>\n\n          <p>\n            Đẩy page <strong>sẽ được dùng lại lâu nhất trong tương lai</strong>. Đây là tối ưu lý thuyết, có thể chứng minh là cho fewest page fault.\n          </p>\n\n          <p>\n            Nhược: <strong>không thể biết tương lai</strong>. Optimal chỉ dùng để so sánh — đo distance giữa thuật toán thực với optimal.\n          </p>\n        </section>\n\n        <!-- 9.9 -->\n        <section id=\"workingset\">\n          <h2 id=\"section-17\">9.9 Working Set — kích thước memory thực sự cần</h2>\n\n          <p>\n            <strong>Working set</strong> của process tại thời điểm t = tập các page mà process đã truy cập trong khoảng thời gian Δ trước đó.\n          </p>\n\n          <p>\n            Quan sát: process có \"locality\" — chỉ dùng 1 phần memory mỗi giai đoạn. Nếu working set vừa đủ trong RAM, page fault thấp.\n            Nếu working set &gt; RAM, page fault cao.\n          </p>\n\n          <h3 id=\"section-18\">Working Set Size — chỉ số quan trọng</h3>\n          <p>\n            OS có thể đo working set của mỗi process, dùng để:\n          </p>\n          <ul>\n            <li>Quyết định cấp bao nhiêu frame cho mỗi process</li>\n            <li>Tránh thrashing: nếu tổng working set &gt; RAM, suspend bớt process</li>\n          </ul>\n        </section>\n\n        <!-- 9.10 -->\n        <section id=\"thrashing\">\n          <h2 id=\"section-19\">9.10 Thrashing — máy \"lag\" không lý do</h2>\n\n          <p>\n            <strong>Thrashing</strong> = OS dành phần lớn thời gian cho page fault thay vì chạy code thực sự. CPU usage giảm, disk I/O tăng cao.\n          </p>\n\n          <h3 id=\"section-20\">Tại sao xảy ra?</h3>\n          <p>\n            Quá nhiều process. Mỗi process được cấp ít frame → working set không đủ → page fault liên tục → swap in/out không ngừng → mọi process tiến triển chậm → OS tưởng cần chạy thêm process → cấp thêm → tệ hơn → tử vòng.\n          </p>\n\n          <h3 id=\"section-21\">Dấu hiệu</h3>\n          <ul>\n            <li><code>vmstat</code>: <code>si</code>/<code>so</code> (swap in/out) cao</li>\n            <li>CPU idle cao mà mọi thứ chạy rất chậm</li>\n            <li>Disk I/O 100% liên tục</li>\n            <li>Tiếng ổ cứng kêu liên tục (HDD)</li>\n          </ul>\n\n          <h3 id=\"section-22\">Khắc phục</h3>\n          <ul>\n            <li>Thêm RAM (giải pháp tự nhiên nhất)</li>\n            <li>Suspend bớt process (Linux OOM killer làm điều này)</li>\n            <li>Working set algorithm: chỉ schedule process có thể fit working set</li>\n            <li>Trong cloud: scale out instance thay vì cố nhồi nhiều workload</li>\n          </ul>\n        </section>\n\n        <!-- 9.11 -->\n        <section id=\"cache\">\n          <h2 id=\"section-23\">9.11 CPU Cache — paging thu nhỏ</h2>\n\n          <p>\n            CPU cache (L1/L2/L3) cùng nguyên lý với paging — chỉ khác cấp độ.\n          </p>\n\n          <div class=\"table-scroll\"><table>\n            <thead>\n              <tr><th>Cấp</th><th>Kích thước</th><th>Latency</th><th>Quản lý bởi</th></tr>\n            </thead>\n            <tbody>\n              <tr><td>Register</td><td>~256 byte</td><td>0 cycle</td><td>Compiler</td></tr>\n              <tr><td>L1 Cache</td><td>~64 KB</td><td>~1 cycle</td><td>Hardware</td></tr>\n              <tr><td>L2 Cache</td><td>~256 KB - 1 MB</td><td>~10 cycle</td><td>Hardware</td></tr>\n              <tr><td>L3 Cache</td><td>~8-30 MB</td><td>~40 cycle</td><td>Hardware</td></tr>\n              <tr><td>RAM</td><td>~16 GB</td><td>~100 cycle (~30 ns)</td><td>OS (paging)</td></tr>\n              <tr><td>SSD</td><td>~512 GB</td><td>~100,000 cycle (~50 µs)</td><td>OS (filesystem)</td></tr>\n              <tr><td>HDD</td><td>~2 TB</td><td>~10M cycle (~5 ms)</td><td>OS (filesystem)</td></tr>\n            </tbody>\n          </table></div>\n\n          <h3 id=\"section-24\">Cache line</h3>\n          <p>CPU cache đơn vị = <strong>cache line</strong> (64 byte trên x86). Đọc 1 byte → load cả cache line. Ghi 1 byte → đánh dấu cache line dirty.</p>\n\n          <h3 id=\"section-25\">Locality of Reference — nguyên lý cốt lõi</h3>\n          <ul>\n            <li><strong>Spatial locality</strong>: đã truy cập x → có thể sắp truy cập x+1 (mảng tuần tự)</li>\n            <li><strong>Temporal locality</strong>: đã truy cập x → có thể truy cập lại x sớm</li>\n          </ul>\n\n          <p>Đây là nền tảng cho cả CPU cache hit rate cao lẫn LRU page replacement.</p>\n\n          <h3 id=\"section-26\">False sharing — bug performance</h3>\n          <pre data-lang=\"c\"><code>// Bug: 2 thread cùng đọc/ghi 2 biến KHÁC NHAU nhưng cùng cache line\nstruct {\n    int a;  // thread 1 ghi\n    int b;  // thread 2 ghi\n} data;     // a, b ở cùng 64-byte cache line\n\n// Mỗi lần thread 1 ghi a, cache line bị invalidate trên CPU 2\n// → Thread 2 phải reload cache → SLOW\n\n// Fix: padding để a, b ở cache line khác nhau\nstruct {\n    int a;\n    char pad[64];\n    int b;\n} data;</code></pre>\n        </section>\n\n        <!-- Bài tập -->\n        <section id=\"exercises\">\n          <h2 id=\"section-27\">Bài tập</h2>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 1 — Tính page fault</div>\n            <p>Reference: <code>7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1</code>. 3 frame. Tính page fault cho FIFO, LRU, Optimal.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 2 — Belady's Anomaly</div>\n            <p>Tìm 1 dãy reference + frame size mà FIFO có anomaly. Verify bằng cách tính tay.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 3 — Quan sát swap</div>\n            <p>Trên Linux, <code>vmstat 1</code> liên tục. Mở app nặng (Chrome 50 tab). Quan sát <code>si</code>/<code>so</code> (swap in/out KB/s).</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 4 — Major fault</div>\n            <p>Đếm major page fault: <code>ps -o pid,maj_flt,comm</code>. Process nào major fault nhiều? Giải thích.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 5 — Cài đặt LRU cache trong JS</div>\n            <p>Cài LRU cache get/set O(1) bằng Map (giữ insertion order trong JS) hoặc DLL+HashMap.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 6 — False sharing demo</div>\n            <p>Viết C program 2 thread inc 2 biến khác nhau. Test 2 trường hợp: (a) 2 biến cùng cache line; (b) 2 biến khác cache line (padding). So sánh thời gian.</p>\n          </div>\n        </section>\n\n        <!-- Quiz -->\n        <section id=\"quiz\">\n          <div class=\"quiz\">\n            <h3 id=\"section-28\">🧪 Quiz cuối chương</h3>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 1.</strong> Page fault xảy ra khi?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: RAM hỏng\">RAM hỏng</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Truy cập page có present bit = 0 — page chưa trong RAM hoặc PTE chưa setup\">Truy cập page có present bit = 0 — page chưa trong RAM hoặc PTE chưa setup</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Process chia 0\">Process chia 0</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Stack overflow\">Stack overflow</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: present bit = 0.</strong> Kernel xử lý: cấp frame + load (nếu major) hoặc chỉ update PTE (nếu minor).\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 2.</strong> Major page fault khác Minor ở?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Major to hơn về kích thước\">Major to hơn về kích thước</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cùng nghĩa\">Cùng nghĩa</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Major: page chưa trong RAM, phải đọc disk; Minor: page trong RAM, chỉ thiếu PTE\">Major: page chưa trong RAM, phải đọc disk; Minor: page trong RAM, chỉ thiếu PTE</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Major chỉ trên Linux\">Major chỉ trên Linux</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: Major = đọc disk.</strong> Cost cao hơn 1000× minor. Quá nhiều major = thrashing.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 3.</strong> TLB là gì?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Cache cho page table — nhớ kết quả dịch VA→PA gần đây\">Cache cho page table — nhớ kết quả dịch VA→PA gần đây</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Một loại RAM\">Một loại RAM</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tên của Linux scheduler\">Tên của Linux scheduler</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Một file system\">Một file system</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: cache cho page table.</strong> Thiếu TLB, mỗi instruction tốn 4 memory access → cực chậm.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 4.</strong> Belady's Anomaly là gì?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Giảm RAM thì page fault giảm\">Giảm RAM thì page fault giảm</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: LRU có anomaly\">LRU có anomaly</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: FIFO: tăng số frame có thể làm tăng page fault — phản trực giác\">FIFO: tăng số frame có thể làm tăng page fault — phản trực giác</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Page table không hoạt động\">Page table không hoạt động</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: FIFO có thể tăng fault khi tăng frame.</strong> LRU và Optimal không có anomaly này.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 5.</strong> Clock (Second Chance) algorithm là?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Đẩy page lâu nhất\">Đẩy page lâu nhất</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Xấp xỉ LRU rẻ — dùng accessed bit, &quot;tha&quot; page có bit=1, evict bit=0\">Xấp xỉ LRU rẻ — dùng accessed bit, \"tha\" page có bit=1, evict bit=0</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: FIFO\">FIFO</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Optimal\">Optimal</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: xấp xỉ LRU.</strong> True LRU quá đắt; Clock dùng accessed bit do hardware set, scan vòng tròn.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 6.</strong> Thrashing xảy ra khi?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: CPU quá nóng\">CPU quá nóng</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: RAM bị virus\">RAM bị virus</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Tổng working set của các process > RAM → page fault liên tục, OS dành phần lớn thời gian swap\">Tổng working set của các process &gt; RAM → page fault liên tục, OS dành phần lớn thời gian swap</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: HDD bị hỏng\">HDD bị hỏng</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: working set &gt; RAM.</strong> Triệu chứng: vmstat si/so cao, CPU idle nhưng máy lag.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 7.</strong> CPU L1 cache truy cập tốn bao nhiêu cycle?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: ~100 cycle\">~100 cycle</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: ~1 cycle\">~1 cycle</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: ~1000 cycle\">~1000 cycle</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: 0 cycle\">0 cycle</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: ~1 cycle.</strong> RAM ~100 cycle, SSD ~100,000 cycle, HDD ~10M cycle.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 8.</strong> Locality of reference?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Process truy cập memory tập trung trong 1 vùng nhỏ thay vì rải đều — cơ sở của caching/paging\">Process truy cập memory tập trung trong 1 vùng nhỏ thay vì rải đều — cơ sở của caching/paging</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Process chỉ chạy trên 1 CPU\">Process chỉ chạy trên 1 CPU</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Process gần localhost\">Process gần localhost</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Process trên cùng máy\">Process trên cùng máy</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: truy cập tập trung.</strong> Spatial (cùng vùng) + temporal (lặp lại). LRU hoạt động được nhờ tính chất này.\n              </p>\n            </div>\n          </div>\n        </section>\n\n        <section>\n          <h2 id=\"section-29\">Tổng kết chương 9</h2>\n          <ul>\n            <li>✅ <strong>Page fault</strong> = present bit 0; kernel cấp frame + (nếu cần) load từ disk</li>\n            <li>✅ <strong>Major fault</strong> (đọc disk, ms) ≠ <strong>Minor fault</strong> (chỉ update PTE, µs)</li>\n            <li>✅ <strong>TLB</strong> = cache page table; quan trọng vì mỗi instruction đều dịch VA</li>\n            <li>✅ Page replacement algorithms: FIFO (đơn giản, có Belady's), <strong>LRU</strong> (tốt nhưng đắt), <strong>Clock</strong> (xấp xỉ LRU rẻ), Optimal (lý thuyết)</li>\n            <li>✅ Linux dùng biến thể Clock với active/inactive list</li>\n            <li>✅ <strong>Working Set</strong>: tập page đang được dùng; nếu vượt RAM → thrashing</li>\n            <li>✅ <strong>Thrashing</strong>: page fault liên tục, máy lag dù CPU idle</li>\n            <li>✅ <strong>CPU cache</strong> (L1/L2/L3) cùng nguyên lý paging; locality of reference làm cả hai work</li>\n            <li>✅ False sharing: 2 thread ghi 2 biến cùng cache line gây slow</li>\n          </ul>\n        </section>\n\n      ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "9.1 Page Fault — hành trình 1 byte",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "Kernel xử lý page fault",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "9.2 Major vs Minor Page Fault",
+      "depth": 2
+    },
+    {
+      "id": "section-4",
+      "text": "9.3 TLB — Translation Lookaside Buffer",
+      "depth": 2
+    },
+    {
+      "id": "section-5",
+      "text": "TLB size",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "TLB shootdown",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "Huge Pages giúp giảm TLB miss",
+      "depth": 3
+    },
+    {
+      "id": "section-8",
+      "text": "9.4 Bài toán Page Replacement",
+      "depth": 2
+    },
+    {
+      "id": "section-9",
+      "text": "9.5 FIFO — và Belady's Anomaly",
+      "depth": 2
+    },
+    {
+      "id": "section-10",
+      "text": "Belady's Anomaly",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "9.6 LRU — Least Recently Used",
+      "depth": 2
+    },
+    {
+      "id": "section-12",
+      "text": "Cài đặt LRU",
+      "depth": 3
+    },
+    {
+      "id": "section-13",
+      "text": "9.7 Clock (Second Chance)",
+      "depth": 2
+    },
+    {
+      "id": "section-14",
+      "text": "Khi cần evict",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "Linux thực tế",
+      "depth": 3
+    },
+    {
+      "id": "section-16",
+      "text": "9.8 Optimal (Belady's Algorithm) — không thể implement",
+      "depth": 2
+    },
+    {
+      "id": "section-17",
+      "text": "9.9 Working Set — kích thước memory thực sự cần",
+      "depth": 2
+    },
+    {
+      "id": "section-18",
+      "text": "Working Set Size — chỉ số quan trọng",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "9.10 Thrashing — máy \"lag\" không lý do",
+      "depth": 2
+    },
+    {
+      "id": "section-20",
+      "text": "Tại sao xảy ra?",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "Dấu hiệu",
+      "depth": 3
+    },
+    {
+      "id": "section-22",
+      "text": "Khắc phục",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "9.11 CPU Cache — paging thu nhỏ",
+      "depth": 2
+    },
+    {
+      "id": "section-24",
+      "text": "Cache line",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "Locality of Reference — nguyên lý cốt lõi",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "False sharing — bug performance",
+      "depth": 3
+    },
+    {
+      "id": "section-27",
+      "text": "Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-28",
+      "text": "🧪 Quiz cuối chương",
+      "depth": 3
+    },
+    {
+      "id": "section-29",
+      "text": "Tổng kết chương 9",
+      "depth": 2
+    }
+  ],
+  "source": "OS/chuong/chuong9.html",
+  "sourceHash": "98cff4bcb4f80426d2b8eb6c87e124048d96c430955012851a58bf8c573c5343",
+  "readingMinutes": 10
+}

@@ -1,0 +1,165 @@
+{
+  "id": "networking--chapter-07",
+  "track": "networking",
+  "trackTitle": "Networking",
+  "slug": "chapter-07",
+  "order": 7,
+  "title": "DNSHow the Internet finds servers",
+  "description": "\"Hệ thống danh bạ\" của Internet. Mỗi lần truy cập google.com, DNS làm việc trước. Chương này dạy: hierarchy root → TLD → authoritative, recursive vs iterative resolver, các record type, TTL, \"DNS propagation\", DoH/DoT, DNS-over-HTTPS, dùng dig.",
+  "html": "\n\n        <!-- 7.1 -->\n        <section id=\"why\">\n          <h2 id=\"section-1\">7.1 Tại sao cần DNS?</h2>\n\n          <p>\n            Máy tính dùng IP để tìm nhau. Con người không nhớ <code>142.250.74.14</code> nổi — nhớ <code>google.com</code> dễ hơn.\n            <strong>DNS</strong> (Domain Name System) là hệ thống dịch domain ↔ IP.\n          </p>\n\n          <h3 id=\"section-2\">Yêu cầu khó</h3>\n          <p>DNS phải:</p>\n          <ul>\n            <li>Phục vụ <strong>hàng tỷ truy vấn/giây</strong> trên toàn cầu</li>\n            <li>Cho phép <strong>thay đổi nhanh</strong> khi cần (move server, đổi IP)</li>\n            <li>Phân tán — không ai làm chủ toàn bộ</li>\n            <li>Resilient — 1 phần down không sập toàn bộ</li>\n          </ul>\n\n          <p>Thiết kế DNS thoả mãn cả bằng <strong>cây phân tầng + caching</strong>.</p>\n        </section>\n\n        <!-- 7.2 -->\n        <section id=\"hierarchy\">\n          <h2 id=\"section-3\">7.2 DNS Hierarchy — phân tầng tree</h2>\n\n          <div class=\"ascii-art\">\n                        . (root)\n                       /    |    \\\n                     com   org   vn\n                    /  |    |    | \\\n              google amazon ... .com.vn  .edu.vn\n                |\n              www, mail, drive, ...\n          </div>\n\n          <h3 id=\"section-4\">3 tầng chính</h3>\n\n          <ol>\n            <li>\n              <strong>Root</strong> (gốc, \".\") — 13 logical servers (a.root-servers.net đến m.root-servers.net),\n              quản lý bởi ICANN. Thực tế hàng trăm physical server qua anycast.\n            </li>\n            <li>\n              <strong>TLD</strong> (Top-Level Domain): <code>.com</code>, <code>.org</code>, <code>.net</code>, country code <code>.vn</code>, <code>.uk</code>, <code>.jp</code>...\n              Mỗi TLD do 1 registry quản lý (Verisign cho .com).\n            </li>\n            <li>\n              <strong>Authoritative</strong>: nameserver của domain cụ thể (vd <code>ns1.google.com</code>) — nơi data thật của domain được lưu.\n            </li>\n          </ol>\n\n          <h3 id=\"section-5\">Domain vs Subdomain</h3>\n          <p>Đọc từ phải sang trái:</p>\n          <pre data-lang=\"text\"><code>www.api.example.com.\n│   │   │       │   │\n│   │   │       │   └─ root (thường ẩn)\n│   │   │       └───── TLD (.com)\n│   │   └───────────── second-level domain (example)\n│   └───────────────── subdomain (api)\n└───────────────────── subdomain (www)</code></pre>\n\n          <h3 id=\"section-6\">FQDN — Fully Qualified Domain Name</h3>\n          <p>Có dấu chấm cuối: <code>www.example.com.</code> — chỉ rõ \"đây là FQDN, không phải relative\". Hằng ngày bỏ dấu chấm cuối.</p>\n        </section>\n\n        <!-- 7.3 -->\n        <section id=\"resolution\">\n          <h2 id=\"section-7\">7.3 DNS Resolution Flow — khi truy cập example.com</h2>\n\n          <p>Đây là chuyện gì xảy ra giây đầu tiên khi bạn gõ URL vào browser:</p>\n\n          <div class=\"ascii-art\">\n   1. Browser kiểm tra cache (browser cache, OS cache)\n      Có rồi? → dùng IP cached, xong.\n      Chưa? → tiếp.\n\n   2. Browser gọi OS resolver (vd systemd-resolved trên Linux)\n      OS check cache. Có? → dùng. Chưa? → gửi cho recursive resolver.\n\n   3. Recursive Resolver (vd 8.8.8.8 Google, 1.1.1.1 Cloudflare,\n      hoặc resolver của ISP)\n\n   ┌─ Recursive resolver công việc:\n   │\n   │  3a. Hỏi Root (\".\") server: \"example.com ở đâu?\"\n   │      → Root: \"Tôi không biết, nhưng .com TLD ở\n   │              a.gtld-servers.net (192.5.6.30)\"\n   │\n   │  3b. Hỏi TLD (.com) server tại a.gtld-servers.net\n   │      → TLD: \"example.com? Hỏi authoritative ns1.example.com\n   │              (203.0.113.5)\"\n   │\n   │  3c. Hỏi authoritative tại ns1.example.com\n   │      → Authoritative: \"example.com → A record 93.184.216.34\"\n   │\n   │  3d. Cache + return cho client\n   │\n   └─\n\n   4. Browser nhận IP, mở TCP connect đến 93.184.216.34:443\n   5. TLS handshake\n   6. HTTP GET /\n   7. Page load\n          </div>\n\n          <h3 id=\"section-8\">Recursive vs Iterative</h3>\n\n          <div class=\"compare\">\n            <div class=\"good\">\n              <h4 class=\"text-blue\">Iterative</h4>\n              <p>Mỗi server trả lời <em>\"Tôi không biết, hỏi server kia\"</em>. Resolver phải đi từng bước. Đây là cách Recursive Resolver làm việc với Root → TLD → Authoritative.</p>\n            </div>\n            <div class=\"good\">\n              <h4 class=\"text-blue\">Recursive</h4>\n              <p>Server <em>tự đi tìm tất cả</em>, trả về kết quả cuối. Đây là cách <strong>Recursive Resolver</strong> trả lời client cuối.</p>\n            </div>\n          </div>\n\n          <p><strong>Client → Recursive Resolver = Recursive query.</strong> Resolver → Root/TLD/Authoritative = Iterative query.</p>\n        </section>\n\n        <!-- 7.4 -->\n        <section id=\"records\">\n          <h2 id=\"section-9\">7.4 DNS Record Types</h2>\n\n          <div class=\"table-scroll\"><table>\n            <thead>\n              <tr><th>Type</th><th>Mục đích</th><th>Ví dụ</th></tr>\n            </thead>\n            <tbody>\n              <tr><td><strong>A</strong></td><td>Domain → IPv4</td><td>example.com → 93.184.216.34</td></tr>\n              <tr><td><strong>AAAA</strong></td><td>Domain → IPv6</td><td>example.com → 2606:2800:220:1::</td></tr>\n              <tr><td><strong>CNAME</strong></td><td>Alias đến domain khác</td><td>www.example.com → example.com</td></tr>\n              <tr><td><strong>MX</strong></td><td>Mail server</td><td>example.com → 10 mail.example.com</td></tr>\n              <tr><td><strong>TXT</strong></td><td>Text bất kỳ (SPF, DKIM, verification)</td><td>\"v=spf1 include:_spf.google.com ~all\"</td></tr>\n              <tr><td><strong>NS</strong></td><td>Authoritative nameserver</td><td>example.com → ns1.example.com</td></tr>\n              <tr><td><strong>SOA</strong></td><td>Start of Authority — admin info, serial number</td><td>—</td></tr>\n              <tr><td><strong>PTR</strong></td><td>Reverse: IP → domain</td><td>34.216.184.93.in-addr.arpa → example.com</td></tr>\n              <tr><td><strong>SRV</strong></td><td>Service location (port, priority)</td><td>_xmpp-server._tcp.example.com</td></tr>\n              <tr><td><strong>CAA</strong></td><td>Hạn chế CA nào được cấp cert cho domain</td><td>0 issue \"letsencrypt.org\"</td></tr>\n            </tbody>\n          </table></div>\n\n          <h3 id=\"section-10\">A vs CNAME vs ALIAS</h3>\n          <ul>\n            <li><strong>A</strong>: trỏ trực tiếp tới IP. Nhanh nhất. Nhưng nếu IP đổi, phải update record.</li>\n            <li><strong>CNAME</strong>: trỏ tới domain khác. Resolver phải resolve thêm 1 lần. <em>Không dùng được ở root domain</em> (apex) — vì SOA/NS phải ở apex.</li>\n            <li><strong>ALIAS / ANAME</strong> (không chuẩn DNS, do registrar implement): \"CNAME ở apex\" — DNS provider tự resolve và trả A record.</li>\n          </ul>\n\n          <h3 id=\"section-11\">MX với priority</h3>\n          <pre data-lang=\"text\"><code>example.com.   MX  10  mail1.example.com.   ← priority 10 (cao nhất, ưu tiên)\nexample.com.   MX  20  mail2.example.com.   ← backup\nexample.com.   MX  20  mail3.example.com.   ← backup (cùng priority → load balance)</code></pre>\n          <p>Số nhỏ = priority cao. Cùng priority → random/round-robin.</p>\n        </section>\n\n        <!-- 7.5 -->\n        <section id=\"ttl\">\n          <h2 id=\"section-12\">7.5 TTL &amp; Caching — vì sao DNS scale được</h2>\n\n          <p>\n            Mỗi DNS record có <strong>TTL</strong> (Time To Live) — bao lâu thì cache hết hạn. Vd <code>3600</code> = 1 giờ.\n          </p>\n\n          <p>Khi resolver/client cache record, dùng đến khi TTL = 0 mới query lại. Đây là lý do DNS chịu được hàng tỷ query/giây — đa số được phục vụ từ cache, không đi qua hierarchy.</p>\n\n          <h3 id=\"section-13\">Cache layers</h3>\n          <ol>\n            <li>Browser cache (vài phút)</li>\n            <li>OS cache (DNS resolver như systemd-resolved, mDNSResponder)</li>\n            <li>Recursive resolver cache (vài giờ)</li>\n            <li>Authoritative server (source of truth)</li>\n          </ol>\n\n          <h3 id=\"section-14\">TTL trade-off</h3>\n          <ul>\n            <li><strong>TTL ngắn</strong> (60s): đổi DNS nhanh có hiệu lực, nhưng tốn nhiều query → load tăng</li>\n            <li><strong>TTL dài</strong> (1 ngày): cache hiệu quả, nhưng đổi DNS phải đợi lâu</li>\n          </ul>\n\n          <p>Best practice: <strong>giảm TTL trước khi đổi DNS</strong>:</p>\n          <ol>\n            <li>1 tuần trước migration: TTL từ 86400 (1 ngày) → 300 (5 phút)</li>\n            <li>Đợi cũ TTL hết hạn → world dùng TTL mới</li>\n            <li>Đổi record</li>\n            <li>Sau migration thành công, tăng TTL lại</li>\n          </ol>\n        </section>\n\n        <!-- 7.6 -->\n        <section id=\"propagation\">\n          <h2 id=\"section-15\">7.6 \"DNS Propagation\" — vì sao đổi DNS phải đợi</h2>\n\n          <p>Khi bạn đổi A record từ IP cũ sang mới, không phải mọi user thấy thay đổi ngay:</p>\n\n          <ul>\n            <li>Resolver A đã cache record cũ với TTL = 3600s → 1 giờ nữa mới query lại</li>\n            <li>Resolver B query lúc bạn vừa đổi → thấy IP mới ngay</li>\n            <li>Resolver C trên CDN khác có thể có lag riêng</li>\n          </ul>\n\n          <p>Hệ quả: trong 1 thời gian, một số user vẫn vào IP cũ. Đó gọi là \"DNS propagation\" — thực ra <strong>không phải propagate, mà là cache expiry</strong>.</p>\n\n          <p>Worst case = max TTL bạn đã cấu hình (vd 24h). Sau đó mọi cache hết hạn.</p>\n\n          <div class=\"callout warning\">\n            <div class=\"callout-title\">⚠️ Misconception</div>\n            \"DNS propagation\" không phải DNS lan truyền chậm. Authoritative đã update ngay. Vấn đề chỉ là <em>cache cũ</em> ở resolver toàn cầu chưa hết TTL.\n          </div>\n        </section>\n\n        <!-- 7.7 -->\n        <section id=\"secure\">\n          <h2 id=\"section-16\">7.7 DNS over HTTPS / TLS — DNS có encryption</h2>\n\n          <p>DNS truyền thống là <strong>plaintext qua UDP/53</strong>. Vấn đề:</p>\n          <ul>\n            <li><strong>Eavesdropping</strong>: ISP/Wi-Fi biết bạn đang truy cập domain nào</li>\n            <li><strong>Tampering</strong>: ISP có thể return IP giả (DNS hijacking)</li>\n            <li><strong>Censorship</strong>: chặn domain bằng DNS (Vietnam chặn Facebook giai đoạn 2009)</li>\n          </ul>\n\n          <h3 id=\"section-17\">DNS over TLS (DoT) — RFC 7858</h3>\n          <p>DNS query qua TCP+TLS, port 853. Encrypt full query.</p>\n\n          <h3 id=\"section-18\">DNS over HTTPS (DoH) — RFC 8484</h3>\n          <p>DNS query qua HTTPS POST/GET đến endpoint chuyên biệt (vd <code>https://1.1.1.1/dns-query</code>). Trông như HTTP request thường → khó censorship.</p>\n\n          <h3 id=\"section-19\">Adoption</h3>\n          <ul>\n            <li>Cloudflare 1.1.1.1, Google 8.8.8.8, Quad9 9.9.9.9 đều support DoH/DoT</li>\n            <li>Firefox enable DoH default (US)</li>\n            <li>Chrome auto-upgrade nếu resolver hỗ trợ</li>\n            <li>iOS, macOS support DoH/DoT từ 14+</li>\n          </ul>\n\n          <h3 id=\"section-20\">DNSSEC — bảo vệ tính toàn vẹn</h3>\n          <p>DNSSEC sign DNS records bằng cryptographic. Resolver verify chữ ký → không bị tamper. Khác với DoH/DoT (chỉ encrypt). Adoption thấp do phức tạp.</p>\n        </section>\n\n        <!-- 7.8 -->\n        <section id=\"tools\">\n          <h2 id=\"section-21\">7.8 Tools — dig, nslookup, host</h2>\n\n          <h3 id=\"section-22\">dig — chuẩn của sysadmin</h3>\n          <pre data-lang=\"bash\"><code># Truy vấn cơ bản\ndig example.com\n# ;; ANSWER SECTION:\n# example.com.    3600  IN  A  93.184.216.34\n\n# Query specific record type\ndig example.com MX\ndig example.com NS\ndig example.com TXT\n\n# Query specific resolver\ndig @8.8.8.8 example.com\ndig @1.1.1.1 example.com\n\n# Trace toàn bộ recursive process\ndig +trace example.com\n# Show: root → .com TLD → authoritative\n\n# Short output\ndig +short example.com\n# 93.184.216.34\n\n# Reverse lookup (PTR)\ndig -x 93.184.216.34</code></pre>\n\n          <h3 id=\"section-23\">nslookup — quen với Windows</h3>\n          <pre data-lang=\"bash\"><code>nslookup example.com\nnslookup example.com 8.8.8.8     # specific resolver\n\n# Interactive mode\nnslookup\n&gt; set type=mx\n&gt; example.com</code></pre>\n\n          <h3 id=\"section-24\">host — nhanh, ngắn</h3>\n          <pre data-lang=\"bash\"><code>host example.com\n# example.com has address 93.184.216.34\n# example.com has IPv6 address 2606:2800:220:1::\n\nhost -t MX example.com</code></pre>\n\n          <h3 id=\"section-25\">Linux/Mac OS resolver config</h3>\n          <pre data-lang=\"bash\"><code># Config file (Linux cũ / macOS)\ncat /etc/resolv.conf\n# nameserver 192.168.1.1\n# nameserver 8.8.8.8\n\n# Linux modern: systemd-resolved\nresolvectl status\n\n# macOS\nscutil --dns\n\n# Flush cache\nsudo killall -HUP mDNSResponder        # macOS\nsudo systemctl restart systemd-resolved # Linux</code></pre>\n        </section>\n\n        <!-- 7.9 -->\n        <section id=\"anycast\">\n          <h2 id=\"section-26\">7.9 Anycast DNS — vì sao 1.1.1.1 nhanh từ mọi nơi</h2>\n\n          <p>\n            <strong>Anycast</strong>: nhiều server có cùng IP. Router tự động route packet đến server gần nhất (về mặt network).\n          </p>\n\n          <p>Vd: Cloudflare có ~300 PoP toàn cầu, mỗi nơi có server với IP <code>1.1.1.1</code>. Bạn ở Việt Nam ping <code>1.1.1.1</code> → tới server Cloudflare ở Vietnam/Singapore. Bạn ở US → tới server US. Cùng IP, server khác.</p>\n\n          <h3 id=\"section-27\">Lợi ích</h3>\n          <ul>\n            <li><strong>Latency thấp</strong> — luôn gần nhất</li>\n            <li><strong>Resilience</strong> — 1 PoP down, traffic tự route đến PoP khác</li>\n            <li><strong>DDoS mitigation</strong> — attack 1 IP, traffic chia khắp các PoP</li>\n          </ul>\n\n          <p>Major DNS resolver dùng anycast: 1.1.1.1, 8.8.8.8, 9.9.9.9, root DNS server cũng anycast.</p>\n        </section>\n\n        <!-- Bài tập -->\n        <section id=\"exercises\">\n          <h2 id=\"section-28\">Bài tập</h2>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 1 — dig +trace</div>\n            <p>Chạy <code>dig +trace example.com</code>. Quan sát flow: root → .com TLD → authoritative. Có bao nhiêu hop?</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 2 — Records của domain bạn</div>\n            <p>Pick 1 domain (vd github.com). Query: A, AAAA, MX, NS, TXT. Liệt kê IP, mail server, name server.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 3 — TTL khác nhau</div>\n            <p>Compare TTL của A record các site sau: <code>cloudflare.com</code>, <code>google.com</code>, <code>github.com</code>. TTL khác nhau ý nghĩa gì?</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 4 — DoH thử nghiệm</div>\n            <p>Curl đến endpoint DoH của Cloudflare:\n            <code>curl -H \"accept: application/dns-json\" \"https://1.1.1.1/dns-query?name=example.com&amp;type=A\"</code>. Quan sát JSON response.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 5 — Hosts file override</div>\n            <p>Edit <code>/etc/hosts</code> (Linux/Mac) hoặc <code>C:\\Windows\\System32\\drivers\\etc\\hosts</code>: thêm <code>1.2.3.4 mytest.local</code>. Ping <code>mytest.local</code> → đi đến 1.2.3.4. Đây là cấp cache trên cả OS.</p>\n          </div>\n\n          <div class=\"exercise\">\n            <div class=\"exercise-title\">Bài 6 — Migration scenario</div>\n            <p>Bạn cần move web server từ DigitalOcean sang AWS. Mô tả các bước thay DNS đảm bảo không downtime. (Hint: TTL).</p>\n          </div>\n        </section>\n\n        <!-- Quiz -->\n        <section id=\"quiz\">\n          <div class=\"quiz\">\n            <h3 id=\"section-29\">🧪 Quiz cuối chương</h3>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 1.</strong> DNS resolution các bước khi truy cập example.com?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Browser → Server\">Browser → Server</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Browser cache → OS cache → Recursive resolver → Root → TLD → Authoritative → Server\">Browser cache → OS cache → Recursive resolver → Root → TLD → Authoritative → Server</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Search engine → Server\">Search engine → Server</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Hosts file → Server\">Hosts file → Server</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: 4 cấp cache + 3 cấp authority.</strong> Đây là flow đầy đủ. Đa số trường hợp dừng ở 1 cấp cache do TTL chưa hết.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 2.</strong> A vs CNAME?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: A nhanh hơn CNAME\">A nhanh hơn CNAME</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: A trỏ IP, CNAME trỏ domain\">A trỏ IP, CNAME trỏ domain</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: A trỏ trực tiếp IP; CNAME alias đến domain khác (resolver phải resolve thêm); CNAME không dùng được ở apex\">A trỏ trực tiếp IP; CNAME alias đến domain khác (resolver phải resolve thêm); CNAME không dùng được ở apex</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: A cho IPv4, CNAME cho IPv6\">A cho IPv4, CNAME cho IPv6</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: A→IP, CNAME→domain.</strong> CNAME thêm 1 lookup; không dùng được ở apex (root domain) vì SOA/NS phải ở đó.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 3.</strong> DNS dùng UDP vì?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Latency thấp + query nhỏ + nếu mất packet client tự retry\">Latency thấp + query nhỏ + nếu mất packet client tự retry</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: UDP an toàn hơn\">UDP an toàn hơn</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: UDP free hơn\">UDP free hơn</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: TCP không hỗ trợ DNS\">TCP không hỗ trợ DNS</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: latency + retry đơn giản.</strong> DNS có thể dùng TCP cho response &gt;512 byte hoặc DNSSEC.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 4.</strong> \"DNS propagation chậm\" thực ra là?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Server lan truyền chậm\">Server lan truyền chậm</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cache cũ ở các resolver chưa hết TTL → một số user vẫn dùng IP cũ\">Cache cũ ở các resolver chưa hết TTL → một số user vẫn dùng IP cũ</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Authoritative chưa nhận update\">Authoritative chưa nhận update</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: BGP route chưa converge\">BGP route chưa converge</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: cache expiry, không phải propagation.</strong> Authoritative update ngay; vấn đề là cache cũ.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 5.</strong> MX record với priority 10 vs 20?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: 20 ưu tiên hơn\">20 ưu tiên hơn</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Số bằng nhau\">Số bằng nhau</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: 10 ưu tiên hơn (số nhỏ = priority cao); 20 dùng làm backup nếu 10 down\">10 ưu tiên hơn (số nhỏ = priority cao); 20 dùng làm backup nếu 10 down</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không liên quan đến priority\">Không liên quan đến priority</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: 10 ưu tiên, 20 backup.</strong> Cùng priority → load balance.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"1\" data-quiz-correct=\"1\">\n              <p><strong>Câu 6.</strong> DNS over HTTPS (DoH) khác DNS thường?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Nhanh hơn\">Nhanh hơn</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: DNS query qua HTTPS — encrypted, ISP không thấy domain bạn truy cập\">DNS query qua HTTPS — encrypted, ISP không thấy domain bạn truy cập</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Free hơn\">Free hơn</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Dùng được offline\">Dùng được offline</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: encrypted DNS qua HTTPS.</strong> Privacy + chống tampering. Khó censor.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"2\" data-quiz-correct=\"2\">\n              <p><strong>Câu 7.</strong> Recursive vs Iterative query?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Hai cái giống nhau\">Hai cái giống nhau</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Recursive cho IPv4, Iterative cho IPv6\">Recursive cho IPv4, Iterative cho IPv6</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Recursive: server tự đi tìm và trả kết quả cuối; Iterative: server trả &quot;hỏi server khác&quot;\">Recursive: server tự đi tìm và trả kết quả cuối; Iterative: server trả \"hỏi server khác\"</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Recursive nhanh hơn\">Recursive nhanh hơn</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: Recursive=tự đi tìm, Iterative=referral.</strong> Client→Resolver=Recursive. Resolver→Root/TLD/Auth=Iterative.\n              </p>\n            </div>\n\n            <div class=\"quiz-question\" data-correct=\"0\" data-quiz-correct=\"0\">\n              <p><strong>Câu 8.</strong> Anycast DNS (1.1.1.1) vì sao nhanh?</p>\n              <ul class=\"quiz-options\" role=\"group\" aria-label=\"Các lựa chọn\">\n                <li data-option=\"0\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 1: Nhiều server cùng IP, router tự route đến server gần nhất theo network distance\">Nhiều server cùng IP, router tự route đến server gần nhất theo network distance</li>\n                <li data-option=\"1\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 2: Cloudflare có Internet riêng\">Cloudflare có Internet riêng</li>\n                <li data-option=\"2\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 3: Cache lớn\">Cache lớn</li>\n                <li data-option=\"3\" tabindex=\"0\" role=\"button\" aria-label=\"Lựa chọn 4: Không qua TCP\">Không qua TCP</li>\n              </ul>\n              <p class=\"quiz-explain\" hidden=\"\">\n                <strong>Đáp án: anycast.</strong> Latency thấp + resilience + DDoS mitigation.\n              </p>\n            </div>\n          </div>\n        </section>\n\n        <section>\n          <h2 id=\"section-30\">Tổng kết chương 7</h2>\n          <ul>\n            <li>✅ DNS = hệ thống dịch domain ↔ IP, hierarchy 3 tầng: <strong>Root → TLD → Authoritative</strong></li>\n            <li>✅ Resolution flow: cache → recursive resolver → iterative qua hierarchy → trả IP</li>\n            <li>✅ Records phổ biến: <strong>A, AAAA, CNAME, MX, TXT, NS</strong></li>\n            <li>✅ <strong>TTL</strong> + nhiều cấp cache → DNS scale được. TTL ngắn = đổi nhanh nhưng tốn query</li>\n            <li>✅ \"DNS propagation\" thực ra là <strong>cache expiry</strong></li>\n            <li>✅ <strong>DoH/DoT</strong>: DNS encrypted qua HTTPS/TLS — privacy</li>\n            <li>✅ <strong>DNSSEC</strong>: ký records, chống tampering (khác encrypt)</li>\n            <li>✅ <strong>Anycast</strong>: cùng IP, nhiều location → 1.1.1.1, 8.8.8.8 nhanh từ mọi nơi</li>\n            <li>✅ Tools: <code>dig</code>, <code>dig +trace</code>, <code>nslookup</code>, <code>host</code>, <code>resolvectl</code></li>\n          </ul>\n        </section>\n\n      ",
+  "headings": [
+    {
+      "id": "section-1",
+      "text": "7.1 Tại sao cần DNS?",
+      "depth": 2
+    },
+    {
+      "id": "section-2",
+      "text": "Yêu cầu khó",
+      "depth": 3
+    },
+    {
+      "id": "section-3",
+      "text": "7.2 DNS Hierarchy — phân tầng tree",
+      "depth": 2
+    },
+    {
+      "id": "section-4",
+      "text": "3 tầng chính",
+      "depth": 3
+    },
+    {
+      "id": "section-5",
+      "text": "Domain vs Subdomain",
+      "depth": 3
+    },
+    {
+      "id": "section-6",
+      "text": "FQDN — Fully Qualified Domain Name",
+      "depth": 3
+    },
+    {
+      "id": "section-7",
+      "text": "7.3 DNS Resolution Flow — khi truy cập example.com",
+      "depth": 2
+    },
+    {
+      "id": "section-8",
+      "text": "Recursive vs Iterative",
+      "depth": 3
+    },
+    {
+      "id": "section-9",
+      "text": "7.4 DNS Record Types",
+      "depth": 2
+    },
+    {
+      "id": "section-10",
+      "text": "A vs CNAME vs ALIAS",
+      "depth": 3
+    },
+    {
+      "id": "section-11",
+      "text": "MX với priority",
+      "depth": 3
+    },
+    {
+      "id": "section-12",
+      "text": "7.5 TTL & Caching — vì sao DNS scale được",
+      "depth": 2
+    },
+    {
+      "id": "section-13",
+      "text": "Cache layers",
+      "depth": 3
+    },
+    {
+      "id": "section-14",
+      "text": "TTL trade-off",
+      "depth": 3
+    },
+    {
+      "id": "section-15",
+      "text": "7.6 \"DNS Propagation\" — vì sao đổi DNS phải đợi",
+      "depth": 2
+    },
+    {
+      "id": "section-16",
+      "text": "7.7 DNS over HTTPS / TLS — DNS có encryption",
+      "depth": 2
+    },
+    {
+      "id": "section-17",
+      "text": "DNS over TLS (DoT) — RFC 7858",
+      "depth": 3
+    },
+    {
+      "id": "section-18",
+      "text": "DNS over HTTPS (DoH) — RFC 8484",
+      "depth": 3
+    },
+    {
+      "id": "section-19",
+      "text": "Adoption",
+      "depth": 3
+    },
+    {
+      "id": "section-20",
+      "text": "DNSSEC — bảo vệ tính toàn vẹn",
+      "depth": 3
+    },
+    {
+      "id": "section-21",
+      "text": "7.8 Tools — dig, nslookup, host",
+      "depth": 2
+    },
+    {
+      "id": "section-22",
+      "text": "dig — chuẩn của sysadmin",
+      "depth": 3
+    },
+    {
+      "id": "section-23",
+      "text": "nslookup — quen với Windows",
+      "depth": 3
+    },
+    {
+      "id": "section-24",
+      "text": "host — nhanh, ngắn",
+      "depth": 3
+    },
+    {
+      "id": "section-25",
+      "text": "Linux/Mac OS resolver config",
+      "depth": 3
+    },
+    {
+      "id": "section-26",
+      "text": "7.9 Anycast DNS — vì sao 1.1.1.1 nhanh từ mọi nơi",
+      "depth": 2
+    },
+    {
+      "id": "section-27",
+      "text": "Lợi ích",
+      "depth": 3
+    },
+    {
+      "id": "section-28",
+      "text": "Bài tập",
+      "depth": 2
+    },
+    {
+      "id": "section-29",
+      "text": "🧪 Quiz cuối chương",
+      "depth": 3
+    },
+    {
+      "id": "section-30",
+      "text": "Tổng kết chương 7",
+      "depth": 2
+    }
+  ],
+  "source": "Networking/chuong/chuong7.html",
+  "sourceHash": "34a8d2cc6f79f81f3100a89084275e2903ab0b5b8420e1fe173353f818d6ddf7",
+  "readingMinutes": 9
+}
