@@ -14,7 +14,7 @@ AV Lore là website học tập và tra cứu kiến thức công nghệ: từ n
 - **Học trực quan:** sơ đồ minh họa, tóm tắt ghi nhớ và 31 bài thử tương tác để quan sát hành vi của hệ thống.
 - **Luyện tập:** lọc câu hỏi theo vai trò, xem gợi ý trả lời và đánh dấu nội dung cần ôn.
 - **Tra cứu:** tìm kiếm toàn văn với chỉ mục riêng cho từng ngôn ngữ, mục lục trong bài và breadcrumb.
-- **Cá nhân hóa:** năm theme sáng/tối, bookmark, tiến độ chương và nhập/xuất dữ liệu học tập bằng JSON.
+- **Cá nhân hóa:** năm theme sáng/tối (mặc định Tối xanh xám), bookmark, tiến độ chương và nhập/xuất dữ liệu học tập bằng JSON.
 - **Hai ngôn ngữ:** chuyển Việt/English ngay tại bài đang đọc, giữ đường dẫn và vị trí mục.
 
 Nội dung đọc được xuất sẵn thành HTML. Các lab, tìm kiếm và công cụ học tập dùng JavaScript. Dữ liệu học tập lưu trên trình duyệt; có thể xuất JSON để sao lưu hoặc chuyển sang thiết bị khác.

@@ -92,6 +92,7 @@ export default function Practice({ items }: Props) {
         <label className="input-field">
           Hướng luyện tập
           <select
+            className="practice-role-select"
             value={role}
             onChange={(e) => {
               setRole(e.target.value);
@@ -99,7 +100,9 @@ export default function Practice({ items }: Props) {
             }}
           >
             {Object.keys(roles).map((r) => (
-              <option key={r}>{r}</option>
+              <option key={r} value={r}>
+                {r}
+              </option>
             ))}
           </select>
         </label>
