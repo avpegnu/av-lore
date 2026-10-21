@@ -1,0 +1,819 @@
+{
+  "id": "networking",
+  "group": "foundation",
+  "status": "review",
+  "title": {
+    "vi": "Networking, API và protocol: theo dõi một request từ FE tới dữ liệu",
+    "en": "Networking, APIs and protocols: trace a request from frontend to data"
+  },
+  "summary": {
+    "vi": "Kết nối DNS, transport, TLS, HTTP, browser security và backend contracts thành một luồng dễ hiểu; chọn REST, RPC, GraphQL, polling hoặc streaming theo nhu cầu thật.",
+    "en": "Connect DNS, transport, TLS, HTTP, browser security and backend contracts into one understandable flow; choose REST, RPC, GraphQL, polling or streaming for actual needs."
+  },
+  "prerequisites": [
+    "framework"
+  ],
+  "takeaways": [
+    {
+      "vi": "Một request có nhiều giai đoạn độc lập: resolution, connection, bảo mật, routing, xử lý và đọc dữ liệu.",
+      "en": "A request has separate stages: resolution, connection, security, routing, processing and data access."
+    },
+    {
+      "vi": "HTTP method, status và idempotency là hợp đồng; protocol không tự chống duplicate business action.",
+      "en": "HTTP methods, statuses and idempotency form a contract; a protocol does not automatically deduplicate business actions."
+    },
+    {
+      "vi": "HTTP/2 multiplexing không loại bỏ TCP head-of-line blocking; HTTP/3 đổi transport, không tự sửa bottleneck của database.",
+      "en": "HTTP/2 multiplexing does not remove TCP head-of-line blocking; HTTP/3 changes transport, not database bottlenecks."
+    },
+    {
+      "vi": "CORS giới hạn browser đọc response; authorization và CSRF cần cơ chế riêng.",
+      "en": "CORS constrains browser response access; authorization and CSRF need separate controls."
+    }
+  ],
+  "sections": [
+    {
+      "id": "mental-model",
+      "title": {
+        "vi": "1. Phân biệt các lớp của request",
+        "en": "1. Separate the layers of a request"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi frontend gọi API, nó không nhảy thẳng vào function backend. Browser cần biết địa chỉ đích, có connection phù hợp, thiết lập bảo mật, gửi HTTP message, qua proxy/load balancer rồi mới tới application. Application còn kiểm tra identity, quyền, input và query dữ liệu trước khi response quay về. Tách các bước giúp biết “chậm mạng” thực sự nằm ở DNS, TLS, queue hay database.",
+          "en": "A frontend API call does not jump directly into a backend function. The browser resolves the destination, obtains a suitable connection, establishes security, sends an HTTP message and traverses proxies/load balancers before reaching the application. The application still checks identity, authorization and input and queries data. Separating stages reveals whether “network slowness” is DNS, TLS, queuing or database work."
+        },
+        {
+          "vi": "Connection reuse, DNS cache và TLS resumption có thể bỏ qua một số chi phí ở request sau. Một request cold và warm khác nhau; waterfall của browser phải được đọc cùng server trace. Frontend static deploy trên CDN vẫn cần backend riêng nếu muốn thực thi logic server, giữ secret hoặc truy cập database an toàn.",
+          "en": "Connection reuse, DNS caching and TLS resumption can avoid some costs on later requests. Cold and warm requests differ; read browser waterfalls alongside server traces. A static frontend on a CDN still needs a backend for server logic, secrets or safe database access."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Transport · Chuyển dữ liệu",
+            "en": "Transport · Move data"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Kết nối, stream, loss và congestion.",
+              "en": "Connections, streams, loss and congestion."
+            },
+            {
+              "vi": "Bảo mật kênh truyền không thay thế authorization.",
+              "en": "Securing the channel does not replace authorization."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "HTTP · Hợp đồng tương tác",
+            "en": "HTTP · Interaction contract"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Method, status, headers, cache và retry semantics.",
+              "en": "Methods, statuses, headers, caching and retry semantics."
+            },
+            {
+              "vi": "Một HTTP response phải gắn với trạng thái ứng dụng đã hứa.",
+              "en": "An HTTP response must match the promised application state."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Ứng dụng · Quyền và invariant",
+            "en": "Application · Rights and invariants"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Ai được làm gì với resource nào?",
+              "en": "Who can do what to which resource?"
+            },
+            {
+              "vi": "Khi timeout, xác minh outcome trước khi lặp side effect.",
+              "en": "After a timeout, establish the outcome before repeating a side effect."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dns",
+      "title": {
+        "vi": "2. DNS và routing không phải service health",
+        "en": "2. DNS and routing are not service health"
+      },
+      "paragraphs": [
+        {
+          "vi": "DNS ánh xạ tên tới record như A/AAAA hoặc CNAME theo resolver và TTL. Browser/OS/recursive resolver có thể giữ cache; đổi record không bảo đảm mọi client chuyển đích ngay. Khi dùng DNS failover, tính thời gian cache, connection đang sống và việc endpoint cũ vẫn nhận traffic.",
+          "en": "DNS maps names to records such as A/AAAA or CNAME through resolvers and TTLs. Browsers, operating systems and recursive resolvers may cache answers; changing a record does not immediately move every client. DNS failover must account for caches, existing connections and old endpoints still receiving traffic."
+        },
+        {
+          "vi": "Service discovery trong backend giải quyết việc tìm instance hiện có; load balancing và readiness quyết định instance nào nên nhận request. DNS resolve thành công không chứng minh application còn kết nối database được. Health check quá nông có thể route vào node đang lỗi, còn probe quá sâu có thể làm cả cụm bị rút khỏi routing vì một dependency chung chậm.",
+          "en": "Backend service discovery finds current instances; balancing and readiness determine which should receive work. Successful DNS resolution does not prove the application can reach its database. Shallow health checks can route into broken instances, while overly deep probes can remove every instance during a shared dependency slowdown."
+        }
+      ],
+      "experiment": "handshake"
+    },
+    {
+      "id": "transport",
+      "title": {
+        "vi": "3. TCP, TLS và HTTP/2/3",
+        "en": "3. TCP, TLS and HTTP/2/3"
+      },
+      "paragraphs": [
+        {
+          "vi": "TCP cung cấp byte stream có thứ tự và retransmission; nó không giữ ranh giới application message. TLS xác thực server theo certificate và bảo vệ confidentiality/integrity trên đoạn kết nối đó. Nếu TLS terminate tại proxy rồi proxy gọi backend plaintext, đoạn sau cần threat model và network policy riêng; biểu tượng HTTPS ở browser không mô tả toàn đường nội bộ.",
+          "en": "TCP provides an ordered retransmitted byte stream without preserving application-message boundaries. TLS authenticates the server certificate and protects confidentiality/integrity on that connection segment. If TLS terminates at a proxy that calls a plaintext backend, the latter segment needs its own threat model and network policy; the browser’s HTTPS indicator does not describe every internal hop."
+        },
+        {
+          "vi": "HTTP/1.1 thường dùng connection reuse; HTTP/2 multiplex nhiều stream trên một TCP connection. Khi TCP thiếu byte do packet loss, các stream cùng connection vẫn có thể bị chặn chờ transport phục hồi. HTTP/3 dùng QUIC trên UDP với reliable streams và security tích hợp, giúp tránh kiểu blocking giữa stream do một ordered TCP byte stream; congestion và shared bottleneck vẫn tồn tại.",
+          "en": "HTTP/1.1 commonly reuses connections; HTTP/2 multiplexes streams over one TCP connection. Missing bytes from packet loss can still stall streams until TCP recovers. HTTP/3 uses QUIC over UDP with reliable streams and integrated security, avoiding cross-stream blocking from one ordered TCP byte stream; congestion and shared bottlenecks still exist."
+        },
+        {
+          "vi": "Không chọn version bằng một khẩu hiệu “UDP nhanh hơn TCP”. So trên packet loss, RTT, connection reuse, proxy support và workload. API mất 500 ms trong query không tự nhanh thành 50 ms khi đổi HTTP/2 sang HTTP/3. Tối ưu protocol phải được đặt trong latency budget toàn request.",
+          "en": "Do not choose versions using “UDP is faster than TCP.” Compare packet loss, RTT, connection reuse, proxy support and workload. A 500 ms database query does not become 50 ms by switching from HTTP/2 to HTTP/3. Protocol optimization belongs in the full request budget."
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "4. Thiết kế hợp đồng HTTP rõ ràng",
+        "en": "4. Design explicit HTTP contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "API contract gồm identity, resource, schema, validation, status, lỗi ổn định, pagination, quota và retry semantics. GET an toàn nghĩa là client không yêu cầu thay đổi business state; logging hoặc metric incidental vẫn có thể xảy ra. Idempotent nghĩa là lặp cùng request có cùng intended effect, không nhất thiết cùng response hoặc chỉ một dòng log.",
+          "en": "An API contract includes identity, resources, schemas, validation, statuses, stable errors, pagination, quotas and retry semantics. A safe GET means the client does not request business-state changes; incidental logs/metrics may still occur. Idempotent means repeated identical requests have the same intended effect, not necessarily identical responses or one log entry."
+        },
+        {
+          "vi": "PUT/DELETE có semantics idempotent theo HTTP, nhưng code phải thực thi đúng. POST tạo order cần application idempotency key nếu muốn retry an toàn: key gắn với actor, request fingerprint và kết quả đã lưu. Khi timeout, client không biết server chưa nhận, đang xử lý hay đã commit; query trạng thái hoặc replay cùng key tốt hơn tạo business action mới.",
+          "en": "PUT/DELETE have idempotent HTTP semantics, which implementations must honor. Retriable order-creation POSTs need application idempotency keys bound to actors, request fingerprints and stored outcomes. A timeout does not reveal whether a server received, is processing or committed the request; status lookup or same-key replay is safer than a new business action."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Status",
+            "en": "Status"
+          },
+          {
+            "vi": "Ý nghĩa trong hợp đồng",
+            "en": "Contract meaning"
+          },
+          {
+            "vi": "Cần làm rõ",
+            "en": "Clarify"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "200 / 201 / 202 / 204",
+              "en": "200 / 201 / 202 / 204"
+            },
+            {
+              "vi": "Thành công có body / created / accepted async / không body",
+              "en": "Success with content / created / accepted asynchronously / no content"
+            },
+            {
+              "vi": "202 chưa xác nhận job hoàn tất; client cần status hoặc completion event.",
+              "en": "202 does not confirm job completion; provide status or completion events."
+            }
+          ],
+          [
+            {
+              "vi": "400 / 422",
+              "en": "400 / 422"
+            },
+            {
+              "vi": "Request sai cú pháp hoặc không thỏa validation theo API",
+              "en": "Malformed or validation-failing requests under the API contract"
+            },
+            {
+              "vi": "Trả field/error code ổn định; retry cùng payload không sửa được lỗi.",
+              "en": "Return stable field/error codes; retrying unchanged data will not fix it."
+            }
+          ],
+          [
+            {
+              "vi": "401 / 403",
+              "en": "401 / 403"
+            },
+            {
+              "vi": "Thiếu/sai authentication / không được phép",
+              "en": "Missing/invalid authentication / disallowed action"
+            },
+            {
+              "vi": "Không để ID hoặc error detail làm lộ resource tenant khác.",
+              "en": "Avoid exposing another tenant’s resources through IDs/error details."
+            }
+          ],
+          [
+            {
+              "vi": "409 / 412",
+              "en": "409 / 412"
+            },
+            {
+              "vi": "Conflict / precondition không thỏa",
+              "en": "Conflict / failed precondition"
+            },
+            {
+              "vi": "Version/ETag giúp optimistic concurrency; client cần reconcile.",
+              "en": "Versions/ETags support optimistic concurrency; clients need reconciliation."
+            }
+          ],
+          [
+            {
+              "vi": "429 / 503",
+              "en": "429 / 503"
+            },
+            {
+              "vi": "Rate limit / service unavailable theo contract",
+              "en": "Rate limiting / service unavailable under the contract"
+            },
+            {
+              "vi": "Retry hint, backoff, deadline và idempotency; không retry vô hạn.",
+              "en": "Use retry hints, backoff, deadlines and idempotency; never retry indefinitely."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "styles",
+      "title": {
+        "vi": "5. REST, gRPC và GraphQL",
+        "en": "5. REST, gRPC and GraphQL"
+      },
+      "paragraphs": [
+        {
+          "vi": "REST là architectural style, không đồng nghĩa mọi JSON qua HTTP đều đã RESTful. Resource-oriented HTTP API thường dễ debug, dùng browser/cache/proxy tốt và hợp với public boundary. gRPC dùng typed contracts và hỗ trợ streaming phù hợp internal RPC, nhưng cần tooling, compatibility discipline và browser adapter khi môi trường yêu cầu.",
+          "en": "REST is an architectural style, not a label automatically earned by JSON over HTTP. Resource-oriented HTTP APIs are often easy to debug and integrate with browsers/caches/proxies. gRPC offers typed contracts and streaming for internal RPC but needs tooling, compatibility discipline and browser adaptation where required."
+        },
+        {
+          "vi": "GraphQL cho client chọn field và ghép dữ liệu qua schema. Nó có thể giảm over/under-fetching nhưng không tự giải quyết N+1 query: resolver cần batching, query depth/cost limits và authorization theo field/resource. Một request HTTP duy nhất vẫn có thể tạo hàng nghìn query bên trong; rate limit theo request count đơn thuần sẽ bỏ lọt chi phí đó.",
+          "en": "GraphQL lets clients select fields and compose data through a schema. It can reduce over/under-fetching but does not automatically eliminate N+1 queries: resolvers need batching, depth/cost limits and field/resource authorization. One HTTP request can trigger thousands of internal queries, so request-count-only rate limits can miss the cost."
+        },
+        {
+          "vi": "Ưu tiên evolution tương thích: thêm field optional thường dễ hơn đổi nghĩa hoặc xóa field đã dùng. Với RPC schema, tuân thủ quy tắc wire compatibility của encoding; với HTTP API, version không chỉ là /v2 mà còn semantics pagination, errors và idempotency. Contract test và staged rollout giúp client/server khác phiên bản vẫn giao tiếp.",
+          "en": "Favor compatible evolution: adding optional fields is usually easier than changing meanings or removing used fields. Follow encoding-specific wire rules for RPC; HTTP API versioning includes pagination, errors and idempotency beyond a /v2 path. Contract tests and staged rollouts support mixed client/server versions."
+        }
+      ]
+    },
+    {
+      "id": "realtime",
+      "title": {
+        "vi": "6. Polling, long polling, SSE và WebSocket",
+        "en": "6. Polling, long polling, SSE and WebSockets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Polling định kỳ dễ triển khai nhưng request count tăng theo số client và interval; 100.000 client poll mỗi 5 giây tạo trung bình 20.000 requests/s ngay cả khi không có update. Dùng jitter tránh mọi client poll cùng thời điểm. Long polling giữ request tới khi có event hoặc timeout, giảm response rỗng nhưng cần connection budget và reconnect policy.",
+          "en": "Periodic polling is simple but request counts grow with clients and interval: 100,000 clients polling every five seconds create 20,000 requests/s on average even with no updates. Jitter prevents synchronized polls. Long polling waits for an event or timeout, reducing empty replies while requiring connection budgets and reconnection policies."
+        },
+        {
+          "vi": "SSE phù hợp stream event từ server sang browser bằng HTTP; submit/cancel có thể dùng request riêng. WebSocket hỗ trợ hai chiều liên tục cho chat realtime, collaboration hoặc audio, nhưng cần app-level identity, message schema, heartbeat, backpressure và reconnect/resume. Transport không tự lưu message hoặc chống duplicate sau reconnect.",
+          "en": "SSE suits server-to-browser HTTP event streams, with separate submission/cancellation requests. WebSockets support continuous bidirectional chat, collaboration or audio but require application identity, message schemas, heartbeats, backpressure and reconnection/resumption. Transports do not automatically persist messages or deduplicate reconnects."
+        },
+        {
+          "vi": "Định nghĩa sequence/event ID, retention và replay window. Client mất kết nối sau event 40 chỉ resume được nếu server còn event 41 trở đi và đã kiểm tra quyền. Nếu log hết hạn, tải snapshot rồi tiếp tục theo protocol đã định nghĩa; không hứa “realtime exactly-once” chỉ vì dùng một socket lâu dài.",
+          "en": "Define event sequences, retention and replay windows. A client disconnected after event 40 can resume only if authorized replay of event 41 onward remains available. When retention expires, load a snapshot and resume under a declared protocol; a long-lived socket alone does not provide realtime exactly-once behavior."
+        },
+        {
+          "vi": "WebTransport cung cấp các kiểu stream và datagram cho ứng dụng cần hai chiều linh hoạt trên transport hiện đại, ví dụ realtime media hoặc game. Nó có mô hình API, deployment và khả năng hỗ trợ client khác WebSocket; kiểm tra browser/proxy và fallback của sản phẩm trước khi chọn. Unreliable datagram chỉ phù hợp dữ liệu được phép bỏ, không tự dùng cho confirm payment hoặc message cần bền vững.",
+          "en": "WebTransport offers streams and datagrams for flexible bidirectional use cases such as realtime media or games. Its API, deployment and client support differ from WebSockets; validate the product’s browsers, proxies and fallback. Unreliable datagrams fit discardable data, not automatically payment confirmations or durable messages."
+        }
+      ],
+      "experiment": "transport"
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "7. Sơ đồ FE → BE và event quay về",
+        "en": "7. Frontend → backend and returning events"
+      },
+      "paragraphs": [],
+      "diagram": {
+        "id": "fe-be-request",
+        "title": {
+          "vi": "Từ frontend tới backend, database và realtime",
+          "en": "From frontend to backend, database and realtime"
+        },
+        "caption": {
+          "vi": "Đây là các boundary logic, không buộc mỗi hộp là một service riêng. DNS/handshake có thể được reuse; event path có thể hoàn thành sau response ghi.",
+          "en": "These are logical boundaries, not mandatory services. DNS/handshakes may be reused; event delivery may finish after a write response."
+        },
+        "width": 1050,
+        "height": 430,
+        "nodes": [
+          {
+            "id": "browser",
+            "label": {
+              "vi": "Frontend / browser",
+              "en": "Frontend / browser"
+            },
+            "kind": "client",
+            "x": 110,
+            "y": 100,
+            "detail": {
+              "vi": "Giữ UI state, gửi request theo auth/session policy và render output an toàn. Không giữ secret database hoặc service admin.",
+              "en": "Owns UI state, sends requests under session policy and renders safely. Never holds database or administrator secrets."
+            }
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "CDN / edge",
+              "en": "CDN / edge"
+            },
+            "kind": "edge",
+            "x": 380,
+            "y": 100,
+            "detail": {
+              "vi": "Phục vụ static asset, TLS/routing và cache response phù hợp. Private response không được chia sẻ theo URL-only key.",
+              "en": "Serves assets, TLS/routing and appropriate response caching. Private responses must not share URL-only keys."
+            }
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Backend / API",
+              "en": "Backend / API"
+            },
+            "kind": "service",
+            "x": 650,
+            "y": 100,
+            "detail": {
+              "vi": "Validate identity, authorization, schema và deadline; giữ transaction và business invariant.",
+              "en": "Validates identity, authorization, schemas and deadlines; owns transactions and business invariants."
+            }
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Database",
+              "en": "Database"
+            },
+            "kind": "store",
+            "x": 930,
+            "y": 100,
+            "detail": {
+              "vi": "Nguồn sự thật của resource; index theo query, constraint giữ invariant và owner ghi rõ ràng.",
+              "en": "Resource authority with query-driven indexes, invariant-preserving constraints and explicit write ownership."
+            }
+          },
+          {
+            "id": "dns",
+            "label": {
+              "vi": "DNS resolver",
+              "en": "DNS resolver"
+            },
+            "kind": "service",
+            "x": 110,
+            "y": 310,
+            "detail": {
+              "vi": "Trả địa chỉ theo cache/TTL; không kiểm tra correctness của application response.",
+              "en": "Returns addresses through caches/TTLs; does not validate application responses."
+            }
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Event log / broker",
+              "en": "Event log / broker"
+            },
+            "kind": "queue",
+            "x": 650,
+            "y": 310,
+            "detail": {
+              "vi": "Phân phối event sau durable commit; replay, ordering và retention theo contract riêng.",
+              "en": "Delivers post-commit events under explicit replay, ordering and retention contracts."
+            }
+          },
+          {
+            "id": "realtime",
+            "label": {
+              "vi": "Realtime gateway",
+              "en": "Realtime gateway"
+            },
+            "kind": "edge",
+            "x": 380,
+            "y": 310,
+            "detail": {
+              "vi": "Giữ connection, map session/user, giới hạn buffer và hỗ trợ resume nếu có retained events.",
+              "en": "Owns connections, session/user mapping, bounded buffers and retained-event resumption."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "read",
+            "label": {
+              "vi": "HTTP read",
+              "en": "HTTP read"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "dns",
+                "description": {
+                  "vi": "Resolve tên nếu chưa có cache phù hợp.",
+                  "en": "Resolve the name if no suitable cached answer exists."
+                }
+              },
+              {
+                "from": "browser",
+                "to": "edge",
+                "description": {
+                  "vi": "Dùng hoặc tạo secure connection, gửi HTTP request.",
+                  "en": "Reuse or create a secure connection and send the HTTP request."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "api",
+                "description": {
+                  "vi": "Route cache miss/private request tới API cùng identity context phù hợp.",
+                  "en": "Route cache misses/private requests to the API with appropriate identity context."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Query có authorization và bounded deadline.",
+                  "en": "Run an authorized query within a bounded deadline."
+                }
+              },
+              {
+                "from": "api",
+                "to": "browser",
+                "description": {
+                  "vi": "Serialize response; browser áp same-origin/CORS và render an toàn.",
+                  "en": "Serialize the response; the browser applies same-origin/CORS and renders safely."
+                }
+              }
+            ]
+          },
+          {
+            "id": "write",
+            "label": {
+              "vi": "Write + event",
+              "en": "Write + event"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "api",
+                "description": {
+                  "vi": "Submit mutation có auth, CSRF protection khi phù hợp và idempotency key.",
+                  "en": "Submit a mutation with authentication, appropriate CSRF protection and an idempotency key."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Commit invariant và event intent theo transaction/outbox.",
+                  "en": "Commit the invariant and event intent through a transaction/outbox."
+                }
+              },
+              {
+                "from": "db",
+                "to": "events",
+                "description": {
+                  "vi": "Relay phát event sau commit; delivery có thể lặp.",
+                  "en": "A relay emits the post-commit event; delivery may repeat."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "realtime",
+                "description": {
+                  "vi": "Gateway nhận event dành cho user đã được cấp quyền.",
+                  "en": "The gateway consumes events for authorized users."
+                },
+                "async": true
+              },
+              {
+                "from": "realtime",
+                "to": "browser",
+                "description": {
+                  "vi": "Gửi event có sequence; client dedup và refresh state nếu cần.",
+                  "en": "Deliver sequenced events; clients deduplicate and refresh state if needed."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "pagination",
+      "title": {
+        "vi": "7a. Pagination và optimistic concurrency",
+        "en": "7a. Pagination and optimistic concurrency"
+      },
+      "paragraphs": [
+        {
+          "vi": "Offset pagination dễ hiểu nhưng deep offset có thể phải bỏ qua nhiều row; insert/delete làm vị trí thay đổi khi user cuộn. Keyset cursor dùng một sort key ổn định và tie-breaker, ví dụ (created_at, id), cùng index tương ứng. Nó giảm chi phí đi sâu theo access pattern phù hợp, không tự bảo đảm snapshot nhất quán khi sort key thay đổi.",
+          "en": "Offset pagination is simple, but deep offsets may skip many rows and inserts/deletions shift positions while scrolling. Keyset cursors use stable sort keys with tie-breakers, such as (created_at, id), and corresponding indexes. They improve deep pagination for suitable access patterns without automatically preserving snapshots when sort keys change."
+        },
+        {
+          "vi": "Cursor nên opaque với client và được validate, có thể ký để chống sửa, gắn filter/user/session khi cần. Base64 chỉ là encoding, không phải encryption hoặc chống giả mạo. Ranked feed cần ranking/session semantics riêng; mỗi trang vẫn kiểm tra quyền hiện tại, dù candidate thuộc snapshot cũ.",
+          "en": "Cursors should be opaque to clients and validated, potentially signed against tampering and bound to filters/users/sessions where needed. Base64 is encoding, not encryption or integrity protection. Ranked feeds need separate ranking/session semantics; each page still enforces current permissions even for old snapshots."
+        },
+        {
+          "vi": "Với update cạnh tranh, trả version hoặc ETag rồi yêu cầu If-Match/expectedVersion. Server dùng conditional update atomic và trả conflict/precondition failure nếu resource đã đổi. Client phải đọc lại/reconcile; không chỉ retry payload cũ cho tới khi ghi đè được thay đổi của người khác.",
+          "en": "For concurrent updates, return a version/ETag and require If-Match or expectedVersion. The server performs an atomic conditional update and returns a conflict/precondition failure when state changed. Clients reread/reconcile instead of retrying stale payloads until another user’s update is overwritten."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/v1/posts?limit=20&cursor=opaque-token",
+          "description": {
+            "vi": "Trang trả tối đa 20 item đã được authorize theo sort và filter cố định.",
+            "en": "Return at most twenty authorized items under declared sorting/filtering."
+          },
+          "response": "200 OK\n{ \"items\": [{ \"id\": \"p_8\", \"createdAt\": \"2026-10-21T07:00:00Z\" }],\n  \"nextCursor\": \"signed-token\" }"
+        },
+        {
+          "method": "PATCH",
+          "path": "/v1/documents/{id}",
+          "description": {
+            "vi": "Chỉ cập nhật nếu version hiện tại khớp; actor vẫn phải có quyền sửa.",
+            "en": "Update only when the current version matches; the actor still needs edit permission."
+          },
+          "request": "If-Match: \"version-7\"\n{ \"title\": \"Revised title\" }",
+          "response": "200 OK\nETag: \"version-8\"\n{ \"id\": \"d_1\", \"title\": \"Revised title\", \"version\": 8 }"
+        }
+      ]
+    },
+    {
+      "id": "gateway",
+      "title": {
+        "vi": "7b. API gateway, BFF và trust boundary",
+        "en": "7b. API gateways, BFFs and trust boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Gateway có thể terminate TLS, xác minh token, áp quota, route và phát trace context chung. Các service bên trong vẫn cần resource-level authorization và chỉ tin identity metadata từ đường đã xác thực; không cho client tự đặt header “internal user” rồi vượt kiểm tra. Gateway là shared dependency nên cần capacity, HA, limits và rollout riêng.",
+          "en": "Gateways can terminate TLS, validate tokens, enforce quotas, route and propagate trace context. Internal services still need resource authorization and may trust identity metadata only from authenticated paths; client-supplied “internal user” headers must not bypass checks. Gateways are shared dependencies needing capacity, availability, limits and safe rollout."
+        },
+        {
+          "vi": "BFF (backend for frontend) tổng hợp dữ liệu phù hợp web/mobile/TV, giảm chatty client và giữ contract thân thiện với từng trải nghiệm. Nó khác việc nhồi mọi business workflow vào gateway: quyền và invariant nên ở domain owner, còn BFF quản lý aggregation/deadline. Hạn chế fan-out, batch các truy vấn và không để một endpoint gateway gọi cả hệ thống không giới hạn.",
+          "en": "A backend for frontend aggregates data for web/mobile/TV, reducing client chatter and shaping suitable contracts. It differs from putting every business workflow in the gateway: domain owners retain authorization/invariants while BFFs manage aggregation/deadlines. Bound fan-out, batch queries and prevent one gateway endpoint from calling the entire system without limits."
+        },
+        {
+          "vi": "Ở quy mô tổ chức, contract và error semantics tồn tại lâu hơn implementation. Có owner cho API, deprecation window, compatibility test và telemetry client version trước khi xóa field. Protocol quyết định cả vận hành: long-lived streams cần drain/reconnect budget khi deploy, không chỉ chọn thư viện gọi request.",
+          "en": "At organizational scale, contracts/error semantics outlive implementations. Assign API ownership, deprecation windows, compatibility tests and client-version telemetry before removing fields. Protocol choices also determine operations: long-lived streams require deployment draining/reconnection budgets, not merely a request library."
+        }
+      ]
+    },
+    {
+      "id": "browser-security",
+      "title": {
+        "vi": "8. CORS, cookies, CSRF và authorization",
+        "en": "8. CORS, cookies, CSRF and authorization"
+      },
+      "paragraphs": [
+        {
+          "vi": "Origin gồm scheme, host và port; khác subdomain hoặc port có thể là cross-origin. CORS là chính sách browser cho script đọc response từ origin khác, không phải firewall bảo vệ backend khỏi curl hoặc request từ server. Một số request có thể đã được gửi trước khi browser chặn đọc response; side effect vẫn cần authentication/authorization và CSRF protection phù hợp.",
+          "en": "An origin consists of scheme, host and port; changing a subdomain or port can be cross-origin. CORS is a browser policy for script access to cross-origin responses, not a firewall against curl or server requests. Some requests can be sent before response access is blocked, so side effects still require authentication/authorization and appropriate CSRF controls."
+        },
+        {
+          "vi": "Cookie session được browser gửi theo cookie policy; cấu hình Secure, HttpOnly và SameSite theo nhu cầu sản phẩm. HttpOnly giảm script đọc cookie nhưng không thay authorization, và SameSite không nên bị hiểu là mọi origin/site đều tương đương. Với cookie-authenticated mutation, dùng CSRF token/origin checks và các biện pháp phù hợp với threat model.",
+          "en": "Session cookies are sent under browser cookie policy; configure Secure, HttpOnly and SameSite for the product. HttpOnly limits script access to cookies but does not replace authorization, and site and origin are not interchangeable. Cookie-authenticated mutations need suitable CSRF tokens/origin checks and threat-model controls."
+        },
+        {
+          "vi": "Credentialed CORS cần allowlist origin rõ ràng và response headers phù hợp; wildcard origin không dùng để cho script đọc credentialed response. Không phản chiếu mọi Origin không kiểm tra. Dù CORS đúng, API vẫn phải kiểm tra quyền trên conversation, order hoặc document theo actor thật; ID khó đoán không phải authorization.",
+          "en": "Credentialed CORS needs an explicit allowed origin and matching headers; a wildcard origin does not grant script access to credentialed responses. Do not blindly reflect every Origin. Correct CORS still leaves resource authorization necessary for the actual actor; unguessable IDs are not authorization."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Cơ chế",
+            "en": "Mechanism"
+          },
+          {
+            "vi": "Giúp kiểm soát",
+            "en": "Helps control"
+          },
+          {
+            "vi": "Vẫn phải làm",
+            "en": "Still required"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "CORS",
+              "en": "CORS"
+            },
+            {
+              "vi": "Browser cho script ở origin khác đọc response hay không.",
+              "en": "Whether a browser lets a cross-origin script read a response."
+            },
+            {
+              "vi": "Authn/authz; một số request vẫn có thể được gửi dù response không được đọc.",
+              "en": "Authentication/authorization; some requests may still be sent even when the response cannot be read."
+            }
+          ],
+          [
+            {
+              "vi": "CSRF defense",
+              "en": "CSRF defense"
+            },
+            {
+              "vi": "Request ngoài ý muốn dùng credential browser tự đính kèm.",
+              "en": "Unwanted requests using credentials automatically attached by a browser."
+            },
+            {
+              "vi": "Token, SameSite và kiểm tra origin theo mô hình ứng dụng; vẫn cần authorization.",
+              "en": "Use tokens, SameSite and origin checks as appropriate; authorization remains necessary."
+            }
+          ],
+          [
+            {
+              "vi": "Authorization",
+              "en": "Authorization"
+            },
+            {
+              "vi": "Quyền thực hiện operation trên resource và tenant cụ thể.",
+              "en": "Permission to perform an operation on a specific resource and tenant."
+            },
+            {
+              "vi": "Kiểm tra server-side cho mỗi đường truy cập; không tin việc UI đã ẩn nút.",
+              "en": "Check each access path server-side; hidden UI buttons do not enforce access."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "deadline",
+      "title": {
+        "vi": "9. Timeout, retry và observability end-to-end",
+        "en": "9. End-to-end timeouts, retries and observability"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chia total deadline cho connect, TLS, upstream processing và response read; propagate remaining deadline xuống dependency. Retry chỉ trong tổng budget, ưu tiên một layer làm chủ để tránh retry multiplicative: 3 layer mỗi nơi 3 attempt có thể tạo 27 call tới dependency. Dùng exponential backoff, jitter, max attempts và idempotency cho side effect.",
+          "en": "Allocate total deadlines across connection, TLS, upstream processing and response reads; propagate remaining time to dependencies. Retries stay within the total budget and should have one owner to avoid multiplicative amplification: three layers with three attempts each can create 27 downstream calls. Use exponential backoff, jitter, attempt caps and side-effect idempotency."
+        },
+        {
+          "vi": "Đo browser DNS/connect/TTFB/download, edge upstream wait và server trace gồm pool/query/service latency. Correlation/trace ID nối các hop; không log Authorization header, cookie hoặc secret trong URL. HTTP 200 với business error giấu trong body có thể làm success metric sai nếu SLI chỉ nhìn status.",
+          "en": "Measure browser DNS/connect/TTFB/download, edge upstream waits and server pool/query/service traces. Correlation/trace IDs connect hops; never log authorization headers, cookies or URL secrets. An HTTP 200 hiding business errors can distort success metrics that look only at status."
+        },
+        {
+          "vi": "Contract tests cần duplicate submit, expired session, permission revoked giữa các trang, malformed cursor, slow stream và client disconnect. Load test có connection reuse và workload size thực; network error giả lập kiểm chứng cancellation không để backend tiếp tục công việc vô hạn.",
+          "en": "Contract tests cover duplicate submission, expired sessions, revoked access during pagination, malformed cursors, slow streams and disconnections. Load tests need realistic connection reuse and payload sizes; network-failure injection verifies cancellation does not leave unbounded backend work."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "10. Câu hỏi và lời giải",
+        "en": "10. Questions and worked answers"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "HTTP/2 có loại bỏ mọi head-of-line blocking không?",
+            "en": "Does HTTP/2 remove all head-of-line blocking?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nó multiplex HTTP streams nhưng vẫn dùng một ordered TCP byte stream; packet loss có thể ảnh hưởng nhiều stream cùng connection. HTTP/3 đổi transport sang QUIC stream semantics, nhưng shared congestion, server queue và application dependencies vẫn có thể gây chậm.",
+              "en": "No. It multiplexes HTTP streams over an ordered TCP byte stream, so packet loss can affect multiple streams. HTTP/3 uses QUIC stream semantics, but shared congestion, server queues and application dependencies can still delay work."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "DELETE trả 404 ở lần hai thì còn idempotent không?",
+            "en": "Can a DELETE returning 404 on the second attempt still be idempotent?"
+          },
+          "answer": [
+            {
+              "vi": "Có nếu intended effect vẫn là resource không tồn tại sau cả hai lần. Idempotency không yêu cầu response giống hệt. API có thể chọn 204 cho delete lặp để client đơn giản hơn, nhưng phải định nghĩa contract và tránh lộ resource ngoài quyền.",
+              "en": "Yes, if the intended effect is resource absence after both attempts. Idempotency does not require identical responses. An API may return 204 for repeated deletion to simplify clients, but must define that contract and avoid leaking unauthorized resources."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "CORS chặn rồi có chắc mutation chưa chạy không?",
+            "en": "If CORS blocked access, can we be sure the mutation did not run?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Có trường hợp browser gửi request nhưng không cho script đọc response; preflight có thể chặn trước một số request khác. Không suy luận business state từ thông báo CORS. Kiểm tra server state bằng actor được phép và giữ CSRF/authz đúng từ đầu.",
+              "en": "No. Browsers can send some requests while withholding response access; preflight can block other requests earlier. Do not infer business state from a CORS error. Inspect state with an authorized actor and enforce CSRF/authorization independently."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một HTTP GraphQL request có phải chỉ tạo một DB query?",
+            "en": "Does one GraphQL request imply one database query?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Resolver có thể tạo nhiều query, đặc biệt N+1 khi fetch mỗi child. Dùng batching/dataloader theo request scope, query cost/depth cap và authorization trên từng resource. Rate limit nên phản ánh work hoặc token/cost, không chỉ số HTTP request.",
+              "en": "No. Resolvers may generate many queries, especially N+1 child fetching. Use request-scoped batching/loaders, query-cost/depth caps and resource authorization. Rate limits should reflect work or cost rather than HTTP counts alone."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Nên dùng WebSocket cho mọi API để nhanh hơn không?",
+            "en": "Should every API use WebSockets for speed?"
+          },
+          "answer": [
+            {
+              "vi": "Không. HTTP request/response phù hợp phần lớn CRUD và tận dụng cache/tooling tốt. WebSocket có lợi khi hai chiều liên tục nhưng thêm connection state, reconnect, message routing và backpressure. Chọn theo interaction pattern và đo latency critical path.",
+              "en": "No. HTTP request/response fits much CRUD work and benefits from caching/tooling. WebSockets help continuous two-way interaction but add connection state, reconnection, routing and backpressure. Choose by interaction patterns and measure the critical path."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "network",
+    "api",
+    "auth"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một request đi qua nhiều hợp đồng",
+      "en": "One request crosses several contracts"
+    },
+    "caption": {
+      "vi": "Các lớp liên quan nhưng không thay thế nhau: TLS không cấp quyền resource; CORS không xác thực user; timeout không chứng minh side effect đã thất bại.",
+      "en": "These layers are related, not interchangeable: TLS does not authorize a resource, CORS does not authenticate a user, and a timeout does not prove a side effect failed."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Tìm địa chỉ đích",
+          "en": "Find the destination"
+        },
+        "detail": {
+          "vi": "DNS, routing và cache TTL.",
+          "en": "DNS, routing and cache TTL."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Thiết lập kết nối",
+          "en": "Establish a connection"
+        },
+        "detail": {
+          "vi": "Transport, TLS và HTTP version.",
+          "en": "Transport, TLS and the HTTP version."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Đọc hợp đồng API",
+          "en": "Read the API contract"
+        },
+        "detail": {
+          "vi": "Method, status, auth, retry.",
+          "en": "Methods, statuses, auth and retries."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Theo dấu đến dữ liệu",
+          "en": "Trace through to data"
+        },
+        "detail": {
+          "vi": "Deadline, ownership, response.",
+          "en": "Deadlines, ownership and responses."
+        },
+        "icon": "inspect"
+      }
+    ]
+  }
+}

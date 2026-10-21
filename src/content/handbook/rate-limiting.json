@@ -1,0 +1,793 @@
+{
+  "id": "rate-limiting",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Rate Limiting: contract, thuật toán và failure",
+    "en": "Rate Limiting: Contracts, Algorithms and Failure"
+  },
+  "summary": {
+    "vi": "So sánh năm thuật toán trên cùng traffic, xử lý counter race và thiết kế admission nhiều lớp có semantics rõ.",
+    "en": "Compare five algorithms on one traffic stream, expose counter races and design layered admission with explicit semantics."
+  },
+  "prerequisites": [
+    "networking",
+    "caching",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "network",
+    "security",
+    "distributed"
+  ],
+  "takeaways": [
+    {
+      "vi": "Định nghĩa subject, unit, window, burst và cost trước khi chọn algorithm.",
+      "en": "Define subject, unit, window, burst and cost before selecting an algorithm."
+    },
+    {
+      "vi": "Token bucket và strict rolling limit là hai contract khác nhau.",
+      "en": "A token bucket and a strict rolling limit are different contracts."
+    },
+    {
+      "vi": "Atomic check/spend không tự giải quyết cross-shard, failover hay exact billing.",
+      "en": "Atomic check/spend does not solve cross-shard coordination, failover or exact billing."
+    },
+    {
+      "vi": "Fail mode, retry guidance và concurrency cap là một phần của thiết kế.",
+      "en": "Failure modes, retry guidance and concurrency caps are part of the design."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ rule đến quyết định admission",
+      "en": "From a rule to an admission decision"
+    },
+    "caption": {
+      "vi": "Mỗi bước phải có contract và failure behavior; quyết định allow không phải lời hứa rằng mọi dependency sẽ thành công.",
+      "en": "Each step needs a contract and failure behavior; admission does not promise every dependency succeeds."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Xác minh subject",
+          "en": "Verify the subject"
+        },
+        "detail": {
+          "vi": "Tenant, user, API key, endpoint.",
+          "en": "Tenant, user, API key and endpoint."
+        },
+        "icon": "users"
+      },
+      {
+        "title": {
+          "vi": "Tính policy và cost",
+          "en": "Determine policy and cost"
+        },
+        "detail": {
+          "vi": "Window, burst, unit, version.",
+          "en": "Window, burst, units and version."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Check và spend",
+          "en": "Check and spend"
+        },
+        "detail": {
+          "vi": "Atomic boundary hoặc credit bound.",
+          "en": "Atomic boundary or bounded credits."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Respond và quan sát",
+          "en": "Respond and observe"
+        },
+        "detail": {
+          "vi": "Allow, throttle, failure và retry.",
+          "en": "Allow, throttle, failure and retry."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "contract",
+      "title": {
+        "vi": "1. Giới hạn hành vi nào, với mục đích gì?",
+        "en": "1. Which behavior is limited, and why?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một rule phải nói subject, operation, unit, window, burst và hành vi khi không đủ budget. Ví dụ “100 request/phút” còn mơ hồ: fixed minute, bất kỳ 60 giây, hay token bucket refill 100/phút và burst 20? Cả ba có thể nhận hoặc từ chối khác nhau với cùng traffic.",
+          "en": "A rule needs a subject, operation, unit, window, burst allowance and exhaustion behavior. “100 requests/minute” is ambiguous: fixed minutes, any rolling sixty seconds, or a bucket refilling at 100/minute with a burst of twenty? They can make different decisions on the same traffic."
+        },
+        {
+          "vi": "Tách protection limit, fairness limit, abuse defense và quota thương mại. Protection có thể xấp xỉ để giảm latency; quota đã tính tiền cần semantics durable, audit và reconciliation riêng. Rate limiter không thay thế authentication, authorization hoặc chống DDoS ở network layer.",
+          "en": "Separate capacity protection, fairness, abuse defenses and commercial quotas. Protection may tolerate approximation for latency; charged quotas need durable semantics, audits and reconciliation. Rate limiting does not replace authentication, authorization or network-layer DDoS protection."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Bảo vệ resource",
+            "en": "Protect a resource"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Đo service time, concurrency và saturation bên cạnh RPS.",
+              "en": "Measure service time, concurrency and saturation alongside RPS."
+            },
+            {
+              "vi": "Chặn sớm trước khi công việc đắt đã được thực hiện.",
+              "en": "Reject before expensive work has already happened."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Chia công bằng và thực thi quota",
+            "en": "Share capacity and enforce quotas"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Chọn user/tenant/API key theo contract; IP chỉ là một tín hiệu.",
+              "en": "Choose users, tenants or API keys by contract; IP is only one signal."
+            },
+            {
+              "vi": "Định nghĩa reset, timezone, cost unit và cách báo usage.",
+              "en": "Define resets, timezones, cost units and usage reporting."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "algorithms",
+      "title": {
+        "vi": "2. Năm thuật toán trả lời năm kiểu contract",
+        "en": "2. Five algorithms implement different contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Token bucket có capacity B và refill r token/s. Trước mỗi decision, tokens=min(B, tokens+r×elapsed), rồi trừ cost nếu đủ. Nó cho burst và giới hạn dài hạn; trong khoảng Δ có thể nhận tới khoảng B+rΔ, nên không hứa “tối đa N ở mọi window”.",
+          "en": "A token bucket has capacity B and refill r tokens/s. Refill to min(B, tokens+r×elapsed), then spend the cost when available. It permits bursts with a long-term rate; over Δ it can admit roughly B+rΔ and does not enforce an arbitrary strict rolling-window maximum."
+        },
+        {
+          "vi": "Leaky bucket có nhiều biến thể. Bài này dùng bounded queue với output đều, có thể gây chờ; một meter không queue có semantics khác. Sliding log đếm timestamp của các request được nhận trong rolling window; những request đó vẫn có thể đến cùng một instant nếu budget còn, nên “exact rolling limit” không đồng nghĩa “không có burst”.",
+          "en": "Leaky buckets have several variants. Here a bounded queue smooths output and adds delay; a queue-free meter differs. A sliding log counts admitted timestamps in a rolling window. Those admissions can still arrive together, so an exact rolling limit does not mean burst-free traffic."
+        }
+      ],
+      "experiment": "rate-race",
+      "table": {
+        "headers": [
+          {
+            "vi": "Thuật toán",
+            "en": "Algorithm"
+          },
+          {
+            "vi": "State theo key",
+            "en": "Per-key state"
+          },
+          {
+            "vi": "Điểm cần nhớ",
+            "en": "Key property"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Token bucket",
+              "en": "Token bucket"
+            },
+            {
+              "vi": "Token balance và timestamp.",
+              "en": "Token balance and timestamp."
+            },
+            {
+              "vi": "Burst capacity độc lập với refill rate.",
+              "en": "Burst capacity is separate from refill rate."
+            }
+          ],
+          [
+            {
+              "vi": "Leaky queue",
+              "en": "Leaky queue"
+            },
+            {
+              "vi": "Bounded backlog và thời điểm phục vụ.",
+              "en": "Bounded backlog and service timing."
+            },
+            {
+              "vi": "Admission không đồng nghĩa execution ngay; chờ có deadline.",
+              "en": "Admission is not immediate execution; queued work needs deadlines."
+            }
+          ],
+          [
+            {
+              "vi": "Fixed window",
+              "en": "Fixed window"
+            },
+            {
+              "vi": "Counter cho từng window ID.",
+              "en": "A counter per window ID."
+            },
+            {
+              "vi": "Có thể nhận gần 2N quanh một ranh giới.",
+              "en": "May admit nearly 2N across a boundary."
+            }
+          ],
+          [
+            {
+              "vi": "Sliding log",
+              "en": "Sliding log"
+            },
+            {
+              "vi": "Timestamp của admissions còn trong window.",
+              "en": "Timestamps of admissions still in the window."
+            },
+            {
+              "vi": "Chính xác theo clock/window contract, chi phí state theo limit.",
+              "en": "Exact under its clock/window contract, with state proportional to the limit."
+            }
+          ],
+          [
+            {
+              "vi": "Sliding counter",
+              "en": "Sliding counter"
+            },
+            {
+              "vi": "Counter window hiện tại và trước.",
+              "en": "Current and previous window counters."
+            },
+            {
+              "vi": "Ước lượng phần window trước; không phải strict rolling guarantee.",
+              "en": "Estimates the prior window’s contribution; not a strict rolling guarantee."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "placement",
+      "title": {
+        "vi": "3. Nhiều lớp bảo vệ, mỗi lớp biết thông tin khác nhau",
+        "en": "3. Layered protection uses different information"
+      },
+      "paragraphs": [
+        {
+          "vi": "Edge/WAF có thể chặn volume theo nguồn trước khi tới origin. Gateway dùng identity đã xác minh để áp tenant/key/plan budget. Service vẫn tự bảo vệ concurrency, queue và cost của resource. Không mặc định edge không biết identity: khả năng này phụ thuộc nơi TLS/auth được terminate và kiến trúc cụ thể.",
+          "en": "An edge/WAF may stop source-volume abuse before origin traffic. Gateways use verified identities for tenant/key/plan budgets. Services still protect concurrency, queues and resource cost. Whether an edge knows identity depends on TLS/auth termination and the actual architecture."
+        },
+        {
+          "vi": "Rule config cần version, owner, rollout và override có hạn dùng. Cache rule ở gateway giúp tránh thêm một dependency bắt buộc mỗi request; counter decision vẫn cần semantics chung giữa replica. Khi đổi limit mid-window, nói rõ rule mới có reset budget hay giữ usage đã tiêu.",
+          "en": "Rules need versions, owners, rollout and expiring overrides. Local rule caching avoids a mandatory configuration fetch per request; counters still need shared semantics. Define whether a mid-window policy change resets a budget or retains spending."
+        }
+      ]
+    },
+    {
+      "id": "request-path",
+      "title": {
+        "vi": "4. Trace một request được nhận hoặc từ chối",
+        "en": "4. Trace an admitted or rejected request"
+      },
+      "paragraphs": [
+        {
+          "vi": "Decision của limiter phải xuất hiện trước side effect. Request được quota cho phép vẫn có thể bị resource admission từ chối; hai lý do cần response và telemetry đủ phân biệt.",
+          "en": "Limit decisions precede side effects. A request within its quota may still fail resource admission; responses and telemetry should distinguish those reasons."
+        }
+      ],
+      "diagram": {
+        "id": "rate-limit-request",
+        "title": {
+          "vi": "Admission nhiều lớp",
+          "en": "Layered admission"
+        },
+        "caption": {
+          "vi": "Allowed path đi hết; quota reject quay lại qua gateway và edge. Không coi counter ACK là bằng chứng backend còn capacity.",
+          "en": "The allowed path reaches the resource; quota rejection returns through gateway and edge. Counter approval does not prove backend capacity."
+        },
+        "width": 1000,
+        "height": 460,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client",
+              "en": "Client"
+            },
+            "kind": "client",
+            "x": 110,
+            "y": 200,
+            "detail": {
+              "vi": "Caller có thể retry và đổi network identity.",
+              "en": "Callers may retry or change network identity."
+            }
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "Edge / WAF",
+              "en": "Edge / WAF"
+            },
+            "kind": "edge",
+            "x": 355,
+            "y": 200,
+            "detail": {
+              "vi": "Coarse admission trước origin, không phải toàn bộ abuse defense.",
+              "en": "Coarse pre-origin admission, not complete abuse defense."
+            }
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "API gateway",
+              "en": "API gateway"
+            },
+            "kind": "service",
+            "x": 610,
+            "y": 200,
+            "detail": {
+              "vi": "Áp identity/tenant rule và budget trước công việc đắt.",
+              "en": "Apply verified identity/tenant budgets before expensive work."
+            }
+          },
+          {
+            "id": "counter",
+            "label": {
+              "vi": "Counter shard",
+              "en": "Counter shard"
+            },
+            "kind": "store",
+            "x": 610,
+            "y": 65,
+            "detail": {
+              "vi": "Decision atomic cho state/rule trong shard; có deadline.",
+              "en": "Atomic decisions on in-shard state/rules, with deadlines."
+            }
+          },
+          {
+            "id": "service",
+            "label": {
+              "vi": "Service",
+              "en": "Service"
+            },
+            "kind": "service",
+            "x": 865,
+            "y": 200,
+            "detail": {
+              "vi": "Concurrency cap, deadline và load shedding.",
+              "en": "Concurrency limits, deadlines and load shedding."
+            }
+          },
+          {
+            "id": "database",
+            "label": {
+              "vi": "Database",
+              "en": "Database"
+            },
+            "kind": "store",
+            "x": 865,
+            "y": 365,
+            "detail": {
+              "vi": "Resource cuối cần được bảo vệ ngay cả khi limiter suy giảm.",
+              "en": "The final resource needs protection during limiter degradation."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "allow",
+            "label": {
+              "vi": "Cho qua và thực hiện",
+              "en": "Admit and execute"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "edge",
+                "description": {
+                  "vi": "Request tới edge với deadline.",
+                  "en": "The request reaches the edge with a deadline."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "gateway",
+                "description": {
+                  "vi": "Edge admission đạt; gateway xác minh rule/identity.",
+                  "en": "Edge admission passes; the gateway checks rules/identity."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "counter",
+                "description": {
+                  "vi": "Atomic check và spend budget theo key.",
+                  "en": "Atomically check and spend the keyed budget."
+                }
+              },
+              {
+                "from": "counter",
+                "to": "gateway",
+                "description": {
+                  "vi": "Trả allowed và thông tin budget theo contract.",
+                  "en": "Return approval and budget information under the contract."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "service",
+                "description": {
+                  "vi": "Chuyển request còn deadline; service kiểm tra concurrency.",
+                  "en": "Forward within the deadline; the service checks concurrency."
+                }
+              },
+              {
+                "from": "service",
+                "to": "database",
+                "description": {
+                  "vi": "Chỉ gọi database khi resource budget còn đủ.",
+                  "en": "Call the database only when resource admission permits."
+                }
+              },
+              {
+                "from": "database",
+                "to": "service",
+                "description": {
+                  "vi": "Database trả kết quả theo contract của operation.",
+                  "en": "The database returns the operation result under its contract."
+                }
+              },
+              {
+                "from": "service",
+                "to": "gateway",
+                "description": {
+                  "vi": "Service trả outcome; hoàn tất in-flight accounting.",
+                  "en": "The service returns the outcome and completes in-flight accounting."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "edge",
+                "description": {
+                  "vi": "Gateway trả response; budget metering theo rule đã định nghĩa.",
+                  "en": "The gateway returns a response with metering under the defined policy."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "client",
+                "description": {
+                  "vi": "Client nhận outcome cuối; limiter allowance không được hiểu là success của mọi mutation.",
+                  "en": "The client receives the final outcome; limiter allowance is not success of every mutation."
+                }
+              }
+            ]
+          },
+          {
+            "id": "reject",
+            "label": {
+              "vi": "Budget hết",
+              "en": "Budget exhausted"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "edge",
+                "description": {
+                  "vi": "Caller gửi request tiếp theo.",
+                  "en": "The caller sends another request."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "gateway",
+                "description": {
+                  "vi": "Request tới gateway sau coarse check.",
+                  "en": "The request reaches the gateway after a coarse check."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "counter",
+                "description": {
+                  "vi": "Check budget không đủ cho cost request.",
+                  "en": "Check finds insufficient budget for the request cost."
+                }
+              },
+              {
+                "from": "counter",
+                "to": "gateway",
+                "description": {
+                  "vi": "Trả denied; không chuyển tới backend.",
+                  "en": "Return denial without forwarding to the backend."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "edge",
+                "description": {
+                  "vi": "Gateway tạo 429 với hướng dẫn retry phù hợp.",
+                  "en": "The gateway creates a 429 with suitable retry guidance."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "client",
+                "description": {
+                  "vi": "Caller nhận policy outcome; retry cần chờ và có budget riêng.",
+                  "en": "The caller receives the policy outcome; retry requires waiting and its own budget."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "atomic",
+      "title": {
+        "vi": "5. Check và spend phải là một decision atomic",
+        "en": "5. Check and spend must be one atomic decision"
+      },
+      "paragraphs": [
+        {
+          "vi": "GET → compare → SET tách rời cho nhiều gateway là race. Counter có thể cuối cùng chỉ tăng một nhưng nhiều request đã được nhận. INCR tự atomic không có nghĩa toàn bộ policy check, TTL initialization và việc tính allowance đều atomic. Chọn script/transaction/conditional write có đúng boundary.",
+          "en": "Separate GET → compare → SET operations race across gateways. A counter may increase once while several requests pass. Atomic INCR alone does not make policy checks, TTL initialization and allowance decisions atomic. Choose scripts, transactions or conditional writes with the required boundary."
+        },
+        {
+          "vi": "Với Redis, script chạy atomic trên instance nhưng phải ngắn để tránh block các request khác. Multi-key transaction/script trong Cluster cần key nằm cùng hash slot; không hứa atomic tenant+global+endpoint trên nhiều shard chỉ bằng một Lua call. Replication/failover và durability của counter vẫn có thể ảnh hưởng quota sau decision.",
+          "en": "Redis scripts execute atomically on an instance but should stay short to avoid blocking other work. Cluster multi-key operations require compatible hash slots; one Lua call does not make tenant/global/endpoint decisions atomic across arbitrary shards. Replication/failover and counter durability can still affect quotas."
+        }
+      ],
+      "experiment": "counter-race"
+    },
+    {
+      "id": "clock-state",
+      "title": {
+        "vi": "6. Clock, TTL và key cardinality",
+        "en": "6. Clocks, TTLs and key cardinality"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng cùng time source cho state liên quan, clamp elapsed âm và quy định clock rollback/forward. Token refill bằng wall clock của từng gateway tạo bất đồng khi chúng lệch nhau. Redis TIME cũng là wall clock của server, không phải phép bảo đảm thời gian tuyệt đối; thiết kế state transition và kiểm thử clock jump.",
+          "en": "Use a shared time source for related state, handle negative elapsed time and define clock-jump behavior. Independent gateway wall clocks can disagree on refill. Redis TIME is still a server wall clock, not absolute-time certainty; define transitions and test jumps."
+        },
+        {
+          "vi": "TTL là cơ chế cleanup state idle, không phải reset budget tùy tiện. Bucket hết hạn chỉ nên tái tạo full khi thời gian idle đủ theo contract. Chuẩn hóa và hash key có scope; giới hạn cardinality do attacker tạo để tránh biến limiter thành nơi tiêu hết memory. Không ghi nguyên API secret vào key hoặc log.",
+          "en": "TTL cleans idle state rather than resetting budgets arbitrarily. Recreating a full bucket should require sufficient idle time under the contract. Normalize scoped keys and bound attacker-created cardinality so the limiter cannot exhaust memory. Never embed raw API secrets in keys/logs."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "content": "ATOMIC on one budget state:\n  read policyVersion, tokens, lastRefill\n  validate cost, capacity, refillRate and time assumptions\n  available := min(capacity, tokens + safeElapsed * refillRate)\n  if available >= cost: available -= cost; decision := allow\n  else: decision := deny\n  persist balance + logical refill position + safe idle expiry\n  return decision + retry guidance",
+        "caption": {
+          "vi": "Pseudocode mô tả boundary, không phải script production. Backend phải thực hiện validation, time policy, expiry và atomicity phù hợp.",
+          "en": "Boundary pseudocode, not a production script. The backend must implement validation, clock policy, expiry and suitable atomicity."
+        }
+      }
+    },
+    {
+      "id": "response",
+      "title": {
+        "vi": "7. 429 và hành vi retry của client",
+        "en": "7. 429 and client retry behavior"
+      },
+      "paragraphs": [
+        {
+          "vi": "429 diễn đạt rate limit đã áp vào caller; overload của cả service thường cần semantics 503 hoặc protocol khác. Nên giải thích rule/unit và gửi Retry-After khi có thể tính hợp lý. RFC 6585 cho phép header này, không bắt buộc ở mọi 429; dùng nó là lựa chọn thiết kế giúp client hợp tác.",
+          "en": "429 communicates caller rate limiting; service-wide overload commonly uses 503 or another defined protocol. Explain the rule/unit and provide meaningful Retry-After guidance where possible. RFC 6585 permits the header rather than requiring it on every 429; including it is a useful cooperative design choice."
+        },
+        {
+          "vi": "Retry-After không phải đặt chỗ: tới thời điểm đó vẫn có thể hết budget do request khác. Client cần cap attempts, deadline và backoff/jitter phù hợp; không retry sớm hơn hướng dẫn đã thỏa thuận. RateLimit/RateLimit-Policy và X-RateLimit-* phải theo contract API; kiểm tra version của spec được adopt, không gán mọi cách đặt header là chuẩn giống nhau.",
+          "en": "Retry-After is not a reservation: other traffic may consume the next allowance. Clients need capped attempts, deadlines and appropriate backoff/jitter without retrying earlier than the agreed guidance. RateLimit/RateLimit-Policy and X-RateLimit-* require an API contract and the adopted specification version, not interchangeable standard claims."
+        }
+      ],
+      "code": {
+        "language": "http",
+        "content": "HTTP/1.1 429 Too Many Requests\nRetry-After: 12\nContent-Type: application/problem+json\n\n{\"type\":\"about:blank\",\"status\":429,\"title\":\"Request budget exhausted\"}",
+        "caption": {
+          "vi": "Response minh họa; 12 giây phải được tính từ policy thực, không hardcode cho mọi caller.",
+          "en": "Illustrative response; derive the twelve-second guidance from the policy rather than hardcoding it for every caller."
+        }
+      }
+    },
+    {
+      "id": "failure",
+      "title": {
+        "vi": "8. Khi counter store chậm hoặc mất",
+        "en": "8. When the counter store is slow or unavailable"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fail open giữ availability của request nhưng có thể làm resource hoặc abuse defense mất bảo vệ. Fail closed bảo vệ một số contract nhưng biến limiter thành dependency gây outage. Local fallback giới hạn thiệt hại nếu budget được chia và fence đúng; nó không mặc định “luôn tốt hơn” hai phương án kia.",
+          "en": "Fail open preserves request availability but may remove resource or abuse protection. Fail closed protects some contracts while making the limiter an outage dependency. Local fallback can bound damage with correctly allocated/fenced budgets; it is not universally better than the alternatives."
+        },
+        {
+          "vi": "Chia limit theo số node chỉ đúng theo giả định traffic/membership: một node hot có thể reject dù tổng usage còn thấp; node count sai hoặc cấp lại allowance trong partition có thể overshoot. Nếu dùng token leasing, hạch toán tổng allowance đã cấp, expiry, epoch và unspent credits khi node chết. Limit billing exact có thể cần durable authority thay vì approximate fallback.",
+          "en": "Dividing a limit by node count relies on traffic and membership assumptions: a hot node can reject despite spare global quota, while stale counts or duplicated allowances can overshoot. Token leasing needs accounting for outstanding credits, expiry, epochs and node loss. Exact charged quotas may need durable authority instead of approximate fallback."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Fail open có điều kiện",
+            "en": "Conditional fail open"
+          },
+          "icon": "route",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Nêu resource còn lớp self-protection nào.",
+              "en": "Identify remaining resource self-protection."
+            },
+            {
+              "vi": "Đo và giới hạn thời gian degraded mode.",
+              "en": "Measure and bound degraded-mode duration."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Fail closed có chủ đích",
+            "en": "Deliberate fail closed"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Phân biệt deny do policy và lỗi authority không kiểm chứng được.",
+              "en": "Distinguish policy denial from unverifiable authority."
+            },
+            {
+              "vi": "Đặt timeout và recovery path; không treo request vô hạn.",
+              "en": "Set timeouts and recovery paths rather than hanging requests."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fairness",
+      "title": {
+        "vi": "9. Nhiều rule, weighted cost và concurrency",
+        "en": "9. Multiple rules, weighted cost and concurrency"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một request có thể phải qua per-user burst, tenant sustained rate, daily quota và global resource cap. Xác định rule nào charge attempt hay chỉ success; nếu rule thứ hai reject sau khi đã spend rule thứ nhất, cần semantics refund hoặc chấp nhận consumption rõ ràng. Không giả định tất cả rule là một atomic decision khi chúng nằm khác shard.",
+          "en": "A request may face per-user bursts, tenant sustained rates, daily quotas and global resource caps. Define whether attempts or successes are charged. If a later rule rejects after an earlier budget was spent, define refunds or intentional consumption. Different shards do not automatically share one atomic decision."
+        },
+        {
+          "vi": "Weighted cost phân biệt search đắt với GET nhỏ, nhưng estimate cần kiểm chứng và có maximum. Concurrency limiter giới hạn in-flight work nên bổ sung rate limit khi service time thay đổi. Fair queue, tenant isolation và adaptive admission có thể giảm noisy neighbor; controller cần stability và observability, không tăng giảm theo mọi spike ngắn.",
+          "en": "Weighted costs distinguish expensive searches from small GETs, but estimates need validation and caps. Concurrency limits complement rates when service time changes. Fair queues, tenant isolation and adaptive admission reduce noisy neighbors; controllers need stability and observability rather than reacting to every brief spike."
+        }
+      ]
+    },
+    {
+      "id": "multiregion",
+      "title": {
+        "vi": "10. Hot key và nhiều region",
+        "en": "10. Hot keys and multiple regions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một tenant hot có thể làm counter shard thành bottleneck. Cache deny ngắn hạn giúp giảm lookup nhưng có thể giữ reject cũ sau policy change, nên cần bound TTL và invalidation/version. Local leases giảm shared writes nhưng đổi độ chính xác; shard theo key không tự chia một logical counter hot.",
+          "en": "A hot tenant can overload its counter shard. Short-lived denial caches reduce lookups but may retain stale rejections after policy changes, requiring bounded TTL/version handling. Local leases reduce shared writes at an accuracy cost; key-based sharding does not split one hot logical counter."
+        },
+        {
+          "vi": "Exact global budget cần coordination hoặc phân bổ authority an toàn giữa region, gây latency/availability trade-off. Regional budgets có thể cho caller nhận tổng allowance bằng tổng các vùng nếu chúng không được trừ từ cùng pool. Nêu overshoot bound từ credits đang lưu hành, không chỉ nói “eventually sync nên sai một chút”.",
+          "en": "Exact global budgets require coordination or safely partitioned authority across regions, creating latency/availability trade-offs. Uncoordinated regional budgets may grant the sum of all allowances. Derive overshoot bounds from outstanding credits instead of saying eventual sync is only slightly inaccurate."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "11. Rollout, khách hàng và đo lường",
+        "en": "11. Rollouts, customers and observability"
+      },
+      "paragraphs": [
+        {
+          "vi": "Shadow mode tính decision và cost nhưng chưa block; đối chiếu false positives, cardinality, store latency và downstream saturation rồi canary rule theo tenant. Có kill switch/rollback riêng cho config, audit override và policy version trong trace. Không dùng user/API key làm metric label không giới hạn.",
+          "en": "Shadow mode computes decisions/cost without blocking. Compare false positives, cardinality, store latency and downstream saturation, then canary tenant rules. Provide configuration rollback/kill switches, audited overrides and policy versions in traces. Avoid unbounded user/API-key metric labels."
+        },
+        {
+          "vi": "Người dùng cần giới hạn được giải thích, usage gần thực tế, reset semantics và đường xử lý khi bị throttle sai. Alert nên phân biệt store failure, legitimate plan exhaustion và attack. Thay đổi quota là product contract, không chỉ đổi một số trong Redis.",
+          "en": "Users need documented limits, useful usage visibility, reset semantics and a path to resolve incorrect throttling. Distinguish store failure, legitimate exhaustion and attacks in alerts. A quota change is a product contract, not merely a Redis number."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "12. Phỏng vấn: chứng minh semantics trước thuật toán",
+        "en": "12. Interview: establish semantics before the algorithm"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "100 request/phút qua 50 gateway: bắt đầu ở đâu?",
+            "en": "Where do you start with 100 requests/minute across 50 gateways?"
+          },
+          "answer": [
+            {
+              "vi": "Hỏi fixed, rolling hay burst/refill; subject, cost và fail policy. Sau đó chọn state chung atomic hoặc credit allocation có bound, identity đã xác minh, 429/retry guidance và resource concurrency cap. Không chia 100/50 rồi coi đó là exact global rule dưới mọi phân bố traffic.",
+              "en": "Clarify fixed/rolling/burst-refill semantics, subject, cost and failure policy. Then choose atomic shared state or bounded credit allocation, verified identity, retry guidance and resource concurrency protection. Dividing 100 by 50 is not an exact global rule under arbitrary traffic distribution."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sliding log có cấm burst không?",
+            "en": "Does a sliding log prohibit bursts?"
+          },
+          "answer": [
+            {
+              "vi": "Không: nếu budget N còn trống thì có thể nhận N request sát nhau. Nó giữ số admissions trong window được định nghĩa không vượt N; leaky queue mới thay đổi lịch execution để làm output đều, và có thể thêm latency.",
+              "en": "No. An empty budget may admit N requests together. It bounds admissions in the defined window; a leaky queue instead smooths execution and may add latency."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một Lua call có đủ cho tenant và global limit trên Redis Cluster?",
+            "en": "Does one Lua call solve tenant and global limits across Redis Cluster?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi các key/state cần atomicity nằm trong boundary mà deployment hỗ trợ, như cùng slot. Nếu khác shard, chọn protocol, phân bổ budget hoặc semantics tiêu budget theo từng bước; Lua không tự tạo cross-shard atomicity.",
+              "en": "Only when required state lies within a supported atomic boundary, such as one slot. Across shards, choose coordination, credit allocation or explicitly staged consumption; Lua does not create cross-shard atomicity."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao limiter đúng RPS nhưng database vẫn nghẽn?",
+            "en": "Why can a correct RPS limiter still overload the database?"
+          },
+          "answer": [
+            {
+              "vi": "Request cost/service time thay đổi, burst đủ lớn hoặc nhiều tenant cùng hợp lệ có thể tạo concurrency quá cao. Đo in-flight, saturation và query cost; thêm admission/bulkhead gần resource, không chỉ giảm một RPS trung bình.",
+              "en": "Variable costs/service times, permitted bursts or many valid tenants can create excessive concurrency. Measure in-flight work, saturation and query cost, and add resource admission/bulkheads rather than relying on mean RPS."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Counter store mất kết nối, trả 429 cho mọi người có đúng không?",
+            "en": "Should every caller get 429 when the counter store is unreachable?"
+          },
+          "answer": [
+            {
+              "vi": "Không mặc định: chưa kiểm chứng budget khác với caller đã vượt policy. Nêu fail mode và status/error contract; lựa chọn cần cân nhắc abuse, business quota và bảo vệ backend. Fallback phải có bound và telemetry.",
+              "en": "Not automatically: an unverifiable budget differs from proven policy exhaustion. Define failure mode and error semantics around abuse, commercial quotas and backend protection, with bounded and observable fallbacks."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Fixed window có lúc nào vẫn hợp lý?",
+            "en": "When is a fixed window still reasonable?"
+          },
+          "answer": [
+            {
+              "vi": "Khi contract theo window cố định hoặc coarse quota chấp nhận boundary behavior và muốn state nhỏ. Document reset/timezone và chống synchronized retry. Nó sai khi được dùng để hứa strict rolling limit mà không cơ chế bổ sung.",
+              "en": "For a fixed-window contract or coarse quota accepting boundary behavior in exchange for small state. Document resets/timezones and avoid synchronized retries. It is unsuitable for an unqualified strict rolling-window promise."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

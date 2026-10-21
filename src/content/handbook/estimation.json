@@ -1,0 +1,587 @@
+{
+  "id": "estimation",
+  "group": "foundation",
+  "status": "review",
+  "title": {
+    "vi": "Ước lượng capacity: từ hành vi tới RPS, bytes và concurrency",
+    "en": "Capacity estimation: from behavior to RPS, bytes and concurrency"
+  },
+  "summary": {
+    "vi": "Một cách tính có đơn vị, giả định và kiểm tra độ nhạy: traffic, storage, bandwidth, queue backlog, Little’s Law và capacity khi mất node.",
+    "en": "Estimate traffic, storage, bandwidth, queue backlog, Little’s Law and degraded capacity with explicit units, assumptions and sensitivity checks."
+  },
+  "takeaways": [
+    {
+      "vi": "Average RPS, peak RPS và concurrency là ba đại lượng khác nhau.",
+      "en": "Average RPS, peak RPS and concurrency are different quantities."
+    },
+    {
+      "vi": "Payload chưa gồm index, replicas, protocol overhead, media hoặc headroom.",
+      "en": "Payload excludes indexes, replicas, protocol overhead, media and headroom unless explicitly included."
+    },
+    {
+      "vi": "Tính background amplification và phân phối hot key, không chỉ traffic ở API edge.",
+      "en": "Account for background amplification and hot-key distribution, not only API-edge traffic."
+    },
+    {
+      "vi": "Mọi kết quả sizing cần benchmark workload thật để biến thành số node.",
+      "en": "Every sizing estimate needs workload benchmarks before it becomes a node count."
+    }
+  ],
+  "prerequisites": [
+    "framework"
+  ],
+  "sections": [
+    {
+      "id": "units",
+      "title": {
+        "vi": "1. Bắt đầu bằng đơn vị và bảng giả định",
+        "en": "1. Begin with units and an assumption sheet"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ghi DAU, số operation mỗi user mỗi ngày, read/write ratio, payload và retention trước khi bấm máy. DAU không phải concurrent user; user đang online không có nghĩa đang gửi request. Tách hành vi: một lần mở app có thể phát 5 API call, một API call có thể chạm 3 database hoặc tạo hàng nghìn background write.",
+          "en": "Record DAU, operations per user per day, read/write ratio, payload and retention before calculating. DAU is not concurrent users; being online does not imply actively sending requests. One app opening may trigger five API calls, while one API call may access three databases or create thousands of background writes."
+        },
+        {
+          "vi": "Dùng đơn vị nhất quán: 1 ngày = 86.400 giây, GB thập phân = 10^9 byte, GiB = 2^30 byte. Giả định 1 KB = 1.000 byte nếu dùng hệ thập phân; nếu dùng KiB thì ghi 1.024. Sai số 7% giữa GB/GiB có thể nhỏ hơn sai số workload, nhưng trộn hai hệ làm khó kiểm tra kết quả.",
+          "en": "Use consistent units: a day has 86,400 seconds, decimal GB is 10^9 bytes and GiB is 2^30 bytes. Use 1,000-byte KB for decimal calculations or explicitly use 1,024-byte KiB. The GB/GiB difference may be smaller than workload uncertainty, but mixing units makes results harder to audit."
+        },
+        {
+          "vi": "Ghi khoảng hợp lý thay vì độ chính xác giả: payload trung bình 0,5–2 KB, peak factor 3–6 và retention 30 ngày. Tính baseline rồi thay một biến mỗi lần để thấy quyết định nào nhạy nhất. Không cần nhớ latency của mọi loại phần cứng để phát hiện một thiết kế đang fan-out quá lớn.",
+          "en": "Use plausible ranges rather than false precision: 0.5–2 KB average payloads, peak factors of three to six and 30-day retention. Calculate a baseline and vary one input at a time to identify sensitive decisions. You do not need every hardware latency memorized to detect excessive fan-out."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Decimal và binary bytes",
+            "en": "Decimal and binary bytes"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "1 GB = 10⁹ byte; 1 GiB = 2³⁰ byte.",
+              "en": "1 GB = 10⁹ bytes; 1 GiB = 2³⁰ bytes."
+            },
+            {
+              "vi": "Đổi về cùng đơn vị trước khi chia cho dung lượng máy.",
+              "en": "Convert to the same units before dividing by machine capacity."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Rate và tổng lượng",
+            "en": "Rates and totals"
+          },
+          "icon": "chart",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Requests/s khác requests/day; bandwidth khác tổng byte lưu.",
+              "en": "Requests/s differs from requests/day; bandwidth differs from stored bytes."
+            },
+            {
+              "vi": "Nhân rate với thời gian khi cần tổng; chia tổng cho thời gian khi cần rate.",
+              "en": "Multiply a rate by duration for a total; divide a total by duration for a rate."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Average và peak",
+            "en": "Average and peak"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Average để hiểu tổng công việc; peak để xét thời điểm tải cao.",
+              "en": "Averages describe total work; peaks describe busy periods."
+            },
+            {
+              "vi": "Peak factor là giả định cần kiểm tra; không phải hằng số của mọi ứng dụng.",
+              "en": "A peak factor is an assumption to validate, not a universal constant."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "powers",
+      "title": {
+        "vi": "1a. Powers of two để kiểm tra đơn vị",
+        "en": "1a. Powers of two for unit checks"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các mốc dưới đây là định nghĩa nhị phân chính xác, khác với cách làm tròn thập phân khi ước lượng dung lượng. Học mốc 2^10 ≈ 10^3 giúp kiểm tra order of magnitude; vẫn ghi rõ byte, bit và đơn vị thời gian để không nhầm hàng nghìn lần.",
+          "en": "The milestones below are exact binary units, distinct from decimal rounding in capacity estimates. Remembering 2^10 ≈ 10^3 helps check order of magnitude; still label bytes, bits and time units to avoid thousandfold errors."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lũy thừa",
+            "en": "Power"
+          },
+          {
+            "vi": "Giá trị",
+            "en": "Value"
+          },
+          {
+            "vi": "Nếu tính byte",
+            "en": "As bytes"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "2^10",
+              "en": "2^10"
+            },
+            {
+              "vi": "1,024",
+              "en": "1,024"
+            },
+            {
+              "vi": "1 KiB",
+              "en": "1 KiB"
+            }
+          ],
+          [
+            {
+              "vi": "2^20",
+              "en": "2^20"
+            },
+            {
+              "vi": "1,048,576",
+              "en": "1,048,576"
+            },
+            {
+              "vi": "1 MiB",
+              "en": "1 MiB"
+            }
+          ],
+          [
+            {
+              "vi": "2^30",
+              "en": "2^30"
+            },
+            {
+              "vi": "1,073,741,824",
+              "en": "1,073,741,824"
+            },
+            {
+              "vi": "1 GiB",
+              "en": "1 GiB"
+            }
+          ],
+          [
+            {
+              "vi": "2^40",
+              "en": "2^40"
+            },
+            {
+              "vi": "1,099,511,627,776",
+              "en": "1,099,511,627,776"
+            },
+            {
+              "vi": "1 TiB",
+              "en": "1 TiB"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "traffic",
+      "title": {
+        "vi": "2. Từ DAU tới average và peak RPS",
+        "en": "2. Convert DAU to average and peak RPS"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 5 triệu DAU, mỗi người 20 read và 2 write/ngày. Reads = 100 triệu/ngày ≈ 1.157/s; writes = 10 triệu/ngày ≈ 116/s. Peak factor 4 cho reads và 3 cho writes cho khoảng 4.630 read/s và 347 write/s. Dùng peak factor riêng nếu đường đọc và ghi có burst khác nhau.",
+          "en": "Assume five million DAU, each with twenty reads and two writes per day. Reads total 100 million/day, about 1,157/s; writes total ten million/day, about 116/s. Read and write peak factors of four and three give roughly 4,630 read/s and 347 write/s. Use separate peak factors when their bursts differ."
+        },
+        {
+          "vi": "Peak factor không phải hằng số tự nhiên. Traffic theo múi giờ, chiến dịch, lịch thông báo và hot event có thể tạo burst ngắn hơn cửa sổ metric một phút. Đối chiếu peak theo giây với capacity instantaneous và burst theo phút với queue/buffer; một average bình thường có thể che 30 giây overload liên tục.",
+          "en": "Peak factors are not natural constants. Time zones, campaigns, scheduled notifications and hot events can create bursts shorter than a one-minute metric window. Compare per-second peaks with instantaneous capacity and longer bursts with queue/buffer capacity; ordinary averages can hide 30 seconds of sustained overload."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "content": "daily_reads = DAU * reads_per_user_per_day\naverage_read_RPS = daily_reads / 86400\npeak_read_RPS = average_read_RPS * read_peak_factor\nbackground_writes = source_writes * eligible_recipients",
+        "caption": {
+          "vi": "Giữ read, write và background work thành các dòng riêng để không bỏ write amplification.",
+          "en": "Keep reads, writes and background work separate to expose amplification."
+        }
+      }
+    },
+    {
+      "id": "storage",
+      "title": {
+        "vi": "3. Storage: payload, index, replicas và retention",
+        "en": "3. Storage: payloads, indexes, replicas and retention"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với 10 triệu write/ngày × 1 KB × 30 ngày, payload là 300 GB. Nếu giả định index/metadata thêm 50%, logical stored bytes là 450 GB; với 3 bản sao vật lý, khoảng 1,35 TB trước compression, allocator, compaction và headroom. Replicas tăng storage nhưng không tự tăng write capacity tuyến tính vì mỗi write còn phải replicate.",
+          "en": "Ten million writes/day × 1 KB × 30 days gives 300 GB of payload. Assuming indexes/metadata add 50%, logical storage is 450 GB; three physical copies require about 1.35 TB before compression, allocation, compaction and headroom. Replicas increase storage but do not linearly multiply write capacity because writes must still replicate."
+        },
+        {
+          "vi": "Retention áp cho loại dữ liệu nào? Message body, attachment, audit event, tombstone và index có vòng đời khác nhau. Soft delete không giải phóng storage ngay; backup và replica có thể giữ dữ liệu thêm một thời gian. Nếu dữ liệu được update nhiều, write-ahead log, versions hoặc LSM compaction làm write amplification khác với kích thước row cuối cùng.",
+          "en": "Which data has that retention? Message bodies, attachments, audit events, tombstones and indexes have different lifetimes. Soft deletion does not immediately free space; backups and replicas may retain data longer. Frequent updates add write-ahead logs, versions or LSM compaction work beyond final-row size."
+        },
+        {
+          "vi": "Đừng lấy 1,35 TB chia dung lượng SSD rồi chốt node count. Cần query latency, read/write IOPS, working set trong RAM, skew, replication/failure policy và maintenance headroom. Một dataset vừa disk một node vẫn có thể cần nhiều node vì throughput hoặc availability.",
+          "en": "Do not divide 1.35 TB by SSD capacity and declare the node count. You need query latency, read/write IOPS, RAM working sets, skew, replication/failure policy and maintenance headroom. A dataset fitting one disk may still need several nodes for throughput or availability."
+        }
+      ]
+    },
+    {
+      "id": "bandwidth",
+      "title": {
+        "vi": "4. Bandwidth và media có thể chi phối",
+        "en": "4. Bandwidth and media may dominate"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu peak read là 4.630/s và response trung bình 20 KB, payload egress khoảng 92,6 MB/s, tương đương 741 Mb/s trước protocol/TLS overhead. Phân biệt bit và byte bằng hệ số 8. Response JSON nhỏ hơn nhiều so với video; một triệu lượt xem video 10 MB tạo khoảng 10 TB egress dù metadata database chỉ tăng ít.",
+          "en": "At 4,630 peak reads/s with a 20 KB average response, payload egress is about 92.6 MB/s or 741 Mb/s before protocol/TLS overhead. Bits and bytes differ by a factor of eight. JSON responses are tiny compared with video: one million views of 10 MB videos create about 10 TB of egress despite little metadata growth."
+        },
+        {
+          "vi": "CDN giảm traffic về origin khi hit rate tốt, nhưng chi phí edge egress vẫn tồn tại. Cache hit rate phải tính theo bytes nếu mục tiêu là bandwidth: 99% hit theo số request không có nghĩa 99% byte được cache khi 1% miss là object rất lớn. Upload/transcoding cũng cần tính ingress và nhiều rendition thay vì chỉ file gốc.",
+          "en": "A CDN reduces origin traffic at good hit rates, while edge egress still exists. Use byte hit rates for bandwidth planning: a 99% request hit rate does not imply 99% of bytes are cached if misses are huge objects. Upload/transcoding planning includes ingress and multiple renditions, not only originals."
+        }
+      ]
+    },
+    {
+      "id": "concurrency",
+      "title": {
+        "vi": "5. Concurrency và Little’s Law",
+        "en": "5. Concurrency and Little’s Law"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong một hệ ổn định, L = λ × W: số công việc trung bình ở hệ bằng throughput trung bình nhân thời gian trung bình ở hệ. 1.000 requests/s × 0,2 s = 200 requests đang tồn tại trung bình. Đây là số trong boundary đã chọn; nếu W gồm queue thì L gồm cả queued request. Không thay p99 latency vào công thức rồi gọi kết quả là mean concurrency.",
+          "en": "In a stable system, L = λ × W: mean work in the system equals mean throughput times mean time in the system. At 1,000 requests/s and 0.2 s, the mean is 200 in-flight requests. The chosen boundary matters: if W includes queues, L includes queued requests. Substituting p99 latency does not produce mean concurrency."
+        },
+        {
+          "vi": "Long-lived connection khác active work: 50.000 WebSocket connection có thể chỉ có 100 message/s, nhưng vẫn tiêu tốn socket, memory buffer, heartbeat và file descriptor. Connection pool của database cũng không nên bằng mọi HTTP connection: giới hạn active query theo capacity DB, queue có deadline và backpressure.",
+          "en": "Long-lived connections differ from active work: 50,000 WebSockets may carry only 100 messages/s while consuming sockets, buffers, heartbeats and file descriptors. Database connection pools should not match all HTTP connections; bound active queries by database capacity and use deadline-aware queues/backpressure."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Little’s Law: giữ phạm vi đo nhất quán",
+          "en": "Little’s Law: keep the measurement scope consistent"
+        },
+        "caption": {
+          "vi": "L = λ × W trong hệ ổn định với các giá trị trung bình cùng boundary. Không lấy peak arrival rate nhân p99 latency rồi gọi đó là định luật.",
+          "en": "L = λ × W for a stable system, using means over the same boundary. Peak arrival rate multiplied by p99 latency is not Little’s Law."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Chọn boundary",
+              "en": "Choose the boundary"
+            },
+            "detail": {
+              "vi": "Ví dụ: request đang ở API.",
+              "en": "For example: requests inside the API."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Đo arrival và thời gian",
+              "en": "Measure arrivals and time"
+            },
+            "detail": {
+              "vi": "λ request/s; W giây/request.",
+              "en": "λ requests/s; W seconds/request."
+            },
+            "icon": "chart"
+          },
+          {
+            "title": {
+              "vi": "Suy ra in-flight trung bình",
+              "en": "Infer mean in-flight work"
+            },
+            "detail": {
+              "vi": "L request = λ × W.",
+              "en": "L requests = λ × W."
+            },
+            "icon": "gauge"
+          }
+        ]
+      }
+    },
+    {
+      "id": "queue",
+      "title": {
+        "vi": "6. Backlog và thời gian phục hồi sau burst",
+        "en": "6. Backlog and post-burst recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Queue chỉ hấp thụ chênh lệch tạm thời. Giả định arrival 2.000 job/s và service capacity 1.500/s trong 60 giây: backlog tăng 30.000 job. Nếu tải sau burst về 1.000/s, capacity dư 500/s cần khoảng 60 giây để drain, chưa tính retry và job time variance. Nếu tải vẫn 1.500/s, backlog không giảm.",
+          "en": "A queue absorbs temporary imbalance. With 2,000 jobs/s arriving and 1,500/s capacity for 60 seconds, backlog grows by 30,000 jobs. If arrivals later fall to 1,000/s, the 500/s surplus drains it in about 60 seconds before retries and variance. At 1,500/s arrivals, the backlog does not shrink."
+        },
+        {
+          "vi": "Đo oldest job age và deadline miss, không chỉ queue length. 10.000 job ngắn và 10.000 job encode video có lượng công việc khác nhau. Nếu một job chậm khóa partition hoặc ordered key, tổng worker count không đủ để suy ra recovery time; cần xem skew và concurrency theo key.",
+          "en": "Measure oldest-job age and deadline misses, not only queue length. Ten thousand short jobs and ten thousand video-encoding jobs represent very different work. A slow job blocking a partition or ordered key invalidates recovery estimates based only on total worker count; inspect key skew and concurrency."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Biến",
+            "en": "Variable"
+          },
+          {
+            "vi": "Công thức đơn giản",
+            "en": "Simple formula"
+          },
+          {
+            "vi": "Điều kiện",
+            "en": "Conditions"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Backlog tăng",
+              "en": "Backlog growth"
+            },
+            {
+              "vi": "(arrival − service) × burst duration",
+              "en": "(arrival − service) × burst duration"
+            },
+            {
+              "vi": "Rates gần ổn định trong cửa sổ; cùng đơn vị job.",
+              "en": "Rates approximately stable in the window; comparable jobs."
+            }
+          ],
+          [
+            {
+              "vi": "Drain time",
+              "en": "Drain time"
+            },
+            {
+              "vi": "backlog / (service − ongoing arrival)",
+              "en": "backlog / (service − ongoing arrival)"
+            },
+            {
+              "vi": "Service phải lớn hơn arrival; còn capacity cho retry/overhead.",
+              "en": "Service must exceed arrivals; allow for retries/overhead."
+            }
+          ],
+          [
+            {
+              "vi": "Mean in-flight",
+              "en": "Mean in-flight"
+            },
+            {
+              "vi": "throughput × mean residence time",
+              "en": "throughput × mean residence time"
+            },
+            {
+              "vi": "Hệ ổn định, boundary và thời gian đo nhất quán.",
+              "en": "Stable system with consistent boundaries and measurement periods."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "headroom",
+      "title": {
+        "vi": "7. Headroom khi mất node và hot key",
+        "en": "7. Headroom for node loss and hot keys"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ba node benchmark được 500 requests/s mỗi node không nên nhận 1.500/s nếu cần chịu mất một node. Sau mất node còn 1.000/s trước phần overhead phục hồi; chọn operating load dưới mức đó để giữ latency và rebalancing budget. Autoscaling có warm-up, không cứu được mọi burst trong vài giây.",
+          "en": "Three nodes benchmarked at 500 requests/s each should not accept 1,500/s if one-node failure must be tolerated. After failure, only 1,000/s remains before recovery overhead; operate below that to preserve latency and rebalancing budget. Autoscaling has warm-up time and cannot rescue every seconds-long burst."
+        },
+        {
+          "vi": "Hash partition phân phối key không đồng nghĩa phân phối traffic. Một hot tenant hoặc URL viral có thể chiếm một shard trong khi các shard còn rảnh. Ước lượng p99 per-key rate, đọc fan-out, cacheability và khả năng split key. Việc thêm shard chỉ có tác dụng khi load thực sự chuyển được sang chúng.",
+          "en": "Hash partitioning spreads keys, not necessarily traffic. A hot tenant or viral URL can saturate one shard while others are idle. Estimate high-percentile per-key rates, read fan-out, cacheability and key-splitting options. Adding shards helps only if the load can move to them."
+        }
+      ]
+    },
+    {
+      "id": "worksheet",
+      "title": {
+        "vi": "8. Tự thay giả định và kiểm tra độ nhạy",
+        "en": "8. Vary assumptions and test sensitivity"
+      },
+      "paragraphs": [
+        {
+          "vi": "Worksheet dưới dùng công thức payload cơ bản. Mỗi input phải phản ánh một loại operation; nếu read/write có payload khác nhau, tính riêng. Storage chưa có index/replica/headroom; thêm chúng ở bảng giả định của bạn thay vì đọc kết quả như kích thước cluster đã chốt.",
+          "en": "The worksheet uses a basic payload formula. Inputs should represent one operation type; calculate reads/writes separately when their payloads differ. Storage excludes indexes/replicas/headroom; add those in your assumption sheet instead of treating the result as a final cluster size."
+        }
+      ],
+      "experiment": "capacity"
+    },
+    {
+      "id": "latency",
+      "title": {
+        "vi": "8a. Latency: tối ưu critical path",
+        "en": "8a. Latency: optimize the critical path"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thứ tự độ lớn quan trọng hơn thuộc một bảng phần cứng cụ thể: thao tác trong CPU cache thường nhanh hơn RAM, RAM nhanh hơn disk/network round trip, còn khoảng cách địa lý tạo giới hạn truyền tín hiệu. Latency thực phụ thuộc hardware, payload, queue và locality. Dùng measurement của workload thay vì trình bày các số minh họa như benchmark hiện tại.",
+          "en": "Orders of magnitude matter more than memorizing one hardware table: CPU caches are typically faster than RAM, which is faster than storage/network round trips, while geographic distance adds propagation limits. Actual latency depends on hardware, payloads, queues and locality. Use workload measurements instead of presenting illustrations as current benchmarks."
+        },
+        {
+          "vi": "Trong request có nhiều nhánh, wall time theo critical path; tổng resource work vẫn tính mọi nhánh. Parallelism có thể giảm latency nhưng tăng concurrency và tail amplification khi phải đợi tất cả dependency. Percentile của tổng không bằng tổng percentile nếu chưa biết phân phối và tương quan; đo end-to-end cùng trace để tìm nguyên nhân.",
+          "en": "For branched requests, wall time follows the critical path while resource work includes every branch. Parallelism can lower latency while increasing concurrency and tail amplification when all dependencies must finish. The percentile of a sum is not generally the sum of percentiles without distribution/correlation assumptions; measure end-to-end latency and trace causes."
+        }
+      ],
+      "experiment": "latency"
+    },
+    {
+      "id": "availability",
+      "title": {
+        "vi": "8b. Availability và error budget",
+        "en": "8b. Availability and error budgets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với SLI theo thời gian, 99,9% trong 30 ngày cho phép 0,1% × 30 × 24 × 60 = 43,2 phút không khả dụng. 99,99% còn 4,32 phút và 99,999% còn 25,92 giây. Số “nines” không mô tả độ dài từng sự cố, blast radius hoặc mức mất dữ liệu; phải chọn SLI đúng trải nghiệm người dùng.",
+          "en": "For a time-based SLI, 99.9% over 30 days permits 0.1% × 30 × 24 × 60 = 43.2 minutes unavailable. At 99.99% this is 4.32 minutes, and 99.999% gives 25.92 seconds. Nines do not describe individual outages, blast radius or data loss; choose an SLI matching user experience."
+        },
+        {
+          "vi": "Hai dependency nối tiếp chỉ có availability bằng tích khi các giả định independence và success semantics phù hợp; shared failure domain thường phá giả định đó. Redundancy cũng không tự tạo independence khi cả hai replica cùng region, cùng bug deployment hoặc cùng credential bị revoke. Error budget hướng dẫn ưu tiên reliability với tốc độ thay đổi, không phải quyền được bỏ qua mọi sự cố cho tới khi hết budget.",
+          "en": "Multiplying serial-dependency availability requires appropriate independence and success assumptions; shared failure domains often violate them. Redundancy does not create independence when replicas share regions, deployment bugs or revoked credentials. Error budgets guide reliability/change priorities, not permission to ignore incidents until the budget is exhausted."
+        }
+      ],
+      "experiment": "availability"
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "9. Bài tập có lời giải",
+        "en": "9. Worked exercises"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "10 triệu DAU có đồng nghĩa 10 triệu concurrent request không?",
+            "en": "Does ten million DAU mean ten million concurrent requests?"
+          },
+          "answer": [
+            {
+              "vi": "Không. DAU là số user có hoạt động trong ngày. Cần operations/day và thời gian xử lý hoặc session activity để suy ra RPS/concurrency. Với 20 request/user/ngày thì average khoảng 2.315 request/s, rồi mới xét peak và residence time.",
+              "en": "No. DAU counts users active during a day. RPS/concurrency require daily operations and processing time or session activity. Twenty requests/user/day gives about 2,315 average requests/s before peak and residence-time analysis."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bài tập: 800 job/s, worker xử lý 600/s trong 90 giây; sau đó arrival 400/s thì drain bao lâu?",
+            "en": "Exercise: 800 jobs/s arrive, workers serve 600/s for 90 seconds; arrivals then fall to 400/s. How long to drain?"
+          },
+          "answer": [
+            {
+              "vi": "Backlog tăng (800−600) × 90 = 18.000 job. Sau burst dư 600−400 = 200 job/s, nên cần khoảng 90 giây. Nếu retry hoặc downstream chậm làm service rate giảm thì cần tính lại từ effective throughput.",
+              "en": "Backlog grows by (800−600) × 90 = 18,000 jobs. The post-burst surplus is 600−400 = 200 jobs/s, so draining takes about 90 seconds. Recompute using effective throughput if retries or a slow downstream reduce service rate."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao không dùng average payload để đảm bảo mọi request vừa memory?",
+            "en": "Why can average payloads not guarantee every request fits in memory?"
+          },
+          "answer": [
+            {
+              "vi": "Average phù hợp ước lượng tổng nhưng bỏ tail. Một request 100 MB có thể làm buffer/OOM dù average chỉ 10 KB. Cần max size, streaming/chunking, concurrency budget và phân phối payload; hard limits bảo vệ từng request và tổng hệ thống.",
+              "en": "Averages estimate totals but hide tails. A 100 MB request can exhaust buffers despite a 10 KB mean. Use size limits, streaming/chunking, concurrency budgets and payload distributions to protect individual requests and aggregate resources."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Kết quả có nhiều chữ số thập phân có chính xác hơn không?",
+            "en": "Do more decimal places make an estimate more accurate?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu giả định chưa chắc. Làm tròn theo order of magnitude, ghi range và thử sensitivity. Một peak factor sai hai lần quan trọng hơn sai số làm tròn 1%; benchmark và telemetry giúp giảm bất định thật.",
+              "en": "Not when assumptions are uncertain. Round by order of magnitude, state ranges and test sensitivity. A peak-factor error of two matters more than a 1% rounding error; benchmarks and telemetry reduce actual uncertainty."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "system-design",
+    "observability"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ nhu cầu đến giới hạn tài nguyên",
+      "en": "From demand to resource limits"
+    },
+    "caption": {
+      "vi": "Mỗi mũi tên đổi đại lượng phải giữ đúng đơn vị; kết quả là ước lượng có giả định, cần đo workload thật để chọn máy.",
+      "en": "Keep units consistent at every conversion. These are estimates with assumptions; choosing hardware still requires workload measurements."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Hành vi sử dụng",
+          "en": "Usage behavior"
+        },
+        "detail": {
+          "vi": "DAU, thao tác/ngày, read/write.",
+          "en": "DAU, operations/day and reads/writes."
+        },
+        "icon": "users"
+      },
+      {
+        "title": {
+          "vi": "Traffic và peak",
+          "en": "Traffic and peaks"
+        },
+        "detail": {
+          "vi": "RPS trung bình, peak, fan-out.",
+          "en": "Average RPS, peaks and fan-out."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Ngân sách tài nguyên",
+          "en": "Resource budgets"
+        },
+        "detail": {
+          "vi": "Bytes, bandwidth, concurrency.",
+          "en": "Bytes, bandwidth and concurrency."
+        },
+        "icon": "gauge"
+      },
+      {
+        "title": {
+          "vi": "Kiểm tra độ nhạy",
+          "en": "Test sensitivity"
+        },
+        "detail": {
+          "vi": "Đổi giả định; đo giới hạn thật.",
+          "en": "Vary assumptions; measure actual limits."
+        },
+        "icon": "inspect"
+      }
+    ]
+  }
+}

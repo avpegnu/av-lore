@@ -127,8 +127,10 @@ assert.ok(
 );
 assert.ok(pages.has(path.join(dist, 'case-studies/index.html')), 'Case Studies index missing');
 assert.ok(pages.has(path.join(dist, 'themes/index.html')), 'Theme preview page missing');
-assert.equal(htmlFiles.length, 560, 'Both languages must contain all 280 pages');
-assert.equal(htmlFiles.filter((f) => path.relative(dist, f).startsWith('en/')).length, 280);
+const newLessons = fs.readdirSync(path.join(site,'src/content/handbook')).filter(f=>f.endsWith('.json')).map(f=>JSON.parse(fs.readFileSync(path.join(site,'src/content/handbook',f),'utf8')));
+const expectedViPages = 281 + newLessons.filter(l=>l.group !== 'case').length;
+assert.equal(htmlFiles.length, expectedViPages * 2, 'Both locales must contain every course, topic and new lesson');
+assert.equal(htmlFiles.filter((f) => path.relative(dist, f).startsWith('en/')).length, expectedViPages);
 for (const [file, { $ }] of pages) {
   if (!path.relative(dist, file).startsWith('en/')) continue;
   const original = pages.get(path.join(dist, path.relative(path.join(dist, 'en'), file)));

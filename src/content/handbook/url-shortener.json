@@ -1,0 +1,1486 @@
+{
+  "id": "url-shortener",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế URL Shortener: code, cache và độ tin cậy",
+    "en": "Designing a URL Shortener: codes, caching and reliability"
+  },
+  "summary": {
+    "vi": "Từ namespace Base62 tới conditional insert, luồng redirect, expiry và multi-region; tự thử collision và cache khi URL đích thay đổi.",
+    "en": "From a Base62 namespace to conditional inserts, redirects, expiry and multiple regions; experiment with collisions and cached destination changes."
+  },
+  "prerequisites": [
+    "estimation",
+    "unique-ids",
+    "caching",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "cache",
+    "database"
+  ],
+  "takeaways": [
+    {
+      "vi": "Base62 chỉ biểu diễn ID; uniqueness đến từ allocator hoặc conditional write.",
+      "en": "Base62 represents an ID; uniqueness comes from allocation or conditional writes."
+    },
+    {
+      "vi": "Cache policy quyết định freshness và origin traffic; status 301/302 một mình không đủ.",
+      "en": "Cache policy controls freshness and origin traffic; 301/302 alone is insufficient."
+    },
+    {
+      "vi": "Expiry/status phải được kiểm trên serving path; background cleanup không thay enforcement.",
+      "en": "Expiry/status require serving-path checks; background cleanup is not enforcement."
+    },
+    {
+      "vi": "Range không giao nhau bảo vệ generated code, không tự bảo vệ custom alias hay read-after-create giữa region.",
+      "en": "Disjoint ranges protect generated codes, not alias ownership or cross-region read-after-create."
+    },
+    {
+      "vi": "Analytics durability, revocation latency và hot-key protection là quyết định sản phẩm và vận hành, không chỉ tên công nghệ.",
+      "en": "Analytics durability, revocation latency and hot-key protection are product/operational decisions, not technology names."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Bốn quyết định tạo nên một short link",
+      "en": "Four decisions behind a short link"
+    },
+    "caption": {
+      "vi": "Học theo vòng đời: cấp code, commit mapping, phục vụ redirect và quản lý thay đổi sau đó.",
+      "en": "Follow the lifecycle: allocate a code, commit a mapping, serve redirects and manage later changes."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Chọn namespace",
+          "en": "Choose a namespace"
+        },
+        "detail": {
+          "vi": "Tính số mã và cơ chế không trùng; tách encoding khỏi generation.",
+          "en": "Size code space and uniqueness; separate encoding from generation."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Commit mapping",
+          "en": "Commit the mapping"
+        },
+        "detail": {
+          "vi": "Conditional insert và idempotency giữ invariant khi retry/race.",
+          "en": "Conditional insertion and idempotency preserve invariants under retries/races."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Resolve nhanh",
+          "en": "Resolve quickly"
+        },
+        "detail": {
+          "vi": "Cache/store trả mapping; reader kiểm policy và trả Location.",
+          "en": "Caches/stores supply mappings; readers check policy and return Location."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Giữ đúng lâu dài",
+          "en": "Keep it correct"
+        },
+        "detail": {
+          "vi": "Expiry, abuse, update, analytics và restore có contract riêng.",
+          "en": "Expiry, abuse, edits, analytics and restore need explicit contracts."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Chốt hành vi và các invariant",
+        "en": "1. Specify behavior and invariants"
+      },
+      "paragraphs": [
+        {
+          "vi": "URL Shortener quản lý một ánh xạ bền vững từ (domain, code) sang URL đích. Trình duyệt nhận Location rồi tự tạo request tới trang đích; dịch vụ không cần tải trang đó về. Nhờ tách hai hành động này, đường redirect có thể chỉ là một key lookup và một response nhỏ.",
+          "en": "A URL shortener maintains a durable mapping from (domain, code) to a destination URL. The browser receives Location and makes a separate request to the destination; the service does not need to download that page. This makes the redirect path a key lookup followed by a small response."
+        },
+        {
+          "vi": "Trước khi vẽ, hỏi: link có sửa đích được không, expiry chính xác tới mức nào, có alias/custom domain không, public hay private, analytics dùng tham khảo hay đối soát? Các câu trả lời quyết định freshness, authorization và độ bền event. Một link bí mật không thể chỉ dựa vào việc code khó đoán; nếu có quyền riêng tư thực sự thì phải xác thực và kiểm quyền.",
+          "en": "Before drawing, ask whether destinations can change, how precisely expiry must be enforced, whether aliases/custom domains exist, whether links are public or private, and whether analytics is approximate or auditable. These choices determine freshness, authorization and event durability. An unguessable code alone does not protect a private resource; real privacy requires authentication and authorization."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Chức năng của link",
+            "en": "Link capabilities"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Tạo link, redirect qua GET/HEAD, alias tùy chọn và expiry.",
+              "en": "Create links, redirect through GET/HEAD, optionally accept aliases and expiry."
+            },
+            {
+              "vi": "Sửa hoặc vô hiệu hóa link chỉ bởi principal được phép; custom domain phải xác minh ownership.",
+              "en": "Only authorized principals can modify or disable a link; custom domains require ownership verification."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Contract về chất lượng",
+            "en": "Quality contract"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Ví dụ bài học: 100 triệu link mới/ngày, redirect gấp 10 lần; p99 mục tiêu 50 ms tại biên dịch vụ được định nghĩa.",
+              "en": "Teaching scenario: 100 million new links/day and ten times as many redirects; a target p99 of 50 ms at a defined service boundary."
+            },
+            {
+              "vi": "Đặt SLO riêng cho redirect và creation; xác định vùng, lỗi được tính và độ trễ thu hồi được chấp nhận.",
+              "en": "Set separate redirect and creation SLOs; define regions, counted failures and the accepted revocation delay."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Invariant phải giữ",
+            "en": "Required invariants"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Không có hai mapping khác nhau cùng sở hữu một (domain, code); retry tạo link không tự sinh thêm mapping nếu cùng idempotency key hợp lệ.",
+              "en": "Two different mappings must not own the same (domain, code); a valid idempotent retry must not create another mapping."
+            },
+            {
+              "vi": "Reader kiểm expiry/status; cleanup trễ không làm link sống lại. Không tái cấp code cho chủ khác khi URL cũ còn có thể được truy cập.",
+              "en": "Readers check expiry/status; delayed cleanup must not revive a link. Avoid reassigning a code while old URLs can still be accessed."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "estimation",
+      "title": {
+        "vi": "2. Tính traffic, storage và số ký tự",
+        "en": "2. Calculate traffic, storage and code length"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng 365 ngày/năm cho phép tính nhẩm, retention 10 năm, mỗi record trung bình 500 B gồm URL và metadata của ví dụ. Không coi các số này là benchmark hoặc giới hạn của database. Read:write là 10:1 trong bài này, không phải hằng số của mọi sản phẩm.",
+          "en": "Use 365 days/year for rough arithmetic, ten-year retention and a 500 B average record including the example URL and metadata. These figures are neither a database benchmark nor a capacity limit. The read:write ratio is 10:1 here, not a universal property of shorteners."
+        },
+        {
+          "vi": "Storage logic là 182,5 TB theo đơn vị thập phân. Nếu giữ ba replica đầy đủ thì riêng payload thành 547,5 TB, trước index, WAL/log, backup, headroom và overhead engine. Analytics có thể lớn hơn mapping nhiều lần; không gộp chúng vào cùng 500 B. Peak factor 3 chỉ là giả định và có thể sai khi một link viral.",
+          "en": "Logical storage is 182.5 TB in decimal units. Three full replicas make the payload alone 547.5 TB before indexes, WAL/logs, backups, headroom and engine overhead. Analytics can dwarf mappings; it is not included in the same 500 B. A peak factor of three is an assumption that can fail during a viral event."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng tính",
+            "en": "Quantity"
+          },
+          {
+            "vi": "Công thức trong ví dụ",
+            "en": "Example calculation"
+          },
+          {
+            "vi": "Kết quả gần đúng",
+            "en": "Approximate result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Creation RPS",
+              "en": "Creation RPS"
+            },
+            {
+              "vi": "100.000.000 / 86.400",
+              "en": "100,000,000 / 86,400"
+            },
+            {
+              "vi": "1.157,4 / s",
+              "en": "1,157.4 / s"
+            }
+          ],
+          [
+            {
+              "vi": "Redirect RPS",
+              "en": "Redirect RPS"
+            },
+            {
+              "vi": "1.000.000.000 / 86.400",
+              "en": "1,000,000,000 / 86,400"
+            },
+            {
+              "vi": "11.574,1 / s",
+              "en": "11,574.1 / s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak redirect giả định",
+              "en": "Assumed peak redirects"
+            },
+            {
+              "vi": "11.574,1 × 3",
+              "en": "11,574.1 × 3"
+            },
+            {
+              "vi": "34.722,2 / s",
+              "en": "34,722.2 / s"
+            }
+          ],
+          [
+            {
+              "vi": "Mapping được giữ",
+              "en": "Retained mappings"
+            },
+            {
+              "vi": "100 triệu × 365 × 10",
+              "en": "100 million × 365 × 10"
+            },
+            {
+              "vi": "365 tỷ",
+              "en": "365 billion"
+            }
+          ],
+          [
+            {
+              "vi": "Storage logic",
+              "en": "Logical storage"
+            },
+            {
+              "vi": "365 tỷ × 500 B",
+              "en": "365 billion × 500 B"
+            },
+            {
+              "vi": "182,5 TB",
+              "en": "182.5 TB"
+            }
+          ],
+          [
+            {
+              "vi": "Namespace 6 ký tự",
+              "en": "Six-character namespace"
+            },
+            {
+              "vi": "62^6",
+              "en": "62^6"
+            },
+            {
+              "vi": "56.800.235.584: không đủ 365 tỷ",
+              "en": "56,800,235,584: insufficient for 365 billion"
+            }
+          ],
+          [
+            {
+              "vi": "Namespace 7 ký tự",
+              "en": "Seven-character namespace"
+            },
+            {
+              "vi": "62^7",
+              "en": "62^7"
+            },
+            {
+              "vi": "3.521.614.606.208: khoảng 9,65 lần số record",
+              "en": "3,521,614,606,208: about 9.65 times the record count"
+            }
+          ]
+        ]
+      },
+      "callout": {
+        "title": {
+          "vi": "p99 không suy ra từ RPS trung bình",
+          "en": "Average RPS does not determine p99"
+        },
+        "body": {
+          "vi": "Capacity cần phân bố key, cache hit ratio, latency khi miss, số connection, payload và failure headroom. Ví dụ 99% hit vẫn có thể đặt p99 sát đường miss; hãy đo histogram end-to-end thay vì cộng p99 của từng hop.",
+          "en": "Capacity depends on key distribution, cache hit ratio, miss latency, connections, payload and failure headroom. Even a 99% hit rate can put p99 near the miss path; measure the end-to-end histogram rather than adding hop p99s."
+        }
+      }
+    },
+    {
+      "id": "encoding",
+      "title": {
+        "vi": "3. Base62 là encoding, collision là bài toán khác",
+        "en": "3. Base62 encoding and collision are different problems"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một ID nguyên không âm đổi sang Base62 bằng cách chia liên tiếp cho 62 và đọc phần dư theo chiều ngược lại. Alphabet phải được cố định; đổi thứ tự a–z/A–Z sẽ đổi mapping. Code phân biệt hoa thường nên router, collation database và custom-domain proxy phải giữ nguyên case. Với namespace đúng L ký tự, có thể pad số 0; khi decode vẫn ra cùng số nhưng cần canonical format để tránh nhiều URL tương đương ngoài ý muốn.",
+          "en": "Encode a non-negative integer by repeatedly dividing by 62 and reading remainders in reverse order. Fix the alphabet: swapping a–z and A–Z changes the mapping. Codes are case-sensitive, so routers, database collations and custom-domain proxies must preserve case. An exact-L-character namespace can use zero padding; decoding gives the same integer, but a canonical format avoids unintended equivalent URLs."
+        },
+        {
+          "vi": "Mã hóa là song ánh giữa integer và biểu diễn canonical; nó không bảo vệ bí mật và không tự sinh ID. Hai writer lấy cùng integer sẽ tạo cùng code. Một Snowflake dùng tới 63 bit có thể cần 11 ký tự Base62, nên không thể hứa mọi ID kiểu đó luôn vừa 7 ký tự. Nếu giới hạn sản phẩm là 7, allocator phải chặn trước 62^7 hoặc dùng thiết kế namespace khác.",
+          "en": "Encoding is a bijection between an integer and its canonical representation; it neither provides secrecy nor generates IDs. Two writers using the same integer produce the same code. A Snowflake using up to 63 bits can require eleven Base62 characters, so such IDs do not always fit in seven. For a seven-character product limit, stop the allocator before 62^7 or choose a different namespace design."
+        }
+      ],
+      "experiment": "url-space"
+    },
+    {
+      "id": "strategies",
+      "title": {
+        "vi": "4. So sánh counter, random và hash",
+        "en": "4. Compare counters, randomness and hashing"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với random uniform, xác suất lần thử tiếp theo đụng một trong n mã đã chiếm là n/M. Xác suất ít nhất một cặp trùng trong n lần sinh thô xấp xỉ 1 − exp(−n(n−1)/(2M)) khi n nhỏ so với M. Hai số này rất khác nhau: namespace lớn không có nghĩa cả lịch sử sẽ không bao giờ có collision. Cần generate rồi conditional insert; nếu conflict thì sinh lại trong retry budget, không dùng read-then-write làm bằng chứng an toàn.",
+          "en": "For uniform random generation, the next-draw collision probability against n occupied codes is n/M. The probability of at least one collision among n raw draws is approximately 1 − exp(−n(n−1)/(2M)) when n is small relative to M. These answer different questions: a large namespace does not make its whole history collision-free. Generate and conditionally insert; retry conflicts within a budget instead of relying on a read-then-write check."
+        },
+        {
+          "vi": "Hash URL rồi cắt ngắn không chứng minh hai URL giống nhau. Khi cùng code nhưng đích khác, phải so sánh full input đã canonicalize theo policy, dùng salt/nonce để tìm code khác hoặc tăng chiều dài. Không tự sửa thứ tự query param, bỏ fragment hay lowercase path vì có thể làm đổi nghĩa URL. Dedupe chỉ nên diễn ra trong scope owner + destination + options đã chốt; hai khách hàng có thể muốn tracking/expiry khác nhau cho cùng một URL.",
+          "en": "A truncated URL hash does not prove that two URLs are equal. If a code conflicts with a different target, compare the full input under a defined canonicalization policy, use a salt/nonce for another candidate, or increase length. Do not casually reorder query parameters, remove fragments or lowercase paths: these can change URL meaning. Deduplicate only in a defined owner + destination + options scope; different customers may want different tracking or expiry for the same URL."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Phương án code",
+            "en": "Code strategy"
+          },
+          {
+            "vi": "Điểm mạnh và uniqueness",
+            "en": "Strength and uniqueness"
+          },
+          {
+            "vi": "Chi phí/ràng buộc thực tế",
+            "en": "Practical costs and constraints"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Counter + Base62",
+              "en": "Counter + Base62"
+            },
+            {
+              "vi": "Không trùng nếu allocator/local concurrency đúng và namespace chưa cạn.",
+              "en": "Collision-free if allocation and local concurrency are correct and the namespace is not exhausted."
+            },
+            {
+              "vi": "Coordination theo block; dễ đoán, lộ gần đúng volume. Dedupe là chức năng riêng.",
+              "en": "Block-level coordination; predictable and can reveal approximate volume. Deduplication is separate."
+            }
+          ],
+          [
+            {
+              "vi": "Random CSPRNG + insert",
+              "en": "Random CSPRNG + insert"
+            },
+            {
+              "vi": "Không cần counter toàn cục; entropy phụ thuộc chiều dài và alphabet.",
+              "en": "No global counter; entropy depends on length and alphabet."
+            },
+            {
+              "vi": "Conditional write + bounded retry; không dùng Math.random cho mục đích chống đoán.",
+              "en": "Conditional writes and bounded retries; do not use Math.random for resistance to guessing."
+            }
+          ],
+          [
+            {
+              "vi": "Hash + truncate",
+              "en": "Hash + truncate"
+            },
+            {
+              "vi": "Cùng input tạo cùng candidate với cùng thuật toán/salt.",
+              "en": "The same input gives the same candidate under the same algorithm/salt."
+            },
+            {
+              "vi": "Không tự dedupe đúng quyền hoặc options; collision resolution và privacy vẫn cần thiết.",
+              "en": "Does not automatically deduplicate correctly across permissions/options; collision resolution and privacy still matter."
+            }
+          ],
+          [
+            {
+              "vi": "Permutation của counter",
+              "en": "Counter permutation"
+            },
+            {
+              "vi": "Một permutation đúng trên miền cố định giữ uniqueness.",
+              "en": "A valid permutation over a fixed domain preserves uniqueness."
+            },
+            {
+              "vi": "Phải thiết kế miền, key/version và migration; không phải thay bằng hash thường. Không thay authorization.",
+              "en": "Requires domain, key/version and migration design; a plain hash is not a replacement. Does not replace authorization."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "5. Thiết kế API có retry và ownership rõ ràng",
+        "en": "5. Design APIs with explicit retries and ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng route /s/:code để không va chạm /api, /health hay asset. Nếu muốn URL ngắn nhất ở /:code, phải reserve một tập tên và bảo đảm dispatcher không nuốt API route. Giới hạn kích thước URL, scheme http/https, alias grammar, expiry tối đa; từ chối credential trong URL và control character. Ownership của custom domain được xác minh trước khi cho ghi mapping.",
+          "en": "Use /s/:code to avoid collisions with /api, /health and assets. For the shortest /:code route, reserve names and ensure dispatch cannot swallow API routes. Bound URL size, allow http/https schemes, define alias grammar and maximum expiry, and reject URL credentials and control characters. Verify custom-domain ownership before allowing mappings."
+        },
+        {
+          "vi": "Idempotency-Key không giống dedupe theo URL. Lưu key theo principal/tenant, hash của payload và kết quả tạo trong một retention window. Cùng key + cùng payload trả lại cùng mapping; cùng key + payload khác trả conflict. Request timeout sau commit không được tạo thêm link khi retry. Nếu transaction không thể bao trùm cả hai bảng/store, cần state machine hoặc một bản ghi operation làm authority.",
+          "en": "An Idempotency-Key is not URL deduplication. Store the tenant/principal-scoped key, a payload hash and the creation result for a retention window. The same key and payload returns the same mapping; the same key with another payload conflicts. A timeout after commit must not create another link on retry. If a transaction cannot cover both records/stores, use an operation state machine or an authoritative operation record."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/links",
+          "description": {
+            "vi": "Tạo mapping với alias hoặc generated code.",
+            "en": "Create a mapping with an alias or generated code."
+          },
+          "request": "Idempotency-Key: create-2026-001\n{ \"url\": \"https://docs.example/learn?topic=cache\", \"alias\": \"learn-cache\", \"expires_at\": \"2027-01-01T00:00:00Z\" }",
+          "response": "201 { \"code\": \"learn-cache\", \"short_url\": \"https://sho.example/s/learn-cache\", \"version\": 1 }",
+          "notes": [
+            {
+              "vi": "400/422 cho input sai, 409 cho alias đã chiếm hoặc idempotency payload mismatch, 429 khi vượt quota; error code phải phân biệt các trường hợp.",
+              "en": "Use 400/422 for invalid input, 409 for an occupied alias or idempotency payload mismatch, and 429 for quota exhaustion; error codes distinguish these cases."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/s/{code}",
+          "description": {
+            "vi": "Resolve link public và trả redirect sau kiểm status/expiry.",
+            "en": "Resolve a public link and redirect after status/expiry checks."
+          },
+          "response": "302 Found\nLocation: https://docs.example/learn?topic=cache\nCache-Control: no-store",
+          "notes": [
+            {
+              "vi": "404 cho missing theo policy; 410 cho expired nếu muốn công khai, hoặc 404 để giảm tiết lộ. HEAD giữ status/header như GET nhưng không response body và không mặc định tính là click người dùng.",
+              "en": "Use 404 for missing links; use 410 for expiry if public policy allows, or 404 to reveal less. HEAD has the GET status/headers without a response body and should not automatically count as a human click."
+            }
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/links/{code}",
+          "description": {
+            "vi": "Chủ sở hữu đổi đích/expiry với optimistic concurrency.",
+            "en": "The owner changes target/expiry using optimistic concurrency."
+          },
+          "request": "If-Match: \"v1\"\n{ \"url\": \"https://docs.example/new\" }",
+          "response": "200 { \"version\": 2 } | 412 Precondition Failed",
+          "notes": [
+            {
+              "vi": "Commit version mới rồi phát invalidation theo cơ chế chống mất event; không hứa xóa được browser cache đã phát.",
+              "en": "Commit the new version and publish invalidation through a mechanism that avoids lost events; do not promise to erase already-issued browser cache entries."
+            }
+          ]
+        },
+        {
+          "method": "DELETE",
+          "path": "/links/{code}",
+          "description": {
+            "vi": "Vô hiệu hóa mapping bằng tombstone, cần authorization.",
+            "en": "Disable the mapping using a tombstone; authorization is required."
+          },
+          "response": "204 No Content",
+          "notes": [
+            {
+              "vi": "Đây là logical disable, không tái cấp code ngay. Privacy deletion và retention của audit/tombstone có policy riêng.",
+              "en": "This is logical disablement, not immediate code reuse. Privacy deletion and audit/tombstone retention need separate policies."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flow",
+      "title": {
+        "vi": "6. Kiến trúc đọc nhiều và các đường request",
+        "en": "6. Read-heavy architecture and request paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bắt đầu bằng một service stateless, database có unique key và cache khi cần; tách Creation API/Redirect API khi deployment, scale hoặc blast radius yêu cầu. Auto-increment ở database có HA có thể đủ ở quy mô vừa; không cần bỏ nó chỉ vì phỏng vấn. Tại hàng trăm tỷ mapping, lập kế hoạch partition, backup và phục hồi sớm, nhưng lựa chọn SQL hay KV vẫn phụ thuộc access pattern và khả năng vận hành.",
+          "en": "Start with a stateless service, a database with a unique key and a cache when needed. Separate creation and redirect services when deployment, scaling or blast radius warrants it. An auto-increment key on an HA database can suffice at moderate scale; interviews alone are not a reason to reject it. Hundreds of billions of mappings require partitioning, backup and recovery planning, but SQL versus KV still depends on access patterns and operational capability."
+        },
+        {
+          "vi": "Cache hit chỉ giảm tải store, không tự chứng minh status mới nhất. Chọn một bounded-staleness contract cho mapping và một policy thu hồi abuse đủ nhanh. Nếu yêu cầu revoke tức thì trên mọi request, mọi tầng có thể bypass authority đều phải được thay đổi hoặc loại bỏ; invalidation best-effort + TTL 1 giờ không đáp ứng lời hứa đó.",
+          "en": "A cache hit reduces store load without proving that status is current. Choose bounded mapping staleness and an abuse-revocation policy with adequate speed. If every request must observe immediate revocation, all layers that bypass authority must be changed or removed; best-effort invalidation plus a one-hour TTL does not meet that promise."
+        }
+      ],
+      "diagram": {
+        "id": "short-link-paths",
+        "title": {
+          "vi": "Tạo link, redirect và phát sinh click event",
+          "en": "Creating links, redirecting and emitting click events"
+        },
+        "caption": {
+          "vi": "Chọn một trace rồi đi từng bước. Mũi tên trả về chỉ rõ lúc nào request thành công; analytics chạy sau một quyết định riêng về độ bền dữ liệu.",
+          "en": "Choose a trace and advance step by step. Return arrows show when a request succeeds; analytics has a separate durability decision."
+        },
+        "width": 1100,
+        "height": 720,
+        "nodes": [
+          {
+            "id": "browser",
+            "label": {
+              "vi": "Browser / client",
+              "en": "Browser / client"
+            },
+            "detail": {
+              "vi": "Giữ HTTP redirect cache theo policy; client không được cấp quyền ghi trực tiếp vào store.",
+              "en": "Holds an HTTP redirect cache according to policy; clients cannot write directly to the store."
+            },
+            "x": 130,
+            "y": 120,
+            "kind": "client"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "Edge / router",
+              "en": "Edge / router"
+            },
+            "detail": {
+              "vi": "TLS, giới hạn abuse, route tạo/đọc. Có thể cache redirect nếu policy và việc thu hồi cho phép.",
+              "en": "Terminates TLS, limits abuse and routes creation/reads. Redirect caching depends on policy and revocation needs."
+            },
+            "x": 410,
+            "y": 120,
+            "kind": "edge"
+          },
+          {
+            "id": "redirect",
+            "label": {
+              "vi": "Redirect API",
+              "en": "Redirect API"
+            },
+            "detail": {
+              "vi": "Lookup theo domain + code; kiểm tra trạng thái và expiry trước khi trả Location. Không fetch nội dung URL đích.",
+              "en": "Looks up domain + code; checks status and expiry before returning Location. Does not fetch the destination page."
+            },
+            "x": 720,
+            "y": 120,
+            "kind": "service"
+          },
+          {
+            "id": "cache",
+            "label": {
+              "vi": "Mapping cache",
+              "en": "Mapping cache"
+            },
+            "detail": {
+              "vi": "Có thể lưu record cũ: TTL, version và invalidation là một phần thiết kế. Không cache lâu kết quả missing cho link vừa tạo.",
+              "en": "May contain stale records: TTLs, versions and invalidation are part of the design. Avoid long negative caching of newly created links."
+            },
+            "x": 990,
+            "y": 310,
+            "kind": "store"
+          },
+          {
+            "id": "create",
+            "label": {
+              "vi": "Creation API",
+              "en": "Creation API"
+            },
+            "detail": {
+              "vi": "Validate, idempotency và conditional insert. Allocator chỉ phục vụ namespace generated; custom alias dùng unique constraint riêng.",
+              "en": "Validates, handles idempotency and performs conditional insertion. The allocator serves generated codes; aliases use uniqueness enforcement."
+            },
+            "x": 410,
+            "y": 370,
+            "kind": "service"
+          },
+          {
+            "id": "store",
+            "label": {
+              "vi": "Link store",
+              "en": "Link store"
+            },
+            "detail": {
+              "vi": "Authority của mapping, status và version. Unique theo (domain, code); acknowledgment sau durable commit theo failure model đã chốt.",
+              "en": "Authoritative mapping, status and version. Unique on (domain, code); acknowledges after a durable commit under the chosen failure model."
+            },
+            "x": 720,
+            "y": 370,
+            "kind": "store"
+          },
+          {
+            "id": "allocator",
+            "label": {
+              "vi": "Range allocator",
+              "en": "Range allocator"
+            },
+            "detail": {
+              "vi": "Cấp các khoảng ID không giao nhau bằng atomic durable update. Range đã cấp không quay lại pool khi writer chết.",
+              "en": "Allocates disjoint ID ranges through atomic durable updates. Assigned ranges are not returned to the pool when a writer dies."
+            },
+            "x": 130,
+            "y": 580,
+            "kind": "service"
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Click pipeline",
+              "en": "Click pipeline"
+            },
+            "detail": {
+              "vi": "Nhận event best-effort hoặc qua durable buffer/outbox theo contract; dedup event ID, phân biệt bot và user.",
+              "en": "Receives best-effort events or uses a durable buffer/outbox according to contract; deduplicates event IDs and distinguishes bots from users."
+            },
+            "x": 990,
+            "y": 580,
+            "kind": "queue"
+          }
+        ],
+        "traces": [
+          {
+            "id": "cache-hit",
+            "label": {
+              "vi": "Redirect: cache hit hợp lệ",
+              "en": "Redirect: valid cache hit"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "edge",
+                "description": {
+                  "vi": "GET /s/abc, browser chưa có response fresh.",
+                  "en": "GET /s/abc; the browser has no fresh cached response."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "redirect",
+                "description": {
+                  "vi": "Router chuyển request tới Redirect API.",
+                  "en": "The router forwards to the Redirect API."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "cache",
+                "description": {
+                  "vi": "Lookup theo (domain, code), nhận mapping kèm expiry/status/version.",
+                  "en": "Look up (domain, code), including expiry, status and version."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "redirect",
+                "description": {
+                  "vi": "Record còn hợp lệ theo freshness policy đã chấp nhận; kiểm expires_at ở thời điểm phục vụ.",
+                  "en": "The record is usable under the accepted freshness policy; check expires_at at serving time."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "edge",
+                "description": {
+                  "vi": "Trả 302 + Location và Cache-Control tường minh.",
+                  "en": "Return 302 + Location with explicit Cache-Control."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "browser",
+                "description": {
+                  "vi": "Browser nhận redirect; một request khác tới host đích diễn ra ngoài sơ đồ.",
+                  "en": "The browser receives the redirect; a separate request to the destination host occurs outside this diagram."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "events",
+                "description": {
+                  "vi": "Phát event theo chính sách best-effort; việc này không nằm trong acknowledgment path vừa vẽ.",
+                  "en": "Emit an event under the best-effort policy; it is outside the acknowledgement path shown above."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "cache-miss",
+            "label": {
+              "vi": "Redirect: miss và điền cache",
+              "en": "Redirect: miss and fill"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "edge",
+                "description": {
+                  "vi": "Client yêu cầu code chưa có trong cache của browser.",
+                  "en": "The client requests a code absent from its browser cache."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "redirect",
+                "description": {
+                  "vi": "Chuyển request tới reader.",
+                  "en": "Forward the request to a reader."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "cache",
+                "description": {
+                  "vi": "Lookup mapping; cache trả miss.",
+                  "en": "Look up the mapping; the cache misses."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "redirect",
+                "description": {
+                  "vi": "Miss không có nghĩa code không tồn tại.",
+                  "en": "A cache miss does not mean the code is absent."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "store",
+                "description": {
+                  "vi": "Đọc authoritative record; với link mới có thể cần home-region fallback để tránh replica lag.",
+                  "en": "Read the authoritative record; a new link may need a home-region fallback to avoid replica lag."
+                }
+              },
+              {
+                "from": "store",
+                "to": "redirect",
+                "description": {
+                  "vi": "Trả record; reader kiểm status và expiry bằng server time.",
+                  "en": "Return the record; the reader checks status and expiry using server time."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "cache",
+                "description": {
+                  "vi": "Điền cache có version và TTL không vượt phần lifetime còn lại; tránh ghi đè version mới hơn.",
+                  "en": "Fill with a version and a TTL no longer than the remaining lifetime; avoid overwriting newer versions."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "edge",
+                "description": {
+                  "vi": "Tạo 302 và Location sau khi kiểm policy.",
+                  "en": "Build a 302 and Location after policy checks."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "browser",
+                "description": {
+                  "vi": "Trả redirect; click pipeline có thể chạy riêng như trace cache hit.",
+                  "en": "Return the redirect; the click pipeline may run separately as in the cache-hit trace."
+                }
+              }
+            ]
+          },
+          {
+            "id": "create-link",
+            "label": {
+              "vi": "Tạo code và trả kết quả",
+              "en": "Create a code and return it"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "edge",
+                "description": {
+                  "vi": "POST /links với Idempotency-Key, URL đích và expiry tùy chọn.",
+                  "en": "POST /links with an Idempotency-Key, destination and optional expiry."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "create",
+                "description": {
+                  "vi": "Authenticate nếu cần; validate scheme, kích thước và hạn mức.",
+                  "en": "Authenticate when required; validate scheme, size and quota."
+                }
+              },
+              {
+                "from": "create",
+                "to": "allocator",
+                "description": {
+                  "vi": "Chỉ khi local range cạn: xin block mới, ví dụ 10.000 ID.",
+                  "en": "Only when the local range is exhausted: request a new block, for example 10,000 IDs."
+                }
+              },
+              {
+                "from": "allocator",
+                "to": "create",
+                "description": {
+                  "vi": "Trả khoảng [start, end) sau durable atomic reservation; không tái sử dụng range đã cấp.",
+                  "en": "Return [start, end) after a durable atomic reservation; never reissue assigned ranges."
+                }
+              },
+              {
+                "from": "create",
+                "to": "store",
+                "description": {
+                  "vi": "Lấy ID local an toàn concurrency, encode và conditional insert mapping + kết quả idempotency trong cùng transaction khi cùng DB.",
+                  "en": "Allocate locally with concurrency safety, encode, and conditionally insert the mapping plus idempotency result in one transaction when using the same DB."
+                }
+              },
+              {
+                "from": "store",
+                "to": "create",
+                "description": {
+                  "vi": "Commit thành công. Một custom alias đã có trả conflict, không overwrite link của người khác.",
+                  "en": "Commit succeeds. An existing custom alias causes a conflict instead of overwriting another link."
+                }
+              },
+              {
+                "from": "create",
+                "to": "edge",
+                "description": {
+                  "vi": "Trả 201 với code, shortUrl và version.",
+                  "en": "Return 201 with code, shortUrl and version."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "browser",
+                "description": {
+                  "vi": "Client nhận link; retry cùng key và payload sẽ nhận lại cùng kết quả trong retention window.",
+                  "en": "The client receives the link; retrying the same key and payload returns the same result within the retention window."
+                }
+              }
+            ]
+          },
+          {
+            "id": "expiry",
+            "label": {
+              "vi": "Link đã hết hạn",
+              "en": "An expired link"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "edge",
+                "description": {
+                  "vi": "Request tới dịch vụ; browser cache có thể đã được giới hạn TTL trước đó.",
+                  "en": "A request reaches the service; browser cache TTLs must have been bounded earlier."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "redirect",
+                "description": {
+                  "vi": "Chuyển tới reader.",
+                  "en": "Forward to the reader."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "cache",
+                "description": {
+                  "vi": "Cache có thể vẫn chứa record vật lý.",
+                  "en": "The cache may still physically contain the record."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "redirect",
+                "description": {
+                  "vi": "Reader thấy expires_at ≤ now hoặc trạng thái disabled.",
+                  "en": "The reader observes expires_at ≤ now or a disabled state."
+                }
+              },
+              {
+                "from": "redirect",
+                "to": "edge",
+                "description": {
+                  "vi": "Trả 410 theo policy công khai; không có Location tới URL đích. Có thể dùng 404 để không tiết lộ sự tồn tại.",
+                  "en": "Return 410 under the public policy, without a destination Location. A privacy-oriented policy may use 404 instead."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "browser",
+                "description": {
+                  "vi": "Không redirect. Cleanup store được thực hiện riêng, không quyết định tính hợp lệ.",
+                  "en": "Do not redirect. Store cleanup runs separately and does not decide validity."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "id-generation",
+      "title": {
+        "vi": "7. Cấp ID theo block mà không cấp lại sau crash",
+        "en": "7. Allocate ID blocks without reissuing them after a crash"
+      },
+      "paragraphs": [
+        {
+          "vi": "Allocator giữ next_id bằng atomic update bền vững và trả khoảng [start, end). Với block 10.000, trung bình khoảng 0,116 lần cấp block/giây cho 100 triệu link/ngày, trước hao hụt và prefetch. Writer lấy ID từ local range bằng phép tăng atomic hoặc mutex; chỉ một request refill tại một thời điểm. Nếu hai coroutine cùng thấy range cạn rồi cùng await allocator, code refill thiếu đồng bộ có thể làm hỏng state hoặc cấp trùng ID.",
+          "en": "The allocator durably updates next_id atomically and returns [start, end). With blocks of 10,000, 100 million daily links require roughly 0.116 block allocations/second before waste and prefetch. Writers consume local ranges with an atomic increment or mutex, allowing only one refill at a time. If two coroutines see exhaustion and both await an allocator without synchronization, refill logic can corrupt state or issue duplicate IDs."
+        },
+        {
+          "vi": "Không dùng lease hết hạn để đưa block cũ về pool: writer bị pause có thể chạy lại và vẫn cấp ID trong block đó. Một range đã cấp phải được coi là tiêu thụ vĩnh viễn; crash tạo khoảng trống, không tạo quyền tái sử dụng. Khi failover/restore allocator, không được lùi high-water mark. Với nhiều block prefetch đang giữ thì lượng hao hụt khi crash không chỉ là một block.",
+          "en": "Do not return expired leases to a pool: a paused writer can resume and continue allocating from an old block. An issued range is permanently consumed; a crash creates gaps, not permission to reuse it. Allocator failover or restore must not roll back its high-water mark. A writer holding several prefetched blocks can waste more than one block on a crash."
+        },
+        {
+          "vi": "Nếu allocator mất kết nối, writer còn range tiếp tục tạo link trong giới hạn quota; writer cạn range ngừng creation hoặc trả lỗi retryable, tuyệt đối không tự random vào cùng namespace mà bỏ kiểm uniqueness. Redirect của link đã tồn tại vẫn phải phục vụ được khi allocator hỏng. Capacity planning cần cảnh báo namespace gần cạn và có kế hoạch tăng chiều dài mà không đổi code cũ.",
+          "en": "During an allocator outage, writers with ranges can create links within quota. Exhausted writers stop creation or return a retryable error; they must not invent random codes in the same namespace without uniqueness checks. Existing redirects should remain available during an allocator failure. Alert on namespace exhaustion and plan longer codes without rewriting old codes."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "-- Example: one authoritative PostgreSQL row, durable transaction.\nBEGIN;\nUPDATE code_allocator\nSET next_id = next_id + 10000\nWHERE namespace = 'generated-v1'\n  AND next_id + 10000 <= 3521614606208\nRETURNING next_id - 10000 AS start_id, next_id AS end_exclusive;\nCOMMIT;\n-- Return the range only after COMMIT succeeds. Zero rows: exhausted.\n-- Lost reply: do not recycle the block; retry may reserve a new one.",
+        "caption": {
+          "vi": "Ví dụ cấp block phía allocator, không phải toàn bộ service. Cần row được tạo sẵn, quyền ghi phù hợp, HA/durability và kiểm tra kết quả commit. Phía writer vẫn cần đồng bộ concurrency.",
+          "en": "An allocator-side block reservation, not a complete service. It requires a precreated row, appropriate permissions, HA/durability and commit-result handling. Writers still need local concurrency safety."
+        }
+      },
+      "flow": {
+        "title": {
+          "vi": "Vòng đời của một range",
+          "en": "Range lifecycle"
+        },
+        "caption": {
+          "vi": "Phân biệt cấp range, tiêu thụ ID và khôi phục sau lỗi; gaps là chi phí được chấp nhận.",
+          "en": "Separate range reservation, local consumption and recovery; gaps are an accepted cost."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Reserve bền vững",
+              "en": "Reserve durably"
+            },
+            "detail": {
+              "vi": "Atomic advance high-water mark trước khi trả [start, end).",
+              "en": "Atomically advance the high-water mark before returning [start, end)."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Cấp ID local",
+              "en": "Allocate locally"
+            },
+            "detail": {
+              "vi": "Mutex/atomic bảo vệ next; không dùng lại ID đã đưa cho request.",
+              "en": "A mutex/atomic operation protects next; never reuse an ID handed to a request."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Crash hoặc hết block",
+              "en": "Crash or exhaustion"
+            },
+            "detail": {
+              "vi": "Bỏ phần dư; restart xin range mới. Không rollback allocator.",
+              "en": "Discard the remainder; restart with a new range. Never roll back allocation."
+            },
+            "icon": "warning"
+          }
+        ]
+      }
+    },
+    {
+      "id": "data-model",
+      "title": {
+        "vi": "8. Schema, partition và custom alias",
+        "en": "8. Schema, partitioning and custom aliases"
+      },
+      "paragraphs": [
+        {
+          "vi": "Record tối thiểu gồm domain, code, target_url, created_at, expires_at, owner_id, status và version. Primary key/unique constraint dùng (domain, code) với comparison phân biệt case cho namespace Base62. Index theo owner + created_at phục vụ dashboard là access pattern khác, có thể tách view; không bắt đường redirect scan theo owner. Alias có grammar/case policy riêng nhưng phải giữ một contract thống nhất ở router và store.",
+          "en": "A minimal record contains domain, code, target_url, created_at, expires_at, owner_id, status and version. Use a primary key/unique constraint on (domain, code), with case-sensitive comparison for the Base62 namespace. An owner + created_at index for dashboards is a separate access pattern, possibly a separate view; redirects must not scan an owner index. Aliases can have their own grammar/case policy, consistently enforced by router and store."
+        },
+        {
+          "vi": "Hash của (domain, code) làm partition key có thể phân tán số record nếu hàm hash tốt; nó không phân tán request của một code viral. Một lookup có thể route tới một logical partition, nhưng vẫn có index lookup, replication, network và storage I/O; gọi toàn bộ thao tác là O(1) không mô tả latency thật. Range partition trực tiếp theo counter có thể dồn insert vào shard cuối; cần đánh giá hash partition hoặc key layout.",
+          "en": "Hashing (domain, code) can distribute records with a good hash, but it does not distribute requests for one viral code. A lookup can route to one logical partition while still involving indexes, replication, networking and storage I/O; calling the whole operation O(1) does not describe real latency. Range partitioning directly on a counter can concentrate inserts on the last shard; evaluate hash partitioning or another key layout."
+        },
+        {
+          "vi": "Hai request cùng alias không được SELECT-not-found rồi INSERT không ràng buộc. Dùng unique constraint/conditional write làm điểm quyết định; chỉ một mapping commit. Trên multi-region eventual writes, local uniqueness không đảm bảo global alias uniqueness. Route một alias namespace về home owner hoặc dùng global conditional transaction/coordination phù hợp. Generated disjoint ranges chỉ giải quyết trùng code generated, không tự giải quyết alias.",
+          "en": "Two requests for one alias must not rely on a SELECT-not-found followed by an unconstrained INSERT. Make a unique constraint/conditional write the decision point so only one mapping commits. With eventual multi-region writes, local uniqueness does not imply global alias uniqueness. Route an alias namespace to a home owner or use appropriate global conditional coordination. Disjoint generated ranges solve generated-code collisions, not alias ownership."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Dữ liệu lưu",
+            "en": "Stored data"
+          },
+          {
+            "vi": "Authority và truy cập",
+            "en": "Authority and access"
+          },
+          {
+            "vi": "Lưu ý của schema",
+            "en": "Schema implications"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Link mapping",
+              "en": "Link mapping"
+            },
+            {
+              "vi": "(domain, code) → record",
+              "en": "(domain, code) → record"
+            },
+            {
+              "vi": "Giữ status/version/expiry, không overwrite qua race.",
+              "en": "Keep status/version/expiry; never overwrite through a race."
+            }
+          ],
+          [
+            {
+              "vi": "Operation idempotency",
+              "en": "Operation idempotency"
+            },
+            {
+              "vi": "(principal, key) → payload hash + result",
+              "en": "(principal, key) → payload hash + result"
+            },
+            {
+              "vi": "Retention được công bố; transaction với creation hoặc operation state machine.",
+              "en": "A documented retention window; transactional creation or an operation state machine."
+            }
+          ],
+          [
+            {
+              "vi": "Click event",
+              "en": "Click event"
+            },
+            {
+              "vi": "event_id, code, timestamp, policy-safe context",
+              "en": "event_id, code, timestamp, policy-safe context"
+            },
+            {
+              "vi": "Tách mapping store; event ID phục vụ dedup, không đồng nghĩa unique user.",
+              "en": "Separate from the mapping store; an event ID enables deduplication, not unique-user counting."
+            }
+          ],
+          [
+            {
+              "vi": "Tombstone",
+              "en": "Tombstone"
+            },
+            {
+              "vi": "(domain, code), disabled_at, version",
+              "en": "(domain, code), disabled_at, version"
+            },
+            {
+              "vi": "Ngăn code bị tái cấp và hỗ trợ replication; policy privacy quyết định thông tin giữ lại.",
+              "en": "Prevents reassignment and supports replication; privacy policy governs retained information."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "redirects",
+      "title": {
+        "vi": "9. 301, 302, 307, 308 và cache đúng nghĩa",
+        "en": "9. 301, 302, 307, 308 and actual cache behavior"
+      },
+      "paragraphs": [
+        {
+          "vi": "301/308 biểu thị chuyển vĩnh viễn và có thể được cache bằng heuristic khi không có chỉ thị khác; 302/307 là tạm thời nhưng vẫn có thể cache khi response cung cấp freshness cho phép. 307/308 giữ nguyên method khi client tự redirect; 301/302 cho phép đổi POST thành GET trong các trường hợp lịch sử. Nếu endpoint chỉ nhận GET/HEAD, khác biệt method nhỏ hơn nhưng cache policy vẫn rất quan trọng.",
+          "en": "301/308 express permanent moves and can be heuristically cached without overriding directives. 302/307 are temporary but can still be cached when the response supplies permitted freshness. 307/308 preserve the method during automatic redirection; 301/302 allow historical POST-to-GET behavior. A GET/HEAD-only endpoint reduces the method issue while leaving cache policy important."
+        },
+        {
+          "vi": "302 không đảm bảo mọi click tới origin, và 301 không bắt buộc mất analytics. Chọn Cache-Control tường minh, rồi quyết định event được ghi ở browser, edge hay origin. no-store không cho cache lưu response mới; no-cache có thể lưu nhưng phải validate trước reuse; max-age cho phép reuse trong freshness window. Invalidation ở CDN không thể xóa browser cache đã phát, và đổi sang no-store hôm nay không tự thu hồi một response cũ vẫn còn fresh.",
+          "en": "302 does not guarantee that every click reaches the origin, and 301 does not inherently prohibit analytics. Choose explicit Cache-Control and decide whether events are recorded at browser, edge or origin. no-store prohibits storing a new response; no-cache permits storage but requires validation before reuse; max-age allows reuse during freshness. CDN invalidation cannot erase issued browser cache entries, and switching to no-store today does not recall an old response that remains fresh."
+        }
+      ],
+      "experiment": "redirect-cache"
+    },
+    {
+      "id": "expiry",
+      "title": {
+        "vi": "10. Expiry, invalidation và link vừa được tạo",
+        "en": "10. Expiry, invalidation and newly created links"
+      },
+      "paragraphs": [
+        {
+          "vi": "expires_at là business rule được reader kiểm tra, không phải chỉ là lời hẹn background TTL cleanup. Một store có thể vẫn trả expired record chưa xóa; cache cũng vậy. Khi cho cache redirect, TTL tối đa cần bị chặn bởi lifetime còn lại, có margin cho clock skew nếu contract yêu cầu. Nếu stale-while-revalidate hoặc stale-if-error được bật, phải quyết định rõ chúng có được phép vượt expiry/revocation không.",
+          "en": "expires_at is a reader-enforced business rule, not merely a background cleanup schedule. A store and its cache can still return expired records awaiting deletion. Cached redirect TTLs must be bounded by remaining lifetime, with clock-skew margin when required. If stale-while-revalidate or stale-if-error is enabled, explicitly decide whether it may cross expiry or revocation."
+        },
+        {
+          "vi": "Update có thể race với cache fill: reader đọc v1, writer commit v2 và xóa cache, reader chậm lại điền v1 vào. Invalidation một lần không chặn được race này. Có thể dùng version-aware cache writes, ordered change stream, bounded TTL hoặc read-through authority theo yêu cầu. Với các policy hard revoke, cần cơ chế version/tombstone đủ mới ở đường phục vụ và xác định cách fail khi không kiểm được.",
+          "en": "An update can race with cache fill: a reader fetches v1, a writer commits v2 and invalidates, then the delayed reader fills v1. A single invalidation does not prevent this. Options include version-aware writes, an ordered change stream, bounded TTLs or authoritative reads. Hard-revocation policies require sufficiently fresh version/tombstone state on the serving path and a defined response when it cannot be checked."
+        },
+        {
+          "vi": "Negative cache giúp giảm lookup khi scanner thử code không tồn tại, nhưng có thể che mất link mới nếu vừa cache 404 hoặc đọc replica còn lag. Dùng TTL ngắn có giới hạn, keyspace bounding để tránh memory DoS, và invalidation sau creation khi phù hợp. Read-after-create có thể dùng home-region read/fallback hoặc routing hint; không trả 404 vĩnh viễn chỉ vì replica đầu tiên chưa thấy mapping.",
+          "en": "Negative caching reduces lookups for scanned missing codes, but can hide a newly created link after a cached 404 or a lagging replica read. Use short bounded TTLs, keyspace limits against memory DoS and creation invalidation when suitable. Read-after-create can use home-region reads/fallback or routing hints; do not turn one lagging replica read into a persistent 404."
+        }
+      ]
+    },
+    {
+      "id": "hot-links",
+      "title": {
+        "vi": "11. Một link viral và analytics không làm nghẽn redirect",
+        "en": "11. Viral links and analytics without blocking redirects"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hash partition phân bố key nhưng một hot key vẫn dồn vào một cache shard. L1 cache nhỏ trong reader, hot-key replication, edge caching có TTL và request coalescing khi miss có thể giảm tải. Mỗi tầng thêm freshness contract; nếu mapping thay đổi được thì phải giới hạn độ cũ hoặc kiểm version. Không coi cache hit ratio trung bình cao là bằng chứng đủ, vì một shard có thể quá tải khi tổng cluster còn rảnh.",
+          "en": "Hash partitioning distributes keys while one hot key still loads one cache shard. Small reader-local caches, hot-key replication, TTL-bound edge caches and miss coalescing can reduce load. Each layer adds freshness obligations; mutable mappings need a staleness bound or version checks. A high average hit ratio is insufficient evidence when one shard is overloaded and the rest of the cluster is idle."
+        },
+        {
+          "vi": "Best-effort async event giúp redirect không chờ analytics nhưng có thể mất click khi process chết hoặc queue đầy. Một local durable spool/outbox giảm mất dữ liệu nhưng thêm I/O và vận hành; một durable enqueue trước response thêm dependency vào latency/availability. Nếu yêu cầu mọi click được ghi bền trước khi redirect thì không thể đồng thời hứa đường redirect không bao giờ chờ analytics durability. Phải chốt contract thay vì viết async rồi coi là xong.",
+          "en": "Best-effort asynchronous events keep redirects from waiting on analytics but can lose clicks during crashes or full queues. A durable local spool/outbox reduces loss while adding I/O and operations; durable enqueue before responding adds a latency/availability dependency. If every click must be durably recorded before redirection, the path cannot also promise never to wait for analytics durability. Specify the contract instead of treating async as a solution by itself."
+        },
+        {
+          "vi": "Metric click không đồng nghĩa số người: retry, crawler, preview bot, prefetch và HEAD tạo traffic khác với user intent. Event ID hỗ trợ dedup delivery; unique-user analytics còn cần identity/privacy policy, time window và cách xử lý bot. Tối thiểu theo dõi event loss/drop rate, backlog age, duplicate rate và độ trễ dashboard; không để backlog vô hạn ăn hết RAM của redirect process.",
+          "en": "Clicks are not people: retries, crawlers, preview bots, prefetch and HEAD requests differ from user intent. Event IDs deduplicate event delivery; unique-user analytics additionally needs identity/privacy rules, time windows and bot handling. Track event loss/drop rate, backlog age, duplicates and dashboard lag, and never allow an unbounded backlog to consume the redirect process memory."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Hot-key protection",
+            "en": "Hot-key protection"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "L1/edge giảm network hop; coalescing giảm số DB read cùng key lúc cache miss.",
+              "en": "L1/edge caches reduce network hops; coalescing reduces concurrent same-key database reads on a miss."
+            },
+            {
+              "vi": "Rate limit miss/scanner riêng; kiểm tải theo shard, không chỉ toàn cụm.",
+              "en": "Limit misses/scanners separately; measure shard-level rather than only cluster-level load."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Event durability có giá",
+            "en": "Event durability has a cost"
+          },
+          "icon": "decision",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Best-effort: chấp nhận mất event và đo mức mất.",
+              "en": "Best effort: accept and measure event loss."
+            },
+            {
+              "vi": "Auditable: chọn durable acknowledgement boundary, dedup và recovery; tính chi phí vào SLO.",
+              "en": "Auditable: choose a durable acknowledgement boundary, deduplication and recovery, and charge the cost to the SLO."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "abuse",
+      "title": {
+        "vi": "12. Abuse, privacy và ranh giới bảo mật",
+        "en": "12. Abuse, privacy and security boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chặn phishing/malware cần rate limit creation, reputation, report/takedown và policy kiểm soát redirect. Async scan có khoảng thời gian chưa biết an toàn: chọn quarantine, warning interstitial hoặc chấp nhận window rủi ro theo sản phẩm. Một lần scan không đảm bảo target luôn an toàn vì nội dung/DNS/redirect chain có thể thay đổi. Nếu redirect bị block, cache tại mọi tầng cũng phải phản ánh policy trong độ trễ đã cam kết.",
+          "en": "Phishing/malware control needs creation limits, reputation, reporting/takedown and a redirect enforcement policy. Asynchronous scanning creates an unknown-safety interval: choose quarantine, warning interstitials or an explicitly accepted risk window. One scan cannot guarantee future safety because content, DNS and redirect chains can change. Block decisions must reach every serving cache within the promised delay."
+        },
+        {
+          "vi": "Dịch vụ redirect thuần không fetch URL nên không tự tạo SSRF; scanner/preview worker có fetch thì có. Cô lập network egress, chặn địa chỉ private/link-local/metadata, kiểm DNS/IP ở lúc kết nối và trên từng redirect, giới hạn body/time/redirect count, không đưa credential nội bộ. URL parser chuẩn và allowlist scheme cần đi cùng kiểm network; regex chuỗi không đủ chống DNS rebinding.",
+          "en": "A pure redirect endpoint does not fetch a URL and therefore does not itself create SSRF; fetching scanners/preview workers can. Isolate egress, block private/link-local/metadata addresses, check DNS/IP at connection time and each redirect, bound response size/time/redirect count, and never attach internal credentials. A proper parser and scheme allowlist need network checks; string regexes alone do not stop DNS rebinding."
+        },
+        {
+          "vi": "Sequential code dễ enumeration; random hoặc permutation giảm khả năng đoán nhưng không phải access control. Không ghi full URL chứa token/password vào log và event không cần thiết; cân nhắc referrer policy, retention và quyền truy cập dữ liệu analytics. Domain short link có thể bị đưa vào blocklist nếu abuse cao, vì vậy reputation và takedown ảnh hưởng trực tiếp availability thực tế.",
+          "en": "Sequential codes invite enumeration; randomness or permutation reduces guessing but is not access control. Avoid unnecessary logs/events containing token-bearing URLs, and consider referrer policy, retention and analytics access. Heavy abuse can get the short-link domain blocklisted, so reputation and takedown affect practical availability."
+        }
+      ]
+    },
+    {
+      "id": "multi-region",
+      "title": {
+        "vi": "13. Multi-region, failover và migration dữ liệu",
+        "en": "13. Multi-region serving, failover and data migration"
+      },
+      "paragraphs": [
+        {
+          "vi": "Serve redirect ở nhiều region có thể giảm latency, nhưng asynchronous replication tạo hai vấn đề khác nhau: link mới chưa có ở region xa và link bị vô hiệu hóa chưa được thu hồi ở đó. Range ID phân chia toàn cục giúp generated code không trùng; nó không giải quyết replication lag, custom alias hoặc write conflict khi sửa đích. Đặt home region/owner cho mapping, replication-version policy và fallback cụ thể.",
+          "en": "Serving redirects across regions can reduce latency, but asynchronous replication creates two different problems: new links are absent remotely and disabled links remain usable there. Globally disjoint ID ranges prevent generated-code collisions; they do not solve replication lag, alias conflicts or conflicting target edits. Define mapping ownership/home region, replication versions and fallback behavior."
+        },
+        {
+          "vi": "Khi partition network, có thể cho redirect dùng mapping cũ trong bounded-staleness window nếu policy cho phép; link bị nghi abuse có thể phải fail closed. Creation của custom alias hoặc update cần giữ invariant bằng quorum/home owner, có thể giảm availability. Công bố lựa chọn theo từng operation, không gắn một nhãn AP/CP cho cả hệ thống rồi bỏ qua quyền sửa.",
+          "en": "During a network partition, redirects may use bounded-stale mappings if policy permits, while suspected-abuse links may require fail-closed behavior. Alias creation and edits must preserve invariants through a quorum/home owner, potentially reducing availability. Make choices per operation instead of applying one AP/CP label to the whole system."
+        },
+        {
+          "vi": "Ở 182,5 TB logic, có thể tách hot/cold storage nhưng mọi live link vẫn cần một lookup path và p99 phù hợp. Migration dùng backfill có checkpoint, change capture, version và cutover có kiểm chứng; dual write đơn giản có thể diverge. Backup restore phải giữ mappings/tombstones và allocator high-water mark tương thích, nếu không có nguy cơ tái cấp ID. Thử restore và đo RPO/RTO, không chỉ kiểm job backup báo xanh.",
+          "en": "At 182.5 TB logical storage, hot/cold tiering is possible, but every live link still needs a lookup path that meets its p99 target. Migrate with checkpointed backfills, change capture, versions and a verified cutover; naive dual writes can diverge. Backup restore must preserve mappings/tombstones and a compatible allocator high-water mark to avoid reissuing IDs. Test restores and measure RPO/RTO instead of relying on green backup jobs."
+        }
+      ]
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "14. Failure matrix và kiểm chứng trước production",
+        "en": "14. Failure matrix and preproduction verification"
+      },
+      "paragraphs": [
+        {
+          "vi": "Theo dõi redirect success/latency theo status, cache tier và region; creation conflict/idempotency replay; store saturation; block allocator headroom; invalidation lag; stale redirects; event loss. Định nghĩa success: 404 đúng cho code thật sự missing không giống 404 do replica lag cho link vừa tạo. Dashboard cần phân biệt lỗi hệ thống với kết quả nghiệp vụ hợp lệ.",
+          "en": "Track redirect success/latency by status, cache tier and region; creation conflicts/idempotency replays; store saturation; allocator headroom; invalidation lag; stale redirects; and event loss. Define success carefully: a correct missing-code 404 differs from a replica-lag 404 for a new link. Dashboards must distinguish system failures from valid business outcomes."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sự cố mô phỏng",
+            "en": "Injected failure"
+          },
+          {
+            "vi": "Hành vi cần định nghĩa",
+            "en": "Required behavior"
+          },
+          {
+            "vi": "Cách kiểm chứng cụ thể",
+            "en": "Concrete verification"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Timeout sau creation commit",
+              "en": "Timeout after creation commits"
+            },
+            {
+              "vi": "Retry cùng key trả cùng mapping.",
+              "en": "Retrying the same key returns the same mapping."
+            },
+            {
+              "vi": "Kill response sau commit, gửi lại payload; kiểm số record và code.",
+              "en": "Drop the response after commit, resend the payload and inspect record count/code."
+            }
+          ],
+          [
+            {
+              "vi": "Hai writer cùng alias",
+              "en": "Two writers claim one alias"
+            },
+            {
+              "vi": "Một thắng; một conflict; không overwrite.",
+              "en": "One wins, one conflicts, neither overwrites."
+            },
+            {
+              "vi": "Chạy conditional insert đồng thời trong đúng scope domain/alias.",
+              "en": "Run concurrent conditional inserts in the same domain/alias scope."
+            }
+          ],
+          [
+            {
+              "vi": "Cache fill chạy sau update",
+              "en": "Cache fill races with an update"
+            },
+            {
+              "vi": "Không giữ v1 vô hạn sau v2; bound phải đo được.",
+              "en": "Do not retain v1 indefinitely after v2; measure the bound."
+            },
+            {
+              "vi": "Pause reader giữa DB read và cache set, update mapping rồi resume.",
+              "en": "Pause a reader between the DB read and cache set, update, then resume."
+            }
+          ],
+          [
+            {
+              "vi": "Store lỗi khi cache miss",
+              "en": "Store fails on a miss"
+            },
+            {
+              "vi": "Không biến timeout thành 404 rồi negative-cache dài.",
+              "en": "Do not turn a timeout into a long-negative-cached 404."
+            },
+            {
+              "vi": "Inject timeout; xác nhận 5xx/retry policy và cache state.",
+              "en": "Inject a timeout and inspect the 5xx/retry policy and cache state."
+            }
+          ],
+          [
+            {
+              "vi": "Queue đầy / process crash",
+              "en": "Full queue / process crash"
+            },
+            {
+              "vi": "Redirect và event loss tuân contract đã công bố.",
+              "en": "Redirects and event loss follow the published contract."
+            },
+            {
+              "vi": "Đo bounded buffer, drop metric, recovery và event dedup.",
+              "en": "Measure buffer bounds, drop metrics, recovery and event deduplication."
+            }
+          ],
+          [
+            {
+              "vi": "Hết hạn nhưng chưa cleanup",
+              "en": "Expired but not yet cleaned up"
+            },
+            {
+              "vi": "Reader không redirect; cache không vượt expiry.",
+              "en": "Readers do not redirect; caches do not outlive expiry."
+            },
+            {
+              "vi": "Giữ record vật lý sau expires_at, thử origin/edge/browser.",
+              "en": "Retain a physical record after expires_at and test origin/edge/browser behavior."
+            }
+          ],
+          [
+            {
+              "vi": "Khôi phục allocator cũ",
+              "en": "Restore an old allocator"
+            },
+            {
+              "vi": "Không cấp lại ID đã dùng.",
+              "en": "Do not reissue consumed IDs."
+            },
+            {
+              "vi": "Restore drill trong môi trường cô lập; so high-water mark với khoảng đã cấp.",
+              "en": "Run an isolated restore drill and compare high-water marks with assigned ranges."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Luyện giải thích quyết định bằng tình huống",
+        "en": "15. Practice decisions through worked scenarios"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trả lời theo chuỗi requirement → invariant → cơ chế → failure → trade-off. Các đáp án dưới đây là điểm bắt đầu cho thảo luận; khi đổi SLO, retention hay privacy thì phải tính lại, không thuộc lòng tên service.",
+          "en": "Answer through requirements → invariants → mechanism → failure → trade-off. The worked answers are discussion starting points; changes in SLOs, retention or privacy require reconsideration rather than memorized service names."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Bảy ký tự đã đủ thì có thể bỏ collision check cho random không?",
+            "en": "If seven characters are enough, can random generation skip collision checks?"
+          },
+          "answer": [
+            {
+              "vi": "Không. 62^7 khoảng 3,52 nghìn tỷ là capacity, không phải bảo đảm các lần draw không trùng. Ở 365 tỷ mã đã chiếm, lần draw kế tiếp trùng khoảng 10,36% nếu uniform. Conditional insert mới bảo vệ uniqueness; conflict thì thử lại trong budget. Birthday collision của toàn bộ lịch sử gần như chắc chắn không đồng nghĩa mỗi request đều conflict.",
+              "en": "No. About 3.52 trillion available codes is capacity, not a guarantee of collision-free draws. With 365 billion occupied codes, a uniform next draw conflicts about 10.36% of the time. Conditional insertion protects uniqueness, with bounded retries for conflicts. Near-certain collisions somewhere in history do not imply that every request conflicts."
+            }
+          ],
+          "followup": {
+            "vi": "Khi occupancy tăng, expected attempts khoảng 1/(1−n/M) có ý nghĩa gì và khi nào cần tăng length?",
+            "en": "As occupancy rises, what does approximately 1/(1−n/M) expected attempts mean, and when should length grow?"
+          }
+        },
+        {
+          "question": {
+            "vi": "Allocator ngừng hoạt động có làm tất cả redirect hỏng không?",
+            "en": "Does an allocator outage break all redirects?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu dependency được tách đúng. Link đã có chỉ cần mapping path; writer còn block vẫn cấp được, writer hết block trả lỗi creation. Cần cảnh báo range còn lại và kiểm crash/restore không tái cấp block. Nếu mọi redirect phải gọi allocator thì kiến trúc đang thêm dependency không cần thiết.",
+              "en": "Not with proper separation. Existing links need only the mapping path; writers with ranges continue, exhausted writers fail creation. Alert on remaining ranges and ensure crash/restore never reissues blocks. A redirect that calls the allocator adds an unnecessary dependency."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Chỉ đổi từ 301 sang 302 có sửa được số liệu click bị thiếu không?",
+            "en": "Will changing 301 to 302 alone fix missing click analytics?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Kiểm Cache-Control, browser/edge cache và điểm ghi event. 302 có max-age vẫn được cache; response 301 cũ còn fresh không bị thu hồi chỉ vì origin đã đổi. Có thể dùng no-store cho response mới hoặc edge logging, nhưng vẫn phải xử lý bot, retry và event loss.",
+              "en": "No. Inspect Cache-Control, browser/edge caching and the event capture point. A 302 with max-age can be cached; an old fresh 301 is not recalled by an origin change. New responses can use no-store or events can be logged at the edge, while bots, retries and event loss still need handling."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một link viral tăng traffic 50 lần: thêm cache shard là đủ chưa?",
+            "en": "One viral link causes a 50-fold spike. Are more cache shards sufficient?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa chắc: cùng key vẫn tới cùng shard nếu routing không đổi. Đo hot-key QPS và dùng L1/edge, hot-key replication hoặc route đặc biệt; coalesce miss và giữ bound cho invalidation. Thêm reader giúp CPU/network ở service nhưng có thể càng tăng QPS tới một shard.",
+              "en": "Not necessarily: one key still routes to one shard unless routing changes. Measure hot-key QPS and use L1/edge caching, hot-key replication or special routing; coalesce misses and preserve invalidation bounds. More readers can ease service CPU/network load while increasing pressure on the same shard."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hai region cùng tạo alias sale, local conditional write đều thắng thì sao?",
+            "en": "What if two regions both win a local conditional write for alias sale?"
+          },
+          "answer": [
+            {
+              "vi": "Local uniqueness không phải global uniqueness. Route alias theo một authority hoặc dùng global conditional/consensus phù hợp; trong partition có thể phải từ chối một phía. Disjoint ID range của generated code không giải quyết tên alias do người dùng chọn.",
+              "en": "Local uniqueness is not global uniqueness. Route aliases to one authority or use appropriate global conditional coordination/consensus; a partition may require rejecting one side. Disjoint generated-ID ranges do not solve user-chosen alias conflicts."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Link hết hạn mà database TTL chưa xóa thì người dùng còn vào được không?",
+            "en": "Can a user follow an expired link before database TTL cleanup?"
+          },
+          "answer": [
+            {
+              "vi": "Reader phải kiểm expires_at và không redirect, dù record còn tồn tại. Cache response đã phát trước đó cũng phải có freshness không vượt lifetime theo contract; nếu đã phát TTL quá dài, chỉ sửa DB không thu hồi được browser cache. Do đó expiry là end-to-end serving policy, cleanup chỉ giải phóng storage.",
+              "en": "The reader must check expires_at and refuse redirection even while the record exists. Previously issued cached responses must also have freshness bounded by the lifetime contract; changing the DB cannot recall a browser response with an excessive TTL. Expiry is an end-to-end serving policy; cleanup only reclaims storage."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể tái dùng code của link bị xóa để tiết kiệm namespace không?",
+            "en": "Can deleted-link codes be reused to save namespace?"
+          },
+          "answer": [
+            {
+              "vi": "Rất rủi ro: bookmark, email cũ, QR và cache có thể dẫn người dùng sang mapping của chủ mới. Cách đơn giản là không tái cấp và giữ tombstone tối thiểu theo policy. Nếu bắt buộc reuse thì cần version/namespace khác hoặc một quy tắc đảm bảo không nhập nhằng; thời gian chờ tùy ý không chứng minh mọi bản sao URL đã biến mất.",
+              "en": "It is risky: old bookmarks, emails, QR codes and caches can send users to a new owner’s mapping. A simple policy never reissues codes and retains minimal tombstones under the data policy. Required reuse needs a versioned namespace or another ambiguity-free rule; an arbitrary delay cannot prove every URL copy has vanished."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Yêu cầu “không mất click” nhưng redirect không chờ analytics có mâu thuẫn không?",
+            "en": "Is “no lost clicks” compatible with never waiting for analytics?"
+          },
+          "answer": [
+            {
+              "vi": "Phải nói rõ “không chờ pipeline xử lý” khác “không chờ ghi bền”. Có thể chờ durable local log rồi xử lý async; latency vẫn có chi phí ghi log và log full là failure mode. Nếu response được gửi trước mọi durable capture thì crash ở khoảng giữa có thể mất event; contract best-effort phải thừa nhận điều đó.",
+              "en": "Separate “not waiting for downstream processing” from “not waiting for durable recording.” A durable local log can precede asynchronous processing, but log I/O costs latency and a full log is a failure mode. Sending a response before any durable capture leaves a crash window that can lose the event; a best-effort contract must acknowledge it."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,774 @@
+{
+  "id": "consistency",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Replication, Consistency và Consensus",
+    "en": "Replication, Consistency and Consensus"
+  },
+  "summary": {
+    "vi": "Theo dõi dữ liệu qua replica, thử lời hứa của read, hiểu quorum và Raft; chọn consistency theo invariant thay vì tên database.",
+    "en": "Follow data across replicas, test read guarantees, understand quorums and Raft, and choose consistency from invariants rather than database names."
+  },
+  "prerequisites": [
+    "databases",
+    "networking"
+  ],
+  "relatedTopics": [
+    "distributed",
+    "database",
+    "architecture"
+  ],
+  "takeaways": [
+    {
+      "vi": "Replication tạo nhiều bản sao; consistency mô tả điều client được quan sát.",
+      "en": "Replication creates copies; consistency specifies what clients may observe."
+    },
+    {
+      "vi": "ACK phải gắn với durable state và tập replica cụ thể, không chỉ từ “synchronous”.",
+      "en": "An acknowledgement needs a durable-state and replica-set contract, not just the word “synchronous”."
+    },
+    {
+      "vi": "R + W > N đảm bảo giao nhau với tập replica cố định, chưa tự đảm bảo linearizability.",
+      "en": "R + W > N ensures intersection for fixed replica sets; it does not by itself establish linearizability."
+    },
+    {
+      "vi": "Một leader cũ có thể còn sống nhưng không đủ quorum để commit write mới.",
+      "en": "An old leader can remain alive without a quorum to commit new writes."
+    },
+    {
+      "vi": "Lease cần cơ chế bảo vệ side effect khi holder cũ tỉnh lại; convergence chưa đủ cho mọi invariant.",
+      "en": "Leases need protection against a resumed stale holder; convergence does not preserve every invariant."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Nhiều bản sao, một lời hứa có thể kiểm chứng",
+      "en": "Many copies, one testable promise"
+    },
+    "caption": {
+      "vi": "Đọc bài theo câu hỏi client: dữ liệu đã được nhận ở đâu, được đọc từ đâu và điều gì xảy ra khi một nhóm node mất liên lạc?",
+      "en": "Read from the client’s perspective: where was the write accepted, where may reads occur, and what happens when groups of nodes lose contact?"
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Chọn người nhận write",
+          "en": "Choose write authority"
+        },
+        "detail": {
+          "vi": "Single leader, multi-leader hay leaderless.",
+          "en": "Single leader, multi-leader or leaderless."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Nêu lời hứa cho read",
+          "en": "State the read guarantee"
+        },
+        "detail": {
+          "vi": "Freshness, session, order, transaction.",
+          "en": "Freshness, sessions, order and transactions."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Kiểm tra khi phân tán",
+          "en": "Test distributed behavior"
+        },
+        "detail": {
+          "vi": "Lag, quorum, partition, failover.",
+          "en": "Lag, quorums, partitions and failover."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Đối chiếu với invariant",
+          "en": "Check the invariant"
+        },
+        "detail": {
+          "vi": "Lỗi nào chấp nhận, lỗi nào phải từ chối?",
+          "en": "Which failures are tolerable, and which require refusing work?"
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "topologies",
+      "title": {
+        "vi": "1. Ai có quyền nhận write?",
+        "en": "1. Who may accept a write?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Replication phục vụ durability, khả năng tiếp tục khi node chết và mở rộng read. Nó cũng tạo thêm trạng thái phải đồng bộ: một write có thể đã commit ở nơi này nhưng chưa được apply ở nơi khác. Trước khi thêm replica, hãy ghi rõ replication unit: một database, một shard hay một partition.",
+          "en": "Replication supports durability, continued operation after node failure and read scaling. It also creates state to synchronize: a write may be committed in one place but not applied elsewhere. Before adding replicas, define the replication unit: database, shard or partition."
+        },
+        {
+          "vi": "Một leader có thể sắp thứ tự write cho một partition nhưng ứng dụng vẫn cần isolation, constraint và idempotency. “Có một leader” không tự ngăn write skew, double booking hoặc lặp payment khi retry. Với nhiều leader, cần chỉ ra cách phát hiện và giải quyết concurrent updates trước khi hứa active-active.",
+          "en": "A leader can order writes for a partition, while applications still need isolation, constraints and idempotency. A single leader does not automatically prevent write skew, double booking or duplicate payments on retry. Multiple leaders require conflict detection and resolution before promising active-active operation."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Single-leader · Một write owner",
+            "en": "Single-leader · One write owner"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Client gửi write đến leader; replica nhận log/state từ owner.",
+              "en": "Clients send writes to a leader; replicas receive its log/state."
+            },
+            {
+              "vi": "Failover phải chọn dữ liệu phù hợp và fence owner cũ.",
+              "en": "Failover must select suitable data and fence the old owner."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Multi-leader · Nhiều nơi ghi",
+            "en": "Multi-leader · Multiple writers"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Write có thể vào nhiều region hoặc node được phân quyền.",
+              "en": "Writes may enter multiple authorized regions or nodes."
+            },
+            {
+              "vi": "Concurrent update có thể cần merge, reject hoặc ownership theo key.",
+              "en": "Concurrent updates may require merging, rejection or per-key ownership."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Leaderless · Phối hợp các replica",
+            "en": "Leaderless · Coordinate replicas"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Coordinator đọc/ghi một tập replica theo policy đã chọn.",
+              "en": "A coordinator reads/writes a replica set under a chosen policy."
+            },
+            {
+              "vi": "Repair, version resolution và membership đều ảnh hưởng guarantee.",
+              "en": "Repair, version resolution and membership all affect the guarantee."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "acknowledgements",
+      "title": {
+        "vi": "2. ACK nghĩa là dữ liệu đã an toàn đến đâu?",
+        "en": "2. How safe is a write when it is acknowledged?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách bốn mốc: nhận vào memory, ghi log, flush theo durability contract, và apply vào state mà query nhìn thấy. Một ACK “đã nhận” chưa đồng nghĩa với “đã durable”; một log đã durable trên replica cũng chưa nhất thiết được query đọc thấy. Phân biệt này quan trọng cho cả failover lẫn read-your-writes.",
+          "en": "Separate four milestones: memory receipt, log writing, flushing under the durability contract, and application to query-visible state. Receipt is not durability, and a durable replica log need not already be query-visible. This matters for both failover and read-your-writes."
+        },
+        {
+          "vi": "Async replication có thể ACK trước khi replica nhận write, nên một lần promote replica trễ có thể làm mất write đã được client thấy thành công. Chờ replica hoặc quorum giảm rủi ro trong failure model đã định, nhưng không bảo vệ mọi loại mất dữ liệu. Cần biết ACK đã flush ở đâu, node nào được phép promote và có thể mất bao nhiêu failure domain cùng lúc.",
+          "en": "Asynchronous replication may acknowledge before a replica receives the write, so promoting a lagging replica can lose an acknowledged write. Waiting for replicas or a quorum reduces risk within the stated failure model, not against every loss scenario. Specify flush locations, eligible promotion candidates and simultaneous failure domains."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Policy ACK minh họa",
+            "en": "Example acknowledgement policy"
+          },
+          {
+            "vi": "Client biết được gì?",
+            "en": "What does the client know?"
+          },
+          {
+            "vi": "Câu hỏi vẫn phải trả lời",
+            "en": "Remaining question"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Local durable",
+              "en": "Local durable"
+            },
+            {
+              "vi": "Owner đã giữ durable record theo cấu hình.",
+              "en": "The owner holds a durable record under its configuration."
+            },
+            {
+              "vi": "Nếu owner mất, replica được promote có record này chưa?",
+              "en": "Does the promotion candidate contain this record if the owner is lost?"
+            }
+          ],
+          [
+            {
+              "vi": "Remote receipt / write",
+              "en": "Remote receipt / write"
+            },
+            {
+              "vi": "Một tập replica đã nhận hoặc ghi record.",
+              "en": "A replica set has received or written the record."
+            },
+            {
+              "vi": "Đã flush hay chỉ vào OS buffer? Đã apply cho query chưa?",
+              "en": "Was it flushed or only written to an OS buffer? Is it query-visible?"
+            }
+          ],
+          [
+            {
+              "vi": "Remote apply",
+              "en": "Remote apply"
+            },
+            {
+              "vi": "Replica đã apply theo contract được cấu hình.",
+              "en": "Replicas have applied the record under the configured contract."
+            },
+            {
+              "vi": "Read tiếp có thực sự tới replica đáp ứng watermark đó không?",
+              "en": "Will the next read actually reach a replica meeting that watermark?"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "lag",
+      "title": {
+        "vi": "3. Lag tạo lỗi hiển thị cụ thể nào?",
+        "en": "3. What visible anomalies does lag create?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Read-your-writes yêu cầu session nhìn thấy write của chính mình sau khi nó hoàn tất. Monotonic reads yêu cầu session không đọc lùi về state cũ hơn lần trước. Hai lời hứa khác nhau: session đã đọc version 2 rồi ghi version 3; đọc lại version 2 giữ monotonic read nhưng vi phạm read-your-writes.",
+          "en": "Read-your-writes lets a session observe its completed writes. Monotonic reads prevent a session from regressing behind an earlier observation. They differ: after reading version 2 and writing version 3, reading version 2 is monotonic but violates read-your-writes."
+        },
+        {
+          "vi": "Một cách là đọc từ write owner; cách khác mang session watermark như log position và chỉ dùng replica đã apply đủ. Nếu chưa đủ, chờ với deadline hoặc fallback theo policy. Routing về primary vài giây chỉ là heuristic nếu không có bound lag. Pin một replica giúp giảm thay đổi nơi đọc, nhưng failover hoặc state regression vẫn có thể phá guarantee nếu thiếu kiểm tra version.",
+          "en": "One option is reading from the write owner; another carries a session watermark, such as a log position, and only reads replicas applied through it. Otherwise wait with a deadline or follow a fallback policy. Routing to the primary for a few seconds is heuristic without a lag bound. Replica pinning helps, but failover or state regression still requires version checks."
+        },
+        {
+          "vi": "Consistent prefix liên quan thứ tự nguyên nhân: không nên thấy câu trả lời mà chưa có câu hỏi tiền đề trong phạm vi guarantee. Với dữ liệu qua nhiều partition, một offset của partition A không tự mô tả tiến độ của partition B. Session token có thể cần nhiều watermark hoặc một cơ chế theo dõi dependency rõ ràng.",
+          "en": "A consistent prefix concerns dependency order: an answer should not appear without its prerequisite question within the guarantee’s scope. Across partitions, one offset from partition A does not describe progress in partition B. A session token may need multiple watermarks or explicit dependency tracking."
+        }
+      ],
+      "experiment": "replication-lag"
+    },
+    {
+      "id": "models",
+      "title": {
+        "vi": "4. Consistency và isolation không phải cùng một trục",
+        "en": "4. Consistency and isolation are not the same axis"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hãy nêu operation và phạm vi object trước khi dùng từ “strong”. Linearizability tôn trọng thứ tự thời gian thực của các operation không chồng lấp trong phạm vi object được đảm bảo. Serializable nói về kết quả transaction tương đương một thứ tự chạy tuần tự; bản thân nó chưa bắt buộc thứ tự đó khớp thời gian thực. Strict serializability kết hợp yêu cầu transaction với real-time order.",
+          "en": "Name the operation and object scope before saying “strong.” Linearizability respects the real-time order of nonoverlapping operations within its guaranteed object scope. Serializability makes transactions equivalent to a serial execution without necessarily preserving real-time order. Strict serializability adds real-time order to the transaction guarantee."
+        },
+        {
+          "vi": "Không nên vẽ mọi guarantee thành một hàng từ mạnh đến yếu rồi suy ra mọi quan hệ. Causal, session và transaction guarantees mô tả các khía cạnh khác nhau; sản phẩm có thể cung cấp tổ hợp theo API. Eventual convergence cần điều kiện propagation/merge; không có lời hứa “cuối cùng” nếu update bị mất vĩnh viễn hoặc repair không tiến triển.",
+          "en": "Do not place every guarantee on one line and infer all implication relationships. Causal, session and transaction guarantees describe different aspects; an API can combine them. Eventual convergence needs propagation/merge conditions; updates lost forever or stalled repair do not converge merely because a store is called eventual."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lời hứa",
+            "en": "Guarantee"
+          },
+          {
+            "vi": "Điều nó ràng buộc",
+            "en": "What it constrains"
+          },
+          {
+            "vi": "Không tự suy ra",
+            "en": "What it does not imply"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Linearizable",
+              "en": "Linearizable"
+            },
+            {
+              "vi": "Operation có thể xem như xảy ra tức thời, giữ real-time order.",
+              "en": "Operations appear instantaneous while preserving real-time order."
+            },
+            {
+              "vi": "Transaction nhiều object nếu API chỉ hứa per-key.",
+              "en": "Multi-object transactions when only per-key behavior is guaranteed."
+            }
+          ],
+          [
+            {
+              "vi": "Sequential",
+              "en": "Sequential"
+            },
+            {
+              "vi": "Có một thứ tự chung hợp lệ giữ program order.",
+              "en": "A valid common order preserves program order."
+            },
+            {
+              "vi": "Thứ tự chung phải khớp real-time giữa client khác nhau.",
+              "en": "That order follows real time across different clients."
+            }
+          ],
+          [
+            {
+              "vi": "Causal",
+              "en": "Causal"
+            },
+            {
+              "vi": "Quan hệ cause-before-effect trong phạm vi được đảm bảo.",
+              "en": "Cause-before-effect relationships within the guarantee’s scope."
+            },
+            {
+              "vi": "Mọi write concurrent đều được tất cả client nhìn theo cùng một thứ tự.",
+              "en": "Every client orders all concurrent writes identically."
+            }
+          ],
+          [
+            {
+              "vi": "Session guarantees",
+              "en": "Session guarantees"
+            },
+            {
+              "vi": "Ví dụ read-your-writes hoặc monotonic reads cho session.",
+              "en": "For example, read-your-writes or monotonic reads for a session."
+            },
+            {
+              "vi": "Mọi client đều nhìn cùng state ở mọi thời điểm.",
+              "en": "All clients always observe the same state."
+            }
+          ],
+          [
+            {
+              "vi": "Serializable",
+              "en": "Serializable"
+            },
+            {
+              "vi": "Transaction có kết quả tương đương thứ tự serial hợp lệ.",
+              "en": "Transactions have results equivalent to a valid serial order."
+            },
+            {
+              "vi": "Real-time order nếu contract không nói strict.",
+              "en": "Real-time order unless the contract is strict."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cap",
+      "title": {
+        "vi": "5. Partition: sẽ trả gì, chờ gì và từ chối gì?",
+        "en": "5. During a partition: what returns, waits or is refused?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong mô hình CAP, consistency là atomic/linearizable behavior, còn availability yêu cầu request tới node không lỗi cuối cùng nhận response phù hợp thay vì bị từ chối chỉ để giữ consistency. Đây không phải cách tính “99,99% request tốt” của một SLO vận hành. Khi network partition ngăn hai phía trao đổi, không thể giữ đồng thời cả hai thuộc tính cho mọi execution trong mô hình.",
+          "en": "In CAP, consistency means atomic/linearizable behavior, while availability requires requests to nonfailed nodes eventually receive suitable responses rather than being refused to preserve consistency. This differs from an operational SLO’s percentage of good requests. A network partition prevents simultaneously guaranteeing both properties for every execution in the model."
+        },
+        {
+          "vi": "Nên trả lời theo operation: lúc mất quorum, confirm booking có thể trả trạng thái không khả dụng thay vì xác nhận inventory không biết có còn hay không. Search có thể trả kết quả cũ với semantics đã nêu. Đổi HTTP status không biến một operation bị từ chối thành successful available execution của operation đó. PACELC bổ sung câu hỏi ngày thường: khi không partition, replication phối hợp đến đâu và phải trả bao nhiêu latency?",
+          "en": "Answer per operation: without quorum, booking confirmation may become unavailable rather than confirming uncertain inventory. Search may return older results under its stated semantics. Changing an HTTP status does not turn a refused operation into a successful available execution. PACELC adds the normal-operation question: how much replication coordination and latency does the chosen consistency require?"
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Khi mất liên lạc",
+            "en": "When communication breaks"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Giữ invariant bằng cách chờ hoặc từ chối write không đủ quyền.",
+              "en": "Protect the invariant by waiting or refusing writes without authority."
+            },
+            {
+              "vi": "Hoặc tiếp tục các operation có semantics chấp nhận phân kỳ và repair.",
+              "en": "Or continue operations whose semantics tolerate divergence and repair."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Khi mạng hoạt động",
+            "en": "When communication works"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Chọn vị trí quorum/owner theo latency và failure domains.",
+              "en": "Place quorums/owners around latency and failure domains."
+            },
+            {
+              "vi": "Đo phối hợp replication; không gán một số RTT cố định cho mọi region.",
+              "en": "Measure replication coordination instead of assuming one RTT for every region."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "quorums",
+      "title": {
+        "vi": "6. Quorum: chứng minh điều kiện giao nhau",
+        "en": "6. Quorums: prove the intersection condition"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với một home set N replica cố định, write đợi W ACK, read đợi R response. Hai tập có giao nhỏ nhất max(0, R + W − N). Ví dụ N=5, W=3, R=3 thì giao ít nhất một node. Nếu mất F node và các node còn lại đều reachable, thu đủ read/write ACK lần lượt cần N−F ≥ R và N−F ≥ W.",
+          "en": "For one fixed home set of N replicas, a write waits for W acknowledgements and a read for R responses. Their minimum intersection is max(0, R + W − N). With N=5, W=3, R=3 it is at least one node. If F nodes fail and all remaining nodes are reachable, reads/writes require N−F ≥ R and N−F ≥ W respectively."
+        },
+        {
+          "vi": "Đó là bằng chứng tập hợp, chưa phải chứng minh một register linearizable. Cần thêm semantics cho version, concurrent writes, read repair/write-back, failed writes và durability. Một write timeout vẫn có thể đã cập nhật một phần replica; một read sau đó có thể thấy nó. Chọn timestamp lớn nhất cũng không biến clock lệch thành real-time order đúng.",
+          "en": "This is a set-intersection proof, not proof of a linearizable register. Version semantics, concurrent writes, repair/write-back, failed writes and durability also matter. A timed-out write may have modified some replicas and become visible to a later read. Picking the largest timestamp does not turn clock skew into correct real-time order."
+        },
+        {
+          "vi": "Sloppy quorum có thể nhận ACK từ node ngoài home set trong lúc lỗi. Khi đó không được áp phép chứng minh R+W>N của cùng một tập N mà bỏ qua node thay thế. Hinted handoff và anti-entropy giúp repair, nhưng phải nêu điều kiện hội tụ và thời gian repair thay vì gọi mọi mức quorum là “strong”.",
+          "en": "A sloppy quorum may accept acknowledgements from nodes outside the home set during failures. The fixed-N intersection proof cannot then ignore substitute nodes. Hinted handoff and anti-entropy aid repair, but require stated convergence and repair conditions rather than calling every quorum level “strong.”"
+        }
+      ],
+      "experiment": "quorum"
+    },
+    {
+      "id": "raft",
+      "title": {
+        "vi": "7. Raft: term, log và commit là các khái niệm riêng",
+        "en": "7. Raft: distinguish term, log and commit"
+      },
+      "paragraphs": [
+        {
+          "vi": "Term là epoch logic. Mỗi node bỏ tối đa một phiếu trong một term và candidate cần majority; giao nhau của majority giúp tránh hai leader cùng term. Một candidate còn phải đáp ứng điều kiện log đủ mới. Leader cũ bị partition có thể chưa biết term mới; điều quan trọng là nó không có quyền commit một lịch sử mâu thuẫn.",
+          "en": "A term is a logical epoch. A node votes at most once per term; a majority elects a candidate whose log is sufficiently up to date. Majority intersection prevents two leaders in one term. A partitioned old leader may not know of a newer term, but cannot commit a conflicting history."
+        },
+        {
+          "vi": "Leader replicate log rồi tiến commit theo rule của protocol, không chỉ đếm bản sao tùy ý. Raft trực tiếp tăng commit bằng majority cho entry thuộc current term; entry trước đó được commit theo prefix. Replica apply entry đã commit theo thứ tự. Membership change, persistence và snapshot cần rule riêng; mô phỏng dưới chỉ chọn vài frame để thấy khác biệt giữa “có leader”, “có log” và “đã commit”.",
+          "en": "Raft advances commit using a current-term entry replicated to a majority; earlier entries commit through the prefix. Replicas apply committed entries in order. Membership changes, persistence and snapshots have additional rules. The selected frames distinguish having a leader, containing an entry and having committed it."
+        },
+        {
+          "vi": "Đọc từ một node đang tự gọi mình leader chưa đủ chứng minh read linearizable. Hệ thống cần xác nhận authority phù hợp và apply tới vị trí cần đọc; read-index/quorum barriers hoặc lease reads có điều kiện khác nhau. Lease reads phụ thuộc giả định thời gian và implementation, nên không dùng tên Raft thay cho contract read của database.",
+          "en": "A node believing it is leader does not establish a linearizable read. The implementation must validate authority and apply through the required position; quorum/read-index barriers and lease-based reads have distinct conditions. Lease reads depend on timing assumptions, so a database’s use of Raft does not replace its API read contract."
+        }
+      ],
+      "experiment": "raft"
+    },
+    {
+      "id": "consensus-scope",
+      "title": {
+        "vi": "8. Dùng consensus ở đâu và trả chi phí gì?",
+        "en": "8. Where should consensus run, and what does it cost?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Consensus thường xuất hiện ở control plane để giữ membership, configuration hoặc ownership. Nó cũng được dùng hợp lệ trên data path của replicated database, thường theo shard/partition, khi dữ liệu cần thứ tự và safety đó. Không có quy tắc rằng mọi user write phải qua một cluster metadata chung, cũng không có quy tắc cấm consensus trên đường dữ liệu.",
+          "en": "Consensus commonly manages membership, configuration and ownership in the control plane. Replicated databases also legitimately use it on the data path, often per shard/partition, when data needs those ordering and safety guarantees. Neither routing every user write through one metadata cluster nor forbidding data-plane consensus is a universal rule."
+        },
+        {
+          "vi": "Majority của N node là floor(N/2)+1. Cụm 3 và 5 node lần lượt chịu được tối đa 1 và 2 node không khả dụng nếu các node cần thiết còn liên lạc và điều kiện liveness được đáp ứng; 6 node vẫn chỉ chịu được 2 theo phép tính này. Vị trí failure domain quan trọng hơn nhãn số lẻ: năm node cùng một vùng mất điện không bảo vệ được mất vùng.",
+          "en": "A majority of N nodes is floor(N/2)+1. Three and five nodes tolerate at most one and two unavailable nodes respectively, provided the required nodes communicate and liveness conditions hold; six still tolerate only two by this calculation. Failure-domain placement matters: five nodes in one failed power domain do not survive that domain’s loss."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Safety · Điều không được sai",
+            "en": "Safety · What must not go wrong"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Committed history không được bị thay bằng history mâu thuẫn.",
+              "en": "Committed history must not be replaced by a conflicting one."
+            },
+            {
+              "vi": "Tăng timeout không phải một bằng chứng safety.",
+              "en": "Increasing timeouts is not a safety proof."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Liveness · Khi nào tiến triển",
+            "en": "Liveness · When progress is possible"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Cần đủ node và liên lạc/timing phù hợp để bầu và replicate.",
+              "en": "Enough nodes and suitable communication/timing must permit election and replication."
+            },
+            {
+              "vi": "Một hệ thống giữ safety có thể tạm thời không nhận write.",
+              "en": "A system preserving safety may temporarily refuse writes."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "conflicts",
+      "title": {
+        "vi": "9. Clock, version và merge concurrent updates",
+        "en": "9. Clocks, versions and merging concurrent updates"
+      },
+      "paragraphs": [
+        {
+          "vi": "Wall clock có thể lệch hoặc nhảy lùi; timestamp lớn hơn không chứng minh update xảy ra sau theo quan hệ nhân quả. Last-write-wins là chính sách bỏ một phía theo thứ tự đã chọn, có thể phù hợp dữ liệu chấp nhận mất update nhưng không phải cơ chế bảo toàn mọi thao tác cộng/trừ. Lamport clocks giữ hướng của quan hệ nhân quả, còn hai số khác nhau không tự chứng minh có causality.",
+          "en": "Wall clocks may skew or move backwards; a larger timestamp does not prove causal succession. Last-write-wins discards one side under a chosen order and may suit data where that loss is acceptable, but does not preserve arbitrary increments/decrements. Lamport clocks respect causal order; distinct logical timestamps alone do not establish causality."
+        },
+        {
+          "vi": "Version vector giữ counter theo actor/replica. Vector {A:2,B:1} và {A:1,B:2} không vector nào trội ở mọi component, nên hai version concurrent. {A:3,B:2} trội cả hai và có thể biểu diễn version đã quan sát/merge chúng nếu protocol cập nhật đúng. Metadata có chi phí khi số actor lớn hoặc thay đổi; cần chiến lược pruning có semantics rõ.",
+          "en": "A version vector tracks counters per actor/replica. Neither {A:2,B:1} nor {A:1,B:2} dominates the other, so they are concurrent. {A:3,B:2} dominates both and can represent a version observing/merging them under the protocol. Large or changing actor sets increase metadata and require semantically safe pruning."
+        },
+        {
+          "vi": "State-based CRDT dùng merge có tính associative, commutative và idempotent cùng các điều kiện update/state phù hợp để hội tụ; operation-based CRDT cần điều kiện delivery/order tùy loại. Hội tụ không tự giữ invariant như stock không âm khi hai region cùng bán unit cuối. Nếu invariant không chịu được merge tự do, đổi thiết kế ownership, dùng escrow phù hợp hoặc phối hợp quyết định.",
+          "en": "State-based CRDTs combine associative, commutative and idempotent merge with suitable state/update conditions; operation-based CRDTs have type-specific delivery/order requirements. Convergence does not automatically preserve invariants such as nonnegative stock when two regions sell the final unit. Use suitable ownership, escrow or coordination when free merging violates the invariant."
+        }
+      ]
+    },
+    {
+      "id": "fencing",
+      "title": {
+        "vi": "10. Lease hết hạn không làm worker cũ biến mất",
+        "en": "10. An expired lease does not make the old worker disappear"
+      },
+      "paragraphs": [
+        {
+          "vi": "Worker A có lease rồi bị pause. Lease hết hạn, worker B nhận quyền mới; A tỉnh lại vẫn có thể gửi write. Vì vậy kiểm tra “tôi từng lấy được lock” không đủ bảo vệ side effect. Token ngẫu nhiên giúp release đúng lease, còn fencing token là số tăng theo lần cấp quyền để resource phân biệt owner cũ và mới.",
+          "en": "Worker A pauses while holding a lease. The lease expires and B acquires new authority, but A can resume and send a write. Having acquired a lock earlier does not protect that side effect. A random ownership token helps release the right lease; an increasing fencing token distinguishes old and new authority at the resource."
+        },
+        {
+          "vi": "Resource phải kiểm tra và ghi nhận token một cách atomic với write. Sau khi chấp nhận token 42, nó từ chối write mang 41. Chỉ tạo token mới ở lock service mà không kiểm tra nơi gây side effect chưa fence được gì. Các write đã đi trước khi resource biết epoch mới cần semantics riêng; fencing không có nghĩa hai process không bao giờ chạy đồng thời.",
+          "en": "The resource must atomically validate and record the token with the write. After accepting token 42, it rejects token 41. Issuing tokens without enforcement at the side-effect boundary provides no fencing. Writes arriving before the resource learns the new epoch need defined semantics; fencing does not mean two processes never execute simultaneously."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Fencing phải được thực thi ở nơi dữ liệu thay đổi",
+          "en": "Enforce fencing where data changes"
+        },
+        "caption": {
+          "vi": "Ví dụ đã ghi nhận token 42: write token 41 đến muộn phải bị resource từ chối bằng kiểm tra atomic.",
+          "en": "After token 42 has been recorded, a late token-41 write must be rejected by an atomic resource-side check."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Cấp epoch mới",
+              "en": "Grant a new epoch"
+            },
+            "detail": {
+              "vi": "B được cấp token 42.",
+              "en": "B receives token 42."
+            },
+            "icon": "target"
+          },
+          {
+            "title": {
+              "vi": "Resource nhận quyền mới",
+              "en": "The resource observes it"
+            },
+            "detail": {
+              "vi": "Write/registration token 42 được xác nhận.",
+              "en": "A token-42 write/registration is accepted."
+            },
+            "icon": "decision"
+          },
+          {
+            "title": {
+              "vi": "Chặn holder cũ",
+              "en": "Fence the stale holder"
+            },
+            "detail": {
+              "vi": "A gửi token 41; resource reject.",
+              "en": "A sends token 41; the resource rejects it."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
+    },
+    {
+      "id": "transactions",
+      "title": {
+        "vi": "11. 2PC, saga và replication giải các bài toán khác nhau",
+        "en": "11. 2PC, sagas and replication solve different problems"
+      },
+      "paragraphs": [
+        {
+          "vi": "Replication sao chép một state machine không tự làm transaction xuyên nhiều owner thành atomic. Two-phase commit phối hợp quyết định commit/abort của các participant: prepare giữ trạng thái sẵn sàng, rồi thực hiện quyết định durable. Nếu chưa biết quyết định và không có cơ chế recovery khả dụng, participant có thể bị block. Replicate coordinator giúp khả năng phục hồi nhưng không xóa mọi phụ thuộc participant.",
+          "en": "Replicating a state machine does not make a transaction across independent owners atomic. Two-phase commit coordinates participants’ commit/abort decision: prepare records readiness, then participants follow the durable decision. A participant unable to recover an unknown decision may block. Replicating the coordinator improves recovery but does not remove every participant dependency."
+        },
+        {
+          "vi": "Saga chia quy trình thành local transactions có compensation. Ví dụ giữ hàng → thu tiền → tạo shipment; hoàn tiền là transaction mới, không làm lịch sử chưa từng có charge. Cần state machine, idempotency, timeout, retry và xử lý compensation thất bại. Chọn 2PC hay saga theo resource, invariant và mức chấp nhận intermediate state, không theo câu khẩu hiệu “microservices phải eventual”.",
+          "en": "A saga uses local transactions with compensations: for example, reserve stock → charge → create shipment. A refund is a new transaction, not erasure of the original charge. It needs state machines, idempotency, timeouts, retries and failed-compensation handling. Choose by resources, invariants and tolerated intermediate states, not a slogan that microservices must be eventual."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Atomic commit qua participant",
+            "en": "Atomic commit across participants"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Cần protocol và khả năng recovery của mọi resource tham gia.",
+              "en": "Requires protocol support and recovery from all participating resources."
+            },
+            {
+              "vi": "Nêu locks, prepared state, timeout và unknown outcome.",
+              "en": "Explain locks, prepared state, timeouts and unknown outcomes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Local commit và compensation",
+            "en": "Local commits and compensation"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Intermediate state có thể được quan sát.",
+              "en": "Intermediate states may be visible."
+            },
+            {
+              "vi": "Bước bù phải có owner, retry và đường xử lý thủ công khi cần.",
+              "en": "Compensations need ownership, retries and manual resolution paths where necessary."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "12. Chọn guarantee theo operation và kiểm thử failure",
+        "en": "12. Choose guarantees per operation and test failures"
+      },
+      "paragraphs": [
+        {
+          "vi": "Viết một bảng contract trước khi chọn sản phẩm: operation nào phải giữ invariant, operation nào chịu staleness, session token được truyền ra sao và khi thiếu authority thì trả gì. Một profile page có thể cần read-your-writes trong khi like count chỉ cần hội tụ; cập nhật số dư nhiều account cần transaction boundary cụ thể thay vì chỉ gắn nhãn linearizable cho từng key.",
+          "en": "Write an operation contract before choosing a product: invariants, permitted staleness, session-token propagation and behavior without authority. A profile page may need read-your-writes while like counts converge eventually. Updating balances across accounts needs an explicit transaction boundary, not merely a per-key linearizability label."
+        },
+        {
+          "vi": "Theo dõi replication apply lag, số read chờ watermark, fallback-to-owner, election frequency, quorum latency và repair backlog. Fault test phải gồm packet delay/drop, pause process, leader crash sau ACK, failover với replica trễ và retry sau unknown outcome. Lưu history request/response rồi kiểm tra invariant; dashboard xanh hoặc replica count đủ không chứng minh consistency.",
+          "en": "Observe apply lag, watermark waits, owner fallbacks, election frequency, quorum latency and repair backlog. Inject network delay/drop, process pauses, post-acknowledgement leader crashes, lagging-replica failover and retries after unknown outcomes. Record operation histories and validate invariants; green dashboards and replica counts do not prove consistency."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "13. Tự giải thích bằng failure scenario",
+        "en": "13. Explain the guarantees through failure scenarios"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "N=3, R=2, W=2 đã đủ kết luận linearizable chưa?",
+            "en": "Do N=3, R=2, W=2 establish linearizability?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Chúng chứng minh giao ít nhất một node với cùng home set cố định. Tôi còn cần định nghĩa version resolution, concurrent/partial writes, read protocol và durability. Sloppy quorum hoặc LWW với clock lệch có thể phá kết luận “read luôn thấy write mới nhất”.",
+              "en": "No. They prove an intersection of at least one node for the same fixed home set. Version resolution, concurrent/partial writes, the read protocol and durability still matter. Sloppy quorums or timestamp conflict resolution under clock skew can invalidate a latest-write claim."
+            }
+          ],
+          "followup": {
+            "vi": "Nếu write timeout sau khi một replica nhận dữ liệu, read sau có được thấy nó không?",
+            "en": "If a write times out after one replica receives it, may a later read observe it?"
+          }
+        },
+        {
+          "question": {
+            "vi": "Vì sao user vừa sửa tên lại thấy tên cũ?",
+            "en": "Why can a user see the old name immediately after editing it?"
+          },
+          "answer": [
+            {
+              "vi": "Write có thể đã hoàn tất ở owner nhưng read lại tới replica chưa apply đủ. Mang write position trong session và yêu cầu read đáp ứng watermark, hoặc đọc owner. Nếu deadline không cho chờ, xác định fallback/error rõ; không tự hạ guarantee mà vẫn báo như dữ liệu mới.",
+              "en": "The owner may have completed the write while the next read reaches an unapplied replica. Carry the write position in the session and require the watermark, or read the owner. If the deadline prevents waiting, define fallback/error behavior rather than silently weakening the promise."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hai node cùng nghĩ mình là leader có nghĩa Raft đã sai?",
+            "en": "Do two nodes believing they are leaders imply a Raft safety failure?"
+          },
+          "answer": [
+            {
+              "vi": "Không nhất thiết: chúng có thể thuộc hai term khác nhau do partition. Cần xét node nào có quorum và entry nào thực sự commit. Leader cũ không đủ quorum không được commit lịch sử mâu thuẫn; khi thấy term mới nó step down. Node ngoài consensus thực hiện side effect còn cần fencing riêng.",
+              "en": "Not necessarily: a partition can leave leaders in different terms. Examine quorum authority and actual commits. An old leader without quorum cannot commit conflicting history and steps down on observing a higher term. External side-effect resources may also require fencing."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dùng lease 30 giây có đảm bảo chỉ một worker ghi file?",
+            "en": "Does a 30-second lease guarantee that only one worker writes a file?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Holder có thể pause quá lease rồi tỉnh lại. Resource phải thực thi fencing hoặc conditional update phù hợp; việc check lock ở đầu hàm không chặn write đến muộn. Nếu resource không hỗ trợ kiểm tra đó, phải thay workflow hoặc chấp nhận rõ rủi ro, không gọi nó là mutual exclusion tuyệt đối.",
+              "en": "No. A holder can pause beyond the lease and resume. The resource needs suitable fencing or conditional updates; checking a lock at function entry cannot stop a late write. If enforcement is unavailable, redesign the workflow or explicitly accept the risk rather than claiming absolute mutual exclusion."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "CRDT đã hội tụ thì có giữ được stock không âm?",
+            "en": "Does CRDT convergence preserve nonnegative stock?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động. Hai region cùng thấy stock=1 có thể cùng bán một unit và merge thành −1 tùy data type. Convergence là cùng kết quả, còn invariant là kết quả được phép. Phải chọn loại operation/escrow/ownership hoặc coordination có chứng minh invariant mong muốn.",
+              "en": "Not automatically. Two regions seeing stock=1 may both sell one unit and merge to −1 under the chosen data type. Convergence means agreeing on a result; an invariant restricts which results are allowed. Choose operations, escrow, ownership or coordination that actually preserves it."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sau failover mất write đã ACK, nên kiểm tra gì trước?",
+            "en": "What should you check after failover loses an acknowledged write?"
+          },
+          "answer": [
+            {
+              "vi": "Xác minh ACK contract, log/flush/apply position của replica được promote, membership và fencing của owner cũ. Async replication hoặc promote sai candidate là khả năng, nhưng cũng phải kiểm tra durability configuration và failure domains. Sau đó reconcile cache, event và downstream đã quan sát write bị mất.",
+              "en": "Check the acknowledgement contract, the promoted replica’s log/flush/apply positions, membership and fencing of the old owner. Asynchronous replication or an unsuitable promotion candidate may explain it, alongside durability configuration and failure domains. Reconcile caches, events and downstream effects that observed the lost write."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

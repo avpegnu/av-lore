@@ -1,0 +1,516 @@
+{
+  "id": "scaling",
+  "group": "foundation",
+  "status": "review",
+  "title": {
+    "vi": "Mở rộng hệ thống: từ một server tới nhiều vùng",
+    "en": "Scaling systems: from one server to multiple regions"
+  },
+  "summary": {
+    "vi": "Mở rộng từng bước theo bottleneck đã đo: stateless API, database indexes, cache, queue, replica, shard và multi-region; hiểu cả migration và failure khi scale.",
+    "en": "Scale by measured bottlenecks: stateless APIs, database indexes, caches, queues, replicas, shards and multiple regions, including migrations and failures."
+  },
+  "takeaways": [
+    {
+      "vi": "Scale là giữ được yêu cầu latency/correctness khi workload đổi, không chỉ thêm server.",
+      "en": "Scaling preserves latency/correctness requirements as workloads change, not merely adding servers."
+    },
+    {
+      "vi": "Tìm bottleneck bằng rate, latency, saturation và skew trước khi chọn giải pháp.",
+      "en": "Find bottlenecks using rate, latency, saturation and skew before choosing a remedy."
+    },
+    {
+      "vi": "Stateless API dễ scale hơn; state vẫn tồn tại ở session, database, queue và cache.",
+      "en": "Stateless APIs are easier to scale; state still lives in sessions, databases, queues and caches."
+    },
+    {
+      "vi": "Mỗi lần phân tán thêm dữ liệu đều tạo chi phí consistency, migration và vận hành.",
+      "en": "Every additional distribution boundary brings consistency, migration and operational costs."
+    }
+  ],
+  "prerequisites": [
+    "framework",
+    "estimation"
+  ],
+  "sections": [
+    {
+      "id": "baseline",
+      "title": {
+        "vi": "1. Phiên nhỏ nhất đáp ứng yêu cầu",
+        "en": "1. Start with the smallest adequate system"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một backend modular, một database và object storage cho file có thể phục vụ sản phẩm ban đầu rất tốt. Transaction trong một database giúp giữ invariant dễ hiểu, deployment ít boundary và debug request đơn giản. Thiết kế module rõ ràng để sau này có thể tách, nhưng không trả chi phí distributed system trước khi có nhu cầu.",
+          "en": "A modular backend, one database and object storage can serve an early product well. Single-database transactions simplify invariants, deployments have fewer boundaries and requests are easier to debug. Keep module boundaries clear for future separation without paying distributed-system costs prematurely."
+        },
+        {
+          "vi": "Thiết lập baseline trước khi tối ưu: workload đại diện, latency p50/p95/p99, throughput, CPU, memory, disk/IO, connection pool và query plans. Một endpoint chậm vì thiếu index không được chữa tận gốc bằng thêm API replica. Kiểm tra correctness và resource limit cùng performance để benchmark không dùng dữ liệu quá nhỏ hoặc cache nóng phi thực tế.",
+          "en": "Establish a representative baseline with p50/p95/p99 latency, throughput, CPU, memory, disk/IO, pools and query plans. More API replicas do not fix a missing database index. Benchmark correctness and resource limits alongside performance, avoiding tiny datasets or unrealistically warm caches."
+        }
+      ]
+    },
+    {
+      "id": "bottlenecks",
+      "title": {
+        "vi": "2. Bottleneck và Amdahl’s Law",
+        "en": "2. Bottlenecks and Amdahl’s Law"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định một request dùng 20 ms CPU app và 180 ms chờ database. Làm app CPU nhanh gấp đôi chỉ giảm tổng từ 200 xuống 190 ms, không thành 100 ms. Amdahl’s Law nhắc rằng phần không được cải thiện giới hạn speedup; đo critical path và query count trước khi đổi ngôn ngữ hoặc mua nhiều CPU.",
+          "en": "Suppose a request uses 20 ms of application CPU and waits 180 ms for the database. Doubling application CPU speed reduces total time from 200 to 190 ms, not 100 ms. Amdahl’s Law highlights the unchanged part limiting speedup; measure critical paths and query counts before changing languages or buying CPUs."
+        },
+        {
+          "vi": "CPU saturation gợi ý parallelism hoặc giảm compute; DB lock wait gợi ý contention và transaction scope; high disk IO có thể cần index/data layout hoặc RAM; high network fan-out cần batch và giảm hops. Các tín hiệu có thể liên quan: app CPU thấp không đồng nghĩa còn capacity nếu mọi worker đang chờ downstream và pool đã cạn.",
+          "en": "CPU saturation suggests parallelism or less computation; lock waits suggest contention/transaction scope; disk IO may need indexes, layouts or RAM; network fan-out needs batching and fewer hops. Signals interact: low application CPU does not imply spare capacity when workers wait on downstreams and pools are exhausted."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Tín hiệu",
+            "en": "Signal"
+          },
+          {
+            "vi": "Đo thêm",
+            "en": "Measure next"
+          },
+          {
+            "vi": "Thử nghiệm phù hợp",
+            "en": "Useful experiment"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "p99 tăng cùng pool wait",
+              "en": "p99 rises with pool waiting"
+            },
+            {
+              "vi": "Active connection, queue age, DB concurrency",
+              "en": "Active connections, queue age, database concurrency"
+            },
+            {
+              "vi": "Giới hạn concurrency và sửa query/transaction trước khi tăng pool.",
+              "en": "Bound concurrency and improve queries/transactions before enlarging the pool."
+            }
+          ],
+          [
+            {
+              "vi": "Một shard quá tải",
+              "en": "One shard overloaded"
+            },
+            {
+              "vi": "Per-key/per-tenant rate, partition size",
+              "en": "Per-key/tenant rates and partition sizes"
+            },
+            {
+              "vi": "Cache hot reads, split hot key hoặc đổi routing có kiểm soát.",
+              "en": "Cache hot reads, split a hot key or change routing deliberately."
+            }
+          ],
+          [
+            {
+              "vi": "Background lag tăng",
+              "en": "Background lag grows"
+            },
+            {
+              "vi": "Arrival/service rate và oldest job age",
+              "en": "Arrival/service rates and oldest-job age"
+            },
+            {
+              "vi": "Tăng effective workers trong giới hạn dependency, áp backpressure.",
+              "en": "Increase effective workers within dependency limits and apply backpressure."
+            }
+          ]
+        ]
+      },
+      "experiment": "saturation"
+    },
+    {
+      "id": "horizontal",
+      "title": {
+        "vi": "3. Vertical và horizontal scaling",
+        "en": "3. Vertical and horizontal scaling"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vertical scaling tăng CPU/RAM/IO cho một node, thường ít thay đổi code và có thể là lựa chọn tốt nhất khi workload còn phù hợp. Nó có giới hạn phần cứng, chi phí và vẫn cần HA riêng. Horizontal scaling thêm node, có lợi khi công việc độc lập và routing chia tải được; shared bottleneck như một write owner vẫn giới hạn cả cụm.",
+          "en": "Vertical scaling adds CPU/RAM/IO to one node, often requiring little code change and working well for suitable workloads. Hardware/cost limits remain, and high availability is separate. Horizontal scaling adds nodes and helps when work is independent and routable; shared bottlenecks such as one write owner still limit the cluster."
+        },
+        {
+          "vi": "Làm API stateless bằng cách đưa session cần chia sẻ vào storage hoặc token có semantics revocation rõ; file upload nằm trong object storage; background work có queue và job identity. Sticky sessions có thể giảm vấn đề trước mắt nhưng node chết vẫn mất local state, và phân phối tải lệch khi một session rất lớn.",
+          "en": "Make APIs stateless by moving shared sessions to storage or using tokens with explicit revocation semantics; put uploads in object storage and background work in identified queue jobs. Sticky sessions can ease an immediate problem, but node failure still loses local state and large sessions skew load."
+        },
+        {
+          "vi": "Load balancer dùng health/readiness checks và connection draining khi deploy. Một node chưa warm cache hoặc connection pool không nên nhận toàn bộ share ngay; graceful shutdown ngừng nhận request mới, chờ inflight trong deadline rồi kết thúc có kiểm soát. Autoscaling metric nên phản ánh bottleneck và queue chứ không chỉ CPU.",
+          "en": "Load balancers need health/readiness checks and draining during deployments. A node with cold caches/pools should not immediately receive its full share. Graceful shutdown stops admission, waits for in-flight work within a deadline and then terminates deliberately. Autoscaling metrics should reflect bottlenecks and queues beyond CPU."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Vertical · Một node mạnh hơn",
+            "en": "Vertical · A larger node"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Ít thay đổi ownership và deployment hơn.",
+              "en": "Usually requires fewer ownership and deployment changes."
+            },
+            {
+              "vi": "Vẫn có giới hạn máy và failure domain của node.",
+              "en": "Machine limits and the node’s failure domain remain."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Horizontal · Nhiều node",
+            "en": "Horizontal · More nodes"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Cần chia việc, cân bằng traffic và làm rõ state nằm đâu.",
+              "en": "Requires distributing work, balancing traffic and locating state."
+            },
+            {
+              "vi": "Thêm node không tự chia một hot key hoặc một transaction tranh chấp.",
+              "en": "More nodes do not automatically split one hot key or contended transaction."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "read-scaling",
+      "title": {
+        "vi": "4. Đường đọc: index, replica và cache",
+        "en": "4. Read scaling: indexes, replicas and caches"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sửa access pattern và index trước: chọn cột cần đọc, tránh N+1, dùng keyset pagination và đo query plan. Read replica chia tải đọc nhưng có lag; user vừa update có thể cần route read-your-writes tới primary hoặc replica đã đạt một version/position. Replica không thay transaction semantics ở primary và không làm một query nặng tự nhanh hơn.",
+          "en": "Improve access patterns/indexes first: select necessary columns, avoid N+1 calls, use keysets and inspect query plans. Read replicas distribute reads but can lag; a recent writer may need the primary or a replica that has reached a required version/position. Replicas do not replace primary transaction semantics or inherently accelerate a heavy query."
+        },
+        {
+          "vi": "Cache giảm repeated reads nếu hit rate và reuse window đủ tốt. Xác định owner nguồn sự thật, TTL, invalidation, negative caching và hành vi khi cache chết. Single-flight và jittered TTL tránh nhiều miss đồng thời; không chuyển mọi request sang DB không giới hạn khi cache cluster mất.",
+          "en": "Caches reduce repeated reads when hit rates and reuse windows justify them. Define the authoritative owner, TTL, invalidation, negative caching and outage behavior. Single-flight and jittered TTLs avoid simultaneous misses; a cache outage must not send unbounded traffic to the database."
+        },
+        {
+          "vi": "Cacheability phụ thuộc personalization và authorization. Static asset có content hash phù hợp CDN; kết quả query cá nhân hóa phải key theo user/tenant và policy version phù hợp. Không cache một response private dưới key chỉ chứa URL rồi phục vụ cho mọi người.",
+          "en": "Cacheability depends on personalization and authorization. Content-hashed static assets fit CDNs; personalized queries require user/tenant and appropriate policy-version keys. Never cache a private response under a URL-only key shared by everyone."
+        }
+      ]
+    },
+    {
+      "id": "async",
+      "title": {
+        "vi": "5. Đường ghi và công việc bất đồng bộ",
+        "en": "5. Writes and asynchronous work"
+      },
+      "paragraphs": [
+        {
+          "vi": "Queue giúp tách latency của ACK khỏi email, indexing, thumbnail hoặc fan-out có thể chạy sau. Nó không tự tăng capacity downstream: nếu arrival dài hạn lớn hơn service rate, backlog tăng mãi. Chốt thời điểm durable ACK và cách client biết job hoàn tất; 202 accepted khác 201 resource đã được tạo đầy đủ theo hợp đồng.",
+          "en": "Queues separate acknowledgement latency from email, indexing, thumbnails or fan-out that can finish later. They do not increase downstream capacity by themselves: sustained arrivals above service rate cause unbounded backlog. Define durable acknowledgement and completion visibility; 202 accepted differs from a fully created resource under a 201 contract."
+        },
+        {
+          "vi": "Ghi DB rồi publish event tạo dual-write gap; outbox/CDC có thể giữ ý định event cùng transaction. Consumer vẫn cần idempotency cho at-least-once delivery. Bulk write/batching giảm overhead nhưng tăng wait và làm failure/retry theo batch phức tạp hơn; giới hạn batch size bằng latency, payload và transaction contention.",
+          "en": "Database-write/event-publication dual writes create a gap; outbox/CDC can persist event intent with the transaction. Consumers still need idempotency for at-least-once delivery. Batching lowers overhead but adds waiting and batch failure/retry complexity; bound sizes by latency, payload and contention."
+        }
+      ]
+    },
+    {
+      "id": "sharding",
+      "title": {
+        "vi": "6. Sharding khi một owner không còn đủ",
+        "en": "6. Shard when one owner no longer suffices"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn shard key từ access pattern và load distribution. tenant_id co-locate dữ liệu tenant nhưng tenant lớn dễ hot; hash(user_id) phân phối user nhưng cross-user query tốn fan-out; time range thuận tiện retention nhưng range hiện tại nóng. Có thể dùng directory hoặc virtual shards để di chuyển ownership mà không đổi mọi ID.",
+          "en": "Choose shard keys from access patterns and load distribution. tenant_id colocates tenant data but large tenants become hot; hash(user_id) spreads users but cross-user queries fan out; time ranges simplify retention but heat the current range. Directories or virtual shards can move ownership without changing every ID."
+        },
+        {
+          "vi": "Migration cần nguồn sự thật về shard ownership, copy snapshot, catch-up changes và cutover có fencing/version. Dual write thiếu reconciliation có thể lệch khi một bên thành công một bên thất bại. Dùng shadow read/checksum có phạm vi, rollback plan và tốc độ backfill không làm hại production traffic.",
+          "en": "Migration needs authoritative shard ownership, snapshot copying, change catch-up and versioned/fenced cutover. Unreconciled dual writes diverge when only one side succeeds. Use scoped shadow reads/checksums, rollback plans and backfill rates that protect production traffic."
+        },
+        {
+          "vi": "Cross-shard transactions và joins trở nên khó hơn; nên giữ invariant trong một partition khi có thể. Nếu booking và payment nằm ở hai owner, state machine/saga với compensation và reconciliation có thể phù hợp, nhưng không tương đương một transaction atomic. Nêu rõ cửa sổ trạng thái trung gian mà người dùng có thể thấy.",
+          "en": "Cross-shard transactions and joins become harder; colocate invariants where possible. If booking and payment have separate owners, a saga/state machine with compensation and reconciliation may fit, but is not equivalent to one atomic transaction. Explain user-visible intermediate states."
+        }
+      ]
+    },
+    {
+      "id": "regions",
+      "title": {
+        "vi": "7. Multi-region: chọn ownership trước",
+        "en": "7. Multiple regions: choose ownership first"
+      },
+      "paragraphs": [
+        {
+          "vi": "Multi-region có thể phục vụ latency địa lý, disaster recovery hoặc residency. Một write region và nhiều read region đơn giản hơn active-active nhưng remote writes có network delay; active-active cần giải quyết concurrent updates và phân vùng mạng theo từng loại dữ liệu. Tách bài toán content có thể merge khỏi inventory không được oversell.",
+          "en": "Multiple regions can serve geographic latency, disaster recovery or residency. One write region with read regions is simpler than active-active but adds delay for distant writers; active-active requires per-data-type conflict and partition semantics. Mergeable content differs from inventory that cannot be oversold."
+        },
+        {
+          "vi": "Failover không chỉ đổi DNS: cần biết replica đã tới đâu, fencing writer cũ để tránh split brain, cập nhật routing và kiểm tra cache/event lag. RPO cho phép mất bao nhiêu dữ liệu và RTO cho phép mất bao lâu phải được thử bằng restore/failover drill. Backup cùng failure domain với primary không đủ cho mọi thảm họa.",
+          "en": "Failover is more than changing DNS: establish replica progress, fence the old writer against split brain, update routing and inspect cache/event lag. Test allowed data loss (RPO) and recovery time (RTO) through restore/failover drills. Backups in the primary failure domain do not cover every disaster."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Một write owner theo phạm vi",
+            "en": "One write owner per scope"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Nêu region/partition nào có quyền chốt write.",
+              "en": "Identify which region/partition can commit a write."
+            },
+            {
+              "vi": "Failover cần xác minh dữ liệu và ngăn owner cũ ghi tiếp.",
+              "en": "Failover needs data validation and fencing of the old owner."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Nhiều nơi nhận write",
+            "en": "Multiple write locations"
+          },
+          "icon": "compare",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Định nghĩa conflict resolution trước khi triển khai.",
+              "en": "Define conflict resolution before deployment."
+            },
+            {
+              "vi": "Latency local có thể tốt hơn; invariant liên region vẫn cần cơ chế riêng.",
+              "en": "Local latency may improve; cross-region invariants still need an explicit mechanism."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "stages",
+      "title": {
+        "vi": "8. Lộ trình mở rộng có tiêu chí",
+        "en": "8. An expansion path with exit criteria"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các giai đoạn dưới là những lựa chọn theo workload, không phải cấp độ bắt buộc. Có hệ thống ổn định nhiều năm ở một database mạnh; có hệ thống cần partition từ đầu vì residency hoặc dữ liệu quá lớn. Số user không phải tín hiệu duy nhất.",
+          "en": "These stages are workload-driven options, not mandatory levels. Some systems work for years on one strong database; others need early partitioning for residency or volume. User count is not the only trigger."
+        }
+      ],
+      "stages": [
+        {
+          "id": "single",
+          "title": {
+            "vi": "Một backend modular",
+            "en": "One modular backend"
+          },
+          "description": {
+            "vi": "Transaction và ownership đơn giản; đo query, index và resource baseline.",
+            "en": "Simple transactions and ownership; measure queries, indexes and resources."
+          },
+          "exitCriteria": {
+            "vi": "Đã có SLO, load test và backup restore thử được.",
+            "en": "SLOs, load tests and tested backup restoration exist."
+          }
+        },
+        {
+          "id": "replicas",
+          "title": {
+            "vi": "Stateless API + replica/cache",
+            "en": "Stateless APIs + replicas/caches"
+          },
+          "description": {
+            "vi": "Chia read/compute load, giữ session và object storage có owner.",
+            "en": "Distribute reads/compute while retaining session and object ownership."
+          },
+          "exitCriteria": {
+            "vi": "Chịu mất một API node và cache miss storm có giới hạn.",
+            "en": "Tolerate an API-node loss and bound cache-miss storms."
+          }
+        },
+        {
+          "id": "async",
+          "title": {
+            "vi": "Queue và shard có chủ đích",
+            "en": "Intentional queues and shards"
+          },
+          "description": {
+            "vi": "Tách async latency và partition theo invariant/access pattern.",
+            "en": "Separate asynchronous latency and partition by invariants/access patterns."
+          },
+          "exitCriteria": {
+            "vi": "Retry/replay, hot shard và backfill không làm hỏng correctness.",
+            "en": "Retries/replays, hot shards and backfills preserve correctness."
+          }
+        },
+        {
+          "id": "global",
+          "title": {
+            "vi": "Region và recovery",
+            "en": "Regions and recovery"
+          },
+          "description": {
+            "vi": "Route theo ownership, replication position và failover policy.",
+            "en": "Route by ownership, replication positions and failover policy."
+          },
+          "exitCriteria": {
+            "vi": "RPO/RTO được đo và old writer được fencing khi failover.",
+            "en": "RPO/RTO are measured and failover fences old writers."
+          }
+        }
+      ]
+    },
+    {
+      "id": "ownership",
+      "title": {
+        "vi": "8a. Scale cả ownership và cách thay đổi hệ thống",
+        "en": "8a. Scale ownership and the change process"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một đội nhỏ có thể vận hành một backend chung hiệu quả. Khi nhiều đội cùng sửa một service, bottleneck có thể là release coordination, schema ownership hoặc on-call chứ chưa phải CPU. Tách service hợp lý khi có boundary domain, API và owner chịu trách nhiệm; nếu mọi deploy vẫn phải đồng bộ thì chỉ đổi monolith thành distributed monolith.",
+          "en": "A small team may operate a shared backend efficiently. With many teams, release coordination, schema ownership or on-call load may bottleneck before CPU. Service separation helps when domains, APIs and accountable owners exist; synchronized deployment of everything merely creates a distributed monolith."
+        },
+        {
+          "vi": "Migration được thiết kế như feature: schema expand trước, backfill có rate limit, dual-read/shadow verification theo phạm vi, cutover có rollback và chỉ contract schema cũ sau khi client đã chuyển. Chọn một chỉ số user impact và một invariant để làm guardrail. Không xem việc “thêm cluster mới” là đã hoàn thành scale nếu không chuyển dữ liệu và traffic an toàn.",
+          "en": "Treat migration as a feature: expand schemas first, rate-limit backfills, scope dual/shadow verification, cut over with rollback and contract old schemas only after clients migrate. Use user-impact and invariant guardrails. Adding a cluster is not complete scaling until data and traffic move safely."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "9. Kiểm tra các quyết định scale",
+        "en": "9. Review your scaling decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Tăng pool DB từ 100 lên 1.000 có luôn tăng throughput không?",
+            "en": "Does increasing a database pool from 100 to 1,000 always improve throughput?"
+          },
+          "answer": [
+            {
+              "vi": "Không. DB có concurrency hiệu quả giới hạn; thêm connection có thể tăng lock contention, memory và context switching. Đo queue wait, execution time và saturation rồi chọn pool bảo vệ DB, kèm timeout/admission thay vì nhận mọi request.",
+              "en": "No. Databases have an effective concurrency limit; more connections can increase lock contention, memory and context switching. Measure pool wait, execution time and saturation, then choose protective pool sizes with deadlines/admission."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao thêm read replica không giúp hot write key?",
+            "en": "Why does a read replica not fix a hot write key?"
+          },
+          "answer": [
+            {
+              "vi": "Read replica giảm tải đọc; một key có nhiều concurrent update vẫn tranh writer/lock hoặc partition owner. Cần thay access pattern, serialize theo key, aggregate có semantics phù hợp hoặc split dữ liệu mà invariant cho phép. Không thể chia tùy tiện số dư/stock rồi bỏ invariant.",
+              "en": "Replicas reduce reads; concurrent writes to one key still contend on a writer/lock or partition owner. Change the access pattern, serialize per key, aggregate under suitable semantics or split data where invariants permit. Arbitrarily splitting balances/stock can violate correctness."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bài tập: 4 node × 400/s, cần chịu mất 1 node thì 1.600/s có an toàn không?",
+            "en": "Exercise: four nodes handle 400/s each and one-node failure is required. Is 1,600/s safe?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Sau mất một node chỉ còn 1.200/s lý thuyết trước recovery overhead và latency headroom. Operating load phải thấp hơn ngưỡng degraded capacity theo SLO đã đo; autoscaling không phải đảm bảo capacity tức thì.",
+              "en": "No. Losing one node leaves a theoretical 1,200/s before recovery overhead and latency headroom. Operate below measured degraded capacity under the SLO; autoscaling does not guarantee immediate capacity."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có nên tách mọi module thành microservice khi user tăng?",
+            "en": "Should every module become a microservice as user count grows?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi boundary có lợi ích ownership, isolation hoặc independent scaling rõ. Service split tạo network latency, versioning, tracing và distributed consistency. Có thể scale nhiều replica của modular monolith trước, rồi tách bottleneck có bằng chứng.",
+              "en": "Only where ownership, isolation or independent scaling benefits are clear. Service splits add network latency, versioning, tracing and distributed consistency. Replicate a modular monolith first and separate evidenced bottlenecks later."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "architecture",
+    "database",
+    "cache"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Mỗi bước scale cần một lý do và một lối lui",
+      "en": "Every scaling step needs a trigger and a way back"
+    },
+    "caption": {
+      "vi": "Đây là lộ trình quyết định, không phải mọi ứng dụng đều phải đi qua mọi bước. Chỉ thêm độ phức tạp khi số đo hoặc invariant yêu cầu.",
+      "en": "This is a decision path, not a sequence every application must follow. Add complexity when measurements or invariants require it."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Giữ baseline đơn giản",
+          "en": "Keep a simple baseline"
+        },
+        "detail": {
+          "vi": "Một đường request đo được.",
+          "en": "A request path you can measure."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Loại bottleneck đã đo",
+          "en": "Remove a measured bottleneck"
+        },
+        "detail": {
+          "vi": "Query, index, CPU, IO hoặc skew.",
+          "en": "Queries, indexes, CPU, I/O or skew."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Tách công việc phù hợp",
+          "en": "Separate suitable work"
+        },
+        "detail": {
+          "vi": "Stateless, read model, async.",
+          "en": "Stateless services, read models and async work."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Chia ownership an toàn",
+          "en": "Partition ownership safely"
+        },
+        "detail": {
+          "vi": "Shard, region và migration.",
+          "en": "Shards, regions and migration."
+        },
+        "icon": "shield"
+      }
+    ]
+  }
+}

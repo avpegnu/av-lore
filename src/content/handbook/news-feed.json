@@ -1,0 +1,1433 @@
+{
+  "id": "news-feed",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế News Feed: từ một post đến hàng triệu timeline",
+    "en": "Designing a News Feed: from one post to millions of timelines"
+  },
+  "summary": {
+    "vi": "Theo dõi đường ghi, fan-out, đường đọc và kiểm tra quyền; tự tính write amplification, thiết kế hybrid feed và xử lý những trường hợp retry, xóa bài, thay đổi privacy.",
+    "en": "Follow publishing, fan-out, reading and authorization; calculate write amplification, design a hybrid feed and handle retries, deletion and privacy changes."
+  },
+  "prerequisites": [
+    "caching",
+    "messaging",
+    "databases",
+    "consistency"
+  ],
+  "takeaways": [
+    {
+      "vi": "Post store là nguồn sự thật; timeline chỉ giữ danh sách candidate ID có thể xây dựng lại.",
+      "en": "The post store is authoritative; a timeline holds rebuildable candidate IDs."
+    },
+    {
+      "vi": "Push mua tốc độ đọc bằng write amplification; pull chuyển chi phí sang lúc người dùng mở feed.",
+      "en": "Push buys faster reads with write amplification; pull moves work to the moment a user opens the feed."
+    },
+    {
+      "vi": "Cache hit không thay thế kiểm tra quyền. Mỗi lần hydrate phải loại post đã xóa, bị chặn hoặc không còn được phép xem.",
+      "en": "A cache hit does not replace authorization. Hydration must remove deleted, blocked or no-longer-visible posts."
+    },
+    {
+      "vi": "Không có exactly-once end-to-end chỉ nhờ queue: outbox, consumer idempotency và invariant dữ liệu phải phối hợp.",
+      "en": "A queue alone cannot provide end-to-end exactly-once behavior: the outbox, idempotent consumers and data invariants must work together."
+    }
+  ],
+  "sections": [
+    {
+      "id": "mental-model",
+      "title": {
+        "vi": "1. Hình dung đúng bài toán",
+        "en": "1. Start with the right mental model"
+      },
+      "paragraphs": [
+        {
+          "vi": "News Feed là danh sách bài viết dành riêng cho một người đọc. Một post được tạo một lần, nhưng có thể trở thành candidate cho rất nhiều người. Vì vậy dữ liệu nguồn và dữ liệu phục vụ đọc có tốc độ tăng khác nhau: lưu 1 post không có nghĩa chỉ thực hiện 1 lần ghi trong toàn hệ thống.",
+          "en": "A News Feed is a personalized list of posts. A post is created once but can become a candidate for many readers. Source data and read-serving data therefore grow at different rates: storing one post does not imply one write across the system."
+        },
+        {
+          "vi": "Hãy nghĩ timeline như mục lục của một thư viện: mỗi dòng chỉ dẫn tới một post. Nội dung, media và quyền truy cập nằm ở các nơi có owner rõ ràng. Nếu cache timeline hỏng, mục lục có thể dựng lại từ post và follow graph; hệ thống không được mất nội dung gốc vì Redis bị restart.",
+          "en": "Think of a timeline as a library index: each entry points to a post. Content, media and access rules have separate authoritative owners. A damaged timeline cache can be rebuilt from posts and the follow graph; restarting Redis must not destroy original content."
+        },
+        {
+          "vi": "Bắt đầu với feed theo thời gian, sau đó mở rộng sang ranking. Feed theo thời gian cần ordering ổn định; ranked feed còn cần candidate generation, feature lookup, scoring, dedup và chính sách diversity. Hai loại có thể dùng chung đường ghi nhưng khác semantics của pagination.",
+          "en": "Begin with a chronological feed, then extend it to ranking. A chronological feed needs stable ordering; a ranked feed also needs candidate generation, feature lookup, scoring, deduplication and diversity policies. They can share a write path while having different pagination semantics."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Post là nguồn nội dung",
+            "en": "The post is authoritative content"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Lưu post, tác giả và trạng thái hiện tại.",
+              "en": "Store the post, author and current state."
+            },
+            {
+              "vi": "Timeline thường giữ candidate ID để lấy nội dung khi đọc.",
+              "en": "A timeline commonly keeps candidate IDs for hydration at read time."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Timeline là read model",
+            "en": "The timeline is a read model"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Push/pull tạo tập candidate cho một recipient.",
+              "en": "Push/pull produces a recipient’s candidate set."
+            },
+            {
+              "vi": "Candidate có mặt chưa chứng minh user còn được xem bài đó.",
+              "en": "Candidate presence does not prove the user still has permission to view it."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "2. Phạm vi, invariant và SLO",
+        "en": "2. Scope, invariants and SLOs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thiết kế học tập này phục vụ post văn bản và tham chiếu ảnh/video, follow/unfollow, home feed và xóa bài. Media được upload riêng bằng URL có thời hạn; API publish chỉ nhận media ID đã xác minh ownership và trạng thái sẵn sàng. Comments, ads, full-text search và recommender training nằm ngoài phạm vi phiên đầu.",
+          "en": "This teaching design supports text posts with image/video references, follow/unfollow, home feeds and deletion. Media uploads use expiring URLs separately; publishing accepts media IDs only after ownership and readiness checks. Comments, ads, full-text search and recommender training are outside the initial scope."
+        },
+        {
+          "vi": "Giả định mục tiêu p99 cho API đọc feed là 300 ms tại server, availability đọc 99,9% theo tháng và p99 độ trễ từ commit post tới timeline của follower đang hoạt động dưới 5 giây trong tải bình thường. Đây là mục tiêu để thiết kế và đo, không phải cam kết đạt được chỉ bằng một sơ đồ. Ngân sách còn phải chia cho candidate fetch, hydration, quyền truy cập và response serialization.",
+          "en": "Assume a 300 ms server-side p99 feed API target, 99.9% monthly read availability and under five seconds p99 from post commit to active-follower timeline delivery under normal load. These are design and measurement targets, not guarantees created by a diagram. The latency budget must cover candidate fetching, hydration, authorization and response serialization."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Invariant",
+            "en": "Invariant"
+          },
+          {
+            "vi": "Hệ quả trong thiết kế",
+            "en": "Design consequence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Một publish logic tạo tối đa một post",
+              "en": "One logical publish creates at most one post"
+            },
+            {
+              "vi": "Idempotency key gắn với user và fingerprint request; replay trả lại cùng post ID.",
+              "en": "Bind the idempotency key to the user and request fingerprint; replays return the same post ID."
+            }
+          ],
+          [
+            {
+              "vi": "Không lộ post ngoài quyền hiện tại",
+              "en": "Do not expose posts outside current permissions"
+            },
+            {
+              "vi": "Candidate cache có thể cũ; hydrate phải kiểm tra trạng thái post, block và audience.",
+              "en": "Candidate caches may be stale; hydration must check post state, blocks and audience."
+            }
+          ],
+          [
+            {
+              "vi": "ACK sau khi lưu bền vững",
+              "en": "Acknowledge only after durable persistence"
+            },
+            {
+              "vi": "Post và outbox event commit trong một transaction; fan-out có thể hoàn thành sau response.",
+              "en": "Commit the post and outbox event in one transaction; fan-out may complete after the response."
+            }
+          ],
+          [
+            {
+              "vi": "Không chèn trùng cùng một post vào cùng timeline",
+              "en": "Do not duplicate a post within a timeline"
+            },
+            {
+              "vi": "Khóa duy nhất (recipient_id, post_id); replay worker không nhân đôi nội dung.",
+              "en": "Use a unique (recipient_id, post_id) key; worker replay must not duplicate entries."
+            }
+          ],
+          [
+            {
+              "vi": "Follow có semantics xác định",
+              "en": "Define follow semantics"
+            },
+            {
+              "vi": "Chốt việc có backfill bài cũ hay không, giới hạn bao nhiêu bài, và unfollow có hiệu lực khi đọc.",
+              "en": "Specify whether following backfills recent posts, cap the backfill and enforce unfollow on reads."
+            }
+          ]
+        ]
+      },
+      "callout": {
+        "title": {
+          "vi": "Freshness khác với correctness",
+          "en": "Freshness and correctness are different"
+        },
+        "body": {
+          "vi": "Follower thấy post chậm vài giây có thể chấp nhận theo SLO. Người đã bị block vẫn thấy post vì cache cũ là lỗi correctness; không dùng eventual consistency như lời giải thích chung cho cả hai.",
+          "en": "A follower seeing a post a few seconds late may satisfy the SLO. A blocked reader seeing a post because of a stale cache is a correctness failure; eventual consistency is not a blanket justification for both."
+        },
+        "tone": "warning"
+      }
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "3. Ước lượng bằng giả định rõ ràng",
+        "en": "3. Estimate with explicit assumptions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng 30 triệu DAU, mỗi người tạo 0,5 post/ngày và đọc feed 10 lần/ngày. Mỗi tác giả có trung bình 200 follower đủ điều kiện nhận push. Giả định này cố ý đơn giản: ngoài thực tế phân phối follower rất lệch và tác giả hoạt động nhiều có thể có nhiều follower hơn. Công thức chính xác hơn là tổng posts_i × eligible_followers_i cho từng tác giả, thay vì luôn nhân hai giá trị trung bình.",
+          "en": "Use 30 million DAU, 0.5 posts per user per day and ten feed reads per user per day. Assume 200 followers eligible for push per author on average. This is deliberately simplified: follower counts are highly skewed, and active authors may have more followers. A more accurate model sums posts_i × eligible_followers_i across authors rather than always multiplying two averages."
+        },
+        {
+          "vi": "Timeline giữ 500 candidate ID, mỗi entry giả định 16 byte payload gồm post ID và sort metadata nhỏ. 240 GB dưới đây chỉ là payload. Redis object overhead, allocator, index, replication, fragmentation, failover headroom và bản thân nội dung post đều nằm ngoài con số này; phải benchmark representation thực tế rồi mới sizing cluster.",
+          "en": "Each timeline keeps 500 candidate IDs at an assumed 16 bytes of payload per entry, covering a post ID and small sort metadata. The 240 GB below is payload only. Redis object overhead, allocation, indexes, replication, fragmentation, failover headroom and post contents are excluded; benchmark the actual representation before sizing a cluster."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng",
+            "en": "Quantity"
+          },
+          {
+            "vi": "Cách tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Kết quả",
+            "en": "Result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Post writes trung bình",
+              "en": "Average post writes"
+            },
+            {
+              "vi": "30M × 0.5 / 86,400",
+              "en": "30M × 0.5 / 86,400"
+            },
+            {
+              "vi": "≈ 174 / s",
+              "en": "≈ 174 / s"
+            }
+          ],
+          [
+            {
+              "vi": "Feed reads trung bình",
+              "en": "Average feed reads"
+            },
+            {
+              "vi": "30M × 10 / 86,400",
+              "en": "30M × 10 / 86,400"
+            },
+            {
+              "vi": "≈ 3,472 / s",
+              "en": "≈ 3,472 / s"
+            }
+          ],
+          [
+            {
+              "vi": "Feed reads peak giả định",
+              "en": "Assumed peak feed reads"
+            },
+            {
+              "vi": "3,472 × 3",
+              "en": "3,472 × 3"
+            },
+            {
+              "vi": "≈ 10,417 / s",
+              "en": "≈ 10,417 / s"
+            }
+          ],
+          [
+            {
+              "vi": "Timeline inserts nếu push toàn bộ",
+              "en": "Timeline inserts with full push"
+            },
+            {
+              "vi": "174 × 200",
+              "en": "174 × 200"
+            },
+            {
+              "vi": "≈ 34,722 / s",
+              "en": "≈ 34,722 / s"
+            }
+          ],
+          [
+            {
+              "vi": "Timeline payload toàn bộ DAU",
+              "en": "Timeline payload for all DAU"
+            },
+            {
+              "vi": "30M × 500 × 16 B",
+              "en": "30M × 500 × 16 B"
+            },
+            {
+              "vi": "240 GB, hệ thập phân",
+              "en": "240 GB, decimal"
+            }
+          ],
+          [
+            {
+              "vi": "Post payload một năm",
+              "en": "One year of post payload"
+            },
+            {
+              "vi": "15M/day × 365 × 1 KB",
+              "en": "15M/day × 365 × 1 KB"
+            },
+            {
+              "vi": "≈ 5.475 TB trước replicas/media",
+              "en": "≈ 5.475 TB before replicas/media"
+            }
+          ]
+        ]
+      },
+      "experiment": "feed-fanout"
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "4. Hợp đồng API và retry từ client",
+        "en": "4. API contracts and client retries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các endpoint dùng user identity từ session/token đã xác thực; không tin author_id hay recipient_id do client tự gửi. Cursor là token opaque được ký, ràng buộc với user, filter, feed session và thời hạn. Error body dùng mã lỗi ổn định để client phân biệt retry với sửa request. Không retry mù mọi 4xx.",
+          "en": "Endpoints derive user identity from the authenticated session/token; they do not trust client-supplied author_id or recipient_id. A cursor is a signed opaque token bound to the user, filters, feed session and expiration. Error bodies use stable codes so clients can distinguish retrying from correcting a request. Do not blindly retry every 4xx."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/posts",
+          "description": {
+            "vi": "Publish một post sau khi kiểm tra quota, audience và media ownership.",
+            "en": "Publish a post after checking quotas, audience and media ownership."
+          },
+          "request": "Idempotency-Key: 58f...\n{ \"text\": \"Hello\", \"mediaIds\": [\"m_1\"], \"audience\": \"followers\" }",
+          "response": "201 Created\n{ \"postId\": \"p_123\", \"createdAt\": \"2026-10-21T08:00:00Z\", \"state\": \"published\" }",
+          "notes": [
+            {
+              "vi": "Replay cùng key và payload trả cùng postId. Cùng key nhưng payload khác trả 409; validation lỗi trả 422, media chưa sẵn sàng trả mã nghiệp vụ riêng.",
+              "en": "Replaying the same key and payload returns the same postId. Reusing a key with a different payload returns 409; invalid content returns 422, and unready media has a distinct domain error."
+            },
+            {
+              "vi": "Lưu response và fingerprint cùng transaction hoặc theo state machine phục hồi được. Đặt TTL của idempotency record theo cửa sổ retry công bố; hết TTL không còn đảm bảo replay cũ.",
+              "en": "Persist the response and fingerprint in the transaction or a recoverable state machine. Set the idempotency record TTL to the documented retry window; expired keys no longer protect old replays."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/v1/feed?limit=20&cursor=...",
+          "description": {
+            "vi": "Đọc một trang feed; limit được giới hạn server-side, không dùng offset cho dữ liệu lớn đang thay đổi.",
+            "en": "Read a feed page; cap the limit on the server and avoid offsets for large changing datasets."
+          },
+          "response": "200 OK\n{ \"items\": [{ \"postId\": \"p_123\", \"author\": { \"id\": \"u_1\" }, \"text\": \"Hello\" }],\n  \"nextCursor\": \"opaque-signed-token\", \"feedSessionId\": \"fs_17\", \"degraded\": false }",
+          "notes": [
+            {
+              "vi": "Response chứa nội dung sau authorization, không chỉ ID. Khi candidate bị lọc, đọc bù trong giới hạn work budget; không truy vấn vô hạn để cố lấp đầy một trang.",
+              "en": "Return authorized hydrated content, not just IDs. When candidates are filtered, refill within a bounded work budget; do not query indefinitely to fill a page."
+            },
+            {
+              "vi": "Cursor hết hạn trả lỗi rõ ràng để bắt đầu session mới. Không gắn nextCursor nếu đã xác định hết candidate; trang rỗng tạm thời cần semantics riêng nếu vẫn còn nguồn chậm.",
+              "en": "An expired cursor returns an explicit error so the client can start a new session. Omit nextCursor when candidates are exhausted; define separate semantics for a temporarily empty page with slow sources."
+            }
+          ]
+        },
+        {
+          "method": "PUT",
+          "path": "/v1/me/following/{authorId}",
+          "description": {
+            "vi": "Tạo quan hệ follow có tính idempotent; tùy sản phẩm có thể chuyển sang trạng thái pending với tài khoản riêng tư.",
+            "en": "Create an idempotent follow relation; private accounts may instead create a pending request."
+          },
+          "response": "204 No Content",
+          "notes": [
+            {
+              "vi": "Backfill tối đa 100 post gần nhất là job riêng sau commit. Mỗi job có follow_version để unfollow rồi follow lại không bị job cũ ghi nhầm.",
+              "en": "Backfill at most 100 recent posts in a separate post-commit job. Carry follow_version so an old job cannot corrupt a later unfollow/refollow cycle."
+            }
+          ]
+        },
+        {
+          "method": "DELETE",
+          "path": "/v1/me/following/{authorId}",
+          "description": {
+            "vi": "Xóa quan hệ follow; đọc feed phải áp dụng trạng thái mới dù cleanup timeline còn đang chạy.",
+            "en": "Remove a follow relation; feed reads must honor the new state while timeline cleanup is still running."
+          },
+          "response": "204 No Content",
+          "notes": [
+            {
+              "vi": "Xóa lặp vẫn trả 204. Cleanup không phải hàng rào bảo mật; quyền được kiểm tra khi hydrate.",
+              "en": "Repeated deletion still returns 204. Cleanup is not a security boundary; enforce access during hydration."
+            }
+          ]
+        },
+        {
+          "method": "DELETE",
+          "path": "/v1/posts/{postId}",
+          "description": {
+            "vi": "Chỉ owner hoặc actor được cấp quyền mới được xóa; ghi tombstone trước rồi phát event cleanup.",
+            "en": "Only the owner or an authorized actor may delete; persist a tombstone before emitting cleanup events."
+          },
+          "response": "204 No Content",
+          "notes": [
+            {
+              "vi": "Định nghĩa rõ thời điểm deletion có hiệu lực, cách invalidate post cache và TTL URL media. CDN có thể giữ object cũ nếu chỉ xóa metadata.",
+              "en": "Define when deletion becomes effective, how post caches are invalidated and the TTL of media URLs. A CDN may retain old objects if only metadata is deleted."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "data-model",
+      "title": {
+        "vi": "5. Data model, index và partition key",
+        "en": "5. Data model, indexes and partition keys"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thiết kế từ access pattern: lấy post theo ID, lấy post mới của một tác giả, lấy follower để fan-out và lấy candidate theo recipient. Một database duy nhất có thể đủ ở phiên đầu; các bảng logic dưới đây không buộc phải là các sản phẩm hoặc microservice riêng.",
+          "en": "Design from access patterns: fetch a post by ID, recent posts by author, followers for fan-out and candidates by recipient. One database may suffice initially; the logical tables below do not require separate products or microservices."
+        },
+        {
+          "vi": "Sharding timeline theo recipient_id giúp đọc một timeline chạm ít shard. Nhưng fan-out một post phải ghi nhiều shard, nên cần bulk write theo shard và concurrency có giới hạn. Sharding post theo author_id giúp pull recent posts; lookup postId cần ID chứa routing hoặc directory/index bổ sung. Không giả định mọi access pattern đều chỉ chạm một shard.",
+          "en": "Partitioning timelines by recipient_id keeps a timeline read on few shards. Publishing still writes across many shards, so bulk writes should group by shard with bounded concurrency. Partitioning posts by author_id helps pull recent posts; postId lookup needs routing encoded in the ID or an additional directory/index. Do not assume every access pattern is single-shard."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Thực thể / khóa",
+            "en": "Entity / key"
+          },
+          {
+            "vi": "Trường quan trọng",
+            "en": "Important fields"
+          },
+          {
+            "vi": "Truy cập và invariant",
+            "en": "Access and invariant"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "posts(post_id)",
+              "en": "posts(post_id)"
+            },
+            {
+              "vi": "author_id, created_at, state, audience_version, text, media_ids",
+              "en": "author_id, created_at, state, audience_version, text, media_ids"
+            },
+            {
+              "vi": "Lookup theo postId; index (author_id, created_at DESC, post_id DESC) cho author feed.",
+              "en": "Lookup by postId; index (author_id, created_at DESC, post_id DESC) for author feeds."
+            }
+          ],
+          [
+            {
+              "vi": "follows(follower_id, followee_id)",
+              "en": "follows(follower_id, followee_id)"
+            },
+            {
+              "vi": "state, follow_version, created_at",
+              "en": "state, follow_version, created_at"
+            },
+            {
+              "vi": "Unique relation; reverse index followee_id để quét follower bằng cursor.",
+              "en": "Unique relation; reverse index on followee_id to scan followers with a cursor."
+            }
+          ],
+          [
+            {
+              "vi": "timeline(recipient_id, post_id)",
+              "en": "timeline(recipient_id, post_id)"
+            },
+            {
+              "vi": "author_id, sort_key, source_version",
+              "en": "author_id, sort_key, source_version"
+            },
+            {
+              "vi": "Unique recipient/post; index (recipient_id, sort_key DESC, post_id DESC); bounded retention.",
+              "en": "Unique recipient/post; index (recipient_id, sort_key DESC, post_id DESC); bounded retention."
+            }
+          ],
+          [
+            {
+              "vi": "outbox(event_id)",
+              "en": "outbox(event_id)"
+            },
+            {
+              "vi": "aggregate_id, event_type, payload, created_at, delivered_at",
+              "en": "aggregate_id, event_type, payload, created_at, delivered_at"
+            },
+            {
+              "vi": "Cùng transaction với post; relay có thể publish lặp, consumer phải dedup.",
+              "en": "Same transaction as the post; the relay may publish duplicates, so consumers must deduplicate."
+            }
+          ],
+          [
+            {
+              "vi": "idempotency(user_id, key)",
+              "en": "idempotency(user_id, key)"
+            },
+            {
+              "vi": "fingerprint, state, post_id, response, expires_at",
+              "en": "fingerprint, state, post_id, response, expires_at"
+            },
+            {
+              "vi": "Unique user/key; kiểm soát concurrent retry bằng constraint hoặc lock.",
+              "en": "Unique user/key; control concurrent retries with a constraint or lock."
+            }
+          ],
+          [
+            {
+              "vi": "feed_session(session_id)",
+              "en": "feed_session(session_id)"
+            },
+            {
+              "vi": "user_id, candidate_snapshot, ranking_version, expires_at",
+              "en": "user_id, candidate_snapshot, ranking_version, expires_at"
+            },
+            {
+              "vi": "Tùy chọn cho ranked feed ổn định; snapshot vẫn phải lọc quyền khi đọc.",
+              "en": "Optional for stable ranked feeds; snapshot entries still require read-time authorization."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "6. Kiến trúc và vòng đời request",
+        "en": "6. Architecture and request lifecycle"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách đường ghi bền vững khỏi công việc mở rộng theo số follower. Publish không chờ ghi vào mọi timeline; nếu chờ, một shard chậm hoặc một tài khoản lớn sẽ kéo dài latency của toàn request. Tác giả có thể xem post vừa đăng từ author feed hoặc overlay đọc của chính mình trước khi fan-out hoàn tất.",
+          "en": "Separate durable publishing from work that grows with follower count. Publishing does not wait for every timeline insertion: otherwise one slow shard or a large account extends the whole request. Authors can see their own new posts through the author feed or a read overlay before fan-out finishes."
+        }
+      ],
+      "diagram": {
+        "id": "news-feed-paths",
+        "title": {
+          "vi": "Một post đi qua hệ thống như thế nào?",
+          "en": "How does a post move through the system?"
+        },
+        "caption": {
+          "vi": "Chọn đường ghi, đọc, celebrity hoặc xóa; bấm từng component để xem owner và điểm cần xử lý lỗi. Mũi tên nét đứt là công việc bất đồng bộ.",
+          "en": "Select publishing, reading, celebrity or deletion; select a component to inspect ownership and failure handling. Dashed arrows represent asynchronous work."
+        },
+        "width": 1080,
+        "height": 570,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Ứng dụng",
+              "en": "App"
+            },
+            "kind": "client",
+            "x": 110,
+            "y": 100,
+            "detail": {
+              "vi": "Giữ idempotency key cho một publish logic và cursor cho một feed session. Retry mạng không được tự tạo key mới.",
+              "en": "Keeps the idempotency key for a logical publish and the cursor for a feed session. A network retry must not generate a new key."
+            }
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "API / Auth",
+              "en": "API / Auth"
+            },
+            "kind": "edge",
+            "x": 360,
+            "y": 100,
+            "detail": {
+              "vi": "Xác thực actor, áp quota và validate request. Tách deadline đọc và ghi; timeout không chứng minh transaction đã rollback.",
+              "en": "Authenticates the actor, enforces quotas and validates requests. Read and write deadlines differ; a timeout does not prove the transaction rolled back."
+            }
+          },
+          {
+            "id": "posts",
+            "label": {
+              "vi": "Post + Outbox",
+              "en": "Post + Outbox"
+            },
+            "kind": "store",
+            "x": 650,
+            "y": 100,
+            "detail": {
+              "vi": "Nguồn sự thật của post, tombstone và event chưa phát. Commit atomic giải quyết khoảng trống giữa DB write và publish event.",
+              "en": "Authority for posts, tombstones and unpublished events. Atomic commit closes the gap between database writes and event publication."
+            }
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Event log",
+              "en": "Event log"
+            },
+            "kind": "queue",
+            "x": 950,
+            "y": 100,
+            "detail": {
+              "vi": "Lưu event cho replay và phân phối. Ordering chỉ trong partition theo key đã chọn; không có global ordering miễn phí.",
+              "en": "Retains events for replay and delivery. Ordering applies within a partition under the chosen key; global ordering is not free."
+            }
+          },
+          {
+            "id": "graph",
+            "label": {
+              "vi": "Follow / Policy",
+              "en": "Follow / Policy"
+            },
+            "kind": "store",
+            "x": 110,
+            "y": 290,
+            "detail": {
+              "vi": "Quản lý follows, blocks và audience. Reverse index giúp fan-out; đường đọc cần kiểm tra trạng thái có hiệu lực hiện tại.",
+              "en": "Owns follows, blocks and audience rules. Reverse indexes support fan-out; reads must check currently effective state."
+            }
+          },
+          {
+            "id": "feed",
+            "label": {
+              "vi": "Feed / Hydrate",
+              "en": "Feed / Hydrate"
+            },
+            "kind": "service",
+            "x": 360,
+            "y": 290,
+            "detail": {
+              "vi": "Merge candidate, dedup, rank và hydrate bằng batch lookup. Loại post không được phép xem trước khi response.",
+              "en": "Merges, deduplicates, ranks and hydrates candidates using batch lookups. Filters unauthorized posts before returning the response."
+            }
+          },
+          {
+            "id": "timeline",
+            "label": {
+              "vi": "Timeline cache",
+              "en": "Timeline cache"
+            },
+            "kind": "store",
+            "x": 650,
+            "y": 290,
+            "detail": {
+              "vi": "Giữ candidate IDs theo recipient. Cache có giới hạn, rebuild được; không được coi candidate tồn tại là quyền truy cập.",
+              "en": "Stores bounded candidate IDs by recipient. It is rebuildable; candidate membership is not authorization."
+            }
+          },
+          {
+            "id": "worker",
+            "label": {
+              "vi": "Fan-out workers",
+              "en": "Fan-out workers"
+            },
+            "kind": "worker",
+            "x": 950,
+            "y": 290,
+            "detail": {
+              "vi": "Quét followers bằng cursor, checkpoint theo chunk và upsert recipient/post. Backpressure khi timeline shard chậm.",
+              "en": "Scans followers with cursors, checkpoints chunks and upserts recipient/post. Applies backpressure when timeline shards slow down."
+            }
+          },
+          {
+            "id": "author",
+            "label": {
+              "vi": "Author recent posts",
+              "en": "Author recent posts"
+            },
+            "kind": "store",
+            "x": 650,
+            "y": 490,
+            "detail": {
+              "vi": "Nguồn pull của tác giả có fan-out lớn. Merge theo timestamp/postId hoặc score đã định nghĩa. Không fetch vô hạn mọi lịch sử.",
+              "en": "Pull source for high-fan-out authors. Merge by timestamp/postId or a defined score. Do not fetch unbounded history."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "publish",
+            "label": {
+              "vi": "Publish + push",
+              "en": "Publish + push"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Client gửi post kèm idempotency key; API kiểm tra actor và media.",
+                  "en": "The client sends a post with an idempotency key; the API checks the actor and media."
+                }
+              },
+              {
+                "from": "api",
+                "to": "posts",
+                "description": {
+                  "vi": "Commit post và outbox cùng transaction, rồi trả ACK có postId.",
+                  "en": "Commit the post and outbox in one transaction, then acknowledge with postId."
+                }
+              },
+              {
+                "from": "posts",
+                "to": "events",
+                "description": {
+                  "vi": "Relay phát event sau commit; publish lặp vẫn có cùng eventId.",
+                  "en": "The relay emits the event after commit; repeated publication preserves eventId."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "worker",
+                "description": {
+                  "vi": "Worker nhận post event và tách công việc theo follower chunk.",
+                  "en": "A worker consumes the post event and splits work into follower chunks."
+                },
+                "async": true
+              },
+              {
+                "from": "worker",
+                "to": "graph",
+                "description": {
+                  "vi": "Đọc follower đủ điều kiện; lưu cursor và phiên bản quan hệ cần thiết.",
+                  "en": "Read eligible followers; retain the cursor and required relationship versions."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "timeline",
+                "description": {
+                  "vi": "Upsert candidate theo recipient/post, trim timeline và checkpoint.",
+                  "en": "Upsert candidates by recipient/post, trim timelines and checkpoint."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "read",
+            "label": {
+              "vi": "Đọc + hydrate",
+              "en": "Read + hydrate"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Request feed có cursor hoặc tạo session mới.",
+                  "en": "Request a feed using a cursor or create a new session."
+                }
+              },
+              {
+                "from": "api",
+                "to": "feed",
+                "description": {
+                  "vi": "Feed service nhận user identity và deadline.",
+                  "en": "The feed service receives the user identity and deadline."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "timeline",
+                "description": {
+                  "vi": "Lấy candidate IDs theo recipient, overfetch có giới hạn.",
+                  "en": "Fetch candidate IDs by recipient with bounded overfetch."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "posts",
+                "description": {
+                  "vi": "Batch hydrate post; giữ đúng thứ tự candidate.",
+                  "en": "Batch hydrate posts while preserving candidate order."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "graph",
+                "description": {
+                  "vi": "Loại deleted, blocked, unfollowed và audience không cho phép.",
+                  "en": "Remove deleted, blocked, unfollowed and disallowed-audience posts."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "client",
+                "description": {
+                  "vi": "Trả item được phép xem và cursor đã ký cho trang tiếp theo.",
+                  "en": "Return authorized items and a signed cursor for the next page."
+                }
+              }
+            ]
+          },
+          {
+            "id": "celebrity",
+            "label": {
+              "vi": "Hybrid / celebrity",
+              "en": "Hybrid / celebrity"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Người đọc mở feed; không chờ fan-out tới toàn bộ follower celebrity.",
+                  "en": "A reader opens the feed without waiting for celebrity-wide fan-out."
+                }
+              },
+              {
+                "from": "api",
+                "to": "feed",
+                "description": {
+                  "vi": "Feed service lấy cấu hình nguồn push và pull của session.",
+                  "en": "The feed service loads the session push/pull source configuration."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "timeline",
+                "description": {
+                  "vi": "Đọc candidate đã được push của tác giả thông thường.",
+                  "en": "Read pushed candidates from ordinary authors."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "author",
+                "description": {
+                  "vi": "Pull số lượng giới hạn post gần nhất của tác giả fan-out lớn.",
+                  "en": "Pull a bounded number of recent posts from high-fan-out authors."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "posts",
+                "description": {
+                  "vi": "Merge, dedup postId, hydrate rồi áp quyền trước khi rank/trả kết quả.",
+                  "en": "Merge, deduplicate postId, hydrate and enforce permissions before ranking/returning."
+                }
+              }
+            ]
+          },
+          {
+            "id": "delete",
+            "label": {
+              "vi": "Xóa / privacy",
+              "en": "Deletion / privacy"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Owner gửi delete hoặc thay đổi audience; API xác minh quyền.",
+                  "en": "The owner requests deletion or an audience change; the API checks authorization."
+                }
+              },
+              {
+                "from": "api",
+                "to": "posts",
+                "description": {
+                  "vi": "Ghi tombstone/audience version và outbox event atomic.",
+                  "en": "Atomically persist a tombstone/audience version and outbox event."
+                }
+              },
+              {
+                "from": "posts",
+                "to": "events",
+                "description": {
+                  "vi": "Phát event invalidation sau commit, có version để chống event cũ.",
+                  "en": "Emit a versioned invalidation event after commit to reject stale events."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "worker",
+                "description": {
+                  "vi": "Worker cleanup và invalidate cache; job có thể chạy lại.",
+                  "en": "Workers clean up and invalidate caches; jobs may be replayed."
+                },
+                "async": true
+              },
+              {
+                "from": "worker",
+                "to": "timeline",
+                "description": {
+                  "vi": "Xóa candidate để tiết kiệm; read-time policy vẫn là hàng rào quyền.",
+                  "en": "Remove candidates to save work; read-time policy remains the authorization boundary."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "fanout",
+      "title": {
+        "vi": "7. Push, pull và hybrid: chọn bằng chi phí",
+        "en": "7. Push, pull and hybrid: choose by cost"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fan-out on write (push) chèn post ID vào timeline follower ngay sau publish. Đọc nhanh vì candidate đã chuẩn bị sẵn, nhưng ghi khuếch đại và tốn công cho follower không hoạt động. Fan-out on read (pull) lấy post gần nhất từ những tác giả người đọc follow rồi merge; ghi rẻ hơn, nhưng latency phụ thuộc số nguồn, độ lệch tải và khả năng batch.",
+          "en": "Fan-out on write pushes a post ID into follower timelines after publication. Reads are fast because candidates are prepared, but writes amplify and inactive followers still consume work. Fan-out on read pulls recent posts from followed authors and merges them; writes are cheaper, while read latency depends on source count, skew and batching."
+        },
+        {
+          "vi": "Một rule học tập là so sánh posts/day × eligible followers × insert cost với active follower reads/day × pull/merge cost. Không có ngưỡng celebrity chung như 10.000 follower đúng cho mọi hệ thống. Tác giả đăng rất nhiều, follower ít hoạt động hoặc shard đang quá tải có thể cần pull sớm hơn; profile và SLO mới quyết định ngưỡng.",
+          "en": "A teaching rule compares posts/day × eligible followers × insertion cost with active follower reads/day × pull/merge cost. There is no universal celebrity threshold such as 10,000 followers. Frequent authors, inactive followers or overloaded shards may justify pulling earlier; profiling and SLOs determine the threshold."
+        },
+        {
+          "vi": "Hybrid giữ push cho tác giả thường và pull cho tác giả lớn. Khi chuyển chế độ, dùng mode_version và khoảng chồng lấp để không bỏ bài: cho phép cả push và pull trong thời gian chuyển, dedup bằng postId, rồi ngừng nguồn cũ sau watermark an toàn. Nếu chuyển tức thời mà không quan tâm in-flight jobs, feed có thể thiếu hoặc lặp bài.",
+          "en": "A hybrid pushes ordinary authors and pulls large ones. During a mode switch, use mode_version and an overlap window to avoid gaps: allow both push and pull temporarily, deduplicate by postId, then retire the old source after a safe watermark. Instant switching without accounting for in-flight jobs can create missing or duplicated entries."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Phương án",
+            "en": "Option"
+          },
+          {
+            "vi": "Lợi ích",
+            "en": "Benefit"
+          },
+          {
+            "vi": "Chi phí / rủi ro",
+            "en": "Cost / risk"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Push",
+              "en": "Push"
+            },
+            {
+              "vi": "Read path ít nguồn, dễ giữ latency ổn định.",
+              "en": "Few read sources make latency easier to bound."
+            },
+            {
+              "vi": "Write amplification, hot author, backlog, cleanup nhiều recipient.",
+              "en": "Write amplification, hot authors, backlog and cleanup across recipients."
+            }
+          ],
+          [
+            {
+              "vi": "Pull",
+              "en": "Pull"
+            },
+            {
+              "vi": "Không ghi timeline cho người không đọc.",
+              "en": "No timeline writes for people who never read."
+            },
+            {
+              "vi": "Merge nhiều author, fan-out RPC lúc đọc, tail latency.",
+              "en": "Many-author merging, read-time RPC fan-out and tail latency."
+            }
+          ],
+          [
+            {
+              "vi": "Hybrid",
+              "en": "Hybrid"
+            },
+            {
+              "vi": "Giới hạn chi phí cho author lớn và giữ read path thường nhanh.",
+              "en": "Bounds large-author cost while keeping ordinary reads fast."
+            },
+            {
+              "vi": "Hai đường dữ liệu, dedup và migration mode phức tạp hơn.",
+              "en": "Two data paths, deduplication and more complex mode migration."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "ranking-pagination",
+      "title": {
+        "vi": "8. Ranking, cursor và snapshot",
+        "en": "8. Ranking, cursors and snapshots"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với chronological feed, dùng keyset cursor (created_at, post_id), trong đó post_id phá hòa khi timestamp trùng nhau. Trang sau lấy khóa nhỏ hơn cursor. Chốt upper watermark ở trang đầu giúp bài mới xuất hiện ở lần refresh thay vì chen vào giữa phiên cuộn. ID có timestamp không tự đảm bảo thứ tự causality toàn cầu khi clock lệch; semantics hiển thị phải được định nghĩa riêng.",
+          "en": "For chronological feeds, use a keyset cursor (created_at, post_id), with post_id breaking timestamp ties. The next page selects keys below the cursor. An upper watermark fixed on the first page keeps new posts for a refresh rather than inserting them during scrolling. Timestamped IDs do not automatically provide global causal ordering under clock skew; define display semantics separately."
+        },
+        {
+          "vi": "Ranked feed không thể chỉ dùng last timestamp nếu score thay đổi giữa hai request. Có hai hướng: giữ snapshot danh sách candidate/score cho feed session có TTL, hoặc dùng ranking_version cùng seed và quy tắc ổn định có giới hạn. Snapshot tốn memory nhưng dễ tránh nhảy thứ tự; tính lại ranking nhẹ state hơn nhưng phải chấp nhận và giải thích khả năng lặp hoặc bỏ candidate.",
+          "en": "A ranked feed cannot rely only on the last timestamp when scores change between requests. One option stores a TTL-bound candidate/score snapshot per feed session; another uses a ranking_version, seed and bounded stability rules. Snapshots use memory but make ordering steadier; recalculation uses less state but requires explicit duplicate/gap semantics."
+        },
+        {
+          "vi": "Một pipeline hợp lý là candidate retrieval → lọc các điều kiện rẻ → scoring → diversity/dedup → hydrate/kiểm tra quyền cuối → response. Nếu scoring cần text hoặc feature thì hydrate một phần trước đó. Luôn giữ kiểm tra quyền cuối vì trạng thái có thể đổi sau khi snapshot được tạo. Không chạy N+1 query theo từng post; batch post và user profile lookup, cache feature với version phù hợp.",
+          "en": "A useful pipeline is candidate retrieval → cheap eligibility filters → scoring → diversity/deduplication → final hydration/authorization → response. Scoring that requires text or features may need partial hydration earlier. Retain the final authorization check because state can change after a snapshot is created. Avoid N+1 queries: batch post and user-profile lookups and version feature caches appropriately."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "SELECT post_id, sort_key\nFROM timeline\nWHERE recipient_id = :reader\n  AND (sort_key, post_id) < (:last_sort_key, :last_post_id)\n  AND sort_key <= :session_watermark\nORDER BY sort_key DESC, post_id DESC\nLIMIT :bounded_candidate_limit;",
+        "caption": {
+          "vi": "Minh họa keyset cho chronological feed. Cú pháp tuple và index support phụ thuộc database; cursor phải được xác minh trước khi bind các tham số.",
+          "en": "Illustrative keyset pagination for a chronological feed. Tuple syntax and index support depend on the database; verify the cursor before binding parameters."
+        }
+      }
+    },
+    {
+      "id": "delivery",
+      "title": {
+        "vi": "9. Outbox, chunking và consumer idempotency",
+        "en": "9. Outbox, chunking and consumer idempotency"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu ghi post thành công rồi publish event thất bại, post không tới timeline. Nếu publish trước rồi transaction post rollback, follower nhận ID không tồn tại. Transactional outbox ghi cả post và ý định publish trong cùng transaction; relay dùng polling hoặc CDC để phát các event đã commit. Relay crash sau publish nhưng trước khi đánh dấu delivered sẽ phát lặp, vì vậy outbox giải quyết mất event chứ không tự loại duplicate.",
+          "en": "Writing a post and then failing to publish its event leaves it absent from timelines. Publishing before a post transaction rolls back creates references to nonexistent posts. A transactional outbox stores the post and publication intent together; a polling or CDC relay emits committed events. A crash after publishing but before marking delivery causes duplicates, so the outbox prevents a delivery gap without eliminating duplication."
+        },
+        {
+          "vi": "Tách follower list thành chunk, ví dụ 1.000 recipient/job, nhưng chọn kích thước bằng latency và giới hạn payload thực tế. Checkpoint cần lưu author/post, chunk cursor, event version và trạng thái. ACK queue chỉ sau khi chunk được ghi và checkpoint đủ bền vững. Crash giữa ghi và ACK có thể replay; unique key hoặc conditional upsert phải khiến replay vô hại.",
+          "en": "Split followers into chunks, for example 1,000 recipients per job, but choose the size from measured latency and payload limits. A checkpoint records the author/post, chunk cursor, event version and status. Acknowledge the queue only after writes and checkpoints are sufficiently durable. A crash between writing and acknowledgement can cause replay; uniqueness or conditional upserts must make replay harmless."
+        },
+        {
+          "vi": "Partition event log theo author_id giữ thứ tự event của một author trong một partition, nhưng một author rất nóng vẫn gây bottleneck. Có thể tách fan-out chunks theo recipient shard sau khi xử lý thứ tự version của post; ordering cần giữ ở mức invariant thực sự, không phải mọi message toàn hệ thống. Tombstone/version ngăn một create event chạy chậm làm sống lại post đã xóa.",
+          "en": "Partitioning the event log by author_id preserves an author’s event order within one partition, but a hot author can still bottleneck it. Fan-out chunks can later be split by recipient shard after resolving post-version order. Preserve ordering where invariants require it, not across all messages globally. Tombstones/versions prevent a delayed create event from resurrecting a deleted post."
+        },
+        {
+          "vi": "Retry dùng exponential backoff với jitter và retry budget. Poison event bị đưa sang hàng cách ly có owner, alert và công cụ replay sau khi sửa nguyên nhân. Không xem DLQ là thùng rác: backlog DLQ chứa post chưa được phân phối và phải có SLO xử lý. Theo dõi tuổi event cũ nhất, không chỉ số message.",
+          "en": "Retries use exponential backoff with jitter and a retry budget. Quarantine poison events with ownership, alerts and a replay tool after fixing the cause. A DLQ is not a wastebasket: it contains undelivered posts and needs a handling SLO. Track the age of the oldest event, not only message count."
+        }
+      ]
+    },
+    {
+      "id": "privacy",
+      "title": {
+        "vi": "10. Delete, unfollow và privacy không dựa vào cache",
+        "en": "10. Deletion, unfollow and privacy cannot rely on caches"
+      },
+      "paragraphs": [
+        {
+          "vi": "Timeline cache có thể chứa candidate không còn hợp lệ; hệ thống phải phân biệt dữ liệu gợi ý với dữ liệu cấp quyền. Khi đọc, post hydration kiểm tra tombstone và audience hiện tại; policy kiểm tra block/follow bằng nguồn hoặc cache có cơ chế version và invalidation phù hợp với thời hạn thu hồi quyền đã cam kết. Nếu không xác minh được quyền cho post riêng tư, chọn fail closed và trả ít item hơn.",
+          "en": "A timeline cache may retain invalid candidates; distinguish suggestion data from authorization data. During reads, post hydration checks tombstones and current audience, while policy checks blocks/follows through an authoritative source or a versioned/invalidation cache that meets the promised revocation window. If a private post’s authorization cannot be established, fail closed and return fewer items."
+        },
+        {
+          "vi": "Để cam kết delete có hiệu lực ngay sau ACK, cần post-state cache invalidation có thứ tự hoặc read barrier/version check chống cache cũ. Chỉ gửi best-effort invalidation rồi vẫn đọc replica trễ không đáp ứng cam kết đó. Một lựa chọn thực tế là đọc deletion deny-set nhất quán trên read path trong cửa sổ replica/cache có thể trễ, sau đó compact khi tombstone đã lan truyền an toàn. Chi phí availability và latency phải được tính vào quyết định.",
+          "en": "To promise deletion immediately after acknowledgement, use ordered post-state invalidation or a read barrier/version check that rejects stale cache entries. Best-effort invalidation followed by reading a lagging replica cannot meet that promise. One possible approach checks a consistent deletion deny-set during the replica/cache lag window, then compacts it after tombstones propagate safely. Include availability and latency costs in the decision."
+        },
+        {
+          "vi": "Unfollow không nhất thiết xóa post public khỏi mọi màn hình, nhưng home feed cần semantics rõ: loại author khỏi candidate sau unfollow, còn profile public có thể vẫn đọc được. Với tài khoản private, thay đổi follow/approval còn thay đổi quyền nội dung. Cleanup timeline và CDN object là các tác vụ riêng; signed URL dài hạn có thể tiếp tục truy cập media dù API đã ngừng trả post.",
+          "en": "Unfollowing need not make a public post inaccessible everywhere, but the home-feed behavior must be explicit: exclude that author’s candidates while a public profile may remain readable. For private accounts, follow/approval changes also change content access. Timeline cleanup and CDN object handling are separate tasks; long-lived signed URLs may still expose media after the API stops returning a post."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Từ candidate đến nội dung được phép hiển thị",
+          "en": "From a candidate to content allowed to render"
+        },
+        "caption": {
+          "vi": "Không dựa vào fan-out cleanup hoặc TTL để thực thi privacy. Đường đọc phải áp chính sách quyền với nguồn trạng thái đủ mới theo contract.",
+          "en": "Do not rely on fan-out cleanup or TTL to enforce privacy. The read path must enforce authorization using state fresh enough for the contract."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Lấy candidate ID",
+              "en": "Fetch candidate IDs"
+            },
+            "detail": {
+              "vi": "Timeline hoặc nguồn pull.",
+              "en": "Timeline or pull sources."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Kiểm tra state và quyền",
+              "en": "Check state and permissions"
+            },
+            "detail": {
+              "vi": "Deleted, block, audience, follow.",
+              "en": "Deletion, blocks, audiences and follows."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Rank và hydrate",
+              "en": "Rank and hydrate"
+            },
+            "detail": {
+              "vi": "Chỉ dùng nội dung còn hợp lệ.",
+              "en": "Use only currently eligible content."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "failure",
+      "title": {
+        "vi": "11. Failure modes và cách degrade",
+        "en": "11. Failure modes and degradation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thiết kế degradation theo từng dependency. Không coi mọi lỗi đều nên fallback sang database: khi cả cache cluster hỏng, chuyển tất cả request sang DB có thể làm mất cả nguồn dữ liệu bền vững. Giới hạn concurrency, request coalescing, cache warming theo ưu tiên và admission control bảo vệ hệ thống gốc.",
+          "en": "Design degradation per dependency. Do not send every failure to the database: a cache-cluster outage can otherwise overwhelm the durable source too. Bound concurrency and use request coalescing, priority warming and admission control to protect the origin."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sự cố",
+            "en": "Failure"
+          },
+          {
+            "vi": "Biểu hiện",
+            "en": "Symptom"
+          },
+          {
+            "vi": "Phản ứng và kiểm chứng",
+            "en": "Response and verification"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Fan-out lag",
+              "en": "Fan-out lag"
+            },
+            {
+              "vi": "Post mới tới follower chậm; publish vẫn có thể thành công.",
+              "en": "New posts reach followers late while publishing may still succeed."
+            },
+            {
+              "vi": "Theo dõi age/lag; ưu tiên active recipients, tăng worker trong giới hạn shard, pull recent posts có budget. Không bypass privacy.",
+              "en": "Track age/lag; prioritize active recipients, scale workers within shard capacity and budget recent-post pulls. Never bypass privacy."
+            }
+          ],
+          [
+            {
+              "vi": "Timeline cache mất shard",
+              "en": "Timeline cache shard loss"
+            },
+            {
+              "vi": "Cache miss tăng tập trung một nhóm reader.",
+              "en": "Cache misses rise for a reader subset."
+            },
+            {
+              "vi": "Rebuild có rate limit, fallback chronological rút gọn, single-flight; giữ post store không bị thundering herd.",
+              "en": "Rate-limit rebuilds, offer a smaller chronological fallback and use single-flight to protect the post store from a herd."
+            }
+          ],
+          [
+            {
+              "vi": "Ranking timeout",
+              "en": "Ranking timeout"
+            },
+            {
+              "vi": "p99 tăng, scoring chưa xong trước deadline.",
+              "en": "p99 rises; scoring misses its deadline."
+            },
+            {
+              "vi": "Fallback deterministic theo thời gian trên candidate được phép xem; đánh dấu degraded, giữ cursor semantics phù hợp.",
+              "en": "Use a deterministic chronological fallback over authorized candidates; mark degradation and preserve compatible cursor semantics."
+            }
+          ],
+          [
+            {
+              "vi": "Policy service không khả dụng",
+              "en": "Policy service unavailable"
+            },
+            {
+              "vi": "Không xác nhận được audience riêng tư hoặc block state.",
+              "en": "Private audience or block state cannot be verified."
+            },
+            {
+              "vi": "Fail closed cho nội dung cần xác minh; không trả cache content như thể đã được cấp quyền. Đo số item bị loại và user impact.",
+              "en": "Fail closed for content requiring verification; cached content is not proof of authorization. Measure filtered items and user impact."
+            }
+          ],
+          [
+            {
+              "vi": "Worker replay / event cũ",
+              "en": "Worker replay / stale event"
+            },
+            {
+              "vi": "Duplicate inserts hoặc nguy cơ resurrect post.",
+              "en": "Duplicate inserts or possible post resurrection."
+            },
+            {
+              "vi": "Upsert unique key, version monotonic/tombstone; test crash trước và sau ACK.",
+              "en": "Unique-key upserts, monotonic versions/tombstones; test crashes before and after acknowledgement."
+            }
+          ],
+          [
+            {
+              "vi": "Một author quá nóng",
+              "en": "Hot author"
+            },
+            {
+              "vi": "Queue/shard nghẽn dù tải tổng chưa lớn.",
+              "en": "A queue/shard saturates below aggregate capacity."
+            },
+            {
+              "vi": "Đổi sang pull/hybrid có overlap, split chunk theo recipient shard, quota theo author và per-tenant fairness.",
+              "en": "Switch to pull/hybrid with overlap, split chunks by recipient shard and enforce author quotas and tenant fairness."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "12. Observability, kiểm thử và rollout",
+        "en": "12. Observability, testing and rollout"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo golden signals riêng cho publish và feed: rate, errors, duration và saturation. Đặt thêm freshness histogram theo post commit → timeline insert, fan-out chunk retry rate, oldest-event age, cache hit/miss theo shard, hydration batch latency, số candidate bị lọc theo lý do và tỷ lệ feed rỗng. Một endpoint 200 nhưng trả timeline cũ nhiều phút vẫn có thể vi phạm trải nghiệm.",
+          "en": "Measure rate, errors, duration and saturation separately for publishing and feed reads. Add commit-to-timeline freshness histograms, fan-out chunk retry rates, oldest-event age, shard-level cache hits/misses, hydration batch latency, candidate-filter reasons and empty-feed rates. A 200 response with a minutes-old timeline can still violate the user experience."
+        },
+        {
+          "vi": "Trace gắn requestId, postId/eventId và fanoutJobId để nối async work; không log nguyên text private hoặc token truy cập. Metric label không dùng userId/postId vì cardinality quá lớn. Dashboard phải phân biệt global load với hot shard và có runbook giảm push, chặn backlog độc, hoặc rollback ranking version.",
+          "en": "Link requestId, postId/eventId and fanoutJobId across asynchronous traces; avoid logging private text or access tokens. Do not use userId/postId as metric labels because cardinality explodes. Dashboards should distinguish global load from hot shards and include runbooks to reduce push, isolate poison backlog or roll back a ranking version."
+        },
+        {
+          "vi": "Kiểm thử quan trọng là crash sau DB commit trước event publish, sau timeline write trước queue ACK, delete trước create event trễ, unfollow trong lúc backfill và cursor đi qua hai post cùng timestamp. Chạy shadow read để so sánh push/pull candidate trước khi chuyển mode; rollout theo cohort nhỏ, đo gap/duplicate và privacy regression, rồi mới mở rộng.",
+          "en": "Critical tests crash after database commit but before event publication, after timeline writes but before queue acknowledgement, deliver a delayed create after deletion, unfollow during backfill and paginate across equal timestamps. Shadow-read push/pull candidates before switching modes; roll out to small cohorts, measure gaps/duplicates and privacy regressions, then expand."
+        }
+      ]
+    },
+    {
+      "id": "extensions",
+      "title": {
+        "vi": "13. Khi quy mô hoặc yêu cầu tăng",
+        "en": "13. When scale or requirements grow"
+      },
+      "paragraphs": [
+        {
+          "vi": "Multi-region cần chốt ownership của post/follow và read-your-writes. Có thể route tác giả tới home region để ghi, replicate post/event sang region đọc và dùng session token để tránh replica chưa thấy bài vừa đăng. Conflict resolution cho follow/unfollow cần version/semantics có chủ đích; last-write-wins theo wall clock có thể sai khi clock lệch.",
+          "en": "Multi-region operation needs explicit post/follow ownership and read-your-writes behavior. Writers may use a home region while posts/events replicate to read regions; session tokens can avoid replicas that have not observed a new post. Follow/unfollow conflict resolution needs intentional versions and semantics; wall-clock last-write-wins can be wrong under clock skew."
+        },
+        {
+          "vi": "Tách retention: timeline candidate chỉ giữ ngắn hạn, post store giữ theo chính sách sản phẩm và dữ liệu xóa phải được thu hồi theo quy trình riêng. Không nhân retention của post với số follower rồi gọi đó là dung lượng post store; fan-out copy ID và copy nội dung là hai mô hình chi phí khác nhau. Với media, object storage và CDN egress thường cần worksheet riêng.",
+          "en": "Separate retention policies: timeline candidates are short-lived, post storage follows product retention and deleted data has a separate removal process. Do not multiply post retention by follower count and call it post-store size; copying IDs and copying content have different costs. Media object storage and CDN egress typically need their own worksheet."
+        },
+        {
+          "vi": "Ranking nâng cao thêm feature store, experiment assignment, model version và feedback events. Impression phải có event ID để dedup và định nghĩa rõ lúc nào được tính là đã hiển thị. Không dùng dữ liệu tương lai trong offline evaluation; kiểm tra fairness, content policy và feedback loop bên cạnh click-through rate. Tối ưu một metric engagement có thể làm giảm chất lượng hoặc diversity của feed.",
+          "en": "Advanced ranking adds a feature store, experiment assignment, model versions and feedback events. Impressions need event IDs for deduplication and a clear definition of display. Avoid future-data leakage in offline evaluation; assess fairness, content policy and feedback loops alongside click-through rate. Optimizing one engagement metric can reduce feed quality or diversity."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "14. Interview drill và lời giải",
+        "en": "14. Interview drills and worked answers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tự trả lời trước khi mở lời giải. Với mỗi câu, nêu invariant, assumptions và điều kiện khiến bạn đổi lựa chọn; gọi đúng tên công nghệ chưa đủ để chứng minh thiết kế.",
+          "en": "Answer before opening the explanation. State the invariant, assumptions and conditions that would change your choice; naming a technology alone does not justify a design."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao không copy toàn bộ post vào từng timeline?",
+            "en": "Why not copy the full post into every timeline?"
+          },
+          "answer": [
+            {
+              "vi": "Copy ID giữ fan-out payload nhỏ và làm edit/delete dễ hơn vì nội dung có một nguồn sự thật. Đổi lại, đường đọc cần hydration bằng batch lookup và cache nội dung riêng. Copy snapshot nội dung có thể hợp lý cho trường hợp audit hoặc offline, nhưng phải có semantics version và thu hồi quyền rõ ràng.",
+              "en": "Copying IDs keeps fan-out payloads small and simplifies edits/deletion through one authoritative content source. Reads then need batched hydration and a separate content cache. Content snapshots may fit audit or offline use cases, but require explicit version and revocation semantics."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một celebrity có 20 triệu follower đăng bài thì sao?",
+            "en": "What happens when a celebrity with 20 million followers posts?"
+          },
+          "answer": [
+            {
+              "vi": "Push toàn bộ tạo 20 triệu timeline inserts cho một post, chưa tính retry. Ưu tiên pull recent posts của tác giả đó hoặc push chỉ active recipients; chia task theo shard, áp concurrency budget và merge/dedup khi đọc. Quyết định dựa vào posts rate, active follower reads và SLO, không chỉ follower count.",
+              "en": "Full push creates 20 million timeline inserts for one post before retries. Prefer pulling that author’s recent posts or pushing only active recipients; shard work, bound concurrency and merge/deduplicate on reads. Decide using posting rate, active follower reads and SLOs, not follower count alone."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Queue đã hỗ trợ exactly-once thì còn cần dedup không?",
+            "en": "If the queue supports exactly-once semantics, do we still need deduplication?"
+          },
+          "answer": [
+            {
+              "vi": "Có, vì phạm vi đảm bảo có thể chỉ là transaction trong broker. Ghi timeline vào database ngoài broker, gọi policy service và trả ACK là những side effect khác. Consumer cần idempotent write hoặc transaction phối hợp offset với output trong cùng phạm vi hỗ trợ; nếu không, crash vẫn có thể làm lặp.",
+              "en": "Yes. The guarantee may cover only transactions inside the broker. Writing a timeline in an external database, calling a policy service and acknowledging delivery are separate side effects. Consumers need idempotent writes or a supported transaction coupling offsets and outputs; otherwise crashes can still repeat work."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao cursor tốt hơn offset ở đây?",
+            "en": "Why is a cursor preferable to an offset here?"
+          },
+          "answer": [
+            {
+              "vi": "Offset lớn phải bỏ qua nhiều row và dữ liệu mới/xóa làm vị trí thay đổi. Keyset cursor dùng sort key ổn định để tiếp tục từ ranh giới đã thấy; ranked feed còn cần snapshot hoặc ranking version. Cursor không tự giải quyết privacy thay đổi: item vẫn được kiểm tra lại khi trả về.",
+              "en": "Large offsets skip many rows, and inserts/deletions shift positions. A keyset cursor continues from a stable sort boundary; ranked feeds additionally need snapshots or ranking versions. Cursors do not solve changing privacy: items must still be reauthorized."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một post đã xóa xuất hiện lại sau retry, lỗi nằm ở đâu?",
+            "en": "A deleted post reappears after a retry. What failed?"
+          },
+          "answer": [
+            {
+              "vi": "Create event cũ có thể chạy sau delete hoặc worker chỉ upsert theo event đến sau. Cần version monotonic/tombstone không bị ghi đè bởi event cũ, và hydrate kiểm tra post state authoritative. Việc timeline đã cleanup một lần không bảo đảm các job đang bay không thể ghi lại candidate.",
+              "en": "A delayed create may follow deletion, or the worker may blindly accept the last arriving event. Use monotonic versions/tombstones that reject stale events and check authoritative post state during hydration. Cleaning a timeline once does not stop in-flight jobs from reinserting a candidate."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bài tập: tăng follower trung bình từ 200 lên 800 thì phần nào tăng bốn lần?",
+            "en": "Exercise: average followers increase from 200 to 800. What grows fourfold?"
+          },
+          "answer": [
+            {
+              "vi": "Với cùng 15 triệu post/ngày và push 100%, timeline inserts tăng từ khoảng 34.722/s lên 138.889/s. Post writes vẫn khoảng 174/s; payload timeline vẫn 240 GB nếu giữ đúng 500 ID cho 30 triệu user. Backlog/trim churn có thể tăng dù kích thước cache bị chặn bởi retention.",
+              "en": "With 15 million posts/day and 100% push, timeline inserts rise from about 34,722/s to 138,889/s. Post writes remain about 174/s; timeline payload remains 240 GB if each of 30 million users still keeps 500 IDs. Backlog and trimming churn may increase even when retention bounds cache size."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Khi ranking timeout, có thể trả cache response cũ luôn không?",
+            "en": "When ranking times out, can we immediately return an old cached response?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi cached item vẫn đi qua kiểm tra quyền hiện tại và đáp ứng semantics freshness. Lựa chọn đơn giản hơn là chronological fallback trên candidate hợp lệ với deadline và work budget. Cache response cá nhân hóa cần key theo identity/policy version và không được chia sẻ nhầm giữa user.",
+              "en": "Only if cached items still pass current authorization and meet freshness semantics. A simpler option is a bounded chronological fallback over valid candidates. Personalized response caches need identity/policy-version keys and must never be accidentally shared between users."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bạn sẽ bắt đầu monolith hay microservices?",
+            "en": "Would you begin with a monolith or microservices?"
+          },
+          "answer": [
+            {
+              "vi": "Một modular service với database và queue/outbox có thể đủ. Tách boundary logic trước: publish, graph/policy, candidate retrieval, hydration và worker. Chỉ tách deployment khi ownership, scaling hoặc isolation có lợi ích đo được; thêm network hops sớm làm consistency và vận hành khó hơn.",
+              "en": "A modular service with a database and queue/outbox can be enough. Establish logical boundaries first: publishing, graph/policy, candidate retrieval, hydration and workers. Split deployments when ownership, scaling or isolation yields measurable benefits; premature network hops complicate consistency and operations."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "cache",
+    "messaging",
+    "database",
+    "distributed"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một post đi vào feed như thế nào?",
+      "en": "How does a post reach a feed?"
+    },
+    "caption": {
+      "vi": "Đây là đường push phổ biến; hybrid có thể pull bài của tác giả nhiều follower lúc đọc. Khi trả feed vẫn phải kiểm tra quyền xem và trạng thái hiện tại.",
+      "en": "This is a typical push path; a hybrid may pull posts from high-fan-out authors at read time. Feed responses still enforce current visibility and state."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Commit bài viết",
+          "en": "Commit the post"
+        },
+        "detail": {
+          "vi": "Post và outbox trong một transaction.",
+          "en": "Post and outbox in one transaction."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Phân phối candidate",
+          "en": "Distribute candidates"
+        },
+        "detail": {
+          "vi": "Worker chia chunk theo recipient.",
+          "en": "Workers split work by recipient."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Đọc timeline",
+          "en": "Read the timeline"
+        },
+        "detail": {
+          "vi": "Cursor ổn định, push/pull candidates.",
+          "en": "Stable cursors and push/pull candidates."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Lọc, rank và hydrate",
+          "en": "Filter, rank and hydrate"
+        },
+        "detail": {
+          "vi": "Quyền xem, delete, payload hiện tại.",
+          "en": "Visibility, deletion and current payloads."
+        },
+        "icon": "shield"
+      }
+    ]
+  }
+}

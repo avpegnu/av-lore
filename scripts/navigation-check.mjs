@@ -23,14 +23,14 @@ try {
   await page.goto(origin + '/handbook/system-design/url-shortener/', { waitUntil: 'networkidle' });
   await expect(page.locator('.sidebar a[aria-current=page]')).toHaveCount(1);
   await expect(page.locator('.sidebar a[aria-current=page]')).toContainText('URL Shortener');
-  expect(await page.locator('.sidebar [data-active=true]').count()).toBe(1);
+  expect(await page.locator('.sidebar [data-active=true]').count()).toBe(2);
   for (const e of await page.locator('.sidebar [data-active=true]').all())
     await expect(e).toHaveAttribute('open', '');
   await expect(page.locator('.breadcrumb')).toContainText('Case Studies');
   await expect(page.locator('.breadcrumb')).not.toContainText('Notes & Interview');
-  await expect(page.locator('.sidebar nav > [data-nav-id=system-design-cases]')).toHaveCount(1);
+  await expect(page.locator('.sidebar [data-nav-id=system-design-ai] [data-nav-id=system-design-cases]')).toHaveCount(1);
   await expect(page.locator('[data-nav-id=handbook]')).not.toHaveAttribute('open');
-  await expect(page.locator('.breadcrumb li').last()).toHaveText('URL Shortener');
+  await expect(page.locator('.breadcrumb li').last()).toHaveText(JSON.parse(fs.readFileSync('src/content/handbook/url-shortener.json','utf8')).title.vi);
   await page.locator('[data-nav-id=system-design-cases]>summary').click();
   await expect(page.locator('[data-nav-id=system-design-cases]')).not.toHaveAttribute('open');
   await page.reload();
@@ -50,7 +50,7 @@ try {
   await expect(page.locator('.sidebar a[aria-current=page]')).toContainText('All case studies');
   await page.goto(origin + '/handbook/system-design/url-shortener/', { waitUntil: 'networkidle' });
   report.checks.push(
-    'Top-level case navigation, dedicated bilingual catalog, breadcrumb and fold persistence',
+    'System Design & AI case branch, dedicated bilingual catalog, breadcrumb and fold persistence',
   );
   for (const theme of themeIds) {
     await page.locator('#theme-toggle').click();

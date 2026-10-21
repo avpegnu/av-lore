@@ -1,0 +1,739 @@
+{
+  "id": "messaging",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Messaging, Queues và Event-Driven Design",
+    "en": "Messaging, Queues and Event-Driven Design"
+  },
+  "summary": {
+    "vi": "Từ một event tới effect đáng tin cậy: partition, offset, replay, outbox, DLQ và saga với các boundary rõ ràng.",
+    "en": "From an event to a reliable effect: partitions, offsets, replay, outbox, DLQs and sagas with explicit boundaries."
+  },
+  "prerequisites": [
+    "consistency",
+    "databases"
+  ],
+  "relatedTopics": [
+    "messaging",
+    "distributed",
+    "architecture"
+  ],
+  "takeaways": [
+    {
+      "vi": "ACK của broker không phải bằng chứng side effect đã hoàn tất.",
+      "en": "A broker acknowledgement does not prove side-effect completion."
+    },
+    {
+      "vi": "Ordering cần key, generation và consumer execution semantics, không chỉ tên topic.",
+      "en": "Ordering needs keys, generations and execution semantics, not just a topic name."
+    },
+    {
+      "vi": "Outbox atomic ở local; relay và consumer vẫn cần chịu duplicate.",
+      "en": "An outbox is locally atomic; relays and consumers still handle duplicates."
+    },
+    {
+      "vi": "Replay và DLQ phải giữ invariant, ordering và retention contract.",
+      "en": "Replay and DLQs must preserve invariants, ordering and retention contracts."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Theo dấu một logical event",
+      "en": "Follow one logical event"
+    },
+    "caption": {
+      "vi": "Phân biệt intent, publication, effect và progress; mỗi mốc có failure window riêng.",
+      "en": "Distinguish intent, publication, effect and progress; each has its own failure window."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Commit intent",
+          "en": "Commit intent"
+        },
+        "detail": {
+          "vi": "Business state và outbox local.",
+          "en": "Business state and local outbox."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Publish và deliver",
+          "en": "Publish and deliver"
+        },
+        "detail": {
+          "vi": "Broker contract và subscription.",
+          "en": "Broker contract and subscriptions."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Apply an toàn",
+          "en": "Apply safely"
+        },
+        "detail": {
+          "vi": "Idempotency, ordering, transaction.",
+          "en": "Idempotency, ordering and transactions."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Theo dõi và replay",
+          "en": "Observe and replay"
+        },
+        "detail": {
+          "vi": "Offset, lag, DLQ, reconciliation.",
+          "en": "Offsets, lag, DLQs and reconciliation."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "purpose",
+      "title": {
+        "vi": "1. Async đổi cả kiến trúc lẫn trải nghiệm",
+        "en": "1. Async changes architecture and user experience"
+      },
+      "paragraphs": [
+        {
+          "vi": "Messaging tách người tạo việc khỏi người thực hiện và thời điểm hoàn tất. Client có thể nhận “accepted” trước khi email gửi, ảnh resize hoặc read model cập nhật. Vì vậy phải phân biệt đã lưu intent, đã publish, đã xử lý và đã hoàn tất side effect; một ACK ở broker không chứng minh payment provider đã charge.",
+          "en": "Messaging separates work creation from execution and completion. Clients may receive “accepted” before email delivery, image resizing or read-model updates. Distinguish persisted intent, publication, processing and side-effect completion: broker acknowledgement does not prove a payment provider charged."
+        },
+        {
+          "vi": "Queue/log hấp thụ burst trong giới hạn disk, retention và tốc độ drain; chúng không tạo capacity miễn phí. Nếu arrival luôn lớn hơn processing rate, backlog vẫn tăng tới khi hết tài nguyên hoặc dữ liệu hết retention. Một synchronous call đơn giản có thể hợp lý hơn nếu caller cần kết quả ngay và không cần replay/fan-out.",
+          "en": "Queues/logs absorb bursts within disk, retention and drain limits; they do not create free capacity. Sustained arrival above processing rate grows the backlog until resources or retention run out. A simple synchronous call may fit better when the caller needs the result immediately without replay or fan-out."
+        }
+      ]
+    },
+    {
+      "id": "queue-log",
+      "title": {
+        "vi": "2. Queue và log: hỏi về semantics, không chỉ tên sản phẩm",
+        "en": "2. Queue versus log: ask about semantics, not product names"
+      },
+      "paragraphs": [
+        {
+          "vi": "Command yêu cầu làm một việc; event ghi nhận một sự thật đã xảy ra. Queue thường phân phối việc cho competing consumers và xóa delivery khi ACK; log giữ record để các subscription/group có tiến độ độc lập và replay trong retention. Đây là cách phân biệt mô hình sử dụng, không phải ranh giới tuyệt đối của mọi sản phẩm.",
+          "en": "A command requests work; an event records a fact. A queue commonly distributes work to competing consumers and removes acknowledged deliveries. A log retains records for independent subscription/group progress and replay within retention. This distinguishes usage models, not every product’s capabilities."
+        },
+        {
+          "vi": "Ordering cần contract cụ thể: FIFO ở broker, delivery order và completion order là các thứ khác nhau. Prefetch, nhiều worker, retry hoặc requeue có thể làm effect hoàn tất khác thứ tự enqueue. Nếu “Cancel sau Create” phải được áp đúng, hãy thiết kế per-key sequencing hoặc version/state-machine validation ở consumer.",
+          "en": "Broker FIFO, delivery order and completion order differ. Prefetch, parallel workers, retries and requeueing can change effect order. If Cancel must follow Create, design per-key sequencing or consumer-side version/state-machine validation."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Queue · Chia việc",
+            "en": "Queue · Distribute work"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Một logical job có thể được redeliver khi ACK bị mất.",
+              "en": "A logical job may be redelivered when acknowledgement is lost."
+            },
+            {
+              "vi": "Visibility/ACK deadline và retry policy phụ thuộc broker.",
+              "en": "Visibility/acknowledgement deadlines and retries depend on the broker."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Log · Nhiều tiến độ đọc",
+            "en": "Log · Independent read progress"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Group giữ offset riêng; replay vẫn phải kiểm soát side effect.",
+              "en": "Groups keep separate offsets; replay still needs side-effect controls."
+            },
+            {
+              "vi": "Retention/compaction quyết định record nào còn để đọc lại.",
+              "en": "Retention/compaction determines what remains available for replay."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "groups",
+      "title": {
+        "vi": "3. Partition, key và classic consumer group",
+        "en": "3. Partitions, keys and classic consumer groups"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong classic group, mỗi partition được gán cho một member ở một generation. Group khác có assignment/offset riêng nên cùng một event có thể phục vụ billing projection, analytics và notifications. Thêm consumer vượt partition count tạo member idle; CPU của consumer vẫn có thể dùng worker pool bên trong, nhưng khi đó phải tự giữ ordering và progress.",
+          "en": "In a classic group, a partition is assigned to one member in a generation. Other groups maintain their own assignments/offsets, letting one event feed billing projections, analytics and notifications. Consumers beyond the partition count sit idle; internal worker pools can add concurrency but must preserve ordering and progress."
+        },
+        {
+          "vi": "Key thường là aggregate cần ordering, như order ID. Cùng key tới cùng partition chỉ giữ append order của log trong cấu hình routing hiện tại, không tự tái tạo business causality của nhiều producer. Producer sequencing, retry configuration, version và việc đổi partition count đều có thể ảnh hưởng thứ tự bạn cần.",
+          "en": "Keys commonly identify the aggregate needing order, such as an order ID. A shared key preserves log append order under current routing, not arbitrary business causality across producers. Producer sequencing, retry configuration, versions and changes to partition count can affect the required order."
+        }
+      ],
+      "experiment": "consumer-groups"
+    },
+    {
+      "id": "offsets",
+      "title": {
+        "vi": "4. Rebalance và khoảng trống khi xử lý song song",
+        "en": "4. Rebalances and holes in parallel processing"
+      },
+      "paragraphs": [
+        {
+          "vi": "Member rời group hoặc partition được reassigned không làm thread cũ đang gọi external API tự dừng. Trước khi nhường ownership cần ngừng nhận việc, drain/cancel phù hợp và không commit sau khi mất quyền. Side effect cần idempotency hoặc fencing ở resource để chống worker cũ còn chạy.",
+          "en": "Group reassignment does not automatically stop a stale thread calling an external API. Stop admission, drain/cancel as appropriate and avoid commits after losing authority. Resource-side idempotency or fencing protects against stale workers still executing."
+        },
+        {
+          "vi": "Nếu offset 0 chưa xong nhưng 1 và 2 đã xong, commit 3 có thể bỏ mất 0 sau crash. Giữ “next offset” ở prefix durable liên tục. Offset chỉ là tiến độ của partition; cập nhật projection đúng semantics và kiểm soát external effect vẫn là trách nhiệm riêng.",
+          "en": "If offset 0 is unfinished while 1 and 2 are complete, committing 3 may skip 0 after a crash. Advance the next offset only through the contiguous durable prefix. An offset tracks partition progress; projection correctness and external effects remain separate responsibilities."
+        }
+      ],
+      "experiment": "offset-gaps"
+    },
+    {
+      "id": "delivery",
+      "title": {
+        "vi": "5. Điểm ACK quyết định mất việc hay xử lý lặp",
+        "en": "5. Acknowledgement placement determines loss or repetition"
+      },
+      "paragraphs": [
+        {
+          "vi": "ACK/commit tiến độ trước effect có thể mất việc khi crash giữa hai bước. Effect trước ACK giữ khả năng redelivery nhưng có thể lặp effect. Delivery guarantee không phải một thuộc tính của cả hệ thống nếu chưa nói boundary từ producer, broker tới đích cuối.",
+          "en": "Acknowledging progress before the effect can lose work if a crash occurs between them. Applying the effect first permits redelivery but can duplicate it. A delivery guarantee needs a defined producer–broker–destination boundary."
+        },
+        {
+          "vi": "Idempotency không chỉ là “check event ID rồi chạy”. Check và effect phải có transaction/conditional-write contract thích hợp; hai worker check cùng lúc vẫn có thể cùng thấy chưa xử lý. Dedup retention cũng phải bao phủ khoảng replay/redelivery mà bạn hứa hỗ trợ.",
+          "en": "Idempotency requires more than checking an event ID before work. The check and effect need an appropriate transaction/conditional-write contract; concurrent workers may both otherwise see an unseen event. Dedup retention must cover the promised replay/redelivery horizon."
+        }
+      ],
+      "experiment": "delivery-crash"
+    },
+    {
+      "id": "exactly-once",
+      "title": {
+        "vi": "6. Exactly-once có phạm vi",
+        "en": "6. Exactly-once has a scope"
+      },
+      "paragraphs": [
+        {
+          "vi": "Kafka transactions có thể kết hợp các output records và consumer offsets trong Kafka; consumer đọc committed data cần cấu hình phù hợp. Idempotent producer xử lý một số duplicate do retry ở producer, không tự nhận ra hai business requests độc lập nhưng cùng ý nghĩa. Nêu API, transaction boundary và isolation trước khi dùng chữ exactly-once.",
+          "en": "Kafka transactions can combine output records and consumer offsets within Kafka, with suitable committed-read configuration. Producer idempotence addresses certain producer-retry duplicates, not independent business requests expressing the same intent. Define APIs, transaction boundaries and isolation before claiming exactly-once."
+        },
+        {
+          "vi": "Khi ghi database riêng hoặc gọi provider, cần sự hợp tác của sink: transaction ghi effect và progress, unique receipt, conditional update hoặc provider idempotency key. Một số connector/sink có protocol bảo đảm riêng; không thể suy ra từ việc “dùng Kafka”, cũng không nên khẳng định mọi exactly-once ngoài Kafka đều bất khả thi.",
+          "en": "A separate database/provider needs sink cooperation: effect-and-progress transactions, unique receipts, conditional updates or provider idempotency keys. Some connectors/sinks provide their own protocols. Kafka alone neither proves these guarantees nor makes every external exactly-once arrangement impossible."
+        }
+      ]
+    },
+    {
+      "id": "outbox",
+      "title": {
+        "vi": "7. Transactional outbox khép khoảng trống dual write",
+        "en": "7. Transactional outbox closes the dual-write gap"
+      },
+      "paragraphs": [
+        {
+          "vi": "Save order rồi publish event là hai lần ghi khác hệ thống. Nếu save xong rồi process chết, event có thể không bao giờ xuất hiện. Ghi order và outbox trong một local transaction làm chúng cùng tồn tại hoặc cùng rollback. Relay/poller/CDC sau đó đọc committed outbox và publish với event ID ổn định.",
+          "en": "Saving an order and publishing its event are two writes to different systems. A crash after saving may omit publication. An order and outbox in one local transaction either both exist or both roll back. A relay/poller/CDC process then publishes committed outbox records using stable event IDs."
+        },
+        {
+          "vi": "Relay có thể publish thành công rồi chết trước khi đánh dấu published, nên consumer vẫn phải chịu duplicate. Nếu đánh dấu trước publish thì lại có cửa sổ mất event. Theo dõi outbox age, retry, poison row và retention; giữ thứ tự per aggregate khi đó là contract, không chỉ chạy nhiều relay rồi hy vọng.",
+          "en": "A relay can publish successfully and crash before marking publication, so consumers still need duplicate handling. Marking first reintroduces a loss window. Observe outbox age, retries, poison rows and retention, and preserve aggregate order where required instead of assuming more relays are safe."
+        }
+      ]
+    },
+    {
+      "id": "flow",
+      "title": {
+        "vi": "8. Theo dấu event từ commit đến effect",
+        "en": "8. Trace an event from commit to effect"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn từng path để phân biệt publish acknowledgement với effect completion. Subscription của ví dụ là projection nội bộ; không biểu diễn một external charge như thể nó nằm trong cùng transaction.",
+          "en": "Select each path to distinguish publication acknowledgement from effect completion. This example uses an internal projection, not an external charge pretending to share its transaction."
+        }
+      ],
+      "diagram": {
+        "id": "outbox-event-path",
+        "title": {
+          "vi": "Order, outbox và projection idempotent",
+          "en": "Order, outbox and an idempotent projection"
+        },
+        "caption": {
+          "vi": "Mũi tên thể hiện trao đổi logic; relay và consumer tiến triển bất đồng bộ sau order commit.",
+          "en": "Arrows show logical exchanges; relay and consumer progress asynchronously after the order commit."
+        },
+        "width": 1040,
+        "height": 450,
+        "nodes": [
+          {
+            "id": "api",
+            "label": {
+              "vi": "Order API",
+              "en": "Order API"
+            },
+            "kind": "service",
+            "x": 120,
+            "y": 170,
+            "detail": {
+              "vi": "Nhận order intent và request ID; ACK nghiệp vụ theo trạng thái đã lưu.",
+              "en": "Receive the order intent and request ID; acknowledge the persisted business state."
+            }
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Orders + outbox",
+              "en": "Orders + outbox"
+            },
+            "kind": "store",
+            "x": 380,
+            "y": 170,
+            "detail": {
+              "vi": "Một local transaction lưu cả order và event ổn định.",
+              "en": "One local transaction stores the order and stable event."
+            }
+          },
+          {
+            "id": "relay",
+            "label": {
+              "vi": "Relay / CDC",
+              "en": "Relay / CDC"
+            },
+            "kind": "worker",
+            "x": 640,
+            "y": 80,
+            "detail": {
+              "vi": "Đọc committed outbox; publish lại cùng event ID khi outcome chưa biết.",
+              "en": "Read committed outbox records; republish the same event ID when outcome is unknown."
+            }
+          },
+          {
+            "id": "broker",
+            "label": {
+              "vi": "Event broker",
+              "en": "Event broker"
+            },
+            "kind": "queue",
+            "x": 900,
+            "y": 170,
+            "detail": {
+              "vi": "Lưu theo durability/retention contract; phân phối event tới subscription/group.",
+              "en": "Persist under the durability/retention contract and distribute to subscriptions/groups."
+            }
+          },
+          {
+            "id": "worker",
+            "label": {
+              "vi": "Projection worker",
+              "en": "Projection worker"
+            },
+            "kind": "worker",
+            "x": 640,
+            "y": 340,
+            "detail": {
+              "vi": "Consumer có thể nhận event lặp và cần dedup cùng transaction với effect.",
+              "en": "The consumer may receive duplicates and needs transactional effect/dedup."
+            }
+          },
+          {
+            "id": "projection",
+            "label": {
+              "vi": "Projection + inbox",
+              "en": "Projection + inbox"
+            },
+            "kind": "store",
+            "x": 380,
+            "y": 340,
+            "detail": {
+              "vi": "Receipt và projection update commit cùng nhau; ACK tiến độ sau commit.",
+              "en": "Commit the receipt and projection update together; acknowledge progress afterwards."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "publish",
+            "label": {
+              "vi": "Commit và publish",
+              "en": "Commit and publish"
+            },
+            "steps": [
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Lưu order và outbox event trong một transaction.",
+                  "en": "Store the order and outbox event in one transaction."
+                },
+                "async": false
+              },
+              {
+                "from": "db",
+                "to": "api",
+                "description": {
+                  "vi": "Commit được xác nhận; API trả trạng thái order đã nhận, chưa hứa projection đã xong.",
+                  "en": "Commit is confirmed; the API acknowledges the order without promising completed projections."
+                },
+                "async": false
+              },
+              {
+                "from": "db",
+                "to": "relay",
+                "description": {
+                  "vi": "Relay đọc committed event.",
+                  "en": "The relay reads the committed event."
+                },
+                "async": true
+              },
+              {
+                "from": "relay",
+                "to": "broker",
+                "description": {
+                  "vi": "Publish event ID ổn định và chờ broker ACK theo contract.",
+                  "en": "Publish a stable event ID and await the broker acknowledgement contract."
+                },
+                "async": false
+              },
+              {
+                "from": "broker",
+                "to": "relay",
+                "description": {
+                  "vi": "Broker ACK; relay có thể ghi nhận publication checkpoint.",
+                  "en": "The broker acknowledges; the relay may record its publication checkpoint."
+                },
+                "async": false
+              }
+            ]
+          },
+          {
+            "id": "consume",
+            "label": {
+              "vi": "Effect và ACK",
+              "en": "Effect and acknowledgement"
+            },
+            "steps": [
+              {
+                "from": "broker",
+                "to": "worker",
+                "description": {
+                  "vi": "Deliver event; chưa coi effect đã hoàn tất.",
+                  "en": "Deliver the event without considering its effect complete."
+                },
+                "async": true
+              },
+              {
+                "from": "worker",
+                "to": "projection",
+                "description": {
+                  "vi": "Transaction lưu inbox ID cùng projection change; lỗi phải rollback cả hai.",
+                  "en": "A transaction saves the inbox ID and projection change; errors roll back both."
+                },
+                "async": false
+              },
+              {
+                "from": "projection",
+                "to": "worker",
+                "description": {
+                  "vi": "Commit receipt và effect.",
+                  "en": "Commit the receipt and effect."
+                },
+                "async": false
+              },
+              {
+                "from": "worker",
+                "to": "broker",
+                "description": {
+                  "vi": "ACK/commit offset sau durable effect theo contract.",
+                  "en": "Acknowledge/commit progress after the durable effect under the contract."
+                },
+                "async": false
+              }
+            ]
+          },
+          {
+            "id": "duplicate",
+            "label": {
+              "vi": "Crash sau effect",
+              "en": "Crash after effect"
+            },
+            "steps": [
+              {
+                "from": "broker",
+                "to": "worker",
+                "description": {
+                  "vi": "ACK trước đã mất; broker redeliver cùng event ID.",
+                  "en": "An earlier acknowledgement was lost; redeliver the same event ID."
+                },
+                "async": true
+              },
+              {
+                "from": "worker",
+                "to": "projection",
+                "description": {
+                  "vi": "Unique inbox receipt cho biết logical event đã commit.",
+                  "en": "The unique inbox receipt identifies an already committed logical event."
+                },
+                "async": false
+              },
+              {
+                "from": "projection",
+                "to": "worker",
+                "description": {
+                  "vi": "Trả kết quả đã xử lý mà không lặp projection change.",
+                  "en": "Return the processed outcome without repeating the projection change."
+                },
+                "async": false
+              },
+              {
+                "from": "worker",
+                "to": "broker",
+                "description": {
+                  "vi": "Consumer ACK lại delivery; duplicate đã được hấp thụ trong boundary này.",
+                  "en": "Acknowledge again; this boundary has absorbed the duplicate."
+                },
+                "async": false
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "poison",
+      "title": {
+        "vi": "9. Retry, DLQ và ordering phải cùng một thiết kế",
+        "en": "9. Design retries, DLQs and ordering together"
+      },
+      "paragraphs": [
+        {
+          "vi": "Transient failure nên retry có giới hạn, backoff, jitter và deadline. Invalid schema hoặc lỗi deterministic không tự khỏi bằng retry vô hạn. DLQ cần event ID, aggregate/version, lỗi, attempt count và thời điểm đầu/cuối; có owner, alert, công cụ xem và redrive sau khi sửa nguyên nhân.",
+          "en": "Transient failures need bounded retries, backoff, jitter and deadlines. Invalid schemas and deterministic bugs do not heal through infinite retries. A DLQ needs IDs, aggregate/version, errors, attempt counts and first/last times, with ownership, alerts, inspection and controlled redrive."
+        },
+        {
+          "vi": "Đưa event lỗi sang retry topic/DLQ rồi tiếp tục có thể cho event sau của cùng key đi trước. Nếu invariant đòi ordering nghiêm, có thể park cả aggregate, dùng retry lane theo key hoặc consumer state machine từ chối version chưa có predecessor. Không mặc định DLQ là giải pháp miễn phí cho một partition bị block.",
+          "en": "Moving a record to a retry topic/DLQ can let later records for its key overtake it. Strict ordering may require parking the aggregate, per-key retry lanes or state machines rejecting versions without predecessors. A DLQ is not a free solution to partition blocking."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một message thất bại đi đâu?",
+          "en": "Where does a failed message go?"
+        },
+        "caption": {
+          "vi": "Đường retry/redrive phải giữ idempotency và ordering contract; không xóa record chỉ để dashboard hết đỏ.",
+          "en": "Retry/redrive must preserve idempotency and ordering; do not remove records merely to clear a dashboard."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Phân loại lỗi",
+              "en": "Classify the failure"
+            },
+            "detail": {
+              "vi": "Transient, invalid hay unknown outcome?",
+              "en": "Transient, invalid or unknown outcome?"
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Retry có budget",
+              "en": "Retry within a budget"
+            },
+            "detail": {
+              "vi": "Backoff, attempt cap, deadline.",
+              "en": "Backoff, attempt cap and deadline."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Park và điều tra",
+              "en": "Park and investigate"
+            },
+            "detail": {
+              "vi": "DLQ + owner + thông tin chẩn đoán.",
+              "en": "DLQ, ownership and diagnostic context."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Redrive có kiểm soát",
+              "en": "Redrive with controls"
+            },
+            "detail": {
+              "vi": "Sửa nguyên nhân, giữ ID, throttle.",
+              "en": "Fix the cause, retain IDs and throttle."
+            },
+            "icon": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "backpressure",
+      "title": {
+        "vi": "10. Capacity, lag và thời gian phục hồi",
+        "en": "10. Capacity, lag and recovery time"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với arrival λ và xử lý μ đo cùng đơn vị event/s, backlog B chỉ giảm khi μ>λ; drain time xấp xỉ B/(μ−λ) nếu rate ổn định. Ví dụ B=600.000, λ=2.000/s, μ=3.000/s thì cần 600 giây. Replay/backfill, retries và event fan-out đều phải cộng vào tải.",
+          "en": "For rates λ and μ in events/s, backlog B drains only when μ>λ; under stable rates its drain time is approximately B/(μ−λ). With B=600,000, λ=2,000/s and μ=3,000/s, draining takes 600 seconds. Include replay/backfill, retries and event fan-out in the load."
+        },
+        {
+          "vi": "Lag count hữu ích cho capacity nhưng event age/oldest unprocessed age sát freshness SLO hơn khi traffic đổi. Theo dõi cả hai cùng processing latency và skew theo partition/key. Bound prefetch, in-flight work và queue memory; visibility extension/heartbeat giúp job dài nhưng không thay thế idempotency khi lease hết hạn hoặc worker pause.",
+          "en": "Lag count helps capacity planning while event age/oldest-unprocessed age better tracks freshness under changing traffic. Observe both alongside processing latency and partition/key skew. Bound prefetch, in-flight work and memory. Visibility extension/heartbeats help long jobs but do not replace idempotency after lease expiry or pauses."
+        }
+      ]
+    },
+    {
+      "id": "sagas",
+      "title": {
+        "vi": "11. Saga là local commit và bước bù",
+        "en": "11. Sagas use local commits and compensation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Orchestration giữ workflow state và quyết định bước tiếp theo; choreography phân tán phản ứng qua event. Cả hai đều cần durable state, correlation, timeout, idempotency và owner của failure. Chọn theo độ phức tạp, khả năng quan sát và quyền sở hữu, không vì coordinator luôn xấu hoặc events luôn ít coupling.",
+          "en": "Orchestration records workflow state and chooses the next step; choreography distributes reactions across events. Both need durable state, correlation, timeouts, idempotency and failure ownership. Choose for complexity, observability and ownership, not a claim that coordinators are always bad or events always loosely coupled."
+        },
+        {
+          "vi": "Reserve → charge → ship có thể thất bại ở mỗi bước. Compensation như release inventory hoặc refund là transaction mới có thể thất bại; một shipment đã rời kho không thể “rollback” bằng xóa row. Business state phải thể hiện pending/compensating/manual-review thay vì coi mọi timeout là đã hủy.",
+          "en": "Reserve → charge → ship can fail at each step. Releasing inventory or refunding is a new, fallible transaction; a shipped parcel cannot be rolled back by deleting a row. Represent pending, compensating and manual-review states rather than treating every timeout as cancellation."
+        }
+      ]
+    },
+    {
+      "id": "schema",
+      "title": {
+        "vi": "12. Event là API, event sourcing là quyết định khác",
+        "en": "12. Events are APIs; event sourcing is a separate decision"
+      },
+      "paragraphs": [
+        {
+          "vi": "Envelope nên có event ID, type/version, aggregate ID/version, occurred-at và correlation/causation IDs theo nhu cầu. Phân biệt event time với processing time; late events cần policy rõ. Kiểm tra compatibility của schema và ý nghĩa field; schema registry không phát hiện được việc amount đổi đơn vị mà tên field vẫn giữ nguyên.",
+          "en": "An envelope may carry an event ID, type/version, aggregate ID/version, occurrence time and correlation/causation IDs. Distinguish event time from processing time and define late-event handling. Test semantic as well as schema compatibility; a registry cannot detect a changed amount unit behind an unchanged field name."
+        },
+        {
+          "vi": "Event-driven không đồng nghĩa event sourcing. Event sourcing lấy event history làm nguồn sự thật và dựng projection bằng replay; đòi hỏi chiến lược evolution, snapshot, replay side effects và dữ liệu nhạy cảm. Một outbox ghi event từ database state vẫn có thể giữ database là source of truth.",
+          "en": "Event-driven does not imply event sourcing. Event sourcing makes event history authoritative and reconstructs projections through replay, requiring evolution, snapshots, side-effect controls and sensitive-data handling. An outbox emitting events from database state can leave that database authoritative."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "13. Vận hành bằng contract và dữ liệu thật",
+        "en": "13. Operate through contracts and measurements"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chỉ định owner cho topic, schema, retention, DLQ và redrive; biết group nào tiêu thụ trước khi thay đổi. Đo publish/commit latency, outbox age, consumer age, duplicate rate, failed compensation và replay headroom. Dùng low-cardinality metrics để alert; event IDs nằm trong trace/log có kiểm soát dữ liệu nhạy cảm.",
+          "en": "Assign owners for topics, schemas, retention, DLQs and redrive, and identify consumers before changes. Measure publication/commit latency, outbox age, consumer age, duplicates, failed compensation and replay headroom. Use low-cardinality alerts and controlled trace/log context for event IDs and sensitive data."
+        },
+        {
+          "vi": "Fault test ở các boundary: database commit trước publish, broker ACK mất, effect commit trước ACK, worker mất ownership nhưng còn chạy và redrive event cũ sau schema change. Restore broker hoặc replay thành công chưa đủ; kiểm tra projection và business invariant sau phục hồi.",
+          "en": "Inject faults at database-commit/publication, lost broker ACK, effect-commit/consumer-ACK, stale-worker ownership and old-event redrive after schema changes. Restoring a broker or completing replay is insufficient; verify projections and business invariants after recovery."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "14. Câu hỏi có lời giải và điều kiện",
+        "en": "14. Questions with worked reasoning"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Charge đã timeout, có nên gửi lại event?",
+            "en": "A charge timed out: should you resend the event?"
+          },
+          "answer": [
+            {
+              "vi": "Outcome chưa biết. Giữ logical payment intent ID, dùng idempotency của provider trong retention đã thỏa thuận, tra status khi có thể và reconcile. Dedup event trong database không tự ngăn provider charge hai lần nếu API call nằm ngoài transaction.",
+              "en": "The outcome is unknown. Retain the logical payment intent ID, use the provider’s idempotency contract within its horizon, query status where supported and reconcile. Database event deduplication alone cannot prevent duplicate external charges."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tăng consumer từ 4 lên 20 nhưng throughput không tăng, vì sao?",
+            "en": "Why might growing from 4 to 20 consumers not increase throughput?"
+          },
+          "answer": [
+            {
+              "vi": "Kiểm tra partition count, hot key và sink bottleneck. Classic assignment chỉ cho một member/partition; thêm member không chia một hot aggregate. Có thể tối ưu handler hoặc dùng concurrency theo key, nhưng phải giữ contiguous progress và ordering. Đo trước khi tăng partition vì routing key có thể đổi.",
+              "en": "Check partitions, hot keys and sink limits. Classic assignment has one member per partition; more members do not split a hot aggregate. Optimize handlers or use per-key concurrency while preserving contiguous progress and ordering. Measure before changing partition counts and key routing."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Outbox đã atomic, tại sao vẫn duplicate?",
+            "en": "Why can an atomic outbox still produce duplicates?"
+          },
+          "answer": [
+            {
+              "vi": "Atomicity chỉ bao phủ state và outbox local. Relay publish thành công rồi crash trước checkpoint sẽ publish lại. Consumer cần stable event IDs, transactional dedup hoặc idempotent operation; cleanup/retention phải bao phủ replay contract.",
+              "en": "Atomicity covers local state and outbox. A relay can publish and crash before checkpointing, then republish. Consumers need stable IDs and transactional dedup/idempotent operations, with retention covering the replay contract."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "DLQ có giữ thứ tự cho một order không?",
+            "en": "Does a DLQ preserve one order’s event order?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động. Nếu park order version 2 rồi xử lý version 3, effect có thể sai. Chọn park theo aggregate, lane retry giữ thứ tự hoặc version validation; đồng thời tránh một order lỗi làm nghẽn toàn bộ các key khác.",
+              "en": "Not automatically. Parking version 2 while processing version 3 can produce invalid effects. Use aggregate parking, ordered retry lanes or version validation while preventing one broken order from stalling unrelated keys."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Backlog 600.000 event, capacity 3.000/s và arrival 2.000/s: drain bao lâu?",
+            "en": "How long to drain 600,000 events at 3,000/s capacity and 2,000/s arrivals?"
+          },
+          "answer": [
+            {
+              "vi": "Khoảng 600 giây với rate ổn định và event cost tương đương. Nếu replica mất hoặc hot key giới hạn throughput, μ thực tế nhỏ hơn; nếu μ≤λ thì backlog không drain. Theo dõi event age và capacity phục hồi thay vì chỉ nhìn queue count.",
+              "en": "About 600 seconds under stable rates and comparable event costs. Failures or hot keys may reduce effective μ; if μ≤λ, it will not drain. Observe event age and recovery headroom rather than queue count alone."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Khi nào không nên thêm Kafka hoặc queue?",
+            "en": "When should you avoid adding Kafka or a queue?"
+          },
+          "answer": [
+            {
+              "vi": "Khi một synchronous path đáp ứng latency, tải và failure boundary và caller cần kết quả ngay. Async thêm state trung gian, replay, duplicate, schema/retention và vận hành. Chỉ thêm khi lợi ích như burst isolation, nhiều subscription hoặc deferred work bù được chi phí đó.",
+              "en": "When a synchronous path meets latency, load and failure requirements and callers need immediate results. Async adds intermediate states, replay, duplicates, schema/retention and operations. Introduce it when isolation, subscriptions or deferred work justify those costs."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

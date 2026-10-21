@@ -1,0 +1,790 @@
+{
+  "id": "databases",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Database, Index và Sharding: thiết kế từ access pattern và invariant",
+    "en": "Databases, indexes and sharding: design from access patterns and invariants"
+  },
+  "summary": {
+    "vi": "So các họ database, hiểu transaction/isolation, theo dõi B-tree và LSM, mở rộng read trước khi shard và kiểm tra hot key, migration cùng cross-shard workflow.",
+    "en": "Compare database families, understand transactions/isolation, follow B-trees and LSMs, scale reads before sharding and handle hot keys, migration and cross-shard workflows."
+  },
+  "prerequisites": [
+    "estimation",
+    "scaling",
+    "load-balancing"
+  ],
+  "relatedTopics": [
+    "database",
+    "sql",
+    "nosql",
+    "distributed"
+  ],
+  "takeaways": [
+    {
+      "vi": "Chọn database theo query, invariant và workload, không theo nhãn SQL/NoSQL chung.",
+      "en": "Choose databases by queries, invariants and workload rather than broad SQL/NoSQL labels."
+    },
+    {
+      "vi": "ACID không đồng nghĩa mọi transaction tự serializable; isolation level và engine semantics quyết định anomaly nào còn có thể xảy ra.",
+      "en": "ACID does not make every transaction serializable; isolation levels and engine semantics determine remaining anomalies."
+    },
+    {
+      "vi": "Index tăng tốc một số read bằng storage và write work; cần query plan và workload để đánh giá.",
+      "en": "Indexes trade storage/write work for particular reads; evaluate them with plans and workloads."
+    },
+    {
+      "vi": "Shard key chọn luôn cách truy vấn, hotspot và transaction boundary; migration là một phần thiết kế.",
+      "en": "Shard keys determine queries, hotspots and transaction boundaries; migration is part of the design."
+    }
+  ],
+  "sections": [
+    {
+      "id": "access",
+      "title": {
+        "vi": "1. Bắt đầu bằng bảng access pattern",
+        "en": "1. Begin with an access-pattern table"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trước khi chọn engine, liệt kê entity, khóa, query quan trọng, read/write rate, payload, retention và invariant. “Cần database scale lớn” chưa cho biết query là lookup một ID, scan theo time range, search text hay graph traversal. Một schema tốt phản ánh cách dữ liệu được đọc và cập nhật, đồng thời giữ được ownership dễ hiểu.",
+          "en": "Before choosing an engine, list entities, keys, critical queries, read/write rates, payloads, retention and invariants. “A scalable database” does not specify ID lookups, time-range scans, text search or graph traversal. A good schema supports reads/updates while preserving understandable ownership."
+        },
+        {
+          "vi": "Ví dụ order: lookup order theo ID, liệt kê order mới theo user, tìm payment state và giữ unique logical checkout. Có thể bắt đầu relational model với index (user_id, created_at, order_id) và uniqueness constraint cho idempotency. Search đa chiều hoặc analytics nặng có thể dùng projection/index riêng; projection có lag nên không được dùng thay nguồn quyết định payment correctness.",
+          "en": "For orders, consider ID lookup, recent user orders, payment state and unique logical checkouts. A relational model can start with a (user_id, created_at, order_id) index and an idempotency constraint. Rich search/analytics may use separate projections with lag, unsuitable as payment-correctness authorities."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Access pattern",
+            "en": "Access pattern"
+          },
+          {
+            "vi": "Khóa/index gợi ý",
+            "en": "Candidate key/index"
+          },
+          {
+            "vi": "Cần hỏi thêm",
+            "en": "Clarify"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Order theo ID",
+              "en": "Order by ID"
+            },
+            {
+              "vi": "Primary key order_id",
+              "en": "Primary key order_id"
+            },
+            {
+              "vi": "Ordering, ID routing và tenant authorization.",
+              "en": "Ordering, ID routing and tenant authorization."
+            }
+          ],
+          [
+            {
+              "vi": "Order gần nhất của user",
+              "en": "Recent orders for a user"
+            },
+            {
+              "vi": "(user_id, created_at, order_id)",
+              "en": "(user_id, created_at, order_id)"
+            },
+            {
+              "vi": "Sort direction, cursor và max page size.",
+              "en": "Sort direction, cursors and page limits."
+            }
+          ],
+          [
+            {
+              "vi": "Reserve stock",
+              "en": "Reserve stock"
+            },
+            {
+              "vi": "inventory(item_id) + conditional update",
+              "en": "inventory(item_id) + conditional update"
+            },
+            {
+              "vi": "Không oversell, transaction scope và contention.",
+              "en": "No overselling, transaction scope and contention."
+            }
+          ],
+          [
+            {
+              "vi": "Revenue report",
+              "en": "Revenue report"
+            },
+            {
+              "vi": "Event/projection theo time range",
+              "en": "Time-oriented events/projections"
+            },
+            {
+              "vi": "Freshness, reconciliation và scan cost.",
+              "en": "Freshness, reconciliation and scan cost."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "families",
+      "title": {
+        "vi": "2. Các họ database và phạm vi phù hợp",
+        "en": "2. Database families and suitable boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Relational database mạnh ở schema/constraints, joins và transaction trong phạm vi hỗ trợ. Document database giữ aggregate dạng tài liệu và có thể có transaction/index phong phú; không mặc định mọi document store đều schema-free hoặc không ACID. Key-value đơn giản cho lookup theo key; wide-column hợp một số access pattern partition/range; graph phục vụ traversal và analytics có mô hình khác với OLTP.",
+          "en": "Relational databases support schemas/constraints, joins and transactions within declared scopes. Document stores manage document aggregates and may offer rich transactions/indexes; they are not automatically schema-free or non-ACID. Key-value systems suit key lookups, wide-column systems suit some partition/range patterns and graph traversal/analytics differ from OLTP."
+        },
+        {
+          "vi": "Data model, storage engine, consistency và distribution là các trục khác nhau. Một SQL system có thể dùng LSM; một NoSQL system có thể hỗ trợ strong consistency trong một phạm vi. Chọn theo guarantees cụ thể, query support, latency, cost và khả năng đội ngũ vận hành. Thêm nhiều database tăng integration/backup/recovery burden; polyglot persistence cần lý do rõ.",
+          "en": "Data models, storage engines, consistency and distribution are separate axes. SQL systems can use LSM engines; NoSQL systems may offer strong consistency within a scope. Choose explicit guarantees, queries, latency, cost and operational skills. Multiple databases add integration/backup/recovery burden; polyglot persistence needs justification."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Họ",
+            "en": "Family"
+          },
+          {
+            "vi": "Điểm phù hợp",
+            "en": "Typical fit"
+          },
+          {
+            "vi": "Trade-off cần kiểm tra",
+            "en": "Inspect"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Relational",
+              "en": "Relational"
+            },
+            {
+              "vi": "Business invariants, joins, OLTP có schema.",
+              "en": "Business invariants, joins and schema-based OLTP."
+            },
+            {
+              "vi": "Index/query tuning, contention, partition/replication semantics.",
+              "en": "Query/index tuning, contention and partition/replication semantics."
+            }
+          ],
+          [
+            {
+              "vi": "Document",
+              "en": "Document"
+            },
+            {
+              "vi": "Aggregate tài liệu, nested records và truy vấn theo field.",
+              "en": "Document aggregates, nesting and field queries."
+            },
+            {
+              "vi": "Aggregate size, update contention, transaction scope và index cost.",
+              "en": "Aggregate size, update contention, transaction scope and indexes."
+            }
+          ],
+          [
+            {
+              "vi": "Key-value",
+              "en": "Key-value"
+            },
+            {
+              "vi": "Lookup/update theo key và TTL/counter theo contract.",
+              "en": "Key lookups/updates and contract-specific TTL/counters."
+            },
+            {
+              "vi": "Query ngoài key, secondary index và atomicity scope.",
+              "en": "Non-key queries, secondary indexes and atomicity scope."
+            }
+          ],
+          [
+            {
+              "vi": "Wide-column",
+              "en": "Wide-column"
+            },
+            {
+              "vi": "Partition key + clustering/range cho time-ordered data.",
+              "en": "Partition keys plus clustered/ranged time-ordered data."
+            },
+            {
+              "vi": "Query-driven denormalization, partition size và hot key.",
+              "en": "Query-driven denormalization, partition size and hot keys."
+            }
+          ],
+          [
+            {
+              "vi": "Search / columnar analytics",
+              "en": "Search / columnar analytics"
+            },
+            {
+              "vi": "Full-text/ranking hoặc scan/aggregate trên nhiều record.",
+              "en": "Full-text/ranking or large scans/aggregations."
+            },
+            {
+              "vi": "Ingestion lag, projection rebuild, update pattern và authority.",
+              "en": "Ingestion lag, rebuilds, update patterns and authority."
+            }
+          ],
+          [
+            {
+              "vi": "Graph",
+              "en": "Graph"
+            },
+            {
+              "vi": "Node/edge traversal như quan hệ nhiều bước.",
+              "en": "Multi-hop node/edge relationship traversal."
+            },
+            {
+              "vi": "Traversal fan-out, authorization, locality và partitioning.",
+              "en": "Traversal fan-out, authorization, locality and partitioning."
+            }
+          ],
+          [
+            {
+              "vi": "Time-series",
+              "en": "Time-series"
+            },
+            {
+              "vi": "Timestamped metrics/events, retention, downsampling và compression.",
+              "en": "Timestamped metrics/events, retention, downsampling and compression."
+            },
+            {
+              "vi": "Label cardinality, out-of-order writes, retention và query window.",
+              "en": "Label cardinality, out-of-order writes, retention and query windows."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "transactions",
+      "title": {
+        "vi": "3. ACID, BASE và transaction boundary",
+        "en": "3. ACID, BASE and transaction boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Atomicity là all-or-nothing cho transaction trong phạm vi engine hỗ trợ; consistency là giữ invariant/schema do ứng dụng và database phối hợp, không phải tự biết mọi quy tắc business; isolation kiểm soát tương tác concurrent transaction; durability nói về dữ liệu sau ACK trong failure model đã cấu hình. Mỗi từ cần được gắn với scope và cấu hình, không chỉ một nhãn marketing.",
+          "en": "Atomicity provides all-or-nothing behavior within supported transaction scopes. Consistency preserves application/database invariants rather than discovering every business rule. Isolation governs concurrent interactions, and durability describes acknowledged data under configured failures. Each term needs a scope/configuration, not a marketing label."
+        },
+        {
+          "vi": "BASE thường dùng để mô tả thiết kế chấp nhận eventual consistency để ưu tiên các mục tiêu khác; nó không là một isolation level và không đồng nghĩa mọi NoSQL đều BASE. Eventual consistency cần cơ chế convergence và thời điểm lag chấp nhận được; retry, version và conflict handling vẫn phải thiết kế.",
+          "en": "BASE commonly describes systems accepting eventual consistency in pursuit of other goals; it is not an isolation level or a property of every NoSQL system. Eventual convergence needs mechanisms and acceptable lag, with explicit retries, versions and conflict handling."
+        },
+        {
+          "vi": "Ví dụ trừ stock rồi tạo order nên ở cùng atomic boundary nếu có thể. Gọi payment provider không nằm trong local DB transaction dù code nằm giữa BEGIN/COMMIT; không giữ lock DB trong network call dài rồi giả định rollback sẽ hoàn tác charge. Cross-owner workflow cần idempotency, state machine, outbox và reconciliation/compensation theo contract.",
+          "en": "Decrementing stock and creating an order should share an atomic boundary where possible. A provider call is outside a local database transaction even when code surrounds it with BEGIN/COMMIT. Long network calls under database locks do not make rollback undo charges. Cross-owner workflows need idempotency, state machines, outboxes and reconciliation/compensation."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Atomicity · Cùng commit hay abort",
+            "en": "Atomicity · Commit or abort together"
+          },
+          "icon": "decision",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Các thay đổi trong transaction boundary phải được xét như một đơn vị.",
+              "en": "Changes inside the transaction boundary form one unit."
+            },
+            {
+              "vi": "Ghi database và publish ra broker riêng chưa tự thành một transaction.",
+              "en": "A database write and a separate broker publish do not automatically share a transaction."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Isolation · Tương tác giữa transaction",
+            "en": "Isolation · Transaction interaction"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Hai transaction atomic vẫn có thể tạo write skew ở mức isolation cho phép.",
+              "en": "Two atomic transactions may still produce write skew under an isolation level that permits it."
+            },
+            {
+              "vi": "Chọn isolation, constraint hoặc locking theo invariant; chuẩn bị retry khi cần.",
+              "en": "Choose isolation, constraints or locking for the invariant; handle retries when needed."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "isolation",
+      "title": {
+        "vi": "4. Isolation: đọc ổn định chưa chắc giữ được invariant",
+        "en": "4. Isolation: stable reads may still violate invariants"
+      },
+      "paragraphs": [
+        {
+          "vi": "Read committed thường không cho dirty read nhưng các statement trong một transaction có thể quan sát state khác nhau tùy engine. Snapshot/repeatable-read semantics phụ thuộc implementation; snapshot ổn định không tự ngăn write skew trên nhiều row. Serializable yêu cầu hiệu ứng tương đương một thứ tự tuần tự, có thể dùng locking hoặc detection/abort; application phải xử lý retry toàn transaction khi engine yêu cầu.",
+          "en": "Read committed commonly prevents dirty reads while statements may observe different states, depending on the engine. Snapshot/repeatable-read semantics vary; stable snapshots do not inherently prevent cross-row write skew. Serializable requires equivalence to some serial ordering, using locking or detection/abort; applications must retry entire transactions where required."
+        },
+        {
+          "vi": "Lost update là hai writer dựa vào value cũ rồi ghi đè; conditional update hoặc row lock có thể bảo vệ một resource. Write skew có thể xảy ra khi hai transaction đọc cùng predicate rồi update hai row khác nhau; chống write-write conflict của một row vẫn chưa đủ. Chọn constraint, lock chung cho invariant hoặc serializable với retry, rồi kiểm thử interleaving thực.",
+          "en": "Lost updates arise when writers use old values and overwrite changes; conditional updates/row locks can protect a resource. Write skew arises when transactions read a shared predicate and update different rows, escaping same-row write conflicts. Use constraints, invariant-level locks or serializable retries and test real interleavings."
+        }
+      ],
+      "experiment": "db-isolation"
+    },
+    {
+      "id": "indexes",
+      "title": {
+        "vi": "5. B-tree, composite index và query plan",
+        "en": "5. B-trees, composite indexes and query plans"
+      },
+      "paragraphs": [
+        {
+          "vi": "B-tree giữ cây cân bằng với fan-out lớn để lookup và range scan theo thứ tự key. Chi phí tìm vị trí gần O(log_B N) page traversal, nhưng trả nhiều row vẫn có cost theo số row và có thể phải fetch heap/data pages. Root/upper pages trong RAM, selectivity, clustering và cache locality làm latency thực khác một công thức đơn giản.",
+          "en": "B-trees maintain high-fan-out balanced trees for key lookups and ordered ranges. Positioning costs roughly O(log_B N) page traversal, while output size and data-page fetching still cost work. Cached upper pages, selectivity, clustering and locality make real latency differ from one simple formula."
+        },
+        {
+          "vi": "Composite index (user_id, created_at, order_id) phù hợp query recent orders của một user với stable tie-breaker. Leading equality predicates thường giúp giới hạn scan hiệu quả; optimizer có thể dùng index theo cách khác tùy engine/version, nên không học quy tắc tuyệt đối “bỏ cột trái thì không bao giờ dùng được”. Đọc EXPLAIN với actual cardinality, rows removed và IO trên dữ liệu đại diện.",
+          "en": "A (user_id, created_at, order_id) index fits recent-user-order queries with stable tie-breaking. Leading equality predicates often narrow scans effectively; optimizers may use indexes differently by engine/version, so avoid absolute “missing the first column means never usable” rules. Inspect plans, actual cardinality, filtered rows and IO on representative data."
+        },
+        {
+          "vi": "Index thêm storage và write maintenance; nhiều index làm insert/update/delete nặng hơn, có thể tăng lock/IO và cache churn. Covering/index-only access có điều kiện engine/visibility, không tự miễn phí. Chọn index cho query quan trọng rồi đo trade-off; sequential scan đôi khi đúng khi cần phần lớn bảng.",
+          "en": "Indexes add storage and write maintenance, increasing insert/update/delete work, IO and cache churn. Covering/index-only access depends on engine/visibility rules and is not free. Index important queries and measure trade-offs; sequential scans can be appropriate for most of a table."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "CREATE INDEX orders_by_user_time\n  ON orders (user_id, created_at DESC, order_id DESC);\n\nSELECT order_id, created_at, state\nFROM orders\nWHERE user_id = :user_id\n  AND (created_at, order_id) < (:last_time, :last_id)\nORDER BY created_at DESC, order_id DESC\nLIMIT 20;",
+        "caption": {
+          "vi": "Ví dụ kiểu PostgreSQL; :name là placeholder của adapter. Trang đầu cần nhánh không có cursor; cursor được validate và user authorization trước khi query.",
+          "en": "PostgreSQL-style example with adapter placeholders. The first page needs a cursor-free branch; validate cursors and authorize the user before querying."
+        }
+      }
+    },
+    {
+      "id": "index-ownership",
+      "title": {
+        "vi": "5a. Index types và ownership khi phân tán",
+        "en": "5a. Index types and distributed ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Primary key là ràng buộc identity/uniqueness theo scope; clustered organization là cách engine bố trí row. Không phải mọi primary key tự sắp xếp vật lý toàn bảng. Secondary index là cấu trúc khác để truy vấn; update chỉ phải duy trì những cấu trúc liên quan theo engine, không có quy tắc mọi write đều sửa mọi byte index.",
+          "en": "Primary keys constrain identity/uniqueness within a scope; clustered organization is engine-specific physical layout. A primary key does not automatically sort every table physically. Secondary indexes provide other access paths; maintenance depends on affected structures and the engine, not a rule that every write rewrites every index byte."
+        },
+        {
+          "vi": "Inverted index phục vụ tìm term, spatial indexes hỗ trợ hình học/range và bitmap-oriented structures có ích trong một số analytics workload. Tên index không đủ: operator support, selectivity, update cost và visibility quyết định query plan. Một “covering” index còn có thể cần visibility/data access tùy engine, nên kiểm chứng bằng EXPLAIN và IO.",
+          "en": "Inverted indexes serve term lookup, spatial indexes support geometric/range operations and bitmap-oriented structures help some analytics workloads. Operator support, selectivity, updates and visibility determine plans beyond the name. Covering indexes may still need visibility/data access, so verify plans and IO."
+        },
+        {
+          "vi": "Local secondary index giữ index cùng shard của dữ liệu: write local hơn nhưng query không biết shard có thể scatter-gather. Global index partition theo indexed value: query targeted hơn nhưng write/projection update chạm owner khác. Chốt consistency, duplicate handling và rebuild/catch-up; không mặc định mọi global index đều strong hoặc đều eventual.",
+          "en": "Local secondary indexes live with their data shards: writes are more local, but queries without routing keys may scatter. Global indexes partition by indexed value for targeted lookup while updates reach another owner. Specify consistency, duplicate handling and rebuild/catch-up rather than assuming all global indexes are strong or eventual."
+        },
+        {
+          "vi": "Distributed ID giải quyết tạo identity không trùng theo thuật toán của nó, không tự giữ business uniqueness như một email chỉ thuộc một account trên mọi shard. Global uniqueness cần owner theo unique key, global constraint/index hoặc protocol phù hợp. Cùng một user có thể tạo hai ID khác nhau cho cùng email nếu chỉ dựa ID generator.",
+          "en": "Distributed IDs provide algorithm-specific identity uniqueness, not business uniqueness such as one account per email across shards. Global business uniqueness needs a unique-key owner, constraint/index or suitable protocol. Two different IDs can still represent the same email."
+        }
+      ]
+    },
+    {
+      "id": "lsm",
+      "title": {
+        "vi": "6. LSM: write buffer, SST và compaction",
+        "en": "6. LSMs: write buffers, SSTs and compaction"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một LSM thường nhận write vào WAL cho durability theo cấu hình, cập nhật memtable rồi flush sorted immutable files. Batching/append giảm một số random-write cost, nhưng dữ liệu có nhiều version và nhiều run phải merge. Compaction đổi read, write và space amplification; backlog compaction có thể làm write stall và p99 tăng dù app request rate không đổi.",
+          "en": "An LSM commonly logs writes for configured durability, updates memtables and flushes immutable sorted files. Append/batching reduces some random-write costs while creating versions/runs to merge. Compaction trades read, write and space amplification; backlog can stall writes and raise p99 at unchanged application rates."
+        },
+        {
+          "vi": "Read kiểm tra memory và những file/range có thể chứa key, kết hợp version/tombstone đúng thứ tự. Bloom filters có thể bỏ qua file chắc chắn không có key nhưng vẫn có false positive; chúng không trả value hoặc thay permission checks. Toy dưới đọc file theo generation mới tới cũ; engine có nhiều level/partial compaction cần sequence/version semantics tinh tế hơn.",
+          "en": "Reads inspect memory and relevant files/ranges and resolve versions/tombstones. Bloom filters skip definitely absent keys but can false-positive; they return neither values nor authorization. The toy reads runs newest-first; real levels/partial compactions require more nuanced sequence/version semantics."
+        },
+        {
+          "vi": "Delete thường là tombstone để chặn old value. Chỉ drop tombstone khi engine biết không còn version/snapshot/replica cần nó trong phạm vi thiết kế; drop sớm có thể resurrect dữ liệu. Disk không nhất thiết giảm ngay sau DELETE, và compaction cần IO/space headroom trong khi input/output cùng tồn tại.",
+          "en": "Deletion commonly writes a tombstone blocking older values. Remove it only when no required versions/snapshots/replicas still depend on it; premature removal can resurrect data. DELETE need not immediately free disk, and compaction needs IO/space while inputs and outputs coexist."
+        }
+      ],
+      "experiment": "lsm",
+      "table": {
+        "headers": [
+          {
+            "vi": "Khía cạnh",
+            "en": "Aspect"
+          },
+          {
+            "vi": "B-tree",
+            "en": "B-tree"
+          },
+          {
+            "vi": "LSM",
+            "en": "LSM"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Write path",
+              "en": "Write path"
+            },
+            {
+              "vi": "Cập nhật tree/page với logging và engine-specific buffering.",
+              "en": "Tree/page updates with logging and engine-specific buffering."
+            },
+            {
+              "vi": "WAL/memtable/flush rồi compaction; write amplification phụ thuộc policy.",
+              "en": "WAL/memtable/flush then compaction, with policy-dependent amplification."
+            }
+          ],
+          [
+            {
+              "vi": "Read path",
+              "en": "Read path"
+            },
+            {
+              "vi": "Lookup/range theo key order và data visibility.",
+              "en": "Key-ordered lookup/ranges with visibility rules."
+            },
+            {
+              "vi": "Memory + relevant SST runs, filters và version merge.",
+              "en": "Memory plus relevant SST runs, filters and version merging."
+            }
+          ],
+          [
+            {
+              "vi": "Trade-off",
+              "en": "Trade-off"
+            },
+            {
+              "vi": "Page splits, random IO và write/index locality.",
+              "en": "Page splits, random IO and write/index locality."
+            },
+            {
+              "vi": "Compaction IO/CPU, space/temporary headroom và read amplification.",
+              "en": "Compaction IO/CPU, space/temporary headroom and read amplification."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "read-scaling",
+      "title": {
+        "vi": "7. Mở rộng read trước khi chia nhỏ dữ liệu",
+        "en": "7. Scale reads before splitting data"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tối ưu query/index, pagination, batching và connection pool trước. Cache có freshness contract có thể giảm repeated work; read replica phân tải query nhưng có replication lag. Analytics/reporting scan nặng có thể tách sang projection/warehouse để không tranh IO với OLTP. Mỗi bước cần đo lại bottleneck thay vì giữ nguyên giả định cũ.",
+          "en": "Improve queries/indexes, pagination, batching and connection pools first. Freshness-aware caches reduce repeated work; replicas distribute reads but lag. Heavy reporting can use projections/warehouses to avoid OLTP IO contention. Remeasure bottlenecks after each change."
+        },
+        {
+          "vi": "Read-your-writes có thể route tới primary hoặc replica đã đạt commit position/session version. Chỉ chờ một số giây cố định không chứng minh replica đã bắt kịp trong mọi failure. Failover cần biết acknowledged durability và replication progress; mất primary không được tự promotion tùy ý tạo hai writer.",
+          "en": "Read-your-writes can route to the primary or a replica meeting a commit position/session version. Waiting a fixed delay does not prove catch-up under all failures. Failover needs acknowledged durability and replication progress; arbitrary promotion risks multiple writers."
+        }
+      ]
+    },
+    {
+      "id": "shards",
+      "title": {
+        "vi": "8. Shard key, range/hash/directory và skew",
+        "en": "8. Shard keys, ranges, hashes, directories and skew"
+      },
+      "paragraphs": [
+        {
+          "vi": "Range partition thuận tiện range scan và retention, nhưng time/ID tăng dần có thể làm shard hiện tại nóng. Hash phân phối nhiều key, đổi lại range queries chạm nhiều shard và key movement khi đổi topology nếu không có indirection. Directory/virtual shard thêm metadata lookup/ownership nhưng cho phép move partition có chủ đích.",
+          "en": "Ranges help scans/retention but monotonic time/IDs can heat the current shard. Hashes distribute keys while making ranges fan out and potentially remapping keys when topology changes. Directories/virtual shards add metadata ownership but support deliberate partition movement."
+        },
+        {
+          "vi": "Tenant/user key giữ dữ liệu liên quan cùng nơi và transaction local, nhưng big tenant có thể vượt một shard. Composite/bucketed key có thể tách tải nhưng làm query/transaction fan-out. Chốt invariant nào phải local, limit tenant và khả năng split trước khi chọn key; data-count cân bằng không đảm bảo traffic hoặc bytes cân bằng.",
+          "en": "Tenant/user keys colocate related data and transactions but large tenants can exceed a shard. Composite/bucketed keys split load at the cost of query/transaction fan-out. Define local invariants, tenant limits and splitting before choosing; balanced key counts do not imply balanced bytes or traffic."
+        }
+      ],
+      "experiment": "sharding"
+    },
+    {
+      "id": "after-sharding",
+      "title": {
+        "vi": "9. Cuộc sống sau sharding",
+        "en": "9. Life after sharding"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi query cần biết partition nào; lookup theo alternate key có thể cần global directory/index. Cross-shard join, aggregation và pagination cần fan-out bounded, partial-failure policy và merge semantics. p99 thường bị shard chậm nhất kéo; đừng hứa query toàn hệ thống nhanh chỉ vì mỗi shard nhỏ.",
+          "en": "Queries need partition routing, with alternate-key lookups potentially requiring global directories/indexes. Cross-shard joins, aggregations and pagination need bounded fan-out, partial-failure policy and merging. The slowest shard often dominates tails; smaller shards do not guarantee fast global queries."
+        },
+        {
+          "vi": "Transaction cross-shard có thể dùng distributed transaction nếu engine hỗ trợ guarantees cần thiết, hoặc workflow/saga có trạng thái trung gian. Sự lựa chọn phụ thuộc invariant và failure tolerance, không phải mọi trường hợp đều dùng 2PC hoặc đều dùng eventual consistency. Giữ atomic boundary nhỏ và owner rõ giúp giảm blast radius và retry complexity.",
+          "en": "Cross-shard transactions can use supported distributed guarantees or stateful workflows/sagas. Choose by invariants/failures rather than always choosing 2PC or eventual consistency. Small atomic boundaries and explicit ownership reduce blast radius and retry complexity."
+        },
+        {
+          "vi": "Rebalancing cần consistent snapshot, change catch-up, ownership version/fencing, cutover và rollback. Schema migration phải tương thích trong lúc các shard chạy version khác nhau. Backup từng shard chưa tự tạo một global consistent restore point; xác định semantics restore, metadata directory và event positions liên quan.",
+          "en": "Rebalancing needs snapshots, change catch-up, ownership versions/fencing, cutover and rollback. Schemas must coexist across shard versions. Per-shard backups do not automatically create a globally consistent restore point; define restore semantics, directory metadata and relevant event positions."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một shard mới cần nhiều hơn một routing entry",
+          "en": "A new shard needs more than a routing entry"
+        },
+        "caption": {
+          "vi": "Một kế hoạch migration phải có catch-up và verification; fencing/epoch bảo vệ ownership khi chuyển write. Chi tiết phụ thuộc hệ quản trị và workload.",
+          "en": "A migration plan needs catch-up and verification; fencing/epochs protect ownership during write cutover. Details depend on the database and workload."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Chuẩn bị đích",
+              "en": "Prepare the destination"
+            },
+            "detail": {
+              "vi": "Schema, capacity, routing version.",
+              "en": "Schema, capacity and routing version."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Copy và catch-up",
+              "en": "Copy and catch up"
+            },
+            "detail": {
+              "vi": "Snapshot/backfill + thay đổi mới.",
+              "en": "Snapshot/backfill plus new changes."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Đối chiếu và chuyển",
+              "en": "Verify and cut over"
+            },
+            "detail": {
+              "vi": "Kiểm tra dữ liệu; chuyển quyền ghi.",
+              "en": "Validate data; transfer write authority."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Quan sát và dọn dẹp",
+              "en": "Observe and clean up"
+            },
+            "detail": {
+              "vi": "Giữ rollback, rồi mới xóa nguồn cũ.",
+              "en": "Retain rollback before removing the old source."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inventory",
+      "title": {
+        "vi": "10. Ví dụ giữ inventory trong một atomic statement",
+        "en": "10. Keep inventory within an atomic statement"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tránh read-then-write không khóa: hai request cùng thấy stock=1 rồi cùng bán. Với một database owner, conditional update cùng order creation có thể giữ invariant trong atomic boundary. Query dưới chỉ insert order khi reserve trả row; qty phải là số nguyên dương và actor đã được cấp quyền.",
+          "en": "Avoid unlocked read-then-write: two requests can see stock=1 and both sell. Under one database owner, a conditional update plus order creation can share an atomic boundary. The query below inserts only when reservation returns a row; quantity must be a positive integer and the actor authorized."
+        },
+        {
+          "vi": "Đặt unique constraint trên (user_id, checkout_key); nếu duplicate checkout làm insert fail, toàn statement phải rollback phần reserve. Adapter xử lý replay bằng stored outcome và request fingerprint, không trả order khác payload như thành công. Sau commit, payment/network work đi qua workflow/outbox, không nằm trong lời hứa atomic của statement này.",
+          "en": "Use a unique (user_id, checkout_key) constraint; duplicate-checkout insertion failure rolls back the reservation in the statement. Adapters reconcile replays through stored outcomes/fingerprints rather than treating different payloads as success. Post-commit payment/network work uses workflows/outboxes outside this statement’s atomicity."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "WITH reserved AS (\n  UPDATE inventory\n  SET available = available - :qty\n  WHERE item_id = :item_id\n    AND :qty > 0\n    AND available >= :qty\n  RETURNING item_id\n)\nINSERT INTO orders (order_id, user_id, item_id, quantity, checkout_key)\nSELECT :order_id, :user_id, item_id, :qty, :checkout_key\nFROM reserved\nRETURNING order_id;",
+        "caption": {
+          "vi": "Ví dụ PostgreSQL-style với placeholder của driver; constraint và retry/idempotency handling thuộc schema/adapter. Không có row trả về nghĩa là không reserve được inventory.",
+          "en": "PostgreSQL-style example with driver placeholders; schema constraints and adapter retry/idempotency handling are required. No returned row means no inventory reservation."
+        }
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "11. Tuning và vận hành bằng dữ liệu đo",
+        "en": "11. Tune and operate with measurements"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo query mix/latency, lock waits, transaction age, pool wait, buffer hit, IO, replication lag, disk headroom và compaction backlog nếu có. Query timeout không đồng nghĩa transaction đã rollback mọi nơi; đóng/cancel và reconcile theo driver/engine contract. Long-running transaction có thể giữ snapshot, lock hoặc garbage lâu hơn dự kiến.",
+          "en": "Measure query mix/latency, locks, transaction age, pool waits, buffer hits, IO, lag, disk headroom and compaction backlog where applicable. Query timeouts do not prove rollback everywhere; cancel/reconcile under driver/engine contracts. Long transactions can retain snapshots, locks or garbage unexpectedly."
+        },
+        {
+          "vi": "Ở cấp hệ thống, database choice gồm cost, restore test, schema rollout, on-call expertise và migration path. Benchmark với data size, distribution, index count và failure mode đại diện. Một benchmark point lookup trên key uniform không chứng minh khả năng phục vụ joins, hot tenant hoặc failover của sản phẩm.",
+          "en": "Database choices include cost, restore tests, schema rollout, on-call skills and migration. Benchmark realistic data sizes, distributions, index counts and failures. Uniform-key point lookups do not prove suitability for product joins, hot tenants or failover."
+        }
+      ]
+    },
+    {
+      "id": "denormalization",
+      "title": {
+        "vi": "11a. Denormalization và lựa chọn tự xây hay dùng nền tảng",
+        "en": "11a. Denormalization and platform choices"
+      },
+      "paragraphs": [
+        {
+          "vi": "Denormalize theo query có thể giữ hot path một shard, ví dụ message theo conversation và inbox theo user là hai projection khác nhau. Mỗi bản sao cần owner, event version, idempotency, replay và repair để không lệch mãi. Search toàn user/message nên có projection phù hợp thay vì fan-out vô hạn vào OLTP; xóa/revoke phải lan tới mọi projection chứa dữ liệu liên quan.",
+          "en": "Query-driven denormalization can keep hot paths local: conversation messages and user inboxes are different projections. Copies need ownership, event versions, idempotency, replay and repair. Global search should use a suitable projection rather than unbounded OLTP fan-out; deletion/revocation must reach relevant copies."
+        },
+        {
+          "vi": "Tự xây routing/sharding layer cho quyền điều khiển nhưng cần đội chịu trách nhiệm metadata, migration, restore và failover. Một distributed SQL hoặc sharding platform có thể cung cấp một phần cơ chế, với cost/latency/operational contracts riêng. So guarantees và workload thực, gồm failure test, trước khi chuyển khỏi hệ đơn giản đang đáp ứng SLO.",
+          "en": "Building routing/sharding provides control but requires ownership of metadata, migration, restoration and failover. Distributed SQL or sharding platforms can supply mechanisms under their own cost/latency/operational contracts. Compare guarantees and real workloads, including failures, before leaving a simpler system that meets SLOs."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "12. Interview drill và lời giải",
+        "en": "12. Interview drills and worked answers"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "ACID có loại bỏ write skew tự động không?",
+            "en": "Does ACID automatically prevent write skew?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Phải xem isolation và scope; snapshot isolation có thể cho phép hai transaction update hai row khác nhau dựa trên predicate cũ. Serializable hoặc constraint/locking đúng invariant cùng retry có thể cần thiết. Không suy guarantee cụ thể chỉ từ nhãn ACID.",
+              "en": "No. Isolation and scope matter; snapshots can permit different-row updates based on an old predicate. Serializable or invariant-aware constraints/locking with retries may be required. The ACID label alone is insufficient."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao DELETE xong disk chưa giảm?",
+            "en": "Why may disk usage stay high after DELETE?"
+          },
+          "answer": [
+            {
+              "vi": "Engine có thể giữ tombstone/old version cho snapshot, replication, recovery hoặc compaction/vacuum. Space reclamation là lifecycle riêng và có overhead/headroom; xóa logical row không bằng lập tức xóa mọi physical copy và backup.",
+              "en": "Engines may retain tombstones/old versions for snapshots, replication, recovery or compaction/vacuum. Reclamation has its own lifecycle/headroom; deleting a logical row is not immediately removing every physical copy/backup."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hash partition có xử lý mọi hotspot không?",
+            "en": "Does hash partitioning solve every hotspot?"
+          },
+          "answer": [
+            {
+              "vi": "Nó trải nhiều key, nhưng một key hoặc tenant quá lớn vẫn có một owner nếu key không split. Tách hot reads bằng cache/replica, hoặc split/aggregate writes theo invariant. Đo per-partition traffic/bytes, không chỉ số row.",
+              "en": "It spreads many keys while one large key/tenant may retain one owner. Use caches/replicas for hot reads or invariant-compatible write splitting/aggregation. Measure partition traffic/bytes beyond row counts."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "B-tree hay LSM luôn nhanh hơn?",
+            "en": "Is either B-tree or LSM always faster?"
+          },
+          "answer": [
+            {
+              "vi": "Không có câu trả lời chung. Workload point/range, update rate, cache, compaction, durability settings và hardware quyết định. So latency tails, amplification, space và maintenance dưới workload thật; không dùng “LSM write nhanh” như bảo đảm mọi write đều ít IO.",
+              "en": "There is no universal winner. Points/ranges, update rates, caching, compaction, durability and hardware matter. Compare tails, amplification, space and maintenance on real workloads; “LSMs are write-optimized” does not guarantee little IO for every write."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Retry serialization failure phải chạy lại đoạn nào?",
+            "en": "What should be retried after a serialization failure?"
+          },
+          "answer": [
+            {
+              "vi": "Theo engine contract, thường retry toàn transaction từ đầu với read mới, bounded attempts/backoff và logical action identity ổn định. Không chỉ retry COMMIT hoặc lặp external charge bên trong; side effect ngoài DB cần idempotency/outbox.",
+              "en": "Under the engine contract, usually retry the whole transaction with fresh reads, bounded attempts/backoff and stable logical identity. Do not merely retry COMMIT or repeat external charges inside it; external effects need idempotency/outboxes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Làm sao chọn shard key cho order?",
+            "en": "How would you choose an order shard key?"
+          },
+          "answer": [
+            {
+              "vi": "Bắt đầu query theo user/order và invariant cần atomic. user_id giữ recent-user reads local nhưng cross-user inventory/payment ở owner khác; order_id trải write nhưng user listing cần index/projection. So query fan-out, tenant skew, migration và transaction scope trước khi chọn.",
+              "en": "Start from user/order queries and atomic invariants. user_id localizes recent-user reads but leaves shared inventory/payment elsewhere; order_id spreads writes but needs a user-listing index/projection. Compare fan-out, skew, migration and transaction scopes first."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ câu hỏi nghiệp vụ đến đường truy cập",
+      "en": "From business questions to access paths"
+    },
+    "caption": {
+      "vi": "Chọn database không thay thế việc thiết kế transaction, index hoặc shard key. Mỗi lớp bảo vệ một loại giới hạn khác nhau.",
+      "en": "Choosing a database does not replace designing transactions, indexes or shard keys. Each addresses a different kind of constraint."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Nêu query và invariant",
+          "en": "Name queries and invariants"
+        },
+        "detail": {
+          "vi": "Ai đọc/ghi gì, điều gì không được sai?",
+          "en": "Who reads/writes what, and what must never fail?"
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Thiết kế transaction",
+          "en": "Design transactions"
+        },
+        "detail": {
+          "vi": "Isolation, constraint, retry.",
+          "en": "Isolation, constraints and retries."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Tối ưu đường dữ liệu",
+          "en": "Optimize the access path"
+        },
+        "detail": {
+          "vi": "Index, B-tree/LSM, query plan.",
+          "en": "Indexes, B-trees/LSM and query plans."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Phân tán có kiểm chứng",
+          "en": "Distribute with validation"
+        },
+        "detail": {
+          "vi": "Replica, sharding, migration.",
+          "en": "Replicas, sharding and migration."
+        },
+        "icon": "route"
+      }
+    ]
+  }
+}

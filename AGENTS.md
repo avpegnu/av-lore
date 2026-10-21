@@ -6,6 +6,14 @@ Theo yêu cầu của chủ sở hữu, không thêm lại file acknowledgements
 
 Thương hiệu hiển thị của repo này luôn là AV Lore, gồm giao diện, nội dung bài học, ví dụ, file tải xuống và cả hai ngôn ngữ. Các key lưu trữ `it-basic-*` hiện có được giữ để tương thích dữ liệu học tập; không dùng chúng làm tên hiển thị. Tên IT Basic chỉ dùng trong hướng dẫn kỹ thuật về repo đối ứng bên dưới.
 
+Các khối minh họa của lộ trình học dùng `src/styles/course-visuals.css`, giới hạn bởi `.legacy-prose[data-course-track]`. Khi sửa nội dung, giữ các class và số đo bố cục của bảng, biểu đồ, sơ đồ; kiểm tra cả Việt/English và mobile. Chạy `node scripts/course-visuals-check.mjs` trên bản preview để phát hiện mất bố cục hoặc tràn ngang.
+
+Nội dung chuyên sâu ở `src/content/handbook/*.json` là bản chuẩn, gồm cặp `vi/en` được biên tập cho cả prose, sơ đồ, stages và câu hỏi. Không dùng lại các script author tạm ngoài repo để ghi đè bài đã chỉnh. `src/lib/handbook-catalog.json` ghi phạm vi 73 bài/công cụ; `npm run content:audit` báo phần còn thiếu và chờ review. Chỉ dùng trạng thái `complete` sau khi đã kiểm tra độ phủ, kiến thức, công thức, bản Anh và tương tác; không lấy số section hoặc build thành công làm bằng chứng nội dung đầy đủ. `npm run content:audit -- --require-complete` chỉ qua khi toàn bộ phạm vi đã hoàn tất.
+
+Sơ đồ/worksheet dùng mô hình minh họa có giả định rõ, không trình bày ceiling lý thuyết thành benchmark. Chạy `node scripts/handbook-browser-check.mjs` với `PREVIEW_URL` khi cần kiểm tra trace, keyboard, responsive và dịch động. Đồng bộ prose tương ứng sang HTML của IT Basic bằng công cụ `tools/sync-handbook.py` ở repo đó; không chép React hoặc tạo lab giả cho bản HTML.
+
+Nội dung chuyên sâu cần được trình bày trực quan theo ý nghĩa: quy trình dùng flow có bước và đầu ra; nhóm yêu cầu/phương án dùng cards hoặc bảng; luồng request dùng sơ đồ; phần luyện tập dùng điều khiển và phản hồi thực. Không xem một bài nhiều đoạn văn cộng một slider là đã đáp ứng yêu cầu trực quan. Dùng `overview`, `flow`, `cards`, `planner` trong schema khi phù hợp; giữ đầy đủ giải thích Việt–Anh. Đối chiếu cả mục đích của hình và tương tác, không chỉ số heading; kiểm tra screenshot desktop/mobile của bài trước khi chốt.
+
 ## Giao diện
 
 Bộ giao diện đã chốt 9 theme: 4 tối (GitHub Dark, Tối hiện đại, Dracula, Ayu Mirage) và 5 sáng (Sáng pastel, Sáng giấy, GitHub Light, Solarized Light, Rosé Pine Dawn). Mặc định là GitHub Dark; giữ các lựa chọn còn hợp lệ đã lưu của người dùng. Không thêm lại các theme bị loại. Trang `/themes/` vẫn dùng để xem và so sánh.
@@ -22,6 +30,7 @@ Hai repo mặc định nằm cạnh nhau. Nội dung được đối chiếu the
 | `Programming Language/`, `Fullstack-ContactCenter/` | `src/content/courses/` theo `track` và trường `source` |
 | `Database/`, `DevOps/`, `SystemDesign/`, `AI/`      | `src/content/courses/` theo `track` và trường `source` |
 | `NotesInterview/content/<topic>.json`               | `src/content/topics/<topic>.json`                      |
+| `SystemDesign/Handbook/*.html` (qua `tools/sync-handbook.py`) | `src/content/handbook/*.json` (nội dung Việt–Anh chuẩn) |
 | Navigation, danh mục, trang HTML theo chủ đề        | `src/lib/content.ts`, các routes và sidebar tương ứng  |
 
 - Trước khi sửa, đọc `git status` ở cả hai repo và giữ nguyên thay đổi ngoài phạm vi của người dùng.

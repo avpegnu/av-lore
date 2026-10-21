@@ -1,0 +1,106 @@
+import { z } from 'zod';
+export const localizedText = z.object({ vi: z.string().min(1), en: z.string().min(1) });
+export type LocalizedText = z.infer<typeof localizedText>;
+const learningIcon = z.enum(['target','route','inspect','flag','users','gauge','scope','chart','compare','decision','shield','check','warning']);
+export const learningFlowSchema = z.object({title:localizedText,caption:localizedText,steps:z.array(z.object({title:localizedText,detail:localizedText,icon:learningIcon})).min(2)});
+export const learningCardsSchema = z.array(z.object({title:localizedText,icon:learningIcon,tone:z.enum(['accent','positive','caution','neutral']).default('accent'),items:z.array(localizedText).min(1)})).min(2);
+export const interviewPlanSchema = z.object({duration:z.number().int().positive(),phases:z.array(z.object({id:z.string(),title:localizedText,minutes:z.number().int().positive(),description:localizedText,checklist:z.array(localizedText).min(1)})).length(4)});
+export type InterviewPlan=z.infer<typeof interviewPlanSchema>;
+const nodeSchema = z.object({
+  id: z.string(),
+  label: localizedText,
+  detail: localizedText,
+  x: z.number(),
+  y: z.number(),
+  kind: z
+    .enum(['client', 'edge', 'service', 'store', 'queue', 'worker', 'model'])
+    .default('service'),
+});
+const traceSchema = z.object({
+  id: z.string(),
+  label: localizedText,
+  steps: z
+    .array(
+      z.object({
+        from: z.string(),
+        to: z.string(),
+        description: localizedText,
+        async: z.boolean().optional(),
+      }),
+    )
+    .min(1),
+});
+export const architectureSchema = z.object({
+  id: z.string(),
+  title: localizedText,
+  caption: localizedText,
+  width: z.number().default(1000),
+  height: z.number().default(520),
+  nodes: z.array(nodeSchema).min(2),
+  traces: z.array(traceSchema).min(1),
+});
+export type Architecture = z.infer<typeof architectureSchema>;
+const sectionSchema = z.object({
+  id: z.string(),
+  title: localizedText,
+  paragraphs: z.array(localizedText).default([]),
+  flow: learningFlowSchema.optional(),
+  cards: learningCardsSchema.optional(),
+  planner: interviewPlanSchema.optional(),
+  bullets: z.array(localizedText).optional(),
+  table: z
+    .object({
+      headers: z.array(localizedText),
+      rows: z.array(z.array(localizedText)),
+      caption: localizedText.optional(),
+    })
+    .optional(),
+  api: z
+    .array(
+      z.object({
+        method: z.string(),
+        path: z.string(),
+        description: localizedText,
+        request: z.string().optional(),
+        response: z.string(),
+        notes: z.array(localizedText).optional(),
+      }),
+    )
+    .optional(),
+  code: z.object({ language: z.string(), content: z.string(), caption: localizedText }).optional(),
+  diagram: architectureSchema.optional(),
+  stages: z.array(z.object({ id:z.string(), title:localizedText, description:localizedText,
+    exitCriteria:localizedText, diagram:architectureSchema.optional() })).min(2).optional(),
+  callout: z
+    .object({
+      title: localizedText,
+      body: localizedText,
+      tone: z.enum(['note', 'warning']).default('note'),
+    })
+    .optional(),
+  questions: z
+    .array(
+      z.object({
+        question: localizedText,
+        answer: z.array(localizedText).min(1),
+        followup: localizedText.optional(),
+      }),
+    )
+    .optional(),
+  experiment: z
+    .enum(['feed-fanout', 'kv-budget', 'capacity','context-budget','roofline','availability','interview-plan','latency','handshake','transport','saturation','balancer','hash-ring','cache-eviction','cache-burst','db-isolation','lsm','sharding','replication-lag','quorum','raft','consumer-groups','delivery-crash','offset-gaps','rate-race','counter-race','id-bits','id-locality','dependency-availability','retry-storm','circuit-breaker','url-space','redirect-cache'])
+    .optional(),
+});
+export const handbookSchema = z.object({
+  id: z.string(),
+  group: z.enum(['foundation', 'building', 'case', 'episode', 'ai', 'practice', 'interview']),
+  title: localizedText,
+  summary: localizedText,
+  prerequisites: z.array(z.string()).default([]),
+  relatedTopics: z.array(z.string()).default([]),
+  takeaways: z.array(localizedText).min(3),
+  overview:learningFlowSchema.optional(),
+  sections: z.array(sectionSchema).min(5),
+  status: z.enum(['review','complete']),
+});
+export type HandbookLesson = z.infer<typeof handbookSchema>;

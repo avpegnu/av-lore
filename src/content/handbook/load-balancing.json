@@ -1,0 +1,687 @@
+{
+  "id": "load-balancing",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Load Balancing và Consistent Hashing: phân phối request và ownership",
+    "en": "Load balancing and consistent hashing: request distribution and ownership"
+  },
+  "summary": {
+    "vi": "Chọn L4/L7, so thuật toán trên workload có request dài, xử lý health/draining và dùng hash ring mà không nhầm routing với di chuyển dữ liệu.",
+    "en": "Choose L4/L7, compare algorithms under long requests, handle health/draining and use a hash ring without confusing routing with data migration."
+  },
+  "prerequisites": [
+    "scaling",
+    "networking"
+  ],
+  "takeaways": [
+    {
+      "vi": "Cân bằng số request không đồng nghĩa cân bằng compute, connection hoặc latency.",
+      "en": "Equal request counts do not imply equal compute, connections or latency."
+    },
+    {
+      "vi": "L4 route connection/flow; L7 có thể route theo HTTP request và application metadata.",
+      "en": "L4 routes connections/flows; L7 can route HTTP requests using application metadata."
+    },
+    {
+      "vi": "Consistent hashing hạn chế key remapping khi membership đổi, nhưng không tự giải quyết hot key hoặc data migration.",
+      "en": "Consistent hashing limits remapping on membership changes but does not solve hot keys or migrate data by itself."
+    },
+    {
+      "vi": "Health, readiness, overload và graceful drain cần semantics riêng; retry phải có budget và idempotency.",
+      "en": "Health, readiness, overload and graceful draining need separate semantics; retries need budgets and idempotency."
+    }
+  ],
+  "sections": [
+    {
+      "id": "purpose",
+      "title": {
+        "vi": "1. Hai bài toán dễ bị nhầm",
+        "en": "1. Two problems that are easy to confuse"
+      },
+      "paragraphs": [
+        {
+          "vi": "Load balancing chọn nơi xử lý một request hoặc connection để phân phối công việc. Data partitioning chọn owner của một key để truy cập đúng dữ liệu. Có thể dùng hashing trong cả hai nhưng mục tiêu khác nhau: web API stateless có thể gửi tới mọi node khỏe; một key cache hoặc storage cần đến đúng owner hoặc replica đã định nghĩa.",
+          "en": "Load balancing chooses a request/connection destination to spread work. Data partitioning chooses a key’s owner to find the right data. Hashing can serve both, but their goals differ: a stateless web API can use any healthy node, while a cache/storage key needs its defined owner or replica."
+        },
+        {
+          "vi": "LB có thể nằm ở edge, giữa service, trong client library hoặc service mesh. Một request đi qua nhiều LB nên local decisions có thể tương tác: edge giữ HTTP/2 connection lâu tới một proxy, proxy lại cân bằng request tới backend. Khi nhìn tải lệch, cần biết policy đang chọn theo connection, request hay key, không chỉ thấy một nhãn round robin.",
+          "en": "Balancing may live at the edge, between services, inside clients or in a mesh. Multiple layers interact: an edge can maintain a long HTTP/2 connection to one proxy that balances requests again. To diagnose skew, identify whether each policy chooses by connection, request or key rather than relying on a round-robin label."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Chọn executor cho request",
+            "en": "Choose a request executor"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Request stateless có thể được xử lý bởi nhiều node phù hợp.",
+              "en": "A stateless request may run on several eligible nodes."
+            },
+            {
+              "vi": "Chọn thuật toán theo service time, tải và connection behavior.",
+              "en": "Choose an algorithm based on service times, load and connection behavior."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Chọn owner theo key",
+            "en": "Choose an owner by key"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Key có placement hoặc ownership cần được tìm nhất quán.",
+              "en": "Keys have placement or ownership that must be located consistently."
+            },
+            {
+              "vi": "Đổi mapping chưa đồng nghĩa dữ liệu đã migrate xong.",
+              "en": "Changing the mapping does not mean data migration has finished."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "layers",
+      "title": {
+        "vi": "2. L4 và L7 theo thông tin có thể nhìn thấy",
+        "en": "2. L4 and L7: what information is available?"
+      },
+      "paragraphs": [
+        {
+          "vi": "L4 thường chọn theo transport flow, IP/port và connection state. Nếu TLS pass-through, LB không đọc được HTTP path/header bên trong ciphertext. L7 proxy hiểu HTTP, có thể terminate TLS, route theo host/path, áp request limits và quan sát status/latency; đổi lại thêm parsing, connection management và một trust boundary chứa plaintext.",
+          "en": "L4 commonly selects by transport flow, IP/port and connection state. TLS pass-through does not expose encrypted HTTP paths/headers. An L7 proxy understands HTTP and can terminate TLS, route by host/path, enforce request limits and observe statuses/latency, at the cost of parsing, connection management and a plaintext trust boundary."
+        },
+        {
+          "vi": "Một connection HTTP/2 có nhiều stream; least connections không nhất thiết đại diện cho số request đang chạy. Với WebSocket hoặc stream dài, một connection có thể tồn tại hàng giờ và giữ nhiều buffer/state. Chọn metric gắn với tài nguyên: active requests, queued work, connection memory hoặc latency, rồi benchmark tính ổn định của policy.",
+          "en": "One HTTP/2 connection can carry many streams, so least connections need not represent active request load. WebSockets/long streams may last hours and retain buffers/state. Choose resource-relevant metrics such as active requests, queued work, connection memory or latency and benchmark policy stability."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lựa chọn",
+            "en": "Choice"
+          },
+          {
+            "vi": "Lợi ích",
+            "en": "Benefit"
+          },
+          {
+            "vi": "Giới hạn",
+            "en": "Limits"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "L4 / pass-through",
+              "en": "L4 / pass-through"
+            },
+            {
+              "vi": "Ít application parsing; giữ TLS end-to-end tới backend nếu cấu hình phù hợp.",
+              "en": "Less application parsing; can preserve TLS to the backend."
+            },
+            {
+              "vi": "Không route theo HTTP path/header mã hóa; flow skew và connection dài.",
+              "en": "Cannot route by encrypted HTTP metadata; flow skew and long connections matter."
+            }
+          ],
+          [
+            {
+              "vi": "L7 / reverse proxy",
+              "en": "L7 / reverse proxy"
+            },
+            {
+              "vi": "Routing, auth integration, request limits và observability chi tiết.",
+              "en": "Routing, auth integration, request limits and detailed observability."
+            },
+            {
+              "vi": "Shared bottleneck, TLS/key ownership, buffering và protocol compatibility.",
+              "en": "Shared bottlenecks, TLS/key ownership, buffering and protocol compatibility."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "algorithms",
+      "title": {
+        "vi": "3. Thuật toán chọn node và workload thực",
+        "en": "3. Algorithms and actual workloads"
+      },
+      "paragraphs": [
+        {
+          "vi": "Round robin đơn giản và có thể hợp khi node/request tương đối đồng đều. Weighted round robin gán share theo capacity đã đo, không nên chỉ dựa số CPU vì workload có thể bị IO hoặc memory giới hạn. Least connections dùng connection count; least outstanding/request dùng công việc đang chạy theo định nghĩa của proxy. Chúng không tự biết duration của request mới.",
+          "en": "Round robin is simple and can fit similar nodes/requests. Weighted round robin uses measured capacity shares rather than CPU counts alone when IO or memory limits work. Least connections counts connections; least outstanding/request counts active work under the proxy’s definition. Neither knows a new request’s duration in advance."
+        },
+        {
+          "vi": "Power of two choices chọn hai candidate rồi lấy candidate có load metric thấp hơn. Nó tránh phải quét toàn pool, nhưng sample, tie-break, weight và metric freshness ảnh hưởng kết quả. Adaptive latency policy có thể phản ứng với node chậm, song cần smoothing/slow-start để không đổ dồn request vào một node vừa hồi phục hoặc tạo feedback oscillation.",
+          "en": "Power of two choices samples two candidates and chooses the lower-load metric. It avoids scanning the whole pool, while sampling, tie-breaking, weights and metric freshness affect results. Adaptive latency policies can react to slow nodes but need smoothing/slow start to avoid recovery floods and feedback oscillation."
+        }
+      ],
+      "experiment": "balancer",
+      "table": {
+        "headers": [
+          {
+            "vi": "Thuật toán",
+            "en": "Algorithm"
+          },
+          {
+            "vi": "Phù hợp khi",
+            "en": "Useful when"
+          },
+          {
+            "vi": "Dễ gặp",
+            "en": "Watch for"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Round robin / weighted",
+              "en": "Round robin / weighted"
+            },
+            {
+              "vi": "Node và cost đủ ổn định; cần policy dễ hiểu.",
+              "en": "Nodes/costs are sufficiently stable and simple policy is valuable."
+            },
+            {
+              "vi": "Request dài hoặc node chậm làm queue lệch dù request count đều.",
+              "en": "Long jobs/slow nodes skew queues despite even counts."
+            }
+          ],
+          [
+            {
+              "vi": "Least connections",
+              "en": "Least connections"
+            },
+            {
+              "vi": "Connection tương đối đại diện cho workload.",
+              "en": "Connections reasonably represent work."
+            },
+            {
+              "vi": "Multiplexed streams và idle keep-alive làm metric sai lệch.",
+              "en": "Multiplexing and idle keep-alives distort the metric."
+            }
+          ],
+          [
+            {
+              "vi": "Least outstanding / P2C",
+              "en": "Least outstanding / P2C"
+            },
+            {
+              "vi": "Có metric active work đủ tốt, request cost thay đổi.",
+              "en": "Active-work metrics are usable and request costs vary."
+            },
+            {
+              "vi": "Stale metrics, selection bias và cost không biết trước.",
+              "en": "Stale metrics, selection bias and unknown costs."
+            }
+          ],
+          [
+            {
+              "vi": "Hash / affinity",
+              "en": "Hash / affinity"
+            },
+            {
+              "vi": "Cần locality hoặc owner ổn định theo key/session.",
+              "en": "Stable key/session locality or ownership is needed."
+            },
+            {
+              "vi": "Hot key, node membership và mất local state.",
+              "en": "Hot keys, membership changes and local-state loss."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "health",
+      "title": {
+        "vi": "4. Health checks, readiness và overload",
+        "en": "4. Health checks, readiness and overload"
+      },
+      "paragraphs": [
+        {
+          "vi": "Liveness hỏi process có còn sống/tiến triển không; readiness hỏi có nên nhận traffic mới không. Active health check probe định kỳ; passive detection quan sát lỗi/timeout trên request thật. Kết hợp threshold/hysteresis để một lỗi ngắn không làm node flapping vào/ra liên tục. Probe phải rẻ và timeout ngắn hơn khả năng gây nghẽn chính nó.",
+          "en": "Liveness asks whether a process is alive/progressing; readiness asks whether it should receive new work. Active checks probe periodically; passive detection observes real-request failures/timeouts. Use thresholds/hysteresis to avoid flapping on transient errors. Probes must be cheap and bounded so they do not create their own bottleneck."
+        },
+        {
+          "vi": "Một dependency chung hỏng có thể làm mọi node báo unready. Nếu LB sau đó “panic route” sang tất cả node hoặc loại toàn pool, hành vi user thay đổi mạnh; định nghĩa policy rõ và test. Overload khác với node chết: admission/load shedding có thể giữ node khỏe bằng cách từ chối phần tải thay vì cho queue tăng tới timeout hàng loạt.",
+          "en": "A shared dependency failure can make every node unready. Panic-routing to all nodes or removing the entire pool changes user behavior dramatically; define and test the policy. Overload differs from node death: admission/load shedding can preserve health by rejecting some work instead of growing queues into mass timeouts."
+        },
+        {
+          "vi": "Retry sang node khác chỉ khi operation có semantics an toàn và còn deadline/budget. Timeout của node A không chứng minh action chưa commit; payment cần cùng idempotency key và reconciliation. Retry nhiều layer có thể khuếch đại outage, vì vậy LB không nên che mọi lỗi bằng retry vô hạn.",
+          "en": "Retry another node only under safe operation semantics and remaining deadline/budget. Node A timing out does not prove no commit; payments need the same idempotency key and reconciliation. Layered retries amplify outages, so balancing must not conceal every error with unlimited retries."
+        }
+      ]
+    },
+    {
+      "id": "draining",
+      "title": {
+        "vi": "5. Graceful drain, slow start và sticky session",
+        "en": "5. Graceful drain, slow start and sticky sessions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi deploy, chuyển node sang draining để không nhận request/connection mới, giữ các request đang chạy trong deadline rồi đóng. Stream dài cần app-level reconnect/resume và client jitter; không thể chờ mọi WebSocket sống hàng giờ tự kết thúc. Giữ đủ capacity ở pool còn lại trong suốt rolling deploy, bao gồm warm-up của node mới.",
+          "en": "During deployment, drain a node by stopping new work, allowing in-flight requests a deadline and then closing. Long streams need application reconnect/resume and jitter; waiting for hours-long WebSockets is not practical. Preserve remaining-pool capacity throughout rolling deployment and new-node warm-up."
+        },
+        {
+          "vi": "Sticky session tăng locality hoặc giữ session tạm ở node, nhưng khi node chết user vẫn cần phục hồi state. IP affinity dễ lệch khi nhiều user chung NAT và có thể đổi khi user chuyển mạng. Tốt hơn là externalize state cần bền vững; chỉ dùng affinity khi lợi ích cache/locality được đo và có failover semantics rõ.",
+          "en": "Sticky sessions improve locality or retain temporary sessions, but node loss still requires state recovery. IP affinity skews users behind NAT and changes with network switching. Externalize durable state and use affinity where measured locality benefits justify explicit failover semantics."
+        }
+      ]
+    },
+    {
+      "id": "global",
+      "title": {
+        "vi": "6. Global load balancing và failover",
+        "en": "6. Global balancing and failover"
+      },
+      "paragraphs": [
+        {
+          "vi": "Global routing chọn region/edge trước khi LB local chọn instance. DNS-based routing chịu cache/TTL và connection còn sống; Anycast dùng cùng địa chỉ được quảng bá từ nhiều nơi và network route quyết định điểm vào, không bảo đảm gần nhất theo khoảng cách địa lý hoặc theo application health. Các lớp global/local cần health signal và ownership policy phối hợp.",
+          "en": "Global routing selects a region/edge before local balancing selects an instance. DNS routing depends on caches/TTLs and existing connections. Anycast advertises one address from multiple locations, with network routes choosing entry; it does not guarantee geographic proximity or application health. Global/local layers need coordinated health and ownership policy."
+        },
+        {
+          "vi": "Latency routing không được vượt data residency hoặc write ownership. Failover read sang region khác có thể thấy replication lag; failover write cần fencing owner cũ và kiểm tra replication position. LB không thể tự giải quyết split brain chỉ bằng chuyển traffic. Đo RTO thực tế với DNS/client caches và reconnect storm, không chỉ thời gian controller phát lệnh.",
+          "en": "Latency routing must respect residency and write ownership. Read failover can expose replication lag; write failover needs old-owner fencing and replication-position checks. Traffic switching alone cannot resolve split brain. Measure recovery including client/DNS caches and reconnect storms, not merely controller command time."
+        }
+      ]
+    },
+    {
+      "id": "ring",
+      "title": {
+        "vi": "7. Consistent hashing, virtual nodes và hot key",
+        "en": "7. Consistent hashing, virtual nodes and hot keys"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với hash(key) mod N, đổi N thường đổi owner của nhiều key. Consistent hash ring đặt token node và key vào cùng không gian hash; owner là token đầu tiên theo chiều kim đồng hồ. Thêm node chỉ nhận lại các khoảng token mới chiếm, còn các key khác giữ owner. Đây là tính chất placement, không phải bảo đảm byte dữ liệu đã chuyển thành công.",
+          "en": "With hash(key) mod N, changing N remaps many keys. A consistent ring places node tokens and keys in one hash space; ownership goes to the first clockwise token. Adding a node takes only the intervals it claims, leaving other owners unchanged. This is a placement property, not proof that bytes migrated successfully."
+        },
+        {
+          "vi": "Virtual nodes đặt nhiều token cho mỗi physical node để giảm độ lệch khoảng và biểu diễn weight. Nhiều token không làm một hot key phân tán: mọi request của key đó vẫn tới cùng owner theo policy. Với hot reads có thể thêm replica/cache; với hot writes cần semantics split/aggregate phù hợp invariant. Key-count cân bằng cũng không bảo đảm byte hoặc request-cost cân bằng.",
+          "en": "Virtual nodes assign multiple tokens per physical node to reduce interval skew and represent weights. More tokens do not spread one hot key: its requests still use the policy’s owner. Hot reads can use replicas/caches; hot writes need invariant-compatible splitting/aggregation. Balanced key counts do not ensure balanced bytes or request costs."
+        },
+        {
+          "vi": "Không phải mọi sharding đều là hash ring. Redis Cluster dùng 16.384 hash slots và gán slot cho node; hệ khác có directory hoặc rendezvous hashing. Hãy nói đúng cơ chế của implementation đã chọn thay vì gọi tất cả là consistent hashing. Bất kỳ cơ chế nào cũng cần membership/routing version và policy cho owner mất kết nối.",
+          "en": "Not all sharding is a ring. Redis Cluster uses 16,384 assigned hash slots; other systems may use directories or rendezvous hashing. Name the chosen mechanism rather than calling all sharding consistent hashing. Every mechanism still needs membership/routing versions and missing-owner policies."
+        }
+      ],
+      "experiment": "hash-ring"
+    },
+    {
+      "id": "migration",
+      "title": {
+        "vi": "8. Routing thay đổi nhưng dữ liệu đang ở đâu?",
+        "en": "8. Routing changed, but where is the data?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với cache có thể rebuild, owner đổi tạo miss và cold-start pressure; cần warm có giới hạn, request coalescing và bảo vệ origin. Với durable storage, phải copy snapshot, catch-up writes và cutover version/fence; không xóa bản cũ trước khi xác minh độ bền và rollback. Routing mới trỏ vào node trống có thể tạo “mất dữ liệu” dù dữ liệu vẫn ở node cũ.",
+          "en": "Rebuildable caches experience misses and cold-start pressure when ownership changes; bound warming, coalesce requests and protect the origin. Durable storage needs snapshots, write catch-up and versioned/fenced cutover; verify durability/rollback before removing old copies. Routing to an empty new node can appear to lose data still on the old node."
+        },
+        {
+          "vi": "Replica placement phải tránh cùng failure domain nếu yêu cầu chịu rack/zone loss. Hash ring owner đầu tiên không tự chọn replica an toàn; cần replication policy, read/write semantics và membership agreement phù hợp. Trong network partition, LB thấy timeout không đủ để kết luận một storage owner đã chết và cho phép writer khác ghi đồng thời.",
+          "en": "Replica placement must separate failure domains when tolerating rack/zone loss. The first ring owner does not automatically choose safe replicas; define replication, read/write semantics and suitable membership agreement. During partitions, a balancer timeout is insufficient evidence to allow another storage writer concurrently."
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "9. Theo dõi request và graceful deploy",
+        "en": "9. Trace requests and graceful deployment"
+      },
+      "paragraphs": [],
+      "diagram": {
+        "id": "lb-drain",
+        "title": {
+          "vi": "Chọn instance và xử lý deploy có drain",
+          "en": "Selecting instances and deploying with draining"
+        },
+        "caption": {
+          "vi": "Connection đang chạy có vòng đời riêng với request mới. Health signal thay routing, không rollback side effect đã commit.",
+          "en": "Existing connections and new requests have separate lifecycles. Health signals change routing, not already committed effects."
+        },
+        "width": 850,
+        "height": 420,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client",
+              "en": "Client"
+            },
+            "kind": "client",
+            "x": 110,
+            "y": 100,
+            "detail": {
+              "vi": "Gửi identity và request ID; retry giữ logical action identity khi có side effect.",
+              "en": "Sends identity/request IDs; retries preserve logical-action identity for side effects."
+            }
+          },
+          {
+            "id": "lb",
+            "label": {
+              "vi": "L7 balancer",
+              "en": "L7 balancer"
+            },
+            "kind": "edge",
+            "x": 390,
+            "y": 100,
+            "detail": {
+              "vi": "Chọn từ pool ready theo algorithm và weight; áp deadline/concurrency, quan sát upstream lỗi.",
+              "en": "Chooses ready instances by algorithm/weight, bounds deadlines/concurrency and observes upstream errors."
+            }
+          },
+          {
+            "id": "a",
+            "label": {
+              "vi": "Node A / ready",
+              "en": "Node A / ready"
+            },
+            "kind": "service",
+            "x": 700,
+            "y": 100,
+            "detail": {
+              "vi": "Có thể nhận request mới. State bền vững nằm ở owner/storage thích hợp.",
+              "en": "Accepts new work; durable state lives in its appropriate owner/storage."
+            }
+          },
+          {
+            "id": "b",
+            "label": {
+              "vi": "Node B / draining",
+              "en": "Node B / draining"
+            },
+            "kind": "service",
+            "x": 700,
+            "y": 300,
+            "detail": {
+              "vi": "Không nhận work mới; inflight hoàn tất trong deadline và stream có reconnect/resume.",
+              "en": "Accepts no new work; in-flight work finishes within deadlines and streams reconnect/resume."
+            }
+          },
+          {
+            "id": "control",
+            "label": {
+              "vi": "Discovery / health",
+              "en": "Discovery / health"
+            },
+            "kind": "service",
+            "x": 390,
+            "y": 300,
+            "detail": {
+              "vi": "Cập nhật readiness, weights và membership có version; tránh flapping và recovery flood.",
+              "en": "Updates readiness, weights and versioned membership; avoids flapping and recovery floods."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "serve",
+            "label": {
+              "vi": "Request mới",
+              "en": "New request"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "lb",
+                "description": {
+                  "vi": "Nhận request, deadline và identity context.",
+                  "en": "Receive the request, deadline and identity context."
+                }
+              },
+              {
+                "from": "lb",
+                "to": "control",
+                "description": {
+                  "vi": "Dùng snapshot membership/readiness được cập nhật, không probe đồng bộ mỗi request.",
+                  "en": "Use updated membership/readiness state rather than synchronously probing every request."
+                }
+              },
+              {
+                "from": "lb",
+                "to": "a",
+                "description": {
+                  "vi": "Chọn node ready theo policy và budget.",
+                  "en": "Choose a ready node within policy and budget."
+                }
+              },
+              {
+                "from": "a",
+                "to": "client",
+                "description": {
+                  "vi": "Trả response với semantics retry rõ ràng.",
+                  "en": "Return a response under explicit retry semantics."
+                }
+              }
+            ]
+          },
+          {
+            "id": "drain",
+            "label": {
+              "vi": "Deploy / drain",
+              "en": "Deploy / drain"
+            },
+            "steps": [
+              {
+                "from": "control",
+                "to": "lb",
+                "description": {
+                  "vi": "Đánh dấu B draining, ngừng routing request mới tới B.",
+                  "en": "Mark B draining and stop new-request routing to it."
+                },
+                "async": true
+              },
+              {
+                "from": "lb",
+                "to": "b",
+                "description": {
+                  "vi": "Giữ request đã được nhận tới deadline; không tạo inflight mới.",
+                  "en": "Keep accepted work until its deadline; do not admit new in-flight work."
+                }
+              },
+              {
+                "from": "b",
+                "to": "client",
+                "description": {
+                  "vi": "Stream kết thúc hoặc gửi tín hiệu reconnect theo protocol của app.",
+                  "en": "Streams finish or signal reconnection through the application protocol."
+                }
+              },
+              {
+                "from": "client",
+                "to": "lb",
+                "description": {
+                  "vi": "Reconnect có jitter và resume token nếu app hỗ trợ.",
+                  "en": "Reconnect with jitter and a resume token if supported."
+                }
+              },
+              {
+                "from": "lb",
+                "to": "a",
+                "description": {
+                  "vi": "Route tới node ready còn capacity.",
+                  "en": "Route to a ready node with available capacity."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "10. Vận hành và quyết định dài hạn",
+        "en": "10. Operations and long-term decisions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Theo dõi per-upstream rate, active work, queue wait, response latency, retries, connect errors, ejections và dropped/admission-rejected requests. Aggregate latency có thể tốt dù một tenant hoặc shard rất xấu; phân nhóm theo bounded dimensions như region/route/cluster, không dùng request ID làm metric label. Trace ID nối hop để phân biệt proxy wait với server execution.",
+          "en": "Track per-upstream rates, active work, queue waits, latency, retries, connection errors, ejections and admission rejection. Aggregate latency can hide a bad tenant/shard; group by bounded dimensions such as region/route/cluster, not request-ID metric labels. Trace hops to distinguish proxy waits from server execution."
+        },
+        {
+          "vi": "LB cũng là một hệ thống phải scale và chịu lỗi: config rollout có validation/canary, certificate rotation, connection limits, memory buffer và rollback. Client-side balancing giảm một network hop nhưng phân tán policy/config trên nhiều client version. Managed LB giảm vận hành riêng nhưng cần hiểu quota, cost và features trước khi chọn.",
+          "en": "The balancer itself needs scaling and resilience: validated/canary configuration, certificate rotation, connection/buffer limits and rollback. Client-side balancing avoids a network hop but spreads policy/configuration across client versions. Managed balancing reduces local operations but requires quota, cost and feature understanding."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "11. Interview drill và lời giải",
+        "en": "11. Interview drills and worked answers"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao round robin vẫn tạo node chậm dù request count đều?",
+            "en": "Why can round robin create slow nodes with even request counts?"
+          },
+          "answer": [
+            {
+              "vi": "Request có duration/CPU/memory khác nhau và node có capacity khác nhau. Một node nhận nhiều job dài sẽ tích queue; nhìn request count bỏ mất work. Đo outstanding, queue wait và duration distribution rồi thử weighted/least outstanding/P2C theo workload, không hứa một algorithm tối ưu mọi trường hợp.",
+              "en": "Requests differ in duration/CPU/memory and nodes differ in capacity. Long jobs build queues despite equal counts. Measure outstanding work, waits and durations, then test weighted/least-outstanding/P2C policies rather than promising a universal winner."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Thêm virtual nodes có sửa được một hot key không?",
+            "en": "Do virtual nodes fix a hot key?"
+          },
+          "answer": [
+            {
+              "vi": "Không: chúng chia nhiều khoảng key giữa node, không chia một key. Hot key cần cache/replica cho reads hoặc partition/aggregate có semantics đúng cho writes. Thêm node mà owner hot key vẫn một node không tăng được capacity của key đó.",
+              "en": "No: they divide key intervals, not one key. Hot keys need read caches/replicas or correctly designed write partitioning/aggregation. Additional nodes do not increase that key’s capacity if it still has one owner."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "HTTP/2 có làm least connections thành metric hoàn hảo không?",
+            "en": "Does HTTP/2 make least connections an ideal metric?"
+          },
+          "answer": [
+            {
+              "vi": "Ngược lại, nhiều stream cùng connection làm connection count ít đại diện cho work. Một connection có hàng trăm request active còn connection khác idle. Dùng request/work metric khi L7 thấy được; L4 cần thừa nhận giới hạn và xem cách upstream multiplex tạo skew.",
+              "en": "Multiplexed streams make connection counts less representative. One connection may carry hundreds of active requests while another is idle. Use request/work metrics where L7 exposes them; L4 must account for its visibility limits and upstream multiplexing skew."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bài tập: thêm node D vào vòng A/B/C, key nào được đổi owner?",
+            "en": "Exercise: adding D to an A/B/C ring may move which keys?"
+          },
+          "answer": [
+            {
+              "vi": "Trong ring giữ nguyên token cũ, chỉ key nằm trong khoảng token D nhận lại chuyển sang D. Những key không chuyển sang D phải giữ owner cũ. Tỷ lệ gần 1/4 chỉ là kỳ vọng với placement cân bằng và đủ key/token, không phải đúng tuyệt đối cho mọi sample.",
+              "en": "With old tokens preserved, only keys in D’s claimed intervals move to D; keys not moving to D keep their old owner. Roughly one quarter is an expectation under balanced placement with enough keys/tokens, not an exact fraction for every sample."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Node bị timeout, có nên tự chuyển mọi write sang replica không?",
+            "en": "If an owner times out, should all writes move to its replica?"
+          },
+          "answer": [
+            {
+              "vi": "Không chỉ dựa timeout. Owner cũ có thể vẫn hoạt động nhưng network partition; cần ownership agreement, fencing và replication semantics trước khi cho writer mới. LB routing là cơ chế chuyển traffic, không phải consensus hay transaction coordinator.",
+              "en": "Not based only on a timeout. The old owner may still be live behind a partition; new write ownership needs agreement, fencing and replication semantics. Balancing routes traffic; it is not consensus or a transaction coordinator."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Làm sao deploy 100.000 stream mà không reconnect storm?",
+            "en": "How would you deploy 100,000 streams without a reconnect storm?"
+          },
+          "answer": [
+            {
+              "vi": "Drain theo batch nhỏ, giữ spare capacity, cho client reconnect với jitter/backoff và resume event nếu app hỗ trợ. Đặt max connection age hoặc migration policy có kiểm soát, theo dõi connect/auth load, không đóng mọi node cùng lúc. SSE và WebSocket đều cần lifecycle của connection.",
+              "en": "Drain small batches with spare capacity and jittered/backoff reconnects, using application event resumption where supported. Set controlled connection-age/migration policies, watch connection/authentication load and avoid closing all nodes together. Both SSE and WebSockets require connection lifecycle management."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "network",
+    "cache",
+    "architecture"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Chọn node cho request, rồi giữ hệ thống ổn định",
+      "en": "Choose a request target, then keep the system stable"
+    },
+    "caption": {
+      "vi": "Request balancing chọn nơi xử lý một request; consistent hashing quyết định placement/ownership theo key. Hai bài toán có thể liên quan nhưng không đồng nhất.",
+      "en": "Request balancing selects where a request runs; consistent hashing determines key placement/ownership. The problems can be related without being identical."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Nhận traffic",
+          "en": "Receive traffic"
+        },
+        "detail": {
+          "vi": "L4/L7 và trust boundary.",
+          "en": "L4/L7 and the trust boundary."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Lọc pool khả dụng",
+          "en": "Filter the available pool"
+        },
+        "detail": {
+          "vi": "Health, readiness, overload.",
+          "en": "Health, readiness and overload."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Chọn theo workload",
+          "en": "Choose for the workload"
+        },
+        "detail": {
+          "vi": "RR, least request hoặc P2C.",
+          "en": "Round robin, least request or P2C."
+        },
+        "icon": "gauge"
+      },
+      {
+        "title": {
+          "vi": "Theo dõi và drain",
+          "en": "Observe and drain"
+        },
+        "detail": {
+          "vi": "Retry budget, deploy, ownership.",
+          "en": "Retry budgets, deployment and ownership."
+        },
+        "icon": "inspect"
+      }
+    ]
+  }
+}

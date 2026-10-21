@@ -19,9 +19,10 @@ const cache = readCache(),
   missing = new Set();
 const t = (value) => {
   const key = normalize(value);
-  if (!key || !hasVietnamese(key)) return value;
+  if (!key) return value;
   const result = cache[key];
   if (!result) {
+    if (!hasVietnamese(key)) return value;
     missing.add(key);
     return value;
   }

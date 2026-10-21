@@ -1,0 +1,719 @@
+{
+  "id": "reliability",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Reliability, Resilience và Observability",
+    "en": "Reliability, Resilience and Observability"
+  },
+  "summary": {
+    "vi": "Định nghĩa SLO theo user journey, mô phỏng retry và dependency failures, rồi thiết kế containment, quan sát và recovery.",
+    "en": "Define journey-based SLOs, explore retries and dependency failures, and design containment, observation and recovery."
+  },
+  "prerequisites": [
+    "estimation",
+    "networking",
+    "rate-limiting"
+  ],
+  "relatedTopics": [
+    "observability",
+    "distributed",
+    "testing"
+  ],
+  "takeaways": [
+    {
+      "vi": "SLI phải đo đúng hành vi user; 2xx hoặc CPU không đủ.",
+      "en": "SLIs must measure user outcomes; 2xx or CPU alone is insufficient."
+    },
+    {
+      "vi": "Availability multiplication cần giả định độc lập; replica có thể lỗi cùng nhau.",
+      "en": "Availability multiplication needs independence; replicas can fail together."
+    },
+    {
+      "vi": "Jitter trải timing; retry budgets, deadlines và admission giới hạn work.",
+      "en": "Jitter spreads timing; budgets, deadlines and admission bound work."
+    },
+    {
+      "vi": "Circuit breaker, bulkhead và load shedding bảo vệ các boundary khác nhau.",
+      "en": "Breakers, bulkheads and load shedding protect different boundaries."
+    },
+    {
+      "vi": "Backup, rollback và failover đều cần recovery test có correctness checks.",
+      "en": "Backups, rollback and failover need recovery tests with correctness checks."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Reliability là một vòng phản hồi",
+      "en": "Reliability is a feedback loop"
+    },
+    "caption": {
+      "vi": "Mục tiêu, tín hiệu và response phải được thiết kế cùng nhau; không chỉ thêm dashboard sau khi hoàn tất kiến trúc.",
+      "en": "Design objectives, signals and responses together rather than adding dashboards after the architecture."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Chốt hành vi tốt",
+          "en": "Define good outcomes"
+        },
+        "detail": {
+          "vi": "Journey, invariant và SLO.",
+          "en": "Journeys, invariants and SLOs."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Khoanh vùng failure",
+          "en": "Contain failures"
+        },
+        "detail": {
+          "vi": "Admission, isolation, degradation.",
+          "en": "Admission, isolation and degradation."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Quan sát và phản ứng",
+          "en": "Observe and respond"
+        },
+        "detail": {
+          "vi": "Burn, trace, owner, runbook.",
+          "en": "Burn, traces, ownership and runbooks."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Phục hồi và học",
+          "en": "Recover and learn"
+        },
+        "detail": {
+          "vi": "Restore, reconcile, sửa feedback loop.",
+          "en": "Restore, reconcile and fix feedback loops."
+        },
+        "icon": "route"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "journeys",
+      "title": {
+        "vi": "1. Bắt đầu bằng hành trình người dùng",
+        "en": "1. Start with the user journey"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một process còn chạy không có nghĩa user hoàn thành tác vụ. Checkout có thể trả 200 nhưng không lưu order; API có thể nhanh nhưng trả stale permission sai contract. Định nghĩa correctness, availability, latency và freshness theo operation quan trọng trước khi chọn “bao nhiêu số 9”.",
+          "en": "A running process does not mean a user completed a task. Checkout may return 200 without saving an order; fast APIs may return permissions older than their contract permits. Define correctness, availability, latency and freshness for important operations before choosing a number of nines."
+        },
+        {
+          "vi": "Reliability bao gồm phát hiện lỗi, giới hạn blast radius, phục hồi và thay đổi an toàn. Một hệ thống phức tạp hơn có thể thêm failure modes và on-call burden; cân nhắc chi phí, dữ liệu được phép mất và thời gian gián đoạn mà user chịu được, không mặc định multi-region luôn tốt hơn.",
+          "en": "Reliability includes detection, containment, recovery and safe changes. More complexity may add failure modes and on-call burden. Consider cost, tolerable data loss and interruption rather than assuming multi-region is always better."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Đúng hành vi",
+            "en": "Correct behavior"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Invariant không được vi phạm dù retry hoặc failover.",
+              "en": "Invariants must survive retries and failover."
+            },
+            {
+              "vi": "Response thành công phải tương ứng với trạng thái đã hứa.",
+              "en": "Successful responses must match the promised state."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Giới hạn tác động",
+            "en": "Bound the impact"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Dependency phụ không kéo hỏng luồng chính.",
+              "en": "Optional dependencies must not break the main journey."
+            },
+            {
+              "vi": "Phân vùng failure domain và rollout theo phạm vi nhỏ.",
+              "en": "Separate failure domains and roll out in small scopes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Phục hồi được kiểm chứng",
+            "en": "Verified recovery"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Có runbook, owner và recovery test.",
+              "en": "Provide runbooks, owners and recovery tests."
+            },
+            {
+              "vi": "Restore dữ liệu và reconcile side effect sau lỗi.",
+              "en": "Restore data and reconcile post-failure effects."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sli-slo",
+      "title": {
+        "vi": "2. SLI, SLO, SLA và phạm vi đo",
+        "en": "2. SLIs, SLOs, SLAs and measurement scope"
+      },
+      "paragraphs": [
+        {
+          "vi": "SLI là phép đo, ví dụ tỷ lệ eligible checkout request hoàn tất đúng trong 500 ms. SLO là mục tiêu cho SLI trên cửa sổ được định nghĩa; SLA là cam kết có hệ quả theo thỏa thuận. Loại trừ invalid input, maintenance hay traffic nào phải được chốt trước, không đổi mẫu số sau incident để làm tỷ lệ đẹp hơn.",
+          "en": "An SLI measures behavior, such as the proportion of eligible checkouts completed correctly within 500 ms. An SLO targets that SLI over a defined window; an SLA adds agreed consequences. Define exclusions before incidents rather than changing denominators to improve results."
+        },
+        {
+          "vi": "Đo ở boundary sát user như edge/client telemetry và correlate với backend. Server CPU thấp không chứng minh service tốt, vì request có thể bị kẹt trước server. Low-traffic journeys, synthetic checks, client disconnect và missing telemetry cần policy rõ để không che failure bằng việc không ghi nhận nó.",
+          "en": "Measure near users, such as edge/client boundaries, and correlate with backend signals. Low CPU does not prove service health when requests stall upstream. Define low-traffic, synthetic-check, disconnect and missing-telemetry policies rather than hiding failures through absent data."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Từ hành vi đến hành động vận hành",
+          "en": "From behavior to operational action"
+        },
+        "caption": {
+          "vi": "Mục tiêu và alert phải gắn cùng definition/window; tránh lấy uptime máy thay request success của user.",
+          "en": "Targets and alerts need the same definitions/windows; machine uptime is not user-request success."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Định nghĩa good event",
+              "en": "Define a good event"
+            },
+            "detail": {
+              "vi": "Correct, timely và eligible.",
+              "en": "Correct, timely and eligible."
+            },
+            "icon": "target"
+          },
+          {
+            "title": {
+              "vi": "Đo SLI",
+              "en": "Measure the SLI"
+            },
+            "detail": {
+              "vi": "Good / total với boundary rõ.",
+              "en": "Good / total at an explicit boundary."
+            },
+            "icon": "chart"
+          },
+          {
+            "title": {
+              "vi": "Chốt SLO và budget",
+              "en": "Set SLO and budget"
+            },
+            "detail": {
+              "vi": "Target, window và policy.",
+              "en": "Target, window and policy."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Alert và giảm rủi ro",
+              "en": "Alert and reduce risk"
+            },
+            "detail": {
+              "vi": "Burn rate, owner, runbook.",
+              "en": "Burn rate, ownership and runbooks."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
+    },
+    {
+      "id": "budget",
+      "title": {
+        "vi": "3. Error budget không luôn là downtime",
+        "en": "3. Error budgets are not always downtime"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với request-based SLO 99,9% trên 10 triệu eligible requests, budget là 10.000 bad requests. Không tự đổi thành 43,2 phút/tháng nếu traffic thay đổi theo giờ. Với time-based availability và tháng giả định 30 ngày, phép đổi 0,1% × 30 ngày mới cho 43,2 phút. Hai SLI trả lời câu hỏi khác nhau.",
+          "en": "A request-based 99.9% SLO over ten million eligible requests allows 10,000 bad requests. That is not automatically 43.2 minutes/month under variable traffic. A time-based SLI over an assumed thirty-day month yields 43.2 minutes at 0.1%. These measure different things."
+        },
+        {
+          "vi": "Burn rate = observed bad-event ratio / allowed bad-event ratio. Nếu target 99,9% và window ngắn có 1% bad events thì burn=10×. Alert nhiều window giúp phát hiện lỗi nhanh lẫn chậm và giảm false alarms; chọn threshold theo budget cần bảo vệ và khả năng phản ứng. Policy khi budget cạn cần được các đội thống nhất, không phải một công thức tự động cấm mọi thay đổi.",
+          "en": "Burn rate is observed bad-event ratio divided by allowed bad-event ratio. At a 99.9% target, a short window with 1% bad events burns at 10×. Multiwindow alerts address fast and slow burns; thresholds should reflect budget protection and response capability. Teams agree what budget exhaustion changes rather than automatically banning every change."
+        }
+      ],
+      "experiment": "availability"
+    },
+    {
+      "id": "dependencies",
+      "title": {
+        "vi": "4. Availability math cần giả định độc lập",
+        "en": "4. Availability math needs independence assumptions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu request cần mọi dependency đều tốt và các sự kiện failure độc lập, xác suất thành công là tích các availability. Nếu có correlation, phải tính joint probability; không lấy tích các con số marketing rồi gọi đó là SLO thực của journey. Failure chung có thể làm phép nhân độc lập sai theo nhiều hướng.",
+          "en": "If all dependencies must succeed and their failures are independent, success probability is the product of their availabilities. Correlated failures require joint probabilities, not multiplication of marketing figures presented as a journey SLO. Common causes can invalidate the independent estimate in different directions."
+        },
+        {
+          "vi": "Redundancy A/B chỉ giúp khi còn capacity để failover, routing đúng và common cause được hạn chế. Hai region có thể cùng phụ thuộc một identity/configuration system hoặc cùng bị deploy lỗi. Hạ một dependency từ hard xuống soft thường hiệu quả hơn thêm replica cho mọi hộp.",
+          "en": "Redundancy needs failover capacity, correct routing and bounded common causes. Two regions may share identity/configuration failures or a bad deployment. Making a dependency optional can be more valuable than replicating every box."
+        }
+      ],
+      "experiment": "dependency-availability"
+    },
+    {
+      "id": "deadlines",
+      "title": {
+        "vi": "5. Timeout, deadline và cancellation",
+        "en": "5. Timeouts, deadlines and cancellation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Timeout cho một call phải phù hợp end-to-end deadline còn lại; connect, TLS, queueing và response reading có thể nằm ngoài hoặc trong timeout tùy client. Nêu boundary trước khi chọn con số. Truyền remaining budget và ngừng nhận việc đã hết hạn; cancellation cần đi tới worker nhưng không mặc định undo transaction đã commit.",
+          "en": "Call timeouts must fit the remaining end-to-end deadline. Connection setup, TLS, queueing and response reads may be included or excluded by a client. Define the boundary first. Propagate remaining budgets and reject expired work; cancellation should reach workers without pretending it undoes committed transactions."
+        },
+        {
+          "vi": "Recommendations không cần là hard dependency của checkout. Có thể fetch với budget riêng, bulkhead và fallback; core checkout tiếp tục khi phần phụ chậm. Theo dõi degraded responses để không biến fallback thành cách che một dependency hỏng lâu dài. Tránh đặt timeout quá ngắn làm tất cả request fail khi cold start/connection handshake bình thường.",
+          "en": "Recommendations need not be a checkout hard dependency. Give them a separate budget, bulkhead and fallback while checkout proceeds. Track degraded responses so fallback does not hide a chronic fault. Overly short timeouts can reject normal cold-start/handshake work."
+        }
+      ]
+    },
+    {
+      "id": "retries",
+      "title": {
+        "vi": "6. Retry: tổng attempts khác số retries",
+        "en": "6. Retries: total attempts differ from retry count"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một initial attempt cộng hai retries là ba attempts. Nếu năm layer đều thử tối đa ba lần khi lỗi kéo dài, worst-case leaf attempts có thể là 3^5=243 cho một request gốc. Đây là trường hợp lỗi xấu nhất, không phải traffic bình thường luôn nhân 243. Chọn retry owner tại layer có đủ thông tin về deadline, error và idempotency; không có quy tắc luôn retry ở ngoài cùng.",
+          "en": "One initial attempt plus two retries is three attempts. Five layers each allowing three attempts can generate 3^5=243 leaf attempts under persistent failure. This is a worst case, not normal traffic. Place retry ownership where deadlines, errors and idempotency are understood rather than always at the outermost layer."
+        },
+        {
+          "vi": "Retry lỗi transient có cơ hội hết; không retry validation error hoặc authorization denial như thể server đang hồi phục. 429/503 cần đọc contract và retry guidance. Timeout sau side effect là unknown outcome: dùng idempotency/status lookup/reconciliation thay vì lặp một mutation không an toàn.",
+          "en": "Retry transient failures likely to clear, not validation errors or authorization denials. Interpret 429/503 under the API’s guidance. A side-effect timeout is an unknown outcome: use idempotency, status lookup and reconciliation instead of repeating unsafe mutations."
+        }
+      ],
+      "experiment": "retry-storm"
+    },
+    {
+      "id": "backoff",
+      "title": {
+        "vi": "7. Backoff, jitter và retry budget làm việc khác nhau",
+        "en": "7. Backoff, jitter and retry budgets do different jobs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Capped exponential backoff tăng ceiling thời gian đợi; full jitter chọn một delay trong [0, ceiling] theo policy. Nó trải thời điểm của một nhóm caller bị lỗi đồng thời, không tự giảm tổng attempts. Ngược lại, retry budget cắt số lần thử được nhận; deadline có thể dừng retry dù budget còn.",
+          "en": "Capped exponential backoff grows a delay ceiling; full jitter samples within its policy’s [0, ceiling]. It spreads synchronized retries without automatically reducing total attempts. Retry budgets instead limit admitted retries; deadlines may stop attempts even when budget remains."
+        },
+        {
+          "vi": "Budget theo ratio hay token bucket phải có scope: một process, tenant, destination hay fleet. Hàng trăm client mỗi bên cho thêm 10% retry vẫn cần xem tổng capacity của destination. Khi server báo overload diện rộng, backoff không thay load shedding/admission. Không sleep lâu rồi tiếp tục khi caller đã bỏ cuộc.",
+          "en": "Define budget scope: process, tenant, destination or fleet. Hundreds of clients each permitting extra retries still need destination capacity. During broad overload, backoff does not replace admission/load shedding. Do not wait and retry after the caller’s deadline has expired."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "content": "before each attempt:\n  require retryable outcome + safe operation\n  require remaining deadline and attempt budget\n  require destination retry allowance\n  delay = policy_backoff_with_jitter(attempt)\n  honor server not-before guidance when present\n  stop if the next attempt cannot fit the remaining budget",
+        "caption": {
+          "vi": "Pseudocode chỉ ra điều kiện; implementation còn cần abort/cancellation và classify error theo protocol thực.",
+          "en": "Condition pseudocode; implementations also need cancellation and protocol-specific error classification."
+        }
+      }
+    },
+    {
+      "id": "breaker",
+      "title": {
+        "vi": "8. Circuit breaker không thay timeout",
+        "en": "8. A circuit breaker does not replace timeouts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Closed cho phép gọi và đo outcome. Open từ chối sớm một thời gian. Half-open chỉ cho một số probe hữu hạn để kiểm tra hồi phục. Chọn failure/slow-call metric, minimum sample, window và cooldown phù hợp; một error 4xx do caller không nhất thiết là tín hiệu dependency hỏng.",
+          "en": "Closed permits calls and observes outcomes; open rejects early; half-open admits a bounded number of recovery probes. Choose failure/slow-call metrics, sample minimums, windows and cooldowns. Caller-caused 4xx errors do not necessarily indicate dependency failure."
+        },
+        {
+          "vi": "Timeout vẫn cần cho từng probe/call. Per-process breaker có thể làm mọi instance cùng probe lúc cooldown hết; dùng jitter/probe limits phù hợp. Trong implementation đồng thời, response cũ không được tự đóng breaker của generation mới; state transition và accounting cần kiểm soát race.",
+          "en": "Every call/probe still needs a timeout. Per-process breakers may probe together after cooldown; use suitable jitter and limits. Concurrent implementations must prevent stale responses closing a newer breaker generation and protect transition/accounting races."
+        }
+      ],
+      "experiment": "circuit-breaker"
+    },
+    {
+      "id": "isolation",
+      "title": {
+        "vi": "9. Bulkhead, load shedding và graceful degradation",
+        "en": "9. Bulkheads, load shedding and graceful degradation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bulkhead tách pool/concurrency theo dependency hoặc tenant để một bên chậm không chiếm toàn bộ tài nguyên. Bound queue theo memory và thời gian hữu ích còn lại; backlog hàng chục nghìn request với deadline một giây có thể chỉ tạo công việc không ai còn chờ. Reject sớm rẻ hơn chạy tới timeout nhưng cần policy priority/fairness rõ.",
+          "en": "Bulkheads isolate pools/concurrency by dependency or tenant. Bound queues by memory and remaining usefulness: thousands of queued one-second requests may be abandoned work. Early rejection is cheaper than running into timeouts but requires explicit priority/fairness."
+        },
+        {
+          "vi": "Degradation như dùng dữ liệu cũ chỉ phù hợp phần cho phép stale; không degrade authorization thành allow hoặc số dư đúng thành “gần đúng” mà vẫn báo thành công. Fallback cũng tiêu CPU/cache/network và có thể lỗi chung. Đo chất lượng degraded mode cùng tỷ lệ request hoàn tất.",
+          "en": "Stale fallbacks are valid only where the contract permits them. Do not degrade authorization to allow or exact balances to approximate while claiming success. Fallbacks consume resources and may share failures. Measure degraded quality alongside completed requests."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Cơ chế resilience",
+            "en": "Resilience mechanism"
+          },
+          {
+            "vi": "Boundary bảo vệ",
+            "en": "Protected boundary"
+          },
+          {
+            "vi": "Giới hạn của cơ chế",
+            "en": "Limitation"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Timeout / deadline",
+              "en": "Timeout / deadline"
+            },
+            {
+              "vi": "Thời gian và công việc còn hữu ích.",
+              "en": "Time and useful work."
+            },
+            {
+              "vi": "Không tự rollback effect đã commit.",
+              "en": "Does not roll back committed effects."
+            }
+          ],
+          [
+            {
+              "vi": "Circuit breaker",
+              "en": "Circuit breaker"
+            },
+            {
+              "vi": "Calls tới dependency bị nghi lỗi.",
+              "en": "Calls to an unhealthy dependency."
+            },
+            {
+              "vi": "Không tự tạo capacity hoặc probe timeout.",
+              "en": "Does not create capacity or supply probe timeouts."
+            }
+          ],
+          [
+            {
+              "vi": "Bulkhead",
+              "en": "Bulkhead"
+            },
+            {
+              "vi": "Pool/concurrency giữa failure domains.",
+              "en": "Pools/concurrency across failure domains."
+            },
+            {
+              "vi": "Chia pool sai có thể lãng phí capacity.",
+              "en": "Poor pool allocation may waste capacity."
+            }
+          ],
+          [
+            {
+              "vi": "Load shedding",
+              "en": "Load shedding"
+            },
+            {
+              "vi": "Admission trước khi overload lan rộng.",
+              "en": "Admission before overload spreads."
+            },
+            {
+              "vi": "Cần policy công bằng và response rõ.",
+              "en": "Requires fairness and defined responses."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "observability",
+      "title": {
+        "vi": "10. Metrics, logs và traces trả lời câu hỏi khác nhau",
+        "en": "10. Metrics, logs and traces answer different questions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metrics cho aggregate/rate/alert, logs cho event detail, traces nối thời gian qua service boundary. RED là Rate, Errors, Duration của request; USE là Utilization, Saturation, Errors của resource. Means vẫn hữu ích cho tổng work và Little’s Law, nhưng không thay tail latency; quantile cần population/window đúng.",
+          "en": "Metrics support aggregates/rates/alerts, logs give event detail and traces connect service boundaries. RED covers request Rate, Errors and Duration; USE covers resource Utilization, Saturation and Errors. Means help total work and Little’s Law but do not replace tail latency; quantiles need defined populations/windows."
+        },
+        {
+          "vi": "Không cộng p99 từng service rồi gọi đó là p99 end-to-end, và không average các p99 của từng instance. Histogram aggregation trước quantile có thể phù hợp khi bucket/schema nhất quán; vẫn phải hiểu sampling và missing data. Tracing cần propagation, span lifecycle và phân biệt queue time với service time.",
+          "en": "Do not sum service p99s for end-to-end p99 or average instance p99s. Aggregate compatible histograms before deriving quantiles where appropriate, accounting for sampling and missing data. Tracing needs propagation, span lifecycles and separate queue/service time."
+        },
+        {
+          "vi": "Giữ metric labels hữu hạn; user ID và request ID có thể làm cardinality bùng nổ. Đặt chúng vào trace/log theo access và retention policy khi cần. Không log tokens/secrets hoặc toàn bộ payload mặc định; debug visibility không được làm hỏng privacy hay chi phí vận hành.",
+          "en": "Keep metric labels bounded; user/request IDs can explode cardinality. Put necessary IDs in controlled traces/logs with access and retention policies. Avoid default logging of tokens, secrets or complete payloads; debugging should not undermine privacy or cost control."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Metrics · Có vấn đề không?",
+            "en": "Metrics · Is something wrong?"
+          },
+          "icon": "chart",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Rate, errors, latency distribution và saturation.",
+              "en": "Rates, errors, latency distributions and saturation."
+            },
+            {
+              "vi": "Alert actionable theo journey và budget.",
+              "en": "Actionable journey/budget alerts."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Logs · Event nào xảy ra?",
+            "en": "Logs · What happened?"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Structured fields, correlation và error context.",
+              "en": "Structured fields, correlation and error context."
+            },
+            {
+              "vi": "Sampling/retention/access kiểm soát được.",
+              "en": "Controlled sampling, retention and access."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Traces · Thời gian đi đâu?",
+            "en": "Traces · Where did time go?"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Critical path, dependency và queue waits.",
+              "en": "Critical paths, dependencies and queue waits."
+            },
+            {
+              "vi": "Sampling có thể bỏ sót lỗi; không coi trace là census.",
+              "en": "Sampling can miss failures; traces are not a census."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "change-safety",
+      "title": {
+        "vi": "11. Release an toàn và rollback có điều kiện",
+        "en": "11. Safe releases and conditional rollback"
+      },
+      "paragraphs": [
+        {
+          "vi": "Deploy/config/schema changes là nguồn failure quan trọng. Feature flags tách deploy và release; canary so cohort theo SLI/error budget trước khi mở rộng. Chọn traffic đủ đại diện và window đủ để phát hiện slow-burn, không chỉ đợi vài request 200. Theo dõi control-plane dependencies và audit config version.",
+          "en": "Deployments, configuration and schema changes are important failure sources. Flags separate deployment from release; canaries compare cohorts before expansion. Use representative traffic and enough observation for slow burns rather than a few successful responses. Track control-plane dependencies and configuration versions."
+        },
+        {
+          "vi": "Rollback code không undo data/schema migration hoặc external effect. Dùng expand/contract, backward-compatible messages, backfill có throttle và reconciliation. Blue-green cần capacity và compatibility ở shared state; không mặc định mọi rollout đều rollback tức thì bằng đổi load balancer.",
+          "en": "Code rollback does not undo data/schema migrations or external effects. Use expand/contract, compatible messages, throttled backfills and reconciliation. Blue-green needs capacity and shared-state compatibility; changing a load balancer is not universal instant rollback."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Rollout có cổng kiểm chứng",
+          "en": "Roll out through validation gates"
+        },
+        "caption": {
+          "vi": "Dừng hoặc rollback khi SLI xấu theo policy; migration không reversible cần forward-recovery plan.",
+          "en": "Stop or roll back under the SLI policy; irreversible migrations need forward-recovery plans."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Chuẩn bị contract",
+              "en": "Prepare contracts"
+            },
+            "detail": {
+              "vi": "Compatibility, flag và fallback.",
+              "en": "Compatibility, flags and fallbacks."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Canary nhỏ",
+              "en": "Small canary"
+            },
+            "detail": {
+              "vi": "Cohort + baseline + guardrails.",
+              "en": "Cohorts, baselines and guardrails."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Mở rộng từng vùng",
+              "en": "Expand by scope"
+            },
+            "detail": {
+              "vi": "Cell, zone rồi region.",
+              "en": "Cells, zones and regions."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Kiểm chứng và phục hồi",
+              "en": "Validate and recover"
+            },
+            "detail": {
+              "vi": "Rollback hoặc reconcile có chủ đích.",
+              "en": "Deliberate rollback or reconciliation."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recovery",
+      "title": {
+        "vi": "12. RPO/RTO, incident response và game day",
+        "en": "12. RPO/RTO, incident response and game days"
+      },
+      "paragraphs": [
+        {
+          "vi": "Replication không thay backup: delete sai có thể replicate rất nhanh. RPO mô tả lượng dữ liệu có thể mất theo thời gian/contract, RTO mô tả thời gian phục hồi mục tiêu. Restore test phải gồm keys, permissions, dependencies, capacity, schema và correctness checks, không chỉ file backup tồn tại.",
+          "en": "Replication is not backup: an erroneous deletion may replicate quickly. RPO describes tolerated data loss under a time/data contract; RTO targets recovery time. Restore tests need keys, permissions, dependencies, capacity, schemas and correctness checks, not merely existing backup files."
+        },
+        {
+          "vi": "Runbook cần chỉ ra owner, cách phân loại tác động, bước an toàn giảm thiệt hại và cách xác minh recovery. Incident response cần vai trò điều phối, communication và nhật ký quyết định. Game day/fault injection có hypothesis, scope, abort condition và capacity dự phòng; thử theo thứ tự từ nhỏ, không kill ngẫu nhiên mọi thứ để chứng minh resilience.",
+          "en": "Runbooks need owners, impact assessment, safe mitigation and recovery validation. Incidents require coordination, communication and decision records. Game days need hypotheses, bounded scope, abort conditions and spare capacity, progressing through controlled failures rather than random destruction."
+        },
+        {
+          "vi": "Cell-based isolation chỉ giới hạn blast radius nếu shared dependencies, routing và deploy không kéo lỗi qua tất cả cell. Sau incident, tìm feedback loops như retry/cache-miss/reconnect storms và cơ chế chặn chúng, rồi kiểm tra việc sửa bằng tình huống tái hiện.",
+          "en": "Cells limit blast radius only when shared dependencies, routing and deployment do not spread failures across them. After incidents, identify retry/cache-miss/reconnect feedback loops, add containment and verify with reproductions."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "13. Interview drill: thiết kế failure behavior",
+        "en": "13. Interview drill: design failure behavior"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Recommendations chậm, bảo vệ checkout thế nào?",
+            "en": "How do you protect checkout from slow recommendations?"
+          },
+          "answer": [
+            {
+              "vi": "Xác nhận recommendations là soft dependency; cho budget/pool riêng, ít hoặc không retry trên critical path và fallback có kiểm thử. Giữ observability của degraded mode. Checkout tự overload vẫn cần admission riêng; circuit breaker của recommendations không giải quyết được phần đó.",
+              "en": "Make recommendations optional with its own budget/pool, minimal critical-path retries and a tested fallback. Observe degraded mode. Checkout overload still needs its own admission; the recommendations breaker does not solve it."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "5 dependency 99,9% có thành 99,5% không?",
+            "en": "Do five 99.9% dependencies yield 99.5%?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ là ước lượng tích khoảng 99,501% khi mọi dependency cần thành công và failure độc lập trong cùng definition/population. Với shared cause hoặc fallback, mô hình khác. Đo journey SLI và tìm hard dependencies có thể bỏ thay vì lấy tích marketing làm guarantee.",
+              "en": "The product is about 99.501% only for required, independent dependencies under compatible definitions/populations. Shared causes and fallbacks change the model. Measure journey SLIs and remove avoidable hard dependencies rather than treating marketing figures as guarantees."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Ba retries ở năm layer có phải 243 không?",
+            "en": "Do three retries at five layers mean 243 attempts?"
+          },
+          "answer": [
+            {
+              "vi": "Phải thống nhất thuật ngữ. Ba total attempts mỗi layer cho 3^5=243. Ba retries cộng initial là bốn attempts, worst case 4^5=1.024. Chọn retry ownership và budget end-to-end để không tạo phép nhân không kiểm soát.",
+              "en": "Define terms first. Three total attempts yield 3^5=243. Three retries plus the initial attempt yield 4^5=1,024 in the worst case. Define retry ownership and end-to-end budgets to prevent uncontrolled multiplication."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Jitter có làm giảm số request không?",
+            "en": "Does jitter reduce request counts?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động: nó thay đổi timing, giúp tránh đồng bộ retry. Attempt cap, budget và deadline mới giới hạn số attempts. Khi dependency không hồi phục, chỉ trải cùng một lượng work vẫn có thể làm quá tải.",
+              "en": "Not automatically: jitter changes timing and reduces synchronization. Attempt caps, budgets and deadlines bound counts. Spreading the same work can still overload an unrecovered dependency."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tăng replica có giải quyết lỗi chung không?",
+            "en": "Do more replicas solve common-cause failures?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu chúng cùng config, credentials, region hoặc pipeline lỗi. Tách failure domains, kiểm tra routing/capacity failover và rollout. Có replica chỉ là topology; recovery và independence cần được chứng minh trong failure model.",
+              "en": "Not when replicas share broken configuration, credentials, regions or deployment pipelines. Separate failure domains and verify routing/capacity and rollout. Replicas describe topology; independence and recovery require evidence."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một trăm phần trăm 2xx có đủ chứng minh SLO tốt?",
+            "en": "Does 100% 2xx establish a healthy SLO?"
+          },
+          "answer": [
+            {
+              "vi": "Không: response có thể quá chậm, sai dữ liệu hoặc chỉ là accepted trong khi work không hoàn tất. Định nghĩa good event theo contract journey, đo boundary sát user và xác minh correctness/freshness cùng latency.",
+              "en": "No. Responses can be late, incorrect or merely accepted while work never completes. Define good events around the journey and observe correctness/freshness and latency near users."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Backup thành công có nghĩa DR sẵn sàng chưa?",
+            "en": "Does a successful backup prove disaster recovery readiness?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Restore trong RPO/RTO cần quyền truy cập keys, compatible schema, dependencies, đủ capacity và kiểm chứng data invariant. Reconcile các side effects bên ngoài rồi xác minh user journey trước khi tuyên bố recovery.",
+              "en": "No. RPO/RTO recovery needs keys/access, compatible schemas, dependencies, capacity and invariant checks. Reconcile external side effects and validate user journeys before declaring recovery."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

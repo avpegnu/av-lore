@@ -1,4 +1,4 @@
-/** Original Vietnamese study outlines. Topic selection inspired by Blueprint; not a translation of its chapters. */
+/** System Design case metadata. Detailed chapters are maintained separately. */
 export interface CaseStudy {
   id: string;
   title: string;

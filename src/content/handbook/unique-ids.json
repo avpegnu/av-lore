@@ -1,0 +1,591 @@
+{
+  "id": "unique-ids",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Unique IDs: bit layout, clock và index locality",
+    "en": "Unique IDs: Bit Layouts, Clocks and Index Locality"
+  },
+  "summary": {
+    "vi": "Thiết kế uniqueness qua restart và nhiều node; thử chia bit Snowflake, quan sát B-tree locality và giữ precision của ID qua API.",
+    "en": "Design uniqueness across restarts and nodes; explore Snowflake bits, B-tree locality and ID precision across APIs."
+  },
+  "prerequisites": [
+    "databases",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "distributed",
+    "database",
+    "programming"
+  ],
+  "takeaways": [
+    {
+      "vi": "Unique, time-sortable và unguessable là ba lời hứa khác nhau.",
+      "en": "Unique, time-sortable and unguessable are different promises."
+    },
+    {
+      "vi": "Bit layout không tự giải quyết clock, concurrency hoặc worker reuse.",
+      "en": "A bit layout does not solve clocks, concurrency or worker reuse."
+    },
+    {
+      "vi": "UUIDv7 không tự cho strict global order hoặc cùng entropy ở mọi implementation.",
+      "en": "UUIDv7 does not imply strict global order or identical entropy in every implementation."
+    },
+    {
+      "vi": "Serialize 64-bit ID thành string khi đi qua Number-based clients.",
+      "en": "Serialize 64-bit IDs as strings for Number-based clients."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một ID đúng cần nhiều hơn một công thức",
+      "en": "A correct ID needs more than a formula"
+    },
+    "caption": {
+      "vi": "Giữ toàn bộ contract qua allocator, storage, API và migration.",
+      "en": "Preserve the contract across allocation, storage, APIs and migration."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Chốt guarantee",
+          "en": "Define guarantees"
+        },
+        "detail": {
+          "vi": "Scope, order, size, exposure.",
+          "en": "Scope, ordering, size and exposure."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Chọn scheme",
+          "en": "Choose a scheme"
+        },
+        "detail": {
+          "vi": "Sequence, random, time-prefix.",
+          "en": "Sequences, randomness and time prefixes."
+        },
+        "icon": "compare"
+      },
+      {
+        "title": {
+          "vi": "Bảo vệ generator",
+          "en": "Protect the generator"
+        },
+        "detail": {
+          "vi": "Clock, state, worker, restart.",
+          "en": "Clocks, state, workers and restarts."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Kiểm tra consumer",
+          "en": "Validate consumers"
+        },
+        "detail": {
+          "vi": "Index, sharding, JSON, migration.",
+          "en": "Indexes, sharding, JSON and migration."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Uniqueness, ordering và secrecy là ba yêu cầu khác nhau",
+        "en": "1. Uniqueness, ordering and secrecy are different requirements"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chốt phạm vi unique: một table, tenant, cluster hay toàn hệ thống qua restart/migration. Sau đó hỏi kích thước, sort semantics, peak IDs/ms, thời gian offline và khả năng đoán ID. Một ID unique không thay authorization; biết hoặc đoán được URL không được phép truy cập resource.",
+          "en": "Define uniqueness across tables, tenants, clusters, restarts and migrations. Then establish size, ordering, peak IDs/ms, offline operation and guessability. Unique IDs do not replace authorization: knowing or guessing a URL must not grant resource access."
+        },
+        {
+          "vi": "Strict global order, approximate time order và uniqueness có chi phí khác nhau. Local generators có thể tạo ID lớn hơn trong tương lai do clock skew; timestamp prefix không chứng minh causality. Invoice numbering không có gap là yêu cầu business riêng, thường cần transaction/stateful allocation thay vì lấy ID object rồi kỳ vọng không bỏ số.",
+          "en": "Strict global order, approximate time order and uniqueness have different costs. Clock skew can make local generators emit apparently future IDs; timestamp prefixes do not prove causality. Gap-free invoice numbers are a separate business requirement, often needing transactional allocation rather than object IDs that happen not to skip."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Định danh đúng phạm vi",
+            "en": "Identify within the right scope"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Unique qua restart, failover và hợp nhất dữ liệu.",
+              "en": "Unique across restarts, failover and data merging."
+            },
+            {
+              "vi": "Tên namespace/tenant có phải một phần key không?",
+              "en": "Does the key include a namespace/tenant?"
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Thứ tự được hứa",
+            "en": "Promised ordering"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Theo generator, theo thời gian gần đúng hay global sequence?",
+              "en": "Per-generator, approximate-time or global-sequence order?"
+            },
+            {
+              "vi": "Phân biệt timestamp của ID với event time và commit order.",
+              "en": "Distinguish ID time, event time and commit order."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Thông tin bị lộ",
+            "en": "Information exposure"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Counter và timestamp có thể lộ volume hoặc thời điểm.",
+              "en": "Counters and timestamps can reveal volume or timing."
+            },
+            {
+              "vi": "Opaque identifier vẫn cần kiểm tra quyền server-side.",
+              "en": "Opaque identifiers still need server-side authorization."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "choices",
+      "title": {
+        "vi": "2. So sánh các phương án",
+        "en": "2. Compare the option space"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ưu tiên nhu cầu của nơi lưu và tiêu thụ ID. Một scheme 128 bit không cần worker allocation có thể rẻ hơn việc vận hành một service 64 bit. Ngược lại, primary key nằm trong nhiều secondary indexes có thể khiến chênh lệch bytes và locality trở nên đáng kể ở workload cụ thể.",
+          "en": "Prioritize storage and consumer needs. A 128-bit scheme without worker allocation may cost less than operating a 64-bit service. Conversely, primary keys repeated in secondary indexes can make size and locality significant for particular workloads."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Phương án ID",
+            "en": "ID scheme"
+          },
+          {
+            "vi": "Phối hợp và thứ tự",
+            "en": "Coordination and order"
+          },
+          {
+            "vi": "Rủi ro/đánh đổi",
+            "en": "Risks/trade-offs"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "DB sequence / identity",
+              "en": "DB sequence / identity"
+            },
+            {
+              "vi": "Authority cấp số; order của allocation không luôn là commit order.",
+              "en": "An allocator issues numbers; allocation order need not equal commit order."
+            },
+            {
+              "vi": "Gaps do rollback/cache; failover và range cần contract.",
+              "en": "Rollback/cache gaps; define failover and range behavior."
+            }
+          ],
+          [
+            {
+              "vi": "Multi-writer step/offset",
+              "en": "Multi-writer step/offset"
+            },
+            {
+              "vi": "Chia lớp số theo node; cấu hình phải không chồng lấp.",
+              "en": "Separate node residue classes; configurations must not overlap."
+            },
+            {
+              "vi": "Thêm node, migrate và reuse offset cần cẩn thận.",
+              "en": "Node changes, migration and offset reuse require care."
+            }
+          ],
+          [
+            {
+              "vi": "Ticket / range allocation",
+              "en": "Ticket / range allocation"
+            },
+            {
+              "vi": "Central authority mỗi ID hoặc mỗi block.",
+              "en": "Authority per ID or block."
+            },
+            {
+              "vi": "Block cấp phát không tạo global emission order; node chết bỏ gap.",
+              "en": "Allocated blocks do not impose global emission order; node loss leaves gaps."
+            }
+          ],
+          [
+            {
+              "vi": "UUIDv4",
+              "en": "UUIDv4"
+            },
+            {
+              "vi": "Random generation không cần authority cấp worker.",
+              "en": "Random generation without worker allocation."
+            },
+            {
+              "vi": "Uniqueness xác suất; cần randomness tốt, key 128 bit.",
+              "en": "Probabilistic uniqueness, quality randomness and 128-bit keys."
+            }
+          ],
+          [
+            {
+              "vi": "UUIDv7 / ULID",
+              "en": "UUIDv7 / ULID"
+            },
+            {
+              "vi": "Time prefix; không phải cùng format hoặc cùng monotonic policy.",
+              "en": "Time prefixes, but distinct formats and monotonic policies."
+            },
+            {
+              "vi": "Clock/ordering policy và lượng randomness theo implementation.",
+              "en": "Implementation-specific clocks, ordering policy and randomness."
+            }
+          ],
+          [
+            {
+              "vi": "Snowflake-style",
+              "en": "Snowflake-style"
+            },
+            {
+              "vi": "Time + worker + sequence theo allocation/epoch đã chọn.",
+              "en": "Time + worker + sequence under a chosen allocation/epoch."
+            },
+            {
+              "vi": "Worker uniqueness, restart, clock và sequence exhaustion.",
+              "en": "Worker uniqueness, restarts, clocks and sequence exhaustion."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "bits",
+      "title": {
+        "vi": "3. Snowflake: chia ngân sách 63 bit",
+        "en": "3. Snowflake: allocate a 63-bit budget"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một layout phổ biến giữ sign bit 0, dùng 41 bit millisecond kể từ custom epoch, 10 bit worker và 12 bit sequence. Nó cho 1.024 worker slots, 4.096 sequence values mỗi millisecond mỗi worker và horizon khoảng 69,7 năm. Đây là giới hạn biểu diễn, không phải throughput benchmark hay bảo đảm phân tán.",
+          "en": "A common layout keeps the sign bit zero and uses 41 relative-millisecond bits, 10 worker bits and 12 sequence bits. It represents 1,024 workers, 4,096 sequence values per millisecond per worker and about 69.7 years. These are representational limits, not throughput benchmarks or distributed guarantees."
+        },
+        {
+          "vi": "ID = (relativeTime << (workerBits+sequenceBits)) | (worker << sequenceBits) | sequence. Kiểm tra mọi field nằm trong range; không mask overflow rồi phát tiếp như bình thường. Khi hết sequence trong cùng timestamp, có thể đợi thời gian tiến lên hoặc dùng logical-time policy đã chứng minh an toàn, với giới hạn latency và clock drift rõ.",
+          "en": "ID = (relativeTime << (workerBits+sequenceBits)) | (worker << sequenceBits) | sequence. Validate field ranges rather than masking overflow and continuing. Sequence exhaustion may require waiting or a proven logical-time policy with explicit latency and drift bounds."
+        }
+      ],
+      "experiment": "id-bits"
+    },
+    {
+      "id": "state",
+      "title": {
+        "vi": "4. State generator phải sống qua concurrency và restart",
+        "en": "4. Generator state must survive concurrency and restarts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong một process, timestamp/sequence update phải serialized hoặc atomic phù hợp. Hai thread cùng đọc last sequence có thể tạo cùng ID dù worker ID được cấp đúng. Sau restart, sequence reset cùng worker và timestamp đã dùng có thể tái phát range cũ; chỉ persist lúc shutdown không bảo vệ crash hoặc power loss.",
+          "en": "Timestamp/sequence updates need appropriate serialization or atomicity within a process. Concurrent threads can issue duplicates despite a valid worker ID. Resetting sequence after restart under a reused timestamp/worker can reissue a range; shutdown-only persistence does not survive crashes or power loss."
+        },
+        {
+          "vi": "Có thể giữ high watermark durable, cấp một epoch/worker namespace mới hoặc đợi tới thời điểm chắc chắn vượt range đã phát theo protocol. Mỗi lựa chọn đổi latency, availability hoặc horizon. Một sleep cố định ở startup không phải bằng chứng nếu không có bound clock/reuse; đồng thời kiểm tra epoch rollover trước khi cạn bit thời gian.",
+          "en": "Options include a durable high watermark, a new epoch/worker namespace, or waiting until previously issued ranges cannot recur under the protocol. Each costs latency, availability or horizon. A fixed startup sleep proves nothing without clock/reuse bounds; plan epoch rollover before time bits run out."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Kiểm tra trước khi phát một ID",
+          "en": "Checks before issuing an ID"
+        },
+        "caption": {
+          "vi": "Đây là chuỗi quyết định; nhánh fail phải đợi, đổi authority an toàn hoặc báo lỗi, không âm thầm tái sử dụng field.",
+          "en": "This is a decision sequence; failed checks must wait, safely change authority or return an error rather than silently reuse fields."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Xác minh authority",
+              "en": "Validate authority"
+            },
+            "detail": {
+              "vi": "Worker/epoch chưa bị cấp trùng.",
+              "en": "No duplicate worker/epoch allocation."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Đọc và kiểm clock",
+              "en": "Read and validate time"
+            },
+            "detail": {
+              "vi": "Không lùi vào range đã phát.",
+              "en": "Do not reenter an issued time range."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Cấp sequence",
+              "en": "Allocate the sequence"
+            },
+            "detail": {
+              "vi": "Atomic; không wrap trùng timestamp.",
+              "en": "Atomic; no wrap under one timestamp."
+            },
+            "icon": "decision"
+          },
+          {
+            "title": {
+              "vi": "Encode và trả string",
+              "en": "Encode and return a string"
+            },
+            "detail": {
+              "vi": "Validate bits, giữ precision qua API.",
+              "en": "Validate fields and preserve API precision."
+            },
+            "icon": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "workers",
+      "title": {
+        "vi": "5. Worker ID và lease không tự ngăn stale generator",
+        "en": "5. Worker leases do not automatically stop stale generators"
+      },
+      "paragraphs": [
+        {
+          "vi": "Worker identity phải unique trong namespace và thời gian reuse được định nghĩa. Stateful ordinal chỉ là một phần của giải pháp: hai cluster có cùng ordinal hoặc một instance cũ còn sống khi replacement chạy vẫn có thể trùng. Worker lease có expiry không làm process pause tự biến mất.",
+          "en": "Worker identity must be unique within its namespace and reuse horizon. Stateful ordinals alone are insufficient: two clusters can share an ordinal, or an old instance may outlive its replacement. Expiring a lease does not terminate a paused process."
+        },
+        {
+          "vi": "Nếu lease mới tái cấp cùng worker nhưng ID format không mang fencing epoch, stale generator có thể phát ID va chạm khi tỉnh lại. Cần protocol ngăn range/time overlap, fencing nơi authority được dùng hoặc epoch được encode/kiểm chứng. “Stop issuing khi biết mất lease” chưa đủ nếu process chưa biết do pause/partition.",
+          "en": "Reissuing the same worker without an encoded/enforced fencing epoch may let a resumed stale generator collide. Prevent overlapping ranges/time, enforce fencing at authority use, or encode/validate epochs. Stopping when lease loss is detected is insufficient while a paused/partitioned process has not detected it."
+        }
+      ]
+    },
+    {
+      "id": "clocks",
+      "title": {
+        "vi": "6. Clock skew khác clock rollback",
+        "en": "6. Clock skew differs from clock rollback"
+      },
+      "paragraphs": [
+        {
+          "vi": "Skew giữa hai worker khác identity chủ yếu làm thứ tự theo thời gian không chính xác; nó không tự tạo trùng tuple time/worker/sequence. Rollback ở cùng generator có thể tái dùng tuple nếu state không bảo vệ. NTP thường có cơ chế slew/step tùy cấu hình; không giả định máy luôn có thời gian tăng đều.",
+          "en": "Skew between distinct workers primarily disturbs time ordering, not tuple uniqueness. Rollback within one generator can reuse tuples without protective state. NTP slew/step behavior depends on configuration; wall-clock monotonicity cannot be assumed."
+        },
+        {
+          "vi": "Refuse/wait khi rollback là cách giữ safety nhưng giảm availability; logical timestamp với sequence có thể tiếp tục trong một số thiết kế nhưng làm ID time lệch wall time và vẫn có overflow. Theo dõi rollback duration, drift, sequence saturation và worker conflicts. Đồng bộ clock hữu ích nhưng không thay protocol uniqueness.",
+          "en": "Refusing or waiting preserves safety at an availability cost. Logical timestamps can continue in some designs but diverge from wall time and still exhaust sequence space. Observe regressions, drift, sequence saturation and worker conflicts. Clock synchronization helps but does not replace a uniqueness protocol."
+        }
+      ]
+    },
+    {
+      "id": "uuids",
+      "title": {
+        "vi": "7. UUIDv4, UUIDv7 và ULID",
+        "en": "7. UUIDv4, UUIDv7 and ULID"
+      },
+      "paragraphs": [
+        {
+          "vi": "UUIDv4 có 122 random bits sau version/variant. Với n mẫu độc lập và randomness đều, xác suất va chạm xấp xỉ n(n−1)/(2×2^122) khi xác suất nhỏ. Đây là xác suất, không phải bằng chứng không thể trùng; generator lỗi, RNG yếu hoặc clone state có thể chi phối rủi ro hơn phép tính birthday. Unique constraint vẫn là hàng rào hữu ích ở nơi lưu.",
+          "en": "UUIDv4 has 122 random bits after version/variant. For n independent uniform samples, small collision probability is approximately n(n−1)/(2×2^122). It is not impossibility: broken generators, weak randomness or cloned state can dominate the birthday calculation. Storage uniqueness constraints remain useful."
+        },
+        {
+          "vi": "UUIDv7 giữ tổng 128 bit, có prefix Unix-millisecond 48 bit và các bit version/variant; phần còn lại có thể chứa randomness cùng counter/sub-millisecond constructs theo implementation. Không phải mọi v7 đều có đúng cùng entropy hoặc monotonic behavior. ULID cũng time-prefixed nhưng encoding và specification khác; đừng đổi tên hai format cho nhau.",
+          "en": "UUIDv7 is 128 bits with a 48-bit Unix-millisecond prefix plus version/variant fields; remaining bits may combine randomness and implementation-specific counter/submillisecond constructs. Entropy and monotonic behavior vary. ULID is also time-prefixed but has different encoding/specification and is not interchangeable with UUIDv7."
+        },
+        {
+          "vi": "Trong cùng millisecond, nhiều v7 có thể sort theo thứ tự khác lúc gọi; monotonic policy của một generator không tạo strict order toàn hệ thống. Dùng thư viện/DB implementation đã kiểm chứng, kiểm tra wire format và collation/sort order của loại dữ liệu đang lưu thay vì tự nối timestamp với một chuỗi random rồi gọi là UUIDv7.",
+          "en": "Within one millisecond, v7 sort order may differ from invocation order. Per-generator monotonicity is not a system-wide strict order. Use a tested implementation and verify wire format and storage ordering rather than labeling an arbitrary timestamp/random concatenation UUIDv7."
+        }
+      ]
+    },
+    {
+      "id": "locality",
+      "title": {
+        "vi": "8. Index locality: tách key order khỏi engine behavior",
+        "en": "8. Index locality: separate key order from engine behavior"
+      },
+      "paragraphs": [
+        {
+          "vi": "Random inserts có thể chạm nhiều leaf pages; time-prefixed keys thường tập trung hơn ở vùng mới của index nhưng không luôn append đúng một leaf. Page splits, fill factor, concurrency, cache và distribution quyết định hiệu năng thực. Một toy tree không thể suy ra “nhanh hơn N lần”.",
+          "en": "Random inserts may touch many leaves; time-prefixed keys often improve locality without guaranteeing every insert appends to one leaf. Splits, fill factors, concurrency, caching and distribution determine performance. A toy tree cannot establish an N-times speedup."
+        },
+        {
+          "vi": "InnoDB cluster row theo primary key và secondary indexes mang primary-key value; key rộng có ảnh hưởng nhiều cấu trúc. PostgreSQL B-tree không tự biến table thành clustered storage giống InnoDB; heap layout và index locality là hai thứ khác nhau. Tránh nói mọi UUIDv4 đều “tệ cho mọi database”.",
+          "en": "InnoDB clusters rows by primary key and stores primary-key values in secondary indexes, so key width affects several structures. PostgreSQL B-trees do not automatically cluster table storage like InnoDB; heap layout and index locality differ. Avoid declaring UUIDv4 universally bad for every database."
+        }
+      ],
+      "experiment": "id-locality"
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "9. 64-bit ID qua JavaScript và JSON",
+        "en": "9. 64-bit IDs through JavaScript and JSON"
+      },
+      "paragraphs": [
+        {
+          "vi": "JavaScript Number chỉ biểu diễn chính xác mọi integer đến 2^53−1. Một signed 64-bit ID có thể lớn hơn; JSON number được parse vào Number có thể làm tròn trước khi application kịp kiểm tra. Dùng decimal string cho field ID xuyên API, client, log, CSV và cache keys.",
+          "en": "JavaScript Number exactly represents every integer only through 2^53−1. Signed 64-bit IDs can exceed it; parsing JSON numbers may round them before validation. Use decimal strings throughout APIs, clients, logs, CSVs and cache keys."
+        },
+        {
+          "vi": "BigInt xử lý phép toán 64-bit trong JavaScript nhưng không được JSON.stringify trực tiếp theo mặc định. Convert có chủ đích sang string ở boundary; khi cần sort numeric strings, dùng BigInt/comparator thích hợp hoặc fixed-width representation đúng contract. “10” và “2” so lexicographic không có thứ tự số học.",
+          "en": "BigInt handles 64-bit arithmetic but is not directly JSON-stringifiable by default. Convert deliberately to strings at boundaries and use suitable numeric comparison or contractually fixed-width representations. Lexicographic order of “10” and “2” is not numeric order."
+        }
+      ],
+      "code": {
+        "language": "typescript",
+        "content": "const id = 9007199254740993n;\nconst body = JSON.stringify({ id: id.toString() });\n// {\"id\":\"9007199254740993\"}\n// Keep the ID as a string in clients; parse as BigInt only for numeric operations.",
+        "caption": {
+          "vi": "Ví dụ giữ nguyên integer; JSON number tương ứng không an toàn với Number client.",
+          "en": "This preserves the integer; its JSON-number counterpart is unsafe for Number-based clients."
+        }
+      }
+    },
+    {
+      "id": "sharding",
+      "title": {
+        "vi": "10. Locality tốt có thể đi kèm hot partition",
+        "en": "10. Good locality can coexist with hot partitions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu range-shard trực tiếp theo ID tăng theo thời gian, write mới tập trung ở range cuối. Time ordering trong một tenant partition có thể hữu ích; partition ownership nên xét tenant/hash/key workload riêng. Thêm hash prefix có thể phân tán write nhưng đổi range query và sort behavior, không phải tối ưu miễn phí.",
+          "en": "Range-sharding directly on increasing IDs concentrates new writes in the newest range. Time ordering within a tenant partition may help, but ownership needs its own tenant/hash/workload design. Hash prefixes distribute writes at a cost to range queries and sorting."
+        },
+        {
+          "vi": "Public IDs có timestamp/counter có thể lộ thông tin. Có thể tách internal key và public opaque ID, nhưng phải quản lý uniqueness, index lookup và migration. Random-looking ID không tự đủ làm password reset token hay bearer secret; các trường hợp đó cần entropy, expiry và access policy riêng.",
+          "en": "Public timestamp/counter IDs can reveal information. Separate internal keys from public opaque IDs when justified, accounting for uniqueness, lookups and migration. Random-looking identifiers are not automatically suitable reset tokens or bearer secrets, which need their own entropy, expiry and access policies."
+        }
+      ]
+    },
+    {
+      "id": "migration",
+      "title": {
+        "vi": "11. Migration và vận hành generator",
+        "en": "11. Generator migration and operations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi đổi scheme, định nghĩa namespace/version để range cũ và mới không chồng lấp. Expand schema, dual-read mapping có thời hạn, backfill có throttle, kiểm tra FK/cache/event consumers rồi đổi write path. ID đã public thường phải tiếp tục resolve; đổi loại cột không có nghĩa tất cả downstream đã hỗ trợ string hoặc 128 bit.",
+          "en": "Define namespaces/versions preventing old/new overlap when changing schemes. Expand schema, use bounded dual-read mappings, throttle backfills, validate FK/cache/event consumers and then switch writes. Public IDs often need permanent resolution; a column change does not update every downstream string/128-bit consumer."
+        },
+        {
+          "vi": "Dashboard cần uniqueness violations, allocation latency, worker reuse, clock regressions và horizon còn lại. Test crash không shutdown, restart nhiều lần trong một millisecond, concurrent generation, mất lease và merge dataset từ môi trường khác. Kiểm tra collision prevention bằng failure model, không chỉ benchmark chạy nhanh.",
+          "en": "Observe uniqueness violations, allocation latency, worker reuse, clock regressions and remaining horizon. Test ungraceful crashes, rapid restarts, concurrent generation, lease loss and cross-environment dataset merging. Validate collision prevention against the failure model, not just generation throughput."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "12. Interview drill: kiểm tra các cạnh khó",
+        "en": "12. Interview drill: test the difficult edges"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Một triệu ID/s, bắt buộc 64 bit và sort gần theo thời gian: chọn gì?",
+            "en": "What fits a million IDs/s with 64-bit and approximate-time ordering?"
+          },
+          "answer": [
+            {
+              "vi": "Snowflake-style là ứng viên, nhưng phải kiểm peak/ms mỗi worker, namespace, clock/restart protocol và worker reuse. 41/10/12 chỉ cho trần biểu diễn. Đặt headroom và benchmark thực; trả ID string. Nếu 128 bit được phép, so chi phí vận hành với UUIDv7 thay vì mặc định một service mới.",
+              "en": "Snowflake-style is a candidate, subject to per-worker peak/ms, namespaces, clock/restart policy and reuse safety. 41/10/12 provides representational ceilings. Add headroom, benchmark and serialize strings. If 128 bits are allowed, compare UUIDv7’s operating cost before introducing a service."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Worker lease hết hạn có chặn duplicate tuyệt đối không?",
+            "en": "Does worker-lease expiry absolutely prevent duplicate IDs?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu holder cũ pause rồi tiếp tục với cùng worker/time/sequence và lease đã cấp lại. Cần ngăn namespace/time overlap hoặc epoch/fencing phù hợp. Việc tự stop sau khi phát hiện mất lease còn phụ thuộc khả năng phát hiện.",
+              "en": "Not if a stale paused holder resumes after the same worker is reissued. Prevent namespace/time overlap or use appropriate epochs/fencing; self-stopping on detected lease loss still depends on detection."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể dùng ID time order thay commit order không?",
+            "en": "Can time-ordered IDs replace commit order?"
+          },
+          "answer": [
+            {
+              "vi": "Không. ID có thể được cấp trước transaction, transaction có thể retry/rollback và clock các node lệch nhau. Cần log sequence hoặc commit metadata có contract phù hợp cho ordering chính xác.",
+              "en": "No. Allocation may precede a transaction that retries or rolls back, and clocks may differ. Exact ordering needs an appropriate log sequence or commit-metadata contract."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "UUIDv7 có luôn nhanh hơn v4 không?",
+            "en": "Is UUIDv7 always faster than UUIDv4?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nó thường cải thiện locality nhưng còn phụ thuộc engine, cache, key distribution, concurrency và index width. Cả hai 128 bit; đo workload và phân biệt InnoDB clustered rows với PostgreSQL heap/index.",
+              "en": "No. It often improves locality, but engines, caches, distribution, concurrency and width matter. Both are 128 bits; benchmark the workload and distinguish InnoDB clustering from PostgreSQL heap/index behavior."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao ID đổi sau khi qua frontend?",
+            "en": "Why might an ID change after passing through the frontend?"
+          },
+          "answer": [
+            {
+              "vi": "Kiểm tra một hop đã parse 64-bit ID vào Number rồi làm tròn. Giữ string ở mọi boundary, test giá trị vượt 2^53−1 và kiểm tra cả analytics/CSV/cache, không chỉ endpoint chính.",
+              "en": "Check for a hop parsing 64-bit IDs into Number. Preserve strings at every boundary, test values above 2^53−1 and inspect analytics/CSV/cache paths as well as the main endpoint."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Cần invoice number không gap thì có dùng Snowflake không?",
+            "en": "Should gap-free invoice numbering use Snowflake?"
+          },
+          "answer": [
+            {
+              "vi": "Không coi object ID generator là cùng bài toán. Chốt business rules về thời điểm cấp số, hủy hóa đơn, audit và authority transaction. Snowflake, sequence cache và range leasing có thể bỏ gap; không giải quyết bằng “retry tới khi lấp số”.",
+              "en": "Do not equate object identifiers with business numbering. Define issuance, cancellation, auditing and transactional authority. Snowflake, cached sequences and leased ranges may leave gaps; retrying to fill numbers is not the solution."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

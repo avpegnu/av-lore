@@ -1,0 +1,2106 @@
+{
+  "id": "ep-chatgpt",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng trợ lý chat AI: từ một cuộc hội thoại đến hệ thống production",
+    "en": "Building an AI chat assistant: from one conversation to production"
+  },
+  "summary": {
+    "vi": "Xây dựng từng giai đoạn: conversation store, token streaming, context budget, retrieval, tool permissions và vận hành inference. Đây là kiến trúc minh họa cho sản phẩm cùng loại, không mô tả hệ thống nội bộ của một công ty.",
+    "en": "Build in stages: conversation storage, token streaming, context budgets, retrieval, tool permissions and inference operations. This is a teaching architecture for this product category, not a description of a company’s private implementation."
+  },
+  "prerequisites": [
+    "ai-inference"
+  ],
+  "takeaways": [
+    {
+      "vi": "Orchestrator quản lý vòng đời turn, context, tools và trạng thái; model chỉ là một dependency trong sản phẩm.",
+      "en": "The orchestrator owns turn lifecycle, context, tools and state; the model is one dependency within the product."
+    },
+    {
+      "vi": "Stream đã phát là một side effect: retry sau token đầu không thể được giấu như retry một GET thông thường.",
+      "en": "Emitted output is a side effect: retrying after the first token cannot be hidden like retrying an ordinary GET."
+    },
+    {
+      "vi": "Context window là ngân sách hữu hạn; retrieval và history phải nhường chỗ cho output và tool results.",
+      "en": "The context window is finite; retrieval and history must leave room for output and tool results."
+    },
+    {
+      "vi": "Model đề xuất tool call; code xác thực identity, schema, quyền và tác động trước khi thực thi.",
+      "en": "The model proposes tool calls; code validates identity, schema, permissions and consequences before execution."
+    }
+  ],
+  "sections": [
+    {
+      "id": "product",
+      "title": {
+        "vi": "1. Chốt sản phẩm và giới hạn của bài xây dựng",
+        "en": "1. Define the product and this build’s boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ta xây ứng dụng cho người dùng đăng nhập, tạo conversation, gửi message, nhận câu trả lời streaming, hủy generation và đọc lại lịch sử. Giai đoạn sau thêm retrieval tài liệu được phép xem và tools có phạm vi hẹp. Không train foundation model trong bài này; inference có thể dùng endpoint do mình vận hành hoặc dịch vụ ngoài qua một adapter có hợp đồng thống nhất.",
+          "en": "We are building an authenticated application that creates conversations, accepts messages, streams responses, cancels generations and reloads history. Later stages add authorized-document retrieval and narrowly scoped tools. Training a foundation model is out of scope; an adapter can connect either a self-hosted engine or an external service through one contract."
+        },
+        {
+          "vi": "Một turn là yêu cầu logic của người dùng và các bước để hoàn tất nó: input validation, context assembly, một hoặc nhiều model/tool round, output persistence và completion. Conversation ID không đủ để xác định một generation: retry, edit và regenerate cần turn/generation ID riêng để UI không trộn hai câu trả lời.",
+          "en": "A turn is a logical user request and the steps needed to complete it: input validation, context assembly, one or more model/tool rounds, persistence and completion. A conversation ID does not uniquely identify a generation: retries, edits and regeneration need distinct turn/generation IDs so the UI does not merge different answers."
+        },
+        {
+          "vi": "Giả định mục tiêu đầu tiên là TTFT p95 dưới 2 giây cho prompt ngắn khi hệ thống không quá tải, hỗ trợ output tối đa theo quota và lưu trạng thái partial khi bị ngắt. Đặt SLO riêng cho câu hỏi có retrieval/tools vì dependency ngoài thêm latency. Không cam kết mọi prompt dài đều có cùng latency như prompt ngắn.",
+          "en": "Assume an initial p95 TTFT target under two seconds for short prompts when not overloaded, quota-bound output limits and persisted partial state on interruption. Retrieval/tool questions need separate SLOs because external dependencies add latency. Long prompts should not be promised the same latency as short ones."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Ứng dụng sở hữu hành vi",
+            "en": "The application owns behavior"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Danh tính, quyền, history, quota, cancel và trạng thái turn.",
+              "en": "Identity, permissions, history, quotas, cancellation and turn state."
+            },
+            {
+              "vi": "Không giao quyền truy cập resource chỉ dựa vào text model sinh ra.",
+              "en": "Do not grant resource access merely because the model generated a request."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Model sinh output có giới hạn",
+            "en": "The model generates bounded output"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Token budget, structured output và khả năng model.",
+              "en": "Token budgets, structured output and model capabilities."
+            },
+            {
+              "vi": "Đo chất lượng bằng tác vụ cụ thể; stream đẹp chưa chứng minh câu trả lời đúng.",
+              "en": "Evaluate concrete tasks; smooth streaming does not prove answer correctness."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "timeline",
+      "title": {
+        "vi": "2. Lộ trình xây dựng theo điều kiện kiểm chứng",
+        "en": "2. Build stages with verifiable exit criteria"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi giai đoạn bổ sung một năng lực và một nhóm failure mode. Không nhảy thẳng tới sơ đồ nhiều service khi chưa kiểm chứng ownership, retry và persistence của một turn đơn giản. Các điều kiện dưới đây giúp quyết định lúc nào thực sự cần mở rộng.",
+          "en": "Each stage adds a capability and a failure class. Do not jump to a many-service architecture before validating ownership, retries and persistence for a simple turn. The exit criteria below determine when expansion is justified."
+        }
+      ],
+      "stages": [
+        {
+          "id": "store",
+          "title": {
+            "vi": "01 · Hội thoại bền vững",
+            "en": "01 · Durable conversations"
+          },
+          "description": {
+            "vi": "Bắt đầu bằng conversation/message/turn store, ownership checks và idempotency. Chưa cần nhiều model hoặc vector database để kiểm chứng sản phẩm chat cơ bản.",
+            "en": "Begin with conversation/message/turn storage, ownership checks and idempotency. Multiple models and a vector database are unnecessary to validate basic chat."
+          },
+          "exitCriteria": {
+            "vi": "Refresh trang không mất message; retry submit không tạo turn trùng; user khác không đọc được conversation.",
+            "en": "Refreshing preserves messages; submit retries do not duplicate turns; other users cannot read the conversation."
+          },
+          "diagram": {
+            "id": "chat-build-store",
+            "title": {
+              "vi": "Kiến trúc ở giai đoạn 1",
+              "en": "Architecture at stage 1"
+            },
+            "caption": {
+              "vi": "Chọn component hoặc chạy luồng để kiểm tra trách nhiệm ở giai đoạn này. Các giai đoạn sau thêm năng lực, không tự bắt buộc thêm deployment riêng.",
+              "en": "Select components or run the trace to inspect this stage’s responsibilities. Later stages add capabilities without necessarily adding separate deployments."
+            },
+            "width": 1080,
+            "height": 440,
+            "nodes": [
+              {
+                "id": "browser",
+                "label": {
+                  "vi": "Browser / stream",
+                  "en": "Browser / stream"
+                },
+                "kind": "client",
+                "x": 110,
+                "y": 110,
+                "detail": {
+                  "vi": "Hiển thị delta theo generationId/seq, chống lặp event và cho phép hủy. Text output được render an toàn, không chạy HTML tùy ý.",
+                  "en": "Renders deltas by generationId/seq, deduplicates events and allows cancellation. Output is rendered safely without arbitrary HTML execution."
+                }
+              },
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "API edge",
+                  "en": "API edge"
+                },
+                "kind": "edge",
+                "x": 370,
+                "y": 110,
+                "detail": {
+                  "vi": "Auth, conversation ownership, quota và admission. Không lưu provider secret trong browser.",
+                  "en": "Owns authentication, conversation access, quotas and admission. Provider secrets never go in the browser."
+                }
+              },
+              {
+                "id": "orchestrator",
+                "label": {
+                  "vi": "Orchestrator",
+                  "en": "Orchestrator"
+                },
+                "kind": "service",
+                "x": 660,
+                "y": 110,
+                "detail": {
+                  "vi": "Quản lý turn, context budget, model/tool rounds, deadline và cancellation. Model output không trực tiếp điều khiển database.",
+                  "en": "Owns turns, context budgets, model/tool rounds, deadlines and cancellation. Model output never directly controls the database."
+                }
+              },
+              {
+                "id": "engine",
+                "label": {
+                  "vi": "Inference adapter",
+                  "en": "Inference adapter"
+                },
+                "kind": "model",
+                "x": 960,
+                "y": 110,
+                "detail": {
+                  "vi": "Chuẩn hóa stream, usage, error và cancellation; route model revision có chủ đích.",
+                  "en": "Normalizes streams, usage, errors and cancellation; routes to intentional model revisions."
+                }
+              },
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Conversation store",
+                  "en": "Conversation store"
+                },
+                "kind": "store",
+                "x": 110,
+                "y": 320,
+                "detail": {
+                  "vi": "Nguồn sự thật của message, generation và trạng thái. Enforce tenant ownership trên mọi truy cập.",
+                  "en": "Authority for messages, generations and state. Enforces tenant ownership on every access."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "stage-flow",
+                "label": {
+                  "vi": "Luồng giai đoạn",
+                  "en": "Stage request path"
+                },
+                "steps": [
+                  {
+                    "from": "browser",
+                    "to": "edge",
+                    "description": {
+                      "vi": "Submit được xác thực và kiểm tra conversation ownership.",
+                      "en": "Authenticate submission and verify conversation ownership."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Tạo logical turn và generation identity.",
+                      "en": "Create logical turn and generation identities."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "history",
+                    "description": {
+                      "vi": "Persist input để refresh không mất message.",
+                      "en": "Persist input so refreshes preserve messages."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Gọi model bằng context đã chọn cho phiên cơ bản.",
+                      "en": "Call the model with the basic selected context."
+                    }
+                  },
+                  {
+                    "from": "engine",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Nhận output hoặc failure; không đánh dấu completed khi chưa kết thúc.",
+                      "en": "Receive output or failure without prematurely marking completion."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "history",
+                    "description": {
+                      "vi": "Persist output và terminal state có điều kiện.",
+                      "en": "Conditionally persist output and terminal state."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "browser",
+                    "description": {
+                      "vi": "Trả snapshot conversation đã lưu.",
+                      "en": "Return the persisted conversation snapshot."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "stream",
+          "title": {
+            "vi": "02 · Streaming và hủy",
+            "en": "02 · Streaming and cancellation"
+          },
+          "description": {
+            "vi": "Thêm generation state machine, event sequence và truyền cancellation xuyên suốt từ browser tới inference adapter. UI phân biệt completed, cancelled và interrupted.",
+            "en": "Add a generation state machine, event sequencing and end-to-end cancellation from browser to inference adapter. The UI distinguishes completed, cancelled and interrupted."
+          },
+          "exitCriteria": {
+            "vi": "Test disconnect trước/sau token đầu, proxy buffering và slow client; không còn generation chạy mồ côi.",
+            "en": "Test disconnects before/after the first token, proxy buffering and slow clients; no orphaned generations remain."
+          },
+          "diagram": {
+            "id": "chat-build-stream",
+            "title": {
+              "vi": "Kiến trúc ở giai đoạn 2",
+              "en": "Architecture at stage 2"
+            },
+            "caption": {
+              "vi": "Chọn component hoặc chạy luồng để kiểm tra trách nhiệm ở giai đoạn này. Các giai đoạn sau thêm năng lực, không tự bắt buộc thêm deployment riêng.",
+              "en": "Select components or run the trace to inspect this stage’s responsibilities. Later stages add capabilities without necessarily adding separate deployments."
+            },
+            "width": 1080,
+            "height": 440,
+            "nodes": [
+              {
+                "id": "browser",
+                "label": {
+                  "vi": "Browser / stream",
+                  "en": "Browser / stream"
+                },
+                "kind": "client",
+                "x": 110,
+                "y": 110,
+                "detail": {
+                  "vi": "Hiển thị delta theo generationId/seq, chống lặp event và cho phép hủy. Text output được render an toàn, không chạy HTML tùy ý.",
+                  "en": "Renders deltas by generationId/seq, deduplicates events and allows cancellation. Output is rendered safely without arbitrary HTML execution."
+                }
+              },
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "API edge",
+                  "en": "API edge"
+                },
+                "kind": "edge",
+                "x": 370,
+                "y": 110,
+                "detail": {
+                  "vi": "Auth, conversation ownership, quota và admission. Không lưu provider secret trong browser.",
+                  "en": "Owns authentication, conversation access, quotas and admission. Provider secrets never go in the browser."
+                }
+              },
+              {
+                "id": "orchestrator",
+                "label": {
+                  "vi": "Orchestrator",
+                  "en": "Orchestrator"
+                },
+                "kind": "service",
+                "x": 660,
+                "y": 110,
+                "detail": {
+                  "vi": "Quản lý turn, context budget, model/tool rounds, deadline và cancellation. Model output không trực tiếp điều khiển database.",
+                  "en": "Owns turns, context budgets, model/tool rounds, deadlines and cancellation. Model output never directly controls the database."
+                }
+              },
+              {
+                "id": "engine",
+                "label": {
+                  "vi": "Inference adapter",
+                  "en": "Inference adapter"
+                },
+                "kind": "model",
+                "x": 960,
+                "y": 110,
+                "detail": {
+                  "vi": "Chuẩn hóa stream, usage, error và cancellation; route model revision có chủ đích.",
+                  "en": "Normalizes streams, usage, errors and cancellation; routes to intentional model revisions."
+                }
+              },
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Conversation store",
+                  "en": "Conversation store"
+                },
+                "kind": "store",
+                "x": 110,
+                "y": 320,
+                "detail": {
+                  "vi": "Nguồn sự thật của message, generation và trạng thái. Enforce tenant ownership trên mọi truy cập.",
+                  "en": "Authority for messages, generations and state. Enforces tenant ownership on every access."
+                }
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Output policy",
+                  "en": "Output policy"
+                },
+                "kind": "service",
+                "x": 960,
+                "y": 320,
+                "detail": {
+                  "vi": "Đánh giá output/command theo policy sản phẩm. Streaming cần chiến lược kiểm tra trước hoặc theo chunk vì text đã gửi không thu hồi được.",
+                  "en": "Applies product policy to output/commands. Streaming requires pre-release or chunk-based checks because emitted text cannot be retracted."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "stage-flow",
+                "label": {
+                  "vi": "Luồng giai đoạn",
+                  "en": "Stage request path"
+                },
+                "steps": [
+                  {
+                    "from": "browser",
+                    "to": "edge",
+                    "description": {
+                      "vi": "Mở stream theo generation đã được cấp quyền.",
+                      "en": "Open an authorized generation stream."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Gắn stream với turn, deadline và cancel signal.",
+                      "en": "Bind the stream to the turn, deadline and cancellation signal."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Bắt đầu generation và nhận delta.",
+                      "en": "Start generation and receive deltas."
+                    }
+                  },
+                  {
+                    "from": "engine",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Áp policy trước khi phát chunk theo contract.",
+                      "en": "Apply policy before emitting chunks under the contract."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "browser",
+                    "description": {
+                      "vi": "Phát chunk có generationId/seq; client bỏ duplicate.",
+                      "en": "Emit generationId/seq chunks; clients discard duplicates."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "history",
+                    "description": {
+                      "vi": "Persist partial/complete state và event replay metadata.",
+                      "en": "Persist partial/complete state and replay metadata."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "context",
+          "title": {
+            "vi": "03 · Ngân sách context",
+            "en": "03 · Context budgeting"
+          },
+          "description": {
+            "vi": "Đếm token bằng tokenizer tương ứng, giữ output reserve, cắt history theo chính sách và lưu metadata summary. Đo chất lượng khi lịch sử dài.",
+            "en": "Count with the matching tokenizer, reserve output space, trim history intentionally and store summary metadata. Evaluate long-conversation quality."
+          },
+          "exitCriteria": {
+            "vi": "Không vượt context limit ở tool round; summary không thay đổi identity hay quyền; có bài test thông tin quan trọng bị bỏ.",
+            "en": "Tool rounds stay within context limits; summaries cannot alter identity or permissions; tests cover omitted important information."
+          },
+          "diagram": {
+            "id": "chat-build-context",
+            "title": {
+              "vi": "Kiến trúc ở giai đoạn 3",
+              "en": "Architecture at stage 3"
+            },
+            "caption": {
+              "vi": "Chọn component hoặc chạy luồng để kiểm tra trách nhiệm ở giai đoạn này. Các giai đoạn sau thêm năng lực, không tự bắt buộc thêm deployment riêng.",
+              "en": "Select components or run the trace to inspect this stage’s responsibilities. Later stages add capabilities without necessarily adding separate deployments."
+            },
+            "width": 1080,
+            "height": 440,
+            "nodes": [
+              {
+                "id": "browser",
+                "label": {
+                  "vi": "Browser / stream",
+                  "en": "Browser / stream"
+                },
+                "kind": "client",
+                "x": 110,
+                "y": 110,
+                "detail": {
+                  "vi": "Hiển thị delta theo generationId/seq, chống lặp event và cho phép hủy. Text output được render an toàn, không chạy HTML tùy ý.",
+                  "en": "Renders deltas by generationId/seq, deduplicates events and allows cancellation. Output is rendered safely without arbitrary HTML execution."
+                }
+              },
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "API edge",
+                  "en": "API edge"
+                },
+                "kind": "edge",
+                "x": 370,
+                "y": 110,
+                "detail": {
+                  "vi": "Auth, conversation ownership, quota và admission. Không lưu provider secret trong browser.",
+                  "en": "Owns authentication, conversation access, quotas and admission. Provider secrets never go in the browser."
+                }
+              },
+              {
+                "id": "orchestrator",
+                "label": {
+                  "vi": "Orchestrator",
+                  "en": "Orchestrator"
+                },
+                "kind": "service",
+                "x": 660,
+                "y": 110,
+                "detail": {
+                  "vi": "Quản lý turn, context budget, model/tool rounds, deadline và cancellation. Model output không trực tiếp điều khiển database.",
+                  "en": "Owns turns, context budgets, model/tool rounds, deadlines and cancellation. Model output never directly controls the database."
+                }
+              },
+              {
+                "id": "engine",
+                "label": {
+                  "vi": "Inference adapter",
+                  "en": "Inference adapter"
+                },
+                "kind": "model",
+                "x": 960,
+                "y": 110,
+                "detail": {
+                  "vi": "Chuẩn hóa stream, usage, error và cancellation; route model revision có chủ đích.",
+                  "en": "Normalizes streams, usage, errors and cancellation; routes to intentional model revisions."
+                }
+              },
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Conversation store",
+                  "en": "Conversation store"
+                },
+                "kind": "store",
+                "x": 110,
+                "y": 320,
+                "detail": {
+                  "vi": "Nguồn sự thật của message, generation và trạng thái. Enforce tenant ownership trên mọi truy cập.",
+                  "en": "Authority for messages, generations and state. Enforces tenant ownership on every access."
+                }
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Output policy",
+                  "en": "Output policy"
+                },
+                "kind": "service",
+                "x": 960,
+                "y": 320,
+                "detail": {
+                  "vi": "Đánh giá output/command theo policy sản phẩm. Streaming cần chiến lược kiểm tra trước hoặc theo chunk vì text đã gửi không thu hồi được.",
+                  "en": "Applies product policy to output/commands. Streaming requires pre-release or chunk-based checks because emitted text cannot be retracted."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "stage-flow",
+                "label": {
+                  "vi": "Luồng giai đoạn",
+                  "en": "Stage request path"
+                },
+                "steps": [
+                  {
+                    "from": "orchestrator",
+                    "to": "history",
+                    "description": {
+                      "vi": "Đọc đúng nhánh history và summary có provenance.",
+                      "en": "Read the correct history branch and provenance-tracked summaries."
+                    }
+                  },
+                  {
+                    "from": "history",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Chọn history trong budget, giữ system/tool/output reserve.",
+                      "en": "Select history within budget while reserving system/tool/output space."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Gửi prompt sau tokenization bằng tokenizer tương ứng.",
+                      "en": "Send the prompt after tokenization with the matching tokenizer."
+                    }
+                  },
+                  {
+                    "from": "engine",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Kiểm tra output và finish reason khi đạt giới hạn.",
+                      "en": "Check output and finish reasons at limits."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "browser",
+                    "description": {
+                      "vi": "UI phân biệt stop, length và interrupted.",
+                      "en": "The UI distinguishes stop, length and interrupted states."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "rag",
+          "title": {
+            "vi": "04 · Retrieval có quyền",
+            "en": "04 · Authorized retrieval"
+          },
+          "description": {
+            "vi": "Ingest tài liệu có version và ACL; retrieval lọc tenant/quyền trước khi đưa chunk vào prompt. Trả dẫn chứng theo chunk/document ID để kiểm tra.",
+            "en": "Ingest versioned documents with ACLs; filter tenant/permissions before placing retrieved chunks in prompts. Return chunk/document references for verification."
+          },
+          "exitCriteria": {
+            "vi": "Không có cross-tenant retrieval, xóa tài liệu được lan truyền tới index, câu trả lời thiếu bằng chứng biết từ chối hoặc nói rõ giới hạn.",
+            "en": "No cross-tenant retrieval, document deletion propagates to indexes, and unsupported answers abstain or state limitations."
+          },
+          "diagram": {
+            "id": "chat-build-rag",
+            "title": {
+              "vi": "Kiến trúc ở giai đoạn 4",
+              "en": "Architecture at stage 4"
+            },
+            "caption": {
+              "vi": "Chọn component hoặc chạy luồng để kiểm tra trách nhiệm ở giai đoạn này. Các giai đoạn sau thêm năng lực, không tự bắt buộc thêm deployment riêng.",
+              "en": "Select components or run the trace to inspect this stage’s responsibilities. Later stages add capabilities without necessarily adding separate deployments."
+            },
+            "width": 1080,
+            "height": 440,
+            "nodes": [
+              {
+                "id": "browser",
+                "label": {
+                  "vi": "Browser / stream",
+                  "en": "Browser / stream"
+                },
+                "kind": "client",
+                "x": 110,
+                "y": 110,
+                "detail": {
+                  "vi": "Hiển thị delta theo generationId/seq, chống lặp event và cho phép hủy. Text output được render an toàn, không chạy HTML tùy ý.",
+                  "en": "Renders deltas by generationId/seq, deduplicates events and allows cancellation. Output is rendered safely without arbitrary HTML execution."
+                }
+              },
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "API edge",
+                  "en": "API edge"
+                },
+                "kind": "edge",
+                "x": 370,
+                "y": 110,
+                "detail": {
+                  "vi": "Auth, conversation ownership, quota và admission. Không lưu provider secret trong browser.",
+                  "en": "Owns authentication, conversation access, quotas and admission. Provider secrets never go in the browser."
+                }
+              },
+              {
+                "id": "orchestrator",
+                "label": {
+                  "vi": "Orchestrator",
+                  "en": "Orchestrator"
+                },
+                "kind": "service",
+                "x": 660,
+                "y": 110,
+                "detail": {
+                  "vi": "Quản lý turn, context budget, model/tool rounds, deadline và cancellation. Model output không trực tiếp điều khiển database.",
+                  "en": "Owns turns, context budgets, model/tool rounds, deadlines and cancellation. Model output never directly controls the database."
+                }
+              },
+              {
+                "id": "engine",
+                "label": {
+                  "vi": "Inference adapter",
+                  "en": "Inference adapter"
+                },
+                "kind": "model",
+                "x": 960,
+                "y": 110,
+                "detail": {
+                  "vi": "Chuẩn hóa stream, usage, error và cancellation; route model revision có chủ đích.",
+                  "en": "Normalizes streams, usage, errors and cancellation; routes to intentional model revisions."
+                }
+              },
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Conversation store",
+                  "en": "Conversation store"
+                },
+                "kind": "store",
+                "x": 110,
+                "y": 320,
+                "detail": {
+                  "vi": "Nguồn sự thật của message, generation và trạng thái. Enforce tenant ownership trên mọi truy cập.",
+                  "en": "Authority for messages, generations and state. Enforces tenant ownership on every access."
+                }
+              },
+              {
+                "id": "retrieval",
+                "label": {
+                  "vi": "Retrieval / ACL",
+                  "en": "Retrieval / ACL"
+                },
+                "kind": "service",
+                "x": 370,
+                "y": 320,
+                "detail": {
+                  "vi": "Lấy chunk đúng quyền và version, trả provenance. Tài liệu là dữ liệu không đáng tin, không phải system instruction.",
+                  "en": "Retrieves authorized versioned chunks and provenance. Documents are untrusted data, not system instructions."
+                }
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Output policy",
+                  "en": "Output policy"
+                },
+                "kind": "service",
+                "x": 960,
+                "y": 320,
+                "detail": {
+                  "vi": "Đánh giá output/command theo policy sản phẩm. Streaming cần chiến lược kiểm tra trước hoặc theo chunk vì text đã gửi không thu hồi được.",
+                  "en": "Applies product policy to output/commands. Streaming requires pre-release or chunk-based checks because emitted text cannot be retracted."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "stage-flow",
+                "label": {
+                  "vi": "Luồng giai đoạn",
+                  "en": "Stage request path"
+                },
+                "steps": [
+                  {
+                    "from": "orchestrator",
+                    "to": "retrieval",
+                    "description": {
+                      "vi": "Query theo tenant/user permission, top-k và deadline.",
+                      "en": "Query within tenant/user permissions, top-k and deadlines."
+                    }
+                  },
+                  {
+                    "from": "retrieval",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Trả evidence có document/version/chunk IDs.",
+                      "en": "Return evidence with document/version/chunk IDs."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Đưa evidence như dữ liệu, giữ token budget và provenance.",
+                      "en": "Insert evidence as data within token budgets and retain provenance."
+                    }
+                  },
+                  {
+                    "from": "engine",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Kiểm tra grounding/citation theo yêu cầu tác vụ.",
+                      "en": "Check grounding/citations under task requirements."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "browser",
+                    "description": {
+                      "vi": "Trả answer có thể kiểm tra evidence và quyền khi mở citation.",
+                      "en": "Return an answer with inspectable evidence and citation-access checks."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "tools",
+          "title": {
+            "vi": "05 · Tools và vận hành",
+            "en": "05 · Tools and operations"
+          },
+          "description": {
+            "vi": "Dùng tool gateway ngoài model cho schema validation, quyền, approval khi cần, idempotency và audit. Bổ sung quota, eval, canary rollout và cost dashboard.",
+            "en": "Use a tool gateway outside the model for schemas, permissions, approvals where needed, idempotency and audit. Add quotas, evaluations, canary rollout and cost dashboards."
+          },
+          "exitCriteria": {
+            "vi": "Tool không dùng quyền admin chung; duplicate call không nhân đôi side effect; rollback model/prompt không làm hỏng conversation cũ.",
+            "en": "Tools do not share blanket admin privileges; duplicate calls do not duplicate side effects; model/prompt rollback preserves existing conversations."
+          },
+          "diagram": {
+            "id": "chat-build-tools",
+            "title": {
+              "vi": "Kiến trúc ở giai đoạn 5",
+              "en": "Architecture at stage 5"
+            },
+            "caption": {
+              "vi": "Chọn component hoặc chạy luồng để kiểm tra trách nhiệm ở giai đoạn này. Các giai đoạn sau thêm năng lực, không tự bắt buộc thêm deployment riêng.",
+              "en": "Select components or run the trace to inspect this stage’s responsibilities. Later stages add capabilities without necessarily adding separate deployments."
+            },
+            "width": 1080,
+            "height": 440,
+            "nodes": [
+              {
+                "id": "browser",
+                "label": {
+                  "vi": "Browser / stream",
+                  "en": "Browser / stream"
+                },
+                "kind": "client",
+                "x": 110,
+                "y": 110,
+                "detail": {
+                  "vi": "Hiển thị delta theo generationId/seq, chống lặp event và cho phép hủy. Text output được render an toàn, không chạy HTML tùy ý.",
+                  "en": "Renders deltas by generationId/seq, deduplicates events and allows cancellation. Output is rendered safely without arbitrary HTML execution."
+                }
+              },
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "API edge",
+                  "en": "API edge"
+                },
+                "kind": "edge",
+                "x": 370,
+                "y": 110,
+                "detail": {
+                  "vi": "Auth, conversation ownership, quota và admission. Không lưu provider secret trong browser.",
+                  "en": "Owns authentication, conversation access, quotas and admission. Provider secrets never go in the browser."
+                }
+              },
+              {
+                "id": "orchestrator",
+                "label": {
+                  "vi": "Orchestrator",
+                  "en": "Orchestrator"
+                },
+                "kind": "service",
+                "x": 660,
+                "y": 110,
+                "detail": {
+                  "vi": "Quản lý turn, context budget, model/tool rounds, deadline và cancellation. Model output không trực tiếp điều khiển database.",
+                  "en": "Owns turns, context budgets, model/tool rounds, deadlines and cancellation. Model output never directly controls the database."
+                }
+              },
+              {
+                "id": "engine",
+                "label": {
+                  "vi": "Inference adapter",
+                  "en": "Inference adapter"
+                },
+                "kind": "model",
+                "x": 960,
+                "y": 110,
+                "detail": {
+                  "vi": "Chuẩn hóa stream, usage, error và cancellation; route model revision có chủ đích.",
+                  "en": "Normalizes streams, usage, errors and cancellation; routes to intentional model revisions."
+                }
+              },
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Conversation store",
+                  "en": "Conversation store"
+                },
+                "kind": "store",
+                "x": 110,
+                "y": 320,
+                "detail": {
+                  "vi": "Nguồn sự thật của message, generation và trạng thái. Enforce tenant ownership trên mọi truy cập.",
+                  "en": "Authority for messages, generations and state. Enforces tenant ownership on every access."
+                }
+              },
+              {
+                "id": "retrieval",
+                "label": {
+                  "vi": "Retrieval / ACL",
+                  "en": "Retrieval / ACL"
+                },
+                "kind": "service",
+                "x": 370,
+                "y": 320,
+                "detail": {
+                  "vi": "Lấy chunk đúng quyền và version, trả provenance. Tài liệu là dữ liệu không đáng tin, không phải system instruction.",
+                  "en": "Retrieves authorized versioned chunks and provenance. Documents are untrusted data, not system instructions."
+                }
+              },
+              {
+                "id": "tool",
+                "label": {
+                  "vi": "Tool gateway",
+                  "en": "Tool gateway"
+                },
+                "kind": "service",
+                "x": 660,
+                "y": 320,
+                "detail": {
+                  "vi": "Validate schema, quyền và side effect; có audit, timeout, idempotency và approval theo tác vụ.",
+                  "en": "Validates schemas, permissions and side effects with audit, timeouts, idempotency and task-specific approval."
+                }
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Output policy",
+                  "en": "Output policy"
+                },
+                "kind": "service",
+                "x": 960,
+                "y": 320,
+                "detail": {
+                  "vi": "Đánh giá output/command theo policy sản phẩm. Streaming cần chiến lược kiểm tra trước hoặc theo chunk vì text đã gửi không thu hồi được.",
+                  "en": "Applies product policy to output/commands. Streaming requires pre-release or chunk-based checks because emitted text cannot be retracted."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "stream",
+                "label": {
+                  "vi": "Gửi + stream",
+                  "en": "Send + stream"
+                },
+                "steps": [
+                  {
+                    "from": "browser",
+                    "to": "edge",
+                    "description": {
+                      "vi": "Gửi input cùng idempotency key; xác thực owner và budget.",
+                      "en": "Send input with an idempotency key; authenticate the owner and budget."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Tạo turn/generation và deadline thực thi.",
+                      "en": "Create the turn/generation and execution deadline."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "history",
+                    "description": {
+                      "vi": "Lưu input và generation running, đọc history đúng nhánh.",
+                      "en": "Persist the input/running generation and read the correct history branch."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Gửi prompt đã token-budget và model revision.",
+                      "en": "Submit the token-budgeted prompt and model revision."
+                    }
+                  },
+                  {
+                    "from": "engine",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Đánh giá output trước khi flush theo policy streaming đã chọn.",
+                      "en": "Evaluate output before flushing under the chosen streaming policy."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "browser",
+                    "description": {
+                      "vi": "Phát delta kèm generationId/seq; hoàn tất có terminal event.",
+                      "en": "Emit deltas with generationId/seq and a terminal completion event."
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "ground",
+                "label": {
+                  "vi": "Ground / retrieval",
+                  "en": "Ground / retrieval"
+                },
+                "steps": [
+                  {
+                    "from": "orchestrator",
+                    "to": "retrieval",
+                    "description": {
+                      "vi": "Query kèm tenant/user scope, top-k và deadline.",
+                      "en": "Query with tenant/user scope, top-k and deadline."
+                    }
+                  },
+                  {
+                    "from": "retrieval",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Trả chunk đã ACL cùng document/version/page metadata.",
+                      "en": "Return ACL-filtered chunks with document/version/page metadata."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Đưa evidence vào vùng dữ liệu, giữ output reserve và yêu cầu dẫn chứng.",
+                      "en": "Insert evidence as data, preserve output reserve and request citations."
+                    }
+                  },
+                  {
+                    "from": "engine",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Kiểm tra định dạng và bằng chứng theo yêu cầu tác vụ.",
+                      "en": "Check format and grounding according to the task."
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "tools",
+                "label": {
+                  "vi": "Tool / kiểm tra quyền",
+                  "en": "Tools / authorization"
+                },
+                "steps": [
+                  {
+                    "from": "engine",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Model đề xuất tool và arguments; chưa có side effect.",
+                      "en": "The model proposes a tool and arguments; no side effect has occurred."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "tool",
+                    "description": {
+                      "vi": "Gateway validate schema, actor permission và approval/idempotency.",
+                      "en": "The gateway validates schemas, actor permission, approval and idempotency."
+                    }
+                  },
+                  {
+                    "from": "tool",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Trả structured result có giới hạn và không làm lộ secret.",
+                      "en": "Return a bounded structured result without exposing secrets."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Append tool result như dữ liệu, kiểm lại token budget cho vòng tiếp.",
+                      "en": "Append the tool result as data and recheck the next round’s token budget."
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "persist",
+                "label": {
+                  "vi": "Persist / cancel",
+                  "en": "Persist / cancel"
+                },
+                "steps": [
+                  {
+                    "from": "browser",
+                    "to": "edge",
+                    "description": {
+                      "vi": "Client hủy hoặc rời stream theo chính sách session.",
+                      "en": "The client cancels or leaves the stream under the session policy."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "orchestrator",
+                    "description": {
+                      "vi": "Truyền cancel signal; phân biệt disconnect với intentional cancel.",
+                      "en": "Propagate cancellation and distinguish disconnect from intentional cancellation."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "engine",
+                    "description": {
+                      "vi": "Hủy inference và tool round khi có thể; giới hạn cleanup deadline.",
+                      "en": "Cancel inference and tool rounds where possible within a cleanup deadline."
+                    }
+                  },
+                  {
+                    "from": "orchestrator",
+                    "to": "history",
+                    "description": {
+                      "vi": "Lưu partial output, usage và terminal state bằng conditional transition.",
+                      "en": "Persist partial output, usage and terminal state through a conditional transition."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "title": {
+        "vi": "3. Data model và state machine của generation",
+        "en": "3. Data model and generation state machine"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách conversation metadata khỏi message và generation. Message input có thể tồn tại dù generation thất bại; partial output không được đánh dấu completed chỉ vì socket đã đóng. Dùng transition có điều kiện để hai worker không cùng hoàn tất một generation hoặc ghi completed sau cancelled mà không có quy tắc ưu tiên.",
+          "en": "Separate conversation metadata, messages and generations. An input message can exist even when generation fails; a partial answer is not completed merely because the socket closed. Conditional transitions prevent two workers from completing the same generation or writing completed after cancelled without an explicit precedence rule."
+        },
+        {
+          "vi": "Trạng thái gợi ý: queued → running → completed; queued/running cũng có thể đi tới cancelled, failed hoặc interrupted. interrupted nghĩa là không thể xác định hoặc tiếp tục hoàn tất đường stream như hợp đồng ban đầu. Lưu finish_reason riêng: stop, length, tool_request hoặc policy_stop có ý nghĩa khác nhau đối với UI và billing.",
+          "en": "An example state machine is queued → running → completed; queued/running can also become cancelled, failed or interrupted. Interrupted means the original streaming contract could not be completed or resumed reliably. Store finish_reason separately: stop, length, tool_request and policy_stop have different UI and billing meanings."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Thực thể",
+            "en": "Entity"
+          },
+          {
+            "vi": "Khóa / trường",
+            "en": "Keys / fields"
+          },
+          {
+            "vi": "Invariant",
+            "en": "Invariant"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Conversation",
+              "en": "Conversation"
+            },
+            {
+              "vi": "id, owner_id/tenant_id, title, version, created_at",
+              "en": "id, owner_id/tenant_id, title, version, created_at"
+            },
+            {
+              "vi": "Mọi read/write kiểm tra membership; URL có ID không cấp quyền.",
+              "en": "Every read/write checks membership; knowing the URL ID grants no access."
+            }
+          ],
+          [
+            {
+              "vi": "Message",
+              "en": "Message"
+            },
+            {
+              "vi": "id, conversation_id, role, content_ref, parent_id, created_at",
+              "en": "id, conversation_id, role, content_ref, parent_id, created_at"
+            },
+            {
+              "vi": "Edit tạo version/nhánh có chủ đích; role do server kiểm soát.",
+              "en": "Edits create intentional versions/branches; the server controls roles."
+            }
+          ],
+          [
+            {
+              "vi": "Turn",
+              "en": "Turn"
+            },
+            {
+              "vi": "id, user_id, idempotency_key, input_fingerprint, status",
+              "en": "id, user_id, idempotency_key, input_fingerprint, status"
+            },
+            {
+              "vi": "Một submit logic có một turn; cùng key khác input bị từ chối.",
+              "en": "One logical submission has one turn; the same key with different input is rejected."
+            }
+          ],
+          [
+            {
+              "vi": "Generation",
+              "en": "Generation"
+            },
+            {
+              "vi": "id, turn_id, model_revision, prompt_version, status, usage",
+              "en": "id, turn_id, model_revision, prompt_version, status, usage"
+            },
+            {
+              "vi": "Mỗi regenerate có identity riêng; terminal transition dùng compare-and-set.",
+              "en": "Each regeneration has its own identity; terminal transitions use compare-and-set."
+            }
+          ],
+          [
+            {
+              "vi": "Stream event",
+              "en": "Stream event"
+            },
+            {
+              "vi": "generation_id, seq, type, payload, expires_at",
+              "en": "generation_id, seq, type, payload, expires_at"
+            },
+            {
+              "vi": "Seq tăng trong một generation; event retention tách khỏi lịch sử message.",
+              "en": "Sequence increases within a generation; event retention is separate from message history."
+            }
+          ],
+          [
+            {
+              "vi": "Tool invocation",
+              "en": "Tool invocation"
+            },
+            {
+              "vi": "call_id, generation_id, tool, args_hash, state, result_ref",
+              "en": "call_id, generation_id, tool, args_hash, state, result_ref"
+            },
+            {
+              "vi": "Side effect có idempotency và audit riêng, không chỉ log text của model.",
+              "en": "Side effects have separate idempotency and audit, not just model-text logs."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "4. API: submit, stream, cancel và resume",
+        "en": "4. APIs: submit, stream, cancel and resume"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một phương án dễ retry là POST tạo turn rồi GET stream theo generation ID. Native EventSource thường dùng GET và không cho đặt tùy ý Authorization header như fetch; có thể dùng cookie phù hợp cùng CSRF/origin protection, hoặc fetch streaming có header và parser SSE. Tránh token dài hạn trong query string vì URL có thể lọt vào log.",
+          "en": "One retry-friendly option creates a turn with POST and streams the generation through GET. Native EventSource uses GET and does not offer arbitrary Authorization headers like fetch; use appropriately protected cookies or fetch streaming with headers and an SSE parser. Avoid long-lived query-string tokens because URLs can appear in logs."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/conversations/{id}/turns",
+          "description": {
+            "vi": "Xác thực ownership, quota và input size; tạo turn/generation rồi trả vị trí stream.",
+            "en": "Validate ownership, quotas and input size; create a turn/generation and return the stream location."
+          },
+          "request": "Idempotency-Key: turn_...\n{ \"message\": \"Explain MVCC\", \"parentMessageId\": \"m_12\", \"maxOutputTokens\": 800 }",
+          "response": "202 Accepted\n{ \"turnId\": \"t_8\", \"generationId\": \"g_9\", \"status\": \"queued\",\n  \"eventsUrl\": \"/v1/generations/g_9/events\" }",
+          "notes": [
+            {
+              "vi": "Model identity được chọn từ allowlist server; client không tự cung cấp endpoint nội bộ hay system role.",
+              "en": "Choose model identity from a server allowlist; clients cannot inject internal endpoints or system roles."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/v1/generations/{id}/events",
+          "description": {
+            "vi": "Stream event có sequence; kiểm tra ownership trên mỗi lần kết nối/reconnect.",
+            "en": "Stream sequenced events and verify ownership on every connection/reconnection."
+          },
+          "response": "200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\n\nid: 12\nevent: delta\ndata: {\"generationId\":\"g_9\",\"seq\":12,\"text\":\"version\"}\n\nid: 13\nevent: completed\ndata: {\"generationId\":\"g_9\",\"seq\":13,\"finishReason\":\"stop\"}\n",
+          "notes": [
+            {
+              "vi": "Event ID chỉ hữu ích để resume nếu server lưu replay log và có semantics sau expiry. Reconnect không tự làm inference engine tiếp tục đúng vị trí.",
+              "en": "Event IDs enable resume only if the server retains a replay log and defines expiry semantics. Reconnecting does not automatically resume inference at the correct position."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/generations/{id}/cancel",
+          "description": {
+            "vi": "Yêu cầu hủy idempotent; server truyền cancellation và lưu terminal state theo quy tắc race đã định nghĩa.",
+            "en": "Request idempotent cancellation; propagate it and persist terminal state under a defined race policy."
+          },
+          "response": "202 Accepted\n{ \"generationId\": \"g_9\", \"cancelRequested\": true }",
+          "notes": [
+            {
+              "vi": "202 xác nhận đã nhận yêu cầu, không khẳng định GPU đã dừng ngay. Poll generation hoặc event terminal để biết kết quả.",
+              "en": "202 acknowledges the request, not instantaneous GPU termination. Observe generation status or a terminal event for the outcome."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/v1/generations/{id}",
+          "description": {
+            "vi": "Lấy trạng thái và output đã lưu sau refresh hoặc disconnect.",
+            "en": "Retrieve persisted state and output after refresh or disconnection."
+          },
+          "response": "200 OK\n{ \"id\": \"g_9\", \"status\": \"completed\", \"outputMessageId\": \"m_13\",\n  \"lastEventSeq\": 13, \"usage\": { \"inputTokens\": 1250, \"outputTokens\": 176 } }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "5. Luồng xử lý tương tác",
+        "en": "5. Interactive request paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Orchestrator nên có state rõ ràng thay vì một handler gọi model rồi pipe bytes. Handler thuần pipe rất nhanh để demo nhưng khó xử lý resume, tool retry, billing, version và cancellation. Một modular backend vẫn có thể chứa orchestrator, policy và adapter trong cùng process; boundary giúp kiểm thử mà chưa đòi hỏi microservices.",
+          "en": "The orchestrator needs explicit state rather than a handler that calls a model and pipes bytes. A raw pipe is fast for a demo but struggles with resumption, tool retries, billing, versioning and cancellation. A modular backend can colocate the orchestrator, policy and adapter; boundaries aid testing without requiring microservices."
+        }
+      ],
+      "diagram": {
+        "id": "chat-turn",
+        "title": {
+          "vi": "Vòng đời một message: stream, ground, tool và persist",
+          "en": "A message lifecycle: stream, ground, tools and persistence"
+        },
+        "caption": {
+          "vi": "Chọn từng đường để theo dõi trách nhiệm. Các node là boundary logic; phiên đầu có thể cùng chạy trong một backend modular.",
+          "en": "Trace each path to inspect responsibilities. Nodes are logical boundaries; an initial implementation may colocate them in one modular backend."
+        },
+        "width": 1080,
+        "height": 440,
+        "nodes": [
+          {
+            "id": "browser",
+            "label": {
+              "vi": "Browser / stream",
+              "en": "Browser / stream"
+            },
+            "kind": "client",
+            "x": 110,
+            "y": 110,
+            "detail": {
+              "vi": "Hiển thị delta theo generationId/seq, chống lặp event và cho phép hủy. Text output được render an toàn, không chạy HTML tùy ý.",
+              "en": "Renders deltas by generationId/seq, deduplicates events and allows cancellation. Output is rendered safely without arbitrary HTML execution."
+            }
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "API edge",
+              "en": "API edge"
+            },
+            "kind": "edge",
+            "x": 370,
+            "y": 110,
+            "detail": {
+              "vi": "Auth, conversation ownership, quota và admission. Không lưu provider secret trong browser.",
+              "en": "Owns authentication, conversation access, quotas and admission. Provider secrets never go in the browser."
+            }
+          },
+          {
+            "id": "orchestrator",
+            "label": {
+              "vi": "Orchestrator",
+              "en": "Orchestrator"
+            },
+            "kind": "service",
+            "x": 660,
+            "y": 110,
+            "detail": {
+              "vi": "Quản lý turn, context budget, model/tool rounds, deadline và cancellation. Model output không trực tiếp điều khiển database.",
+              "en": "Owns turns, context budgets, model/tool rounds, deadlines and cancellation. Model output never directly controls the database."
+            }
+          },
+          {
+            "id": "engine",
+            "label": {
+              "vi": "Inference adapter",
+              "en": "Inference adapter"
+            },
+            "kind": "model",
+            "x": 960,
+            "y": 110,
+            "detail": {
+              "vi": "Chuẩn hóa stream, usage, error và cancellation; route model revision có chủ đích.",
+              "en": "Normalizes streams, usage, errors and cancellation; routes to intentional model revisions."
+            }
+          },
+          {
+            "id": "history",
+            "label": {
+              "vi": "Conversation store",
+              "en": "Conversation store"
+            },
+            "kind": "store",
+            "x": 110,
+            "y": 320,
+            "detail": {
+              "vi": "Nguồn sự thật của message, generation và trạng thái. Enforce tenant ownership trên mọi truy cập.",
+              "en": "Authority for messages, generations and state. Enforces tenant ownership on every access."
+            }
+          },
+          {
+            "id": "retrieval",
+            "label": {
+              "vi": "Retrieval / ACL",
+              "en": "Retrieval / ACL"
+            },
+            "kind": "service",
+            "x": 370,
+            "y": 320,
+            "detail": {
+              "vi": "Lấy chunk đúng quyền và version, trả provenance. Tài liệu là dữ liệu không đáng tin, không phải system instruction.",
+              "en": "Retrieves authorized versioned chunks and provenance. Documents are untrusted data, not system instructions."
+            }
+          },
+          {
+            "id": "tool",
+            "label": {
+              "vi": "Tool gateway",
+              "en": "Tool gateway"
+            },
+            "kind": "service",
+            "x": 660,
+            "y": 320,
+            "detail": {
+              "vi": "Validate schema, quyền và side effect; có audit, timeout, idempotency và approval theo tác vụ.",
+              "en": "Validates schemas, permissions and side effects with audit, timeouts, idempotency and task-specific approval."
+            }
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Output policy",
+              "en": "Output policy"
+            },
+            "kind": "service",
+            "x": 960,
+            "y": 320,
+            "detail": {
+              "vi": "Đánh giá output/command theo policy sản phẩm. Streaming cần chiến lược kiểm tra trước hoặc theo chunk vì text đã gửi không thu hồi được.",
+              "en": "Applies product policy to output/commands. Streaming requires pre-release or chunk-based checks because emitted text cannot be retracted."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "stream",
+            "label": {
+              "vi": "Gửi + stream",
+              "en": "Send + stream"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "edge",
+                "description": {
+                  "vi": "Gửi input cùng idempotency key; xác thực owner và budget.",
+                  "en": "Send input with an idempotency key; authenticate the owner and budget."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "orchestrator",
+                "description": {
+                  "vi": "Tạo turn/generation và deadline thực thi.",
+                  "en": "Create the turn/generation and execution deadline."
+                }
+              },
+              {
+                "from": "orchestrator",
+                "to": "history",
+                "description": {
+                  "vi": "Lưu input và generation running, đọc history đúng nhánh.",
+                  "en": "Persist the input/running generation and read the correct history branch."
+                }
+              },
+              {
+                "from": "orchestrator",
+                "to": "engine",
+                "description": {
+                  "vi": "Gửi prompt đã token-budget và model revision.",
+                  "en": "Submit the token-budgeted prompt and model revision."
+                }
+              },
+              {
+                "from": "engine",
+                "to": "policy",
+                "description": {
+                  "vi": "Đánh giá output trước khi flush theo policy streaming đã chọn.",
+                  "en": "Evaluate output before flushing under the chosen streaming policy."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "browser",
+                "description": {
+                  "vi": "Phát delta kèm generationId/seq; hoàn tất có terminal event.",
+                  "en": "Emit deltas with generationId/seq and a terminal completion event."
+                }
+              }
+            ]
+          },
+          {
+            "id": "ground",
+            "label": {
+              "vi": "Ground / retrieval",
+              "en": "Ground / retrieval"
+            },
+            "steps": [
+              {
+                "from": "orchestrator",
+                "to": "retrieval",
+                "description": {
+                  "vi": "Query kèm tenant/user scope, top-k và deadline.",
+                  "en": "Query with tenant/user scope, top-k and deadline."
+                }
+              },
+              {
+                "from": "retrieval",
+                "to": "orchestrator",
+                "description": {
+                  "vi": "Trả chunk đã ACL cùng document/version/page metadata.",
+                  "en": "Return ACL-filtered chunks with document/version/page metadata."
+                }
+              },
+              {
+                "from": "orchestrator",
+                "to": "engine",
+                "description": {
+                  "vi": "Đưa evidence vào vùng dữ liệu, giữ output reserve và yêu cầu dẫn chứng.",
+                  "en": "Insert evidence as data, preserve output reserve and request citations."
+                }
+              },
+              {
+                "from": "engine",
+                "to": "policy",
+                "description": {
+                  "vi": "Kiểm tra định dạng và bằng chứng theo yêu cầu tác vụ.",
+                  "en": "Check format and grounding according to the task."
+                }
+              }
+            ]
+          },
+          {
+            "id": "tools",
+            "label": {
+              "vi": "Tool / kiểm tra quyền",
+              "en": "Tools / authorization"
+            },
+            "steps": [
+              {
+                "from": "engine",
+                "to": "orchestrator",
+                "description": {
+                  "vi": "Model đề xuất tool và arguments; chưa có side effect.",
+                  "en": "The model proposes a tool and arguments; no side effect has occurred."
+                }
+              },
+              {
+                "from": "orchestrator",
+                "to": "tool",
+                "description": {
+                  "vi": "Gateway validate schema, actor permission và approval/idempotency.",
+                  "en": "The gateway validates schemas, actor permission, approval and idempotency."
+                }
+              },
+              {
+                "from": "tool",
+                "to": "orchestrator",
+                "description": {
+                  "vi": "Trả structured result có giới hạn và không làm lộ secret.",
+                  "en": "Return a bounded structured result without exposing secrets."
+                }
+              },
+              {
+                "from": "orchestrator",
+                "to": "engine",
+                "description": {
+                  "vi": "Append tool result như dữ liệu, kiểm lại token budget cho vòng tiếp.",
+                  "en": "Append the tool result as data and recheck the next round’s token budget."
+                }
+              }
+            ]
+          },
+          {
+            "id": "persist",
+            "label": {
+              "vi": "Persist / cancel",
+              "en": "Persist / cancel"
+            },
+            "steps": [
+              {
+                "from": "browser",
+                "to": "edge",
+                "description": {
+                  "vi": "Client hủy hoặc rời stream theo chính sách session.",
+                  "en": "The client cancels or leaves the stream under the session policy."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "orchestrator",
+                "description": {
+                  "vi": "Truyền cancel signal; phân biệt disconnect với intentional cancel.",
+                  "en": "Propagate cancellation and distinguish disconnect from intentional cancellation."
+                }
+              },
+              {
+                "from": "orchestrator",
+                "to": "engine",
+                "description": {
+                  "vi": "Hủy inference và tool round khi có thể; giới hạn cleanup deadline.",
+                  "en": "Cancel inference and tool rounds where possible within a cleanup deadline."
+                }
+              },
+              {
+                "from": "orchestrator",
+                "to": "history",
+                "description": {
+                  "vi": "Lưu partial output, usage và terminal state bằng conditional transition.",
+                  "en": "Persist partial output, usage and terminal state through a conditional transition."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "streaming",
+      "title": {
+        "vi": "6. Streaming, backpressure và event ordering",
+        "en": "6. Streaming, backpressure and event ordering"
+      },
+      "paragraphs": [
+        {
+          "vi": "SSE phù hợp khi dữ liệu chủ yếu từ server tới client; submit và cancel đi bằng HTTP riêng. WebSocket hữu ích cho hai chiều liên tục như realtime audio hoặc nhiều event tương tác, nhưng cần quản lý connection, heartbeat và protocol state. Chọn transport theo tương tác sản phẩm; dùng WebSocket không tự làm inference nhanh hơn.",
+          "en": "SSE fits predominantly server-to-client output, with separate HTTP submission and cancellation. WebSockets suit continuous bidirectional interaction such as realtime audio or rich event exchange, but require connection, heartbeat and protocol-state management. Choose the transport for the product interaction; WebSockets do not inherently accelerate inference."
+        },
+        {
+          "vi": "Bytes mạng không trùng ranh giới UTF-8 character, token hay SSE event. Parser phải giữ buffer qua nhiều read, decode streaming và chỉ parse JSON sau khi event hoàn chỉnh. UI dùng seq để bỏ event trùng và phát hiện gap; không nối một stream generation mới vào output cũ chỉ vì conversationId giống nhau.",
+          "en": "Network-byte boundaries do not match UTF-8 characters, tokens or SSE events. A parser buffers across reads, decodes incrementally and parses JSON only after an event is complete. The UI uses sequence numbers to ignore duplicates and detect gaps; matching conversation IDs do not justify joining a new generation onto old output."
+        },
+        {
+          "vi": "Giới hạn buffer cho slow client. Nếu browser không đọc kịp, có thể giảm flush frequency trong giới hạn latency, lưu replay log hoặc hủy generation theo policy. Proxy cần không buffer cả response trước khi gửi; heartbeat là comment/event phù hợp để phát hiện kết nối chết, nhưng không thay thế deadline ứng dụng.",
+          "en": "Bound slow-client buffers. If the browser cannot keep up, the system can reduce flush frequency within latency limits, retain a replay log or cancel under policy. Proxies must not buffer the whole response before delivery; heartbeats help detect dead connections but do not replace application deadlines."
+        },
+        {
+          "vi": "Chọn semantics disconnect có chủ đích: hủy ngay tiết kiệm compute nhưng làm mất câu trả lời khi mạng chập chờn; tiếp tục trong grace period cho resume nhưng cần output/event retention và quota. Khi replay log hết hạn, client tải snapshot output/status hoặc bắt đầu generation mới, không giả vờ resume chính xác.",
+          "en": "Choose disconnection semantics intentionally: immediate cancellation saves compute but loses progress on flaky networks; a grace period enables resumption but needs output/event retention and quotas. After replay-log expiry, clients retrieve an output/status snapshot or start a new generation rather than pretending exact resumption."
+        }
+      ]
+    },
+    {
+      "id": "context",
+      "title": {
+        "vi": "7. Context window là một ngân sách",
+        "en": "7. The context window is a budget"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định model có cửa sổ 32.768 token. Dành 4.096 output, 2.000 system/schema và 1.000 token dự phòng tool/template thì còn 25.672 cho history, user input và retrieved evidence. Nếu retrieval lấy 20 chunk × 2.000 token, riêng evidence đã vượt ngân sách; top-k và chunk size phải chịu giới hạn token thực.",
+          "en": "Assume a 32,768-token window. Reserving 4,096 output tokens, 2,000 system/schema tokens and 1,000 for tools/templates leaves 25,672 for history, user input and evidence. Retrieving 20 chunks of 2,000 tokens exceeds the budget on evidence alone; top-k and chunk size must respect actual token limits."
+        },
+        {
+          "vi": "Giữ các message gần và thông tin cần cho tác vụ, summarize lịch sử cũ theo policy, và lưu provenance/version của summary. Summary là dữ liệu có thể sai hoặc bỏ chi tiết, không thay thế quyền server hay lịch sử audit. Với yêu cầu chính xác như số tiền/ID, ưu tiên structured state thay vì chỉ nén thành đoạn văn.",
+          "en": "Retain recent and task-relevant messages, summarize older history under a policy and store summary provenance/version. Summaries can be wrong or omit details; they do not replace server authorization or audit history. Exact values such as amounts/IDs belong in structured state rather than only prose compression."
+        },
+        {
+          "vi": "Mỗi tool round phải tính lại budget vì tool output có thể lớn. Giới hạn result size, truncate theo schema hoặc lưu artifact rồi đưa phần cần thiết vào prompt. Không cắt JSON tùy tiện giữa một object rồi mong model hiểu; cung cấp marker bị rút gọn và metadata để tool có thể lấy trang tiếp nếu được phép.",
+          "en": "Rebudget every tool round because tool outputs can be large. Bound result sizes, truncate by schema or store artifacts and inject only relevant parts. Do not cut JSON arbitrarily inside an object; provide explicit truncation markers and metadata for authorized pagination."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "content": "context_limit >= system_and_template\n               + selected_history\n               + user_input\n               + retrieved_evidence\n               + tool_results\n               + reserved_output\n               + safety_margin",
+        "caption": {
+          "vi": "Bất đẳng thức phải đúng cho mỗi lần gọi model, không chỉ lần đầu của conversation.",
+          "en": "This inequality must hold for every model call, not just the first call in a conversation."
+        }
+      },
+      "experiment": "context-budget"
+    },
+    {
+      "id": "retrieval",
+      "title": {
+        "vi": "8. Retrieval và quyền truy cập",
+        "en": "8. Retrieval and access control"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ingestion đọc tài liệu được cấp quyền, parse, chunk, tạo embedding và lưu document_id, version, tenant_id, ACL cùng chunk. Retrieval có thể kết hợp lexical với vector search rồi rerank. Đánh giá retrieval bằng câu hỏi có evidence chuẩn: recall của chunk đúng, ranking và tỷ lệ evidence đủ để trả lời; similarity score không phải xác suất câu trả lời đúng.",
+          "en": "Ingestion reads authorized documents, parses/chunks them, creates embeddings and stores document_id, version, tenant_id and ACL with each chunk. Retrieval can combine lexical and vector search followed by reranking. Evaluate against questions with known evidence: relevant-chunk recall, ranking and evidence sufficiency. Similarity scores are not probabilities of answer correctness."
+        },
+        {
+          "vi": "Tenant/ACL filter phải được áp trước khi chunk vào prompt; post-filter sau khi model đã thấy dữ liệu là quá muộn. Recheck quyền khi mở citation, xử lý xóa/revoke tới index và cache, và dùng version để tránh chunk cũ sau update. Context chứa tài liệu bên ngoài được coi là untrusted data; một câu “bỏ qua mọi hướng dẫn” trong PDF không được nâng thành instruction có quyền.",
+          "en": "Apply tenant/ACL filters before chunks enter the prompt; filtering after the model has seen data is too late. Recheck permissions when opening citations, propagate deletion/revocation to indexes/caches and use versions to reject stale chunks. External documents are untrusted data: a PDF saying “ignore all instructions” must not become privileged instructions."
+        },
+        {
+          "vi": "RAG không bảo đảm factual accuracy. Khi evidence không đủ hoặc mâu thuẫn, ứng dụng có thể yêu cầu model nói rõ giới hạn, hỏi lại hoặc từ chối kết luận. Citation cần trỏ đúng đoạn hỗ trợ phát biểu; chỉ liệt kê một document có liên quan không chứng minh câu trả lời được grounded.",
+          "en": "RAG does not guarantee factual accuracy. Insufficient or conflicting evidence can require the assistant to state limits, ask a question or abstain. Citations should identify the passage supporting the claim; listing a related document does not prove grounding."
+        }
+      ]
+    },
+    {
+      "id": "tools",
+      "title": {
+        "vi": "9. Tool execution và prompt injection",
+        "en": "9. Tool execution and prompt injection"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tool call là một đề xuất có cấu trúc từ model, chưa phải quyền thực thi. Gateway xác minh tool allowlist, arguments schema, tenant identity và quyền trên từng resource. Không cho model tự chọn userId admin hoặc endpoint mạng bất kỳ. Secret nằm ở execution environment có phạm vi hẹp, không nằm trong prompt hay tool result.",
+          "en": "A model tool call is a structured proposal, not authorization. The gateway checks tool allowlists, argument schemas, tenant identity and resource-level permissions. Models must not select an admin userId or arbitrary network endpoint. Secrets belong in scoped execution environments, not prompts or tool results."
+        },
+        {
+          "vi": "Với hành động ghi, preview và approval phụ thuộc mức tác động của sản phẩm; idempotency key gắn với logical action chống retry nhân đôi. Giới hạn số tool round, tổng tokens, wall-clock deadline và cost. Một vòng lặp model → tool → model có thể chạy mãi dù mỗi call đều hợp lệ; budget toàn turn mới chặn được runaway.",
+          "en": "For writes, preview/approval depends on product impact; bind an idempotency key to the logical action to prevent duplicate effects. Limit tool rounds, total tokens, wall-clock duration and cost. A model → tool → model loop can run indefinitely even if each call is valid; whole-turn budgets prevent runaway work."
+        },
+        {
+          "vi": "Không coi instruction “đừng làm lộ dữ liệu” là authorization control. Prompt injection từ tài liệu/tool output có thể khiến model đề xuất sai; quyền phải được thực thi bằng code ngoài model. Kết hợp privilege minimization, network egress controls, schema validation, audit và adversarial tests; không hứa một bộ lọc text loại bỏ hoàn toàn injection.",
+          "en": "Do not treat “do not leak data” instructions as authorization. Injection in documents/tool outputs may cause bad proposals; code outside the model must enforce permissions. Combine least privilege, egress controls, schema validation, audit and adversarial testing; a text filter cannot be promised to eliminate injection entirely."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Tool call chỉ là đề nghị, ứng dụng quyết định thực thi",
+          "en": "A tool call is a proposal; the application decides execution"
+        },
+        "caption": {
+          "vi": "Dữ liệu retrieval và output model là untrusted input. Kiểm tra server-side trước side effect, đồng thời giữ audit trail và idempotency cho thao tác có thể retry.",
+          "en": "Retrieved data and model output are untrusted input. Validate server-side before side effects, and keep audit trails and idempotency for retryable actions."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Nhận đề nghị",
+              "en": "Receive a proposal"
+            },
+            "detail": {
+              "vi": "Tool name + arguments từ model.",
+              "en": "Tool name and arguments from the model."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Kiểm tra quyền và schema",
+              "en": "Check rights and schema"
+            },
+            "detail": {
+              "vi": "User scope, resource, input limits.",
+              "en": "User scope, resources and input limits."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Thực thi có kiểm soát",
+              "en": "Execute with controls"
+            },
+            "detail": {
+              "vi": "Budget, deadline, xác nhận nếu cần.",
+              "en": "Budgets, deadlines and confirmation where needed."
+            },
+            "icon": "decision"
+          },
+          {
+            "title": {
+              "vi": "Ghi nhận kết quả",
+              "en": "Record the outcome"
+            },
+            "detail": {
+              "vi": "Receipt, audit và state của turn.",
+              "en": "Receipt, audit and turn state."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "scale",
+      "title": {
+        "vi": "10. Capacity, routing và chi phí",
+        "en": "10. Capacity, routing and cost"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 10.000 user đồng thời nhưng chỉ 20% đang chờ/sinh câu trả lời: có 2.000 active turns trong hệ, không phải mặc định 10.000 stream inference. Nếu mỗi turn ở hệ 20 s ở trạng thái ổn định, Little’s Law gợi ý khoảng 100 turn/s; đây chỉ là worked assumption, cần telemetry để đo active fraction và duration thực.",
+          "en": "Assume 10,000 concurrent users with 20% waiting for/generating an answer: there are 2,000 active turns in the system, not automatically 10,000 inference streams. At a stable 20-second turn duration, Little’s Law suggests around 100 turns/s. These are worked assumptions; telemetry must establish real activity and duration."
+        },
+        {
+          "vi": "Ở 100 turn/s, trung bình 2.000 input và 400 output token tạo 200.000 input tokens/s và 40.000 output tokens/s trước tool rounds. Sizing inference phải benchmark mixed workload và SLO TTFT/TPOT; sizing API edge cần connection count, buffer memory và network egress. Stream có thời gian sống dài nên scale chỉ theo HTTP requests/s là thiếu.",
+          "en": "At 100 turns/s with 2,000 input and 400 output tokens on average, demand is 200,000 input tokens/s and 40,000 output tokens/s before tool rounds. Size inference with mixed-workload TTFT/TPOT benchmarks; size the API edge by connections, buffer memory and egress. Long-lived streams make HTTP requests/s alone insufficient."
+        },
+        {
+          "vi": "Routing theo model capability, context limit, latency và cost budget. Fallback model cần eval tương thích tool/schema/policy; đổi model giữa một generation đang stream có thể đổi nội dung và semantics. Cache response chỉ dùng khi identity, prompt version, model version, evidence version và freshness cho phép; không chia sẻ câu trả lời chứa dữ liệu riêng giữa user.",
+          "en": "Route by capability, context limit, latency and cost budget. Fallback models need compatible tool/schema/policy evaluations; changing models mid-stream can change content and semantics. Cache responses only when identity, prompt/model/evidence versions and freshness allow it; never share private responses across users."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "11. Failure modes, eval và rollout",
+        "en": "11. Failure modes, evaluations and rollout"
+      },
+      "paragraphs": [
+        {
+          "vi": "Theo dõi turn success, TTFT, ITL, queue age, cancel propagation time, tool failure, retrieval empty rate, token/cost mỗi task thành công và số generation không có terminal state. Trace nối request → retrieval → model/tool rounds, nhưng redact secrets và nội dung nhạy cảm. Logging toàn conversation mặc định có thể tạo một kho dữ liệu riêng tư khó kiểm soát.",
+          "en": "Track turn success, TTFT, ITL, queue age, cancellation propagation, tool failures, empty retrieval, tokens/cost per successful task and generations lacking terminal states. Link request, retrieval and model/tool rounds in traces while redacting secrets and sensitive content. Default full-conversation logging can create an uncontrolled private-data store."
+        },
+        {
+          "vi": "Eval suite gồm câu hỏi thông thường, lịch sử dài, evidence mâu thuẫn, prompt injection, tool permission denied, duplicate side effect và cancellation race. Version prompt/model/retrieval config cùng kết quả; canary theo cohort, có rollback nhanh và quan sát cả chất lượng lẫn cost. Judge model là tín hiệu hỗ trợ, không phải ground truth tuyệt đối.",
+          "en": "Evaluation suites cover ordinary questions, long histories, conflicting evidence, prompt injection, denied tools, duplicate effects and cancellation races. Version prompts/models/retrieval settings with results; canary by cohort with fast rollback and quality/cost monitoring. Model judges provide evidence, not infallible ground truth."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sự cố",
+            "en": "Failure"
+          },
+          {
+            "vi": "Cách xử lý",
+            "en": "Handling"
+          },
+          {
+            "vi": "Điều không được giả định",
+            "en": "Do not assume"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Model overload trước token đầu",
+              "en": "Model overload before the first token"
+            },
+            {
+              "vi": "Reject/admission hoặc bounded retry sang route đã eval; ghi rõ retry attempt.",
+              "en": "Reject/admit carefully or use bounded retry to an evaluated route; record attempts."
+            },
+            {
+              "vi": "Mọi retry đều miễn phí và không tăng queue.",
+              "en": "All retries are free and harmless to queue pressure."
+            }
+          ],
+          [
+            {
+              "vi": "Stream đứt sau partial",
+              "en": "Stream breaks after partial output"
+            },
+            {
+              "vi": "Replay event nếu còn retention; nếu không, trả snapshot/incomplete và cho regenerate rõ ràng.",
+              "en": "Replay retained events or return a snapshot/incomplete state and explicit regeneration."
+            },
+            {
+              "vi": "Đổi model rồi nối tiếp text sẽ tạo cùng một answer.",
+              "en": "Switching models and concatenating text preserves one coherent answer."
+            }
+          ],
+          [
+            {
+              "vi": "Tool đã ghi thành công nhưng timeout",
+              "en": "Tool succeeds but times out"
+            },
+            {
+              "vi": "Query trạng thái bằng call/idempotency key; không tạo action mới trước khi reconcile.",
+              "en": "Query by call/idempotency key; reconcile before creating another action."
+            },
+            {
+              "vi": "Timeout nghĩa là side effect chưa xảy ra.",
+              "en": "A timeout means no side effect occurred."
+            }
+          ],
+          [
+            {
+              "vi": "Retrieval không có evidence",
+              "en": "No retrieval evidence"
+            },
+            {
+              "vi": "Thông báo giới hạn hoặc hỏi lại theo policy; không tạo citation giả.",
+              "en": "State limits or clarify under policy; do not invent citations."
+            },
+            {
+              "vi": "Model trả lời tự tin đồng nghĩa đã tìm thấy tài liệu.",
+              "en": "Confidence means relevant documents were found."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "staff-decisions",
+      "title": {
+        "vi": "11a. Các lựa chọn ở cấp hệ thống và tổ chức",
+        "en": "11a. Decisions at system and organizational scale"
+      },
+      "paragraphs": [
+        {
+          "vi": "Managed inference giúp khởi động nhanh và giảm vận hành GPU, nhưng thêm dependency về quota, region, dữ liệu và hành vi phiên bản. Self-hosting cho quyền điều khiển scheduler/model và data path, nhưng cần utilization đủ tốt, capacity dự phòng, security patching và người vận hành. So cost trên task đạt chất lượng/SLO, không chỉ giá một triệu token.",
+          "en": "Managed inference speeds up delivery and reduces GPU operations but adds dependencies on quotas, regions, data handling and version behavior. Self-hosting offers scheduler/model/data-path control but requires utilization, spare capacity, patching and operators. Compare cost per task meeting quality/SLOs, not only price per million tokens."
+        },
+        {
+          "vi": "Tách traffic interactive, agent loops và offline batch bằng deadline/quota/scheduling class. Agent có nhiều model/tool round nối tiếp nên cần giảm latency toàn vòng và giới hạn runaway; offline batch có thể chờ lâu hơn. Một tenant upload prompt cực dài không được làm mọi cuộc hội thoại khác chậm mà không có giới hạn hoặc policy rõ.",
+          "en": "Separate interactive, agent-loop and offline traffic using deadlines, quotas and scheduling classes. Agents chain model/tool calls, so optimize whole-loop latency and bound runaway work; offline batches can wait longer. One tenant’s huge prompts should not slow all conversations without explicit bounds or policy."
+        },
+        {
+          "vi": "Version model, prompt, retrieval index và tool schema độc lập nhưng ghi đủ metadata để tái hiện một turn. Canary cần eval cố định cộng đo production có quyền riêng tư; rollback phải giữ message/history cũ đọc được. Chi phí migration, on-call ownership và audit là một phần của kiến trúc, không đợi đến sau khi có nhiều service mới bàn.",
+          "en": "Version models, prompts, retrieval indexes and tool schemas independently while recording enough metadata to reproduce a turn. Canaries need fixed evaluations plus privacy-aware production measurement; rollback must preserve old messages/history. Migration cost, on-call ownership and audit are architectural concerns, not afterthoughts once services multiply."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Quyết định",
+            "en": "Decision"
+          },
+          {
+            "vi": "Chọn khi",
+            "en": "Choose when"
+          },
+          {
+            "vi": "Cần giữ rõ",
+            "en": "Make explicit"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "SSE / WebSocket",
+              "en": "SSE / WebSocket"
+            },
+            {
+              "vi": "Một chiều text stream / hai chiều realtime",
+              "en": "One-way text streams / bidirectional realtime"
+            },
+            {
+              "vi": "Reconnect, auth, buffering, event ordering",
+              "en": "Reconnect, auth, buffering, event ordering"
+            }
+          ],
+          [
+            {
+              "vi": "RAG / fine-tuning",
+              "en": "RAG / fine-tuning"
+            },
+            {
+              "vi": "Evidence thay đổi / behavior-task skill",
+              "en": "Changing evidence / behavior-task skill"
+            },
+            {
+              "vi": "Cả hai cần eval; quyền không nằm trong model",
+              "en": "Both require evaluation; permissions stay outside the model"
+            }
+          ],
+          [
+            {
+              "vi": "Shared / dedicated inference",
+              "en": "Shared / dedicated inference"
+            },
+            {
+              "vi": "Hiệu quả utilization / isolation nghiêm ngặt",
+              "en": "Utilization efficiency / strict isolation"
+            },
+            {
+              "vi": "Noisy neighbor, data boundary, idle cost và capacity",
+              "en": "Noisy neighbors, data boundaries, idle cost and capacity"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "12. Interview angles và bài tập thiết kế",
+        "en": "12. Interview angles and design exercises"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao cần orchestrator khi đã có model API?",
+            "en": "Why have an orchestrator when a model API exists?"
+          },
+          "answer": [
+            {
+              "vi": "Model API thực hiện generation; orchestrator quản lý sản phẩm: identity, context, tools, retries, cancellation, persistence, budget và version. Có thể là module trong một backend thay vì service riêng. Boundary này giúp test một turn bị lỗi mà không phụ thuộc output ngẫu nhiên của model.",
+              "en": "A model API generates output; the orchestrator owns product identity, context, tools, retries, cancellation, persistence, budgets and versions. It can be a backend module rather than a separate service. The boundary makes failed-turn tests independent of stochastic model output."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "SSE event ID có đủ để resume generation không?",
+            "en": "Is an SSE event ID enough to resume generation?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Server phải lưu event sau ID đó, bảo đảm sequence và retention, xác thực owner và biết trạng thái generation. Nếu worker chết hoặc KV mất, replay phần đã lưu khác với tiếp tục inference; cần policy incomplete/regenerate thay vì hứa khôi phục không có cơ sở.",
+              "en": "No. The server needs retained events after that ID, ordering/retention guarantees, owner authorization and generation state. Replaying saved events differs from continuing inference after worker/KV loss; define incomplete/regeneration behavior instead of promising unsupported recovery."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "RAG có thay thế fine-tuning không?",
+            "en": "Does RAG replace fine-tuning?"
+          },
+          "answer": [
+            {
+              "vi": "Chúng giải quyết vấn đề khác nhau. RAG đưa knowledge/evidence có thể cập nhật và áp quyền vào context; fine-tuning điều chỉnh behavior hoặc task skill từ training examples. Có thể kết hợp, nhưng cả hai đều cần eval; fine-tuning không phải nơi lưu quyền truy cập tài liệu động.",
+              "en": "They address different needs. RAG injects updateable authorized evidence into context; fine-tuning changes behavior or task skill from training examples. They can be combined and both require evaluation; fine-tuning is not a store for dynamic document permissions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bài tập: tool call được retry hai lần sau timeout, làm sao không tạo ba ticket?",
+            "en": "Exercise: a tool call retries twice after a timeout. How do we avoid three tickets?"
+          },
+          "answer": [
+            {
+              "vi": "Gateway cấp logical action ID/idempotency key cố định cho create-ticket, lưu fingerprint và trạng thái, rồi target service enforce uniqueness. Timeout được reconcile bằng cùng key hoặc status lookup. Nếu target không hỗ trợ dedup, cần thiết kế reconciliation/compensation và công khai giới hạn, không tuyên bố exactly-once chỉ nhờ retry logic.",
+              "en": "The gateway assigns a stable logical-action ID/idempotency key, stores its fingerprint/state and has the target enforce uniqueness. Reconcile timeouts with the same key or status lookup. Without target deduplication, design reconciliation/compensation and state the limit; retries alone cannot promise exactly-once effects."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bước nào bảo vệ chống đọc conversation của người khác?",
+            "en": "What prevents reading another user’s conversation?"
+          },
+          "answer": [
+            {
+              "vi": "Authorization server-side trên conversation membership và tenant scope ở mọi endpoint, stream reconnect, message lookup và artifact retrieval. ID khó đoán giảm khả năng dò nhưng không thay thế kiểm tra quyền. Model và prompt không quyết định actor có được đọc resource hay không.",
+              "en": "Server-side conversation-membership and tenant authorization on every endpoint, stream reconnect, message lookup and artifact retrieval. Unguessable IDs reduce enumeration but do not replace permission checks. Neither the model nor its prompt decides resource access."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "api",
+    "security",
+    "storage-search"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một tin nhắn cần nhiều hơn một model call",
+      "en": "A message needs more than a model call"
+    },
+    "caption": {
+      "vi": "Đây là kiến trúc ứng dụng chat minh họa. Retrieval và tools là nhánh theo nhu cầu; quyền thực thi và lưu trữ phải được ứng dụng kiểm soát.",
+      "en": "This is an educational chat application architecture. Retrieval and tools are optional branches; the application must enforce execution and storage permissions."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Nhận intent và context",
+          "en": "Receive intent and context"
+        },
+        "detail": {
+          "vi": "User, hội thoại, budget, cancel.",
+          "en": "User, conversation, budget and cancellation."
+        },
+        "icon": "users"
+      },
+      {
+        "title": {
+          "vi": "Điều phối có kiểm soát",
+          "en": "Orchestrate with controls"
+        },
+        "detail": {
+          "vi": "Policy, retrieval và tools nếu cần.",
+          "en": "Policy, retrieval and tools when needed."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Sinh và stream",
+          "en": "Generate and stream"
+        },
+        "detail": {
+          "vi": "Admission, inference, backpressure.",
+          "en": "Admission, inference and backpressure."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Lưu và quan sát kết quả",
+          "en": "Persist and observe outcomes"
+        },
+        "detail": {
+          "vi": "Turn state, usage, eval, recovery.",
+          "en": "Turn state, usage, evaluation and recovery."
+        },
+        "icon": "inspect"
+      }
+    ]
+  }
+}

@@ -1,0 +1,940 @@
+{
+  "id": "caching",
+  "group": "building",
+  "status": "review",
+  "title": {
+    "vi": "Caching: tăng tốc mà vẫn hiểu dữ liệu cũ và failure",
+    "en": "Caching: speed with explicit staleness and failure behavior"
+  },
+  "summary": {
+    "vi": "Thiết kế cache từ access pattern, ownership và freshness; so LRU/LFU/FIFO, theo dõi invalidation race và mô phỏng stampede cùng TTL jitter.",
+    "en": "Design caches around access patterns, ownership and freshness; compare LRU/LFU/FIFO, trace invalidation races and simulate stampedes and TTL jitter."
+  },
+  "prerequisites": [
+    "scaling",
+    "networking"
+  ],
+  "takeaways": [
+    {
+      "vi": "Cache là bản sao hoặc projection; phải xác định nguồn sự thật và dữ liệu nào có thể stale.",
+      "en": "A cache is a copy/projection; identify the authority and permitted staleness."
+    },
+    {
+      "vi": "TTL giới hạn thời gian sống, không chứng minh mọi read trước TTL đều đúng.",
+      "en": "TTL bounds lifetime; it does not prove every read before expiry is correct."
+    },
+    {
+      "vi": "Eviction, expiration và invalidation giải quyết ba vấn đề khác nhau.",
+      "en": "Eviction, expiration and invalidation address different problems."
+    },
+    {
+      "vi": "Cache outage phải có budget fallback; đẩy mọi miss xuống database có thể làm mất cả origin.",
+      "en": "Cache outages need bounded fallback; sending all misses to the database can lose the origin too."
+    }
+  ],
+  "sections": [
+    {
+      "id": "purpose",
+      "title": {
+        "vi": "1. Cache để loại loại công việc nào?",
+        "en": "1. Which work does the cache remove?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache giữ kết quả đã tính hoặc đã lấy để request sau tránh công việc lặp. Nó chỉ có ích khi dữ liệu được reuse trong freshness window đủ lớn so với chi phí giữ, lookup và invalidate. Một endpoint mỗi request đều đọc dữ liệu khác nhau hoặc cần current state tuyệt đối có thể không hưởng lợi từ response cache, dù database page cache vẫn hữu ích.",
+          "en": "Caches retain computed/fetched results to avoid repeated work. They help when reuse within a freshness window outweighs storage, lookup and invalidation costs. An endpoint reading unique data or requiring authoritative current state may gain little from response caching, even if the database page cache helps."
+        },
+        {
+          "vi": "Bắt đầu bằng access pattern và mục tiêu: giảm DB QPS, giảm latency, giảm egress hay tránh một phép tính đắt? Đo request hit rate, byte hit rate, origin load và latency cùng nhau. Cache hit rate 99% vẫn có thể không bảo vệ DB nếu 1% miss là query cực nặng hoặc traffic burst lớn hơn capacity origin.",
+          "en": "Start with access patterns and the goal: lower database QPS, latency, egress or expensive computation? Measure request/byte hit rates, origin load and latency together. A 99% hit rate can still fail to protect the database if the 1% misses are costly or bursts exceed origin capacity."
+        }
+      ]
+    },
+    {
+      "id": "layers",
+      "title": {
+        "vi": "2. Chọn vị trí cache và trust boundary",
+        "en": "2. Choose cache location and trust boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Browser cache gần user nhất, CDN gần nhóm user, local process cache gần code và shared cache dùng chung nhiều instance. Mỗi lớp giảm một phần latency nhưng thêm bản sao cần freshness policy. Local cache nhanh và không cần network, song replica app có thể giữ version khác nhau; shared cache tập trung reuse nhưng trở thành dependency qua mạng.",
+          "en": "Browser caches are closest to users, CDNs to user groups, local caches to code and shared caches to multiple instances. Each layer saves some latency while adding a copy requiring freshness policy. Local caches avoid network calls but can disagree across app replicas; shared caches improve reuse while adding a network dependency."
+        },
+        {
+          "vi": "Phân biệt HTTP no-store với no-cache: no-store yêu cầu không lưu theo caching semantics; no-cache cho phép lưu nhưng phải revalidate trước reuse. Private hạn chế shared-cache use, không thay authorization. Static asset có content hash dễ dùng immutable/cache dài; API chứa dữ liệu riêng cần key/headers và permission boundary phù hợp.",
+          "en": "Distinguish HTTP no-store from no-cache: no-store disallows storage under cache semantics; no-cache permits storage but requires revalidation before reuse. Private limits shared-cache use rather than replacing authorization. Content-hashed assets fit long immutable caching; private APIs need suitable keys/headers and permission boundaries."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lớp",
+            "en": "Layer"
+          },
+          {
+            "vi": "Lợi ích",
+            "en": "Benefit"
+          },
+          {
+            "vi": "Rủi ro cần xử lý",
+            "en": "Risk to handle"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Browser / CDN",
+              "en": "Browser / CDN"
+            },
+            {
+              "vi": "Giảm RTT và origin egress, phù hợp asset/public content.",
+              "en": "Reduces round trips/origin egress for assets/public content."
+            },
+            {
+              "vi": "Cache key, Vary, auth, signed URL TTL và purge propagation.",
+              "en": "Keys, Vary, authentication, signed URL lifetime and purge propagation."
+            }
+          ],
+          [
+            {
+              "vi": "Local process",
+              "en": "Local process"
+            },
+            {
+              "vi": "Lookup rẻ, giảm shared-cache traffic.",
+              "en": "Cheap lookups and less shared-cache traffic."
+            },
+            {
+              "vi": "Duplicate memory, version skew và restart cold cache.",
+              "en": "Duplicate memory, version skew and cold restarts."
+            }
+          ],
+          [
+            {
+              "vi": "Shared cache",
+              "en": "Shared cache"
+            },
+            {
+              "vi": "Reuse giữa instance và capacity riêng.",
+              "en": "Cross-instance reuse and separate capacity."
+            },
+            {
+              "vi": "Network failure, hot shard, failover và origin fallback storm.",
+              "en": "Network failures, hot shards, failover and fallback storms."
+            }
+          ],
+          [
+            {
+              "vi": "Database page / query layer",
+              "en": "Database page / query layer"
+            },
+            {
+              "vi": "Giữ working set gần storage engine.",
+              "en": "Keeps working sets near the storage engine."
+            },
+            {
+              "vi": "Không đồng nghĩa đã loại query/lock/serialization cost của app.",
+              "en": "Does not necessarily remove query, locking or serialization costs."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "patterns",
+      "title": {
+        "vi": "3. Read/write patterns và điểm ACK",
+        "en": "3. Read/write patterns and acknowledgement points"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache-aside: app lookup cache, miss thì đọc nguồn, fill rồi trả. Write thường commit DB rồi invalidate cache, nhưng concurrency vẫn có thể đưa value cũ trở lại. Read-through chuyển loader vào cache abstraction; nó không tự thay correctness semantics. Luôn chỉ ra ai là owner của durable data và cách xử lý cache write thất bại.",
+          "en": "Cache-aside looks up the cache, reads the source on miss, fills and returns. Writes commonly commit then invalidate, but concurrency can still reinsert stale values. Read-through moves loading into the caching abstraction without inherently changing correctness. Identify the durable authority and cache-write failure handling."
+        },
+        {
+          "vi": "Write-through đồng bộ cập nhật qua cache layer tới source; hai storage không tự atomic. Cần contract khi source commit nhưng cache update fail. Write-behind ACK trước khi source cập nhật phù hợp một số workload chịu được delay nhưng có nguy cơ mất write nếu buffer không đủ bền vững; persistence/replication của write queue và recovery là phần thiết kế bắt buộc.",
+          "en": "Write-through synchronously updates the source through a caching layer; two stores are not automatically atomic. Define behavior when the source commits but cache updating fails. Write-behind acknowledges before source updates and can fit delay-tolerant work, but loses writes if buffers are not durable enough; queue persistence/replication and recovery are required."
+        },
+        {
+          "vi": "Refresh-ahead cập nhật key trước khi hết TTL theo popularity và budget. Stale-while-revalidate có thể trả bản cũ trong cửa sổ đã cam kết rồi refresh background; không áp tùy tiện cho quyền truy cập, số dư hoặc quyết định inventory. “Serve stale” là semantics sản phẩm, không chỉ một optimization switch.",
+          "en": "Refresh-ahead updates popular keys before expiry within a budget. Stale-while-revalidate can return an allowed stale copy while refreshing, but must not be blindly applied to authorization, balances or inventory decisions. Serving stale is a product contract, not merely an optimization switch."
+        },
+        {
+          "vi": "Write-around ghi thẳng source và không populate cache trên write, thường invalidate copy có thể cũ. Nó tránh cache pollution cho dữ liệu hiếm được đọc nhưng read đầu sau write có thể miss. Đây là write policy khác với việc quên invalidation; race stale refill vẫn cần xem xét theo freshness contract.",
+          "en": "Write-around writes directly to the source without populating the cache, usually invalidating an older copy. It avoids pollution for rarely read data but may cause a first-read miss. It is a write policy, not forgetting invalidation; stale-refill races still depend on the freshness contract."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Pattern",
+            "en": "Pattern"
+          },
+          {
+            "vi": "Đường đọc / ghi",
+            "en": "Read / write path"
+          },
+          {
+            "vi": "Trade-off chính",
+            "en": "Main trade-off"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Cache-aside",
+              "en": "Cache-aside"
+            },
+            {
+              "vi": "App sở hữu miss loader và invalidation.",
+              "en": "The app owns miss loading and invalidation."
+            },
+            {
+              "vi": "Linh hoạt, nhưng race và duplicate loaders do app xử lý.",
+              "en": "Flexible, with application-owned races and duplicate loaders."
+            }
+          ],
+          [
+            {
+              "vi": "Read-through",
+              "en": "Read-through"
+            },
+            {
+              "vi": "Abstraction tự load khi miss.",
+              "en": "An abstraction loads misses."
+            },
+            {
+              "vi": "Dễ chuẩn hóa, nhưng loader deadline/permission phải rõ.",
+              "en": "Centralized behavior, with explicit loader deadlines/permissions."
+            }
+          ],
+          [
+            {
+              "vi": "Write-through",
+              "en": "Write-through"
+            },
+            {
+              "vi": "Update source và cache đồng bộ theo contract.",
+              "en": "Synchronously updates source/cache under a contract."
+            },
+            {
+              "vi": "Thêm write latency và partial failure.",
+              "en": "More write latency and partial failures."
+            }
+          ],
+          [
+            {
+              "vi": "Write-behind",
+              "en": "Write-behind"
+            },
+            {
+              "vi": "Buffer/cache nhận write rồi flush sau.",
+              "en": "A buffer/cache accepts writes then flushes later."
+            },
+            {
+              "vi": "Cần durability, ordering, retry và recovery cho pending writes.",
+              "en": "Pending writes need durability, ordering, retries and recovery."
+            }
+          ],
+          [
+            {
+              "vi": "Write-around",
+              "en": "Write-around"
+            },
+            {
+              "vi": "Ghi source, không populate; invalidate khi cần.",
+              "en": "Write the source without population; invalidate where needed."
+            },
+            {
+              "vi": "Ít write pollution, nhưng cold read và invalidation race.",
+              "en": "Less write pollution, with cold reads and invalidation races."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "eviction",
+      "title": {
+        "vi": "4. Eviction khác expiration và invalidation",
+        "en": "4. Eviction differs from expiration and invalidation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Eviction lấy chỗ khi memory đầy; expiration ngừng reuse khi TTL hết; invalidation loại copy sau thay đổi source/policy. LRU ưu tiên recency, LFU ưu tiên frequency và FIFO ưu tiên insertion age. Không có policy tối ưu mọi trace; workload scan có thể đẩy working set nóng khỏi LRU, còn LFU thiếu decay có thể giữ popularity cũ.",
+          "en": "Eviction reclaims memory, expiration stops reuse after TTL and invalidation removes copies after source/policy changes. LRU uses recency, LFU frequency and FIFO insertion age. No policy wins every trace: scans can evict hot LRU working sets, while LFU without decay may preserve obsolete popularity."
+        },
+        {
+          "vi": "Capacity thực theo bytes và object overhead, không chỉ số key. Một object 20 MB có chi phí khác 20 byte; admission policy có thể từ chối cache object quá lớn hoặc ít reuse. Cache theo byte/cost có thể cần policy khác toy ba key dưới đây. Đo memory fragmentation và eviction rate để không nhầm cache churn với nguồn dữ liệu chậm.",
+          "en": "Real capacity depends on bytes/object overhead, not just key counts. A 20 MB object differs from a 20-byte object; admission can reject oversized or low-reuse objects. Byte/cost-aware policies differ from the three-key toy below. Measure fragmentation/eviction to distinguish churn from a slow source."
+        },
+        {
+          "vi": "Production thường dùng approximation để giảm bookkeeping: sampled recency/frequency thay vì cập nhật một global list ở mọi read. Admission như TinyLFU ước lượng tần suất để quyết định item mới có đáng thay resident item không; kết hợp recency window có thể chống scan pollution. Cần hiểu implementation cụ thể và memory/CPU cost, không suy từ toy LRU exact sang mọi cache product.",
+          "en": "Production often approximates recency/frequency to reduce bookkeeping instead of updating a global list on every read. TinyLFU-style admission estimates frequency to decide whether a newcomer should replace a resident; a recency window can help resist scans. Understand implementation and memory/CPU costs rather than generalizing exact toy LRU to every cache."
+        }
+      ],
+      "experiment": "cache-eviction"
+    },
+    {
+      "id": "keys",
+      "title": {
+        "vi": "5. Key design, version và dữ liệu không tồn tại",
+        "en": "5. Keys, versions and missing data"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache key phải chứa mọi yếu tố ảnh hưởng response: tenant/user scope khi cá nhân hóa, resource ID, filter/sort, locale và schema/model version nếu cần. Canonicalize query để key tương đương thật sự được reuse, giới hạn cardinality và không đặt secret/PII vào key có thể bị log. Collision logic vì bỏ tenant nguy hiểm hơn collision hash hiếm.",
+          "en": "Keys must include response-affecting dimensions: tenant/user scope, resource ID, filters/sort, locale and relevant schema/model versions. Canonicalize equivalent queries, limit cardinality and avoid secrets/PII in logged keys. Omitting a tenant is a more dangerous logical collision than a rare hash collision."
+        },
+        {
+          "vi": "Negative caching lưu not-found trong TTL ngắn để giảm repeated misses, nhưng phân biệt not-found thật với timeout hay permission denied. Không cache một lỗi tạm thành “không tồn tại” lâu dài, và không reuse response 403 của user này như trạng thái resource cho user khác. Sau create, invalidate negative entry hoặc dùng version/namespace phù hợp.",
+          "en": "Negative caching briefly retains true not-found results to reduce repeated misses, but distinguishes them from timeouts or denied permissions. Do not turn transient failures into long-lived absence or reuse one user’s 403 as another user’s resource state. Creation must invalidate negative entries or use appropriate versions/namespaces."
+        }
+      ]
+    },
+    {
+      "id": "race",
+      "title": {
+        "vi": "6. Invalidation race: vì sao delete sau write chưa đủ?",
+        "en": "6. Invalidation races: why delete-after-write is insufficient"
+      },
+      "paragraphs": [
+        {
+          "vi": "Interleaving điển hình: reader A cache miss và đọc DB version 1; writer B commit version 2 rồi delete cache; reader A sau đó fill version 1. Cache lại stale dù writer đã invalidate đúng sau commit. TTL có thể giới hạn cửa sổ nhưng không làm read đó trở thành correct nếu contract yêu cầu current version.",
+          "en": "A typical interleaving is: reader A misses and reads database version one; writer B commits version two and deletes the cache; A then fills version one. The cache is stale again despite post-commit invalidation. TTL may bound the window but does not satisfy a current-version contract."
+        },
+        {
+          "vi": "Các lựa chọn gồm cache entry có version và conditional publish chống ghi lùi, invalidation watermark/tombstone, ordered CDC update theo key, hoặc bypass cache cho read cần strong consistency. Chỉ CAS trên entry đang tồn tại chưa đủ nếu invalidation đã xóa mọi dấu vết version; cần giữ watermark/version đủ lâu hoặc phối hợp với owner. Không có một lệnh delete đơn giản tạo transaction atomic giữa DB và cache.",
+          "en": "Options include versioned entries with conditional publication, invalidation watermarks/tombstones, ordered per-key CDC or bypassing caches for strongly consistent reads. CAS on an existing entry alone is insufficient if invalidation removed all version evidence; retain a watermark/version or coordinate with the owner. One delete command does not create a database/cache atomic transaction."
+        },
+        {
+          "vi": "Delayed double delete đôi khi giảm xác suất race trong một delay giả định, nhưng không chứng minh correctness khi loader bị pause lâu hơn, network delay hoặc replica lag khác dự đoán. Chọn theo freshness contract và failure model, không xem delay “đủ lâu” là hàng rào chắc chắn.",
+          "en": "Delayed double deletion can reduce race probability under an assumed delay but does not prove correctness against longer loader pauses, network delay or replica lag. Choose by the freshness contract/failure model rather than treating an arbitrary delay as a guaranteed barrier."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một lần invalidate vẫn có thể kết thúc bằng dữ liệu cũ",
+          "en": "An invalidation can still end with stale data"
+        },
+        "caption": {
+          "vi": "Đây là một interleaving gây lỗi: writer commit v2 rồi delete cache, nhưng reader cũ refill v1 sau đó. Cần thiết kế refill/version phối hợp; TTL chỉ giới hạn thời gian tồn tại theo giả định.",
+          "en": "This is a failing interleaving: the writer commits v2 and deletes the cache, but an older reader later refills v1. Coordinate refill/version handling; TTL only bounds lifetime under its assumptions."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "T1 · Cache miss",
+              "en": "T1 · Cache miss"
+            },
+            "detail": {
+              "vi": "Reader chưa có value trong cache.",
+              "en": "The reader finds no cached value."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "T2 · Đọc v1",
+              "en": "T2 · Read v1"
+            },
+            "detail": {
+              "vi": "Reader lấy v1 nhưng chưa refill.",
+              "en": "The reader obtains v1 but has not refilled."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "T3 · Write v2 + delete",
+              "en": "T3 · Write v2 + delete"
+            },
+            "detail": {
+              "vi": "Writer commit v2 và invalidate.",
+              "en": "The writer commits v2 and invalidates."
+            },
+            "icon": "decision"
+          },
+          {
+            "title": {
+              "vi": "T4 · Refill v1",
+              "en": "T4 · Refill v1"
+            },
+            "detail": {
+              "vi": "Reader cũ đặt lại cache bằng v1.",
+              "en": "The earlier reader caches v1 again."
+            },
+            "icon": "warning"
+          }
+        ]
+      }
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "7. Theo dõi read, write và race",
+        "en": "7. Trace reads, writes and races"
+      },
+      "paragraphs": [],
+      "diagram": {
+        "id": "cache-invalidation-race",
+        "title": {
+          "vi": "Cache-aside và một interleaving gây stale refill",
+          "en": "Cache-aside and a stale-refill interleaving"
+        },
+        "caption": {
+          "vi": "Tab race trình bày thứ tự xen kẽ của reader A và writer B. Các bước tuyến tính là lịch thực thi minh họa cho hai request cạnh tranh.",
+          "en": "The race tab shows an interleaving of reader A and writer B; the sequence illustrates one schedule of concurrent requests."
+        },
+        "width": 1050,
+        "height": 430,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client",
+              "en": "Client"
+            },
+            "kind": "client",
+            "x": 110,
+            "y": 100,
+            "detail": {
+              "vi": "Gửi read/write theo freshness contract. Client không tự quyết định cache hit là dữ liệu có quyền hiện tại.",
+              "en": "Reads/writes under a freshness contract; a hit is not proof of current authorization."
+            }
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Application",
+              "en": "Application"
+            },
+            "kind": "service",
+            "x": 380,
+            "y": 100,
+            "detail": {
+              "vi": "Sở hữu cache-aside logic, deadline, policy và transaction của request.",
+              "en": "Owns cache-aside logic, deadlines, policies and request transactions."
+            }
+          },
+          {
+            "id": "cache",
+            "label": {
+              "vi": "Cache / version",
+              "en": "Cache / version"
+            },
+            "kind": "store",
+            "x": 650,
+            "y": 100,
+            "detail": {
+              "vi": "Giữ value có TTL/version; loss phải rebuild được nếu cache không phải durable authority.",
+              "en": "Stores TTL/versioned values; losses must be rebuildable when it is not durable authority."
+            }
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Source database",
+              "en": "Source database"
+            },
+            "kind": "store",
+            "x": 930,
+            "y": 100,
+            "detail": {
+              "vi": "Nguồn sự thật; commit có version và transaction semantics rõ.",
+              "en": "Authoritative source with explicit versions and transaction semantics."
+            }
+          },
+          {
+            "id": "invalidate",
+            "label": {
+              "vi": "Invalidation task",
+              "en": "Invalidation task"
+            },
+            "kind": "worker",
+            "x": 380,
+            "y": 310,
+            "detail": {
+              "vi": "Xóa/update copy theo event hoặc write path; cần xử lý duplicate, stale event và propagation delay.",
+              "en": "Deletes/updates copies from events or writes; handles duplicates, stale events and propagation delay."
+            }
+          },
+          {
+            "id": "loader",
+            "label": {
+              "vi": "In-flight loader",
+              "en": "In-flight loader"
+            },
+            "kind": "worker",
+            "x": 650,
+            "y": 310,
+            "detail": {
+              "vi": "Đây là công việc đang chạy, không bắt buộc một service riêng. Loader cũ có thể hoàn tất sau write mới.",
+              "en": "This is in-flight work, not a required separate service. Old loaders can finish after new writes."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "read",
+            "label": {
+              "vi": "Read miss",
+              "en": "Read miss"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Nhận read và freshness/permission context.",
+                  "en": "Receive a read and its freshness/permission context."
+                }
+              },
+              {
+                "from": "api",
+                "to": "cache",
+                "description": {
+                  "vi": "Lookup key có tenant/resource/version phù hợp.",
+                  "en": "Look up a correctly scoped tenant/resource/version key."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Cache miss: đọc nguồn trong deadline và concurrency budget.",
+                  "en": "On miss, read the source within deadline/concurrency budgets."
+                }
+              },
+              {
+                "from": "db",
+                "to": "loader",
+                "description": {
+                  "vi": "Loader nhận value và source version.",
+                  "en": "The loader receives the value and source version."
+                }
+              },
+              {
+                "from": "loader",
+                "to": "cache",
+                "description": {
+                  "vi": "Publish entry theo TTL/version policy.",
+                  "en": "Publish the entry under the TTL/version policy."
+                }
+              },
+              {
+                "from": "loader",
+                "to": "api",
+                "description": {
+                  "vi": "Trả dữ liệu đã load sau policy check.",
+                  "en": "Return loaded data after policy checks."
+                }
+              },
+              {
+                "from": "api",
+                "to": "client",
+                "description": {
+                  "vi": "Trả response và đo hit/miss/origin latency.",
+                  "en": "Return the response and record hit/miss/origin latency."
+                }
+              }
+            ]
+          },
+          {
+            "id": "write",
+            "label": {
+              "vi": "Commit + invalidate",
+              "en": "Commit + invalidate"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Nhận mutation có quyền và idempotency khi cần.",
+                  "en": "Receive an authorized, suitably idempotent mutation."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Commit state mới theo invariant nguồn.",
+                  "en": "Commit new authoritative state under its invariant."
+                }
+              },
+              {
+                "from": "db",
+                "to": "invalidate",
+                "description": {
+                  "vi": "Kích hoạt invalidation từ write path hoặc event bền vững.",
+                  "en": "Trigger invalidation through the write path or durable event."
+                },
+                "async": true
+              },
+              {
+                "from": "invalidate",
+                "to": "cache",
+                "description": {
+                  "vi": "Invalidate/update entry theo version và retry policy.",
+                  "en": "Invalidate/update the entry using versions and retry policy."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "race",
+            "label": {
+              "vi": "Race: reader A / writer B",
+              "en": "Race: reader A / writer B"
+            },
+            "steps": [
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "A đọc version 1 khi cache miss.",
+                  "en": "A reads version one after a miss."
+                }
+              },
+              {
+                "from": "db",
+                "to": "loader",
+                "description": {
+                  "vi": "A giữ value cũ trong loader bị chậm.",
+                  "en": "A’s delayed loader holds the old value."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "B commit version 2 trong lúc A chưa fill.",
+                  "en": "B commits version two before A fills."
+                }
+              },
+              {
+                "from": "db",
+                "to": "invalidate",
+                "description": {
+                  "vi": "B yêu cầu xóa copy cũ sau commit.",
+                  "en": "B requests invalidation after committing."
+                },
+                "async": true
+              },
+              {
+                "from": "invalidate",
+                "to": "cache",
+                "description": {
+                  "vi": "Cache bị xóa; nếu mất watermark thì chưa có hàng rào version.",
+                  "en": "The cache is deleted; without a watermark, no version barrier remains."
+                }
+              },
+              {
+                "from": "loader",
+                "to": "cache",
+                "description": {
+                  "vi": "A fill version 1 sau invalidation: stale value quay lại.",
+                  "en": "A fills version one after invalidation, restoring a stale value."
+                }
+              },
+              {
+                "from": "api",
+                "to": "cache",
+                "description": {
+                  "vi": "Read tiếp có thể hit version 1 nếu không có cơ chế chống stale publish.",
+                  "en": "A later read can hit version one without stale-publication protection."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "failure",
+      "title": {
+        "vi": "8. Stampede, penetration, avalanche và hot key",
+        "en": "8. Stampedes, penetration, avalanches and hot keys"
+      },
+      "paragraphs": [
+        {
+          "vi": "Stampede: nhiều reader cùng miss một key rồi cùng gọi origin. Single-flight/request coalescing cho một loader làm việc, các waiter chờ trong deadline; lock/lease giữa process phải có expiry, owner identity và xử lý loader chết. Không giữ lock vô hạn và không coi lock cache là công cụ bảo toàn mọi business invariant.",
+          "en": "A stampede occurs when many readers miss one key and all call the origin. Single-flight/coalescing permits one loader while waiters use bounded deadlines; cross-process leases need expiry, owner identity and dead-loader handling. Never hold indefinite locks or use cache locks as universal business-invariant protection."
+        },
+        {
+          "vi": "Avalanche: nhiều key hết hạn hoặc cả cache mất cùng lúc. Jitter TTL, warming theo ưu tiên, admission và origin bulkhead giúp giãn tải. Penetration: request liên tục hỏi key không có, cần input validation, negative cache có TTL và rate limit phù hợp; một Bloom filter chỉ là xác suất membership và phải cập nhật đúng, không thay authorization hoặc nguồn sự thật.",
+          "en": "An avalanche expires many keys or loses a whole cache at once. Jitter, prioritized warming, admission and origin bulkheads spread load. Penetration repeatedly requests absent keys; use validation, short negative caching and rate limits. Bloom filters offer probabilistic membership and require correct updates; they replace neither authorization nor authority."
+        },
+        {
+          "vi": "Hot key: một key áp đảo traffic dù các shard khác rảnh. Local read replica/cache layer hoặc request coalescing có thể giảm pressure; phân mảnh key có ý nghĩa khi dữ liệu/tổng hợp cho phép. Mở rộng số shard không tự chia request của key đó, và TTL ngắn hơn có thể tăng origin load thay vì sửa vấn đề.",
+          "en": "A hot key dominates traffic while other shards sit idle. Local read caches/replicas or coalescing may help; splitting is useful only where data/aggregation semantics permit it. More shards do not split that key’s requests, and shorter TTL can increase origin load instead of solving the problem."
+        },
+        {
+          "vi": "Probabilistic early refresh cho một phần reader thử refresh trước hard expiry, thường điều chỉnh xác suất theo thời gian còn lại và chi phí recompute. Nó có thể giãn regeneration nhưng không thay single-flight, deadline hoặc quyền serve stale. Refresh quá sớm làm tăng origin work; cần đo refresh usefulness và chặn nhiều worker cùng refresh khi load đang lớn.",
+          "en": "Probabilistic early refresh lets some readers regenerate before hard expiry, often using remaining lifetime and recomputation cost. It can spread regeneration but does not replace coalescing, deadlines or permission to serve stale. Overeager refresh adds origin work; measure usefulness and bound concurrent regeneration."
+        }
+      ],
+      "experiment": "cache-burst",
+      "cards": [
+        {
+          "title": {
+            "vi": "Nhiều reader, cùng một key",
+            "en": "Many readers, one key"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Single-flight/coalescing gộp origin work cho cùng key.",
+              "en": "Single-flight/coalescing combines origin work for one key."
+            },
+            {
+              "vi": "Giới hạn concurrency, deadline và xử lý khi loader thất bại.",
+              "en": "Bound concurrency, set deadlines and handle loader failure."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Nhiều key cùng hết hạn",
+            "en": "Many keys expire together"
+          },
+          "icon": "chart",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "TTL jitter trải thời điểm expire của nhiều key.",
+              "en": "TTL jitter spreads expiration across many keys."
+            },
+            {
+              "vi": "Jitter không tự gộp duplicate miss của một key hoặc giảm toàn bộ work dài hạn.",
+              "en": "Jitter does not coalesce duplicate misses for one key or remove all long-term work."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "9. Sizing và observability của cache",
+        "en": "9. Cache sizing and observability"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ước lượng working set theo distinct reusable keys × average entry bytes cộng index/allocator/replication overhead. Chọn TTL theo freshness và update/read pattern, không chỉ để hit rate đẹp. Giả định 10 triệu entry × 200 byte payload là 2 GB payload, chưa phải RAM cluster; object representation và replicas có thể thay tổng đáng kể.",
+          "en": "Estimate working sets from distinct reusable keys × entry bytes plus indexing/allocation/replication overhead. Choose TTLs from freshness/update/read patterns rather than attractive hit rates. Ten million 200-byte payloads equal 2 GB payload, not cluster RAM; representations and replicas can change totals substantially."
+        },
+        {
+          "vi": "Dashboard cần hit/miss theo cache class, origin load, load latency, rejected loads, coalesced waiters, eviction, memory/fragmentation, stale serves và invalidation age. Cache miss tự thân không phải incident; miss làm origin vượt budget hoặc dữ liệu vượt freshness mới là tác động cần alert. Metric label không dùng từng raw key để tránh cardinality và lộ dữ liệu.",
+          "en": "Dashboards need hits/misses by cache class, origin loads/latency, rejected loads, coalesced waiters, evictions, memory/fragmentation, stale serves and invalidation age. A miss is not inherently an incident; origin overload or freshness violations are the user-impact signals. Avoid raw-key metric labels for cardinality and privacy."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "10. Failover, rollout và kiểm thử race",
+        "en": "10. Failover, rollout and race testing"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache failover có thể mất dữ liệu mới hoặc tạo cold working set tùy replication/persistence; nếu cache chỉ là copy thì ứng dụng phải rebuild có giới hạn. Nếu cache đang giữ job pending hoặc state không thể dựng lại, nó đã mang trách nhiệm durable store và cần RPO/RTO tương ứng. Không đánh đồng “Redis dùng cho cache” với mọi deployment có thể mất state an toàn.",
+          "en": "Cache failover may lose recent entries or create cold working sets depending on replication/persistence. Rebuild copies within bounds. A cache retaining unrebuildable pending jobs/state has taken on durable-store responsibilities and needs matching RPO/RTO. Not every deployment called a Redis cache can safely lose its state."
+        },
+        {
+          "vi": "Rollout key/schema version mới làm miss tăng đột ngột, vì vậy warm theo cohort hoặc dual-read có chủ đích, có memory budget cho giai đoạn chồng lấp. Test delayed old loader sau invalidation, writer fail giữa DB/cache, cache timeout, origin slow và permission revoke. Tạo interleaving có kiểm soát đáng tin hơn chỉ tăng số thread rồi hy vọng race xuất hiện.",
+          "en": "New key/schema versions can cause sudden misses; warm cohorts or use deliberate dual reads with an overlap memory budget. Test delayed old loaders after invalidation, partial database/cache writes, cache timeouts, slow origins and permission revocation. Controlled interleavings are more reliable than adding threads and hoping to expose a race."
+        }
+      ]
+    },
+    {
+      "id": "loader",
+      "title": {
+        "vi": "10a. Một loader có budget và single-flight",
+        "en": "10a. A budgeted single-flight loader"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đoạn minh họa yêu cầu adapter cho cache, source, semaphore và request deadline. scopedKey đã chứa identity/policy dimensions cần thiết và authorization được thực thi trước khi gọi. Giới hạn originSlots là budget trong một process; nhiều instance cần tổng budget phù hợp capacity source, không chỉ nhân vô hạn cùng một giới hạn local.",
+          "en": "This illustration requires cache, source, semaphore and deadline adapters. The scopedKey already includes required identity/policy dimensions and authorization runs before entry. originSlots is a per-process budget; multiple instances need an aggregate source-capacity budget rather than unbounded multiplication of a local cap."
+        },
+        {
+          "vi": "Một waiter hết deadline không nên tự hủy work đang được nhiều request dùng chung; loader có internal deadline riêng. Cache fill thất bại không bắt buộc làm mất source result nếu freshness contract cho phép, nhưng phải được đo. publishIfNotOlderThanWatermark là yêu cầu phối hợp version với invalidation, không phải một thao tác atomic có sẵn ở mọi cache.",
+          "en": "One waiter’s deadline should not cancel work shared by others; loaders have internal deadlines. Fill failure need not discard a valid source result where the freshness contract permits it, but must be measured. publishIfNotOlderThanWatermark requires version/invalidation coordination; it is not a universal built-in atomic cache operation."
+        }
+      ],
+      "code": {
+        "language": "typescript",
+        "content": "type Value = { version: number; payload: unknown };\nconst pending = new Map<string, Promise<Value>>();\n\nasync function read(scopedKey: string, requestDeadline: number): Promise<Value> {\n  const hit = await cache.lookupWithinBudget(scopedKey, requestDeadline);\n  if (hit && hit.isFresh) return hit.value;\n\n  const shared = pending.get(scopedKey);\n  if (shared) return waitWithinRequestBudget(shared, requestDeadline);\n\n  const permit = originSlots.tryAcquire();\n  if (!permit) throw new OverloadedError();\n\n  // Internal work has its own deadline; one waiter cannot cancel every waiter.\n  const work = Promise.resolve()\n    .then(() => origin.loadWithDeadline(scopedKey, 150))\n    .then(async (value: Value) => {\n      try {\n        await cache.publishIfNotOlderThanWatermark(scopedKey, value);\n      } catch (error) {\n        metrics.recordCacheFillFailure(error);\n      }\n      return value;\n    })\n    .finally(() => {\n      pending.delete(scopedKey);\n      permit.release();\n    });\n  pending.set(scopedKey, work);\n  return waitWithinRequestBudget(work, requestDeadline);\n}",
+        "caption": {
+          "vi": "Code minh họa adapter contracts, không phải module cắm trực tiếp. 150 ms là deadline giả định cho bài tập; cần chọn bằng SLO và đo thực tế.",
+          "en": "Illustrative adapter contracts, not a drop-in module. The 150 ms deadline is an exercise assumption to be replaced by measured SLO budgets."
+        }
+      }
+    },
+    {
+      "id": "projections",
+      "title": {
+        "vi": "10b. Cache list, nhiều region và read-your-writes",
+        "en": "10b. Lists, multiple regions and read-your-writes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache một list/feed là cache projection của nhiều record. Update một post có thể ảnh hưởng nhiều query key, filter và trang; xóa postId cache không tự invalidate mọi cached list. Chọn tag/dependency index, namespace version hoặc giữ list chỉ gồm ID rồi hydrate state hiện tại. Mỗi phương án đổi chi phí invalidation, memory và read path; không thể giả định một row luôn tương ứng một key.",
+          "en": "A cached list/feed projects many records. One post update can affect query keys, filters and pages; deleting a postId entry does not invalidate every list. Choose dependency tags/indexes, namespace versions or ID-only lists with current hydration. Each trades invalidation cost, memory and read complexity; one row need not map to one key."
+        },
+        {
+          "vi": "Cache ở nhiều region làm invalidation có network delay và failure domain rộng hơn. Đo invalidation age theo region, version events và chống event cũ ghi đè mới. Read-your-writes có thể dùng session version/routing tới owner hoặc bypass cache trong cửa sổ phù hợp. Nếu quyền cần revoke nhanh, chỉ giảm TTL không đủ để chứng minh deadline thu hồi; cần version/policy validation theo contract.",
+          "en": "Regional caches add invalidation delay and broader failure domains. Measure per-region invalidation age, version events and reject stale overwrites. Read-your-writes can use session versions, owner routing or deliberate cache bypass. Fast revocation cannot be proven merely by shortening TTL; validate policy/versions under the contract."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "11. Câu hỏi và lời giải có điều kiện",
+        "en": "11. Questions and conditional worked answers"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao TTL 60 giây không bảo đảm dữ liệu chỉ chậm tối đa 60 giây từ lần update?",
+            "en": "Why does a 60-second TTL not necessarily bound staleness to 60 seconds after an update?"
+          },
+          "answer": [
+            {
+              "vi": "Loader đọc value cũ từ replica lag hoặc hoàn tất sau update có thể fill lại cache với TTL mới. Cửa sổ tính từ source update còn gồm lag, loader delay và refill. Muốn bound theo update time cần version/watermark và propagation contract, hoặc bypass cache cho read cần current state.",
+              "en": "A loader reading a lagging replica or completing after an update can refill stale data with a new TTL. Update-relative staleness includes lag, loader delay and refill. A real bound needs versions/watermarks and propagation semantics or cache bypass for current-state reads."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Single-flight và TTL jitter có thay nhau được không?",
+            "en": "Can single-flight and TTL jitter replace each other?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Single-flight hợp nhất concurrent miss cùng key; jitter giãn thời điểm hết hạn giữa nhiều key. Một hot key hết TTL vẫn có thể stampede dù mọi key khác đã được jitter. Cả hai vẫn cần origin deadline và failure policy.",
+              "en": "No. Single-flight coalesces concurrent misses for one key; jitter spreads expiration across keys. One hot expired key can stampede despite jitter elsewhere. Both still need origin deadlines and failure policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có nên cache permission check rất lâu để API nhanh hơn?",
+            "en": "Should permission checks be cached for a long time to speed up APIs?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi đáp ứng thời hạn revocation đã cam kết. Scope theo actor/resource/policy version và invalidate/version đúng; khi không xác minh được quyền private, fail closed theo contract. Timeline/content cache hit không chứng minh permission hiện tại.",
+              "en": "Only when the promised revocation window is satisfied. Scope by actor/resource/policy version and invalidate/version correctly; fail closed for unverifiable private access under the contract. A content/timeline hit does not prove current permission."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bài tập: 100 key cùng hết TTL, mỗi key có 10 concurrent miss, origin load thay đổi thế nào với single-flight?",
+            "en": "Exercise: 100 keys expire, each with ten concurrent misses. What does single-flight change?"
+          },
+          "answer": [
+            {
+              "vi": "Mô hình không coalescing tạo 1.000 origin load; coalescing hoàn hảo theo key tạo 100. Nó không giảm số key phải load. Với nhiều process chưa phối hợp, có thể còn nhiều loader mỗi key; kết quả 100 là giả định lý tưởng đã nêu, không tự đúng trong deployment.",
+              "en": "Without coalescing the toy creates 1,000 origin loads; perfect per-key coalescing creates 100. It does not reduce distinct loaded keys. Uncoordinated processes may still create several loaders per key; 100 is the declared ideal model, not an automatic deployment property."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Nếu cache trả lỗi, fallback DB cho mọi request có an toàn không?",
+            "en": "Is unrestricted database fallback safe when the cache fails?"
+          },
+          "answer": [
+            {
+              "vi": "Không. DB thường được sizing với cache hit rate; toàn bộ traffic có thể làm cạn pool/IO. Giới hạn fallback concurrency, ưu tiên request quan trọng, coalesce load, serve stale chỉ khi contract cho phép và shed load trước khi mất cả origin.",
+              "en": "No. The database may be sized for normal cache hits; all traffic can exhaust pools/IO. Bound fallback concurrency, prioritize critical requests, coalesce loads, serve stale only where permitted and shed load before losing the origin."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Khi nào LFU có thể tệ hơn LRU?",
+            "en": "When can LFU perform worse than LRU?"
+          },
+          "answer": [
+            {
+              "vi": "Nếu popularity đổi nhanh, key từng rất nóng có thể chiếm cache dù không còn được dùng, nhất là khi không decay/aging. LRU phản ứng recency nhanh hơn nhưng dễ scan pollution. Chọn qua trace đại diện, byte cost và admission policy thay vì một thứ hạng cố định.",
+              "en": "Rapid popularity changes can leave historically frequent keys resident without current reuse, especially without decay/aging. LRU reacts to recency but is vulnerable to scans. Choose using representative traces, byte costs and admission rather than a universal ranking."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "cache",
+    "database",
+    "distributed"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Cache tốt bắt đầu từ một lời hứa về dữ liệu",
+      "en": "A good cache starts with a data promise"
+    },
+    "caption": {
+      "vi": "Hit rate cao chưa đủ: kiểm tra dữ liệu có được phép cũ, cache có giữ đúng quyền truy cập và origin có chịu được lúc miss tăng hay không.",
+      "en": "A high hit rate is not enough: check permitted staleness, authorization and whether the origin survives a surge in misses."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Chọn freshness",
+          "en": "Choose freshness"
+        },
+        "detail": {
+          "vi": "Dữ liệu nào được cũ, trong bao lâu?",
+          "en": "What may be stale, and for how long?"
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Thiết kế key và vòng đời",
+          "en": "Design keys and lifetime"
+        },
+        "detail": {
+          "vi": "Scope, TTL, eviction, version.",
+          "en": "Scope, TTL, eviction and versions."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Kiểm tra race và burst",
+          "en": "Test races and bursts"
+        },
+        "detail": {
+          "vi": "Refill cũ, stampede, hot key.",
+          "en": "Stale refills, stampedes and hot keys."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Đo lợi ích và chi phí",
+          "en": "Measure benefits and costs"
+        },
+        "detail": {
+          "vi": "Latency, origin load, memory.",
+          "en": "Latency, origin load and memory."
+        },
+        "icon": "chart"
+      }
+    ]
+  }
+}

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { load } from 'cheerio';
 import ts from 'typescript';
+import { handbookTranslations } from './handbook-translations.mjs';
 export const site = path.resolve(import.meta.dirname, '..');
 export const cachePath = path.join(site, 'src/i18n/en.json');
 export const hasVietnamese = (s) => /[À-ỹĐđ]/u.test(s);
@@ -96,9 +97,16 @@ export function collectStrings() {
     const match = line.match(/^\s*--\s*(.*)/);
     if (match) add(match[1]);
   }
+  // Authored pairs can differ even when the Vietnamese-side label is ASCII
+  // (for example singular technical terms). Do not infer language from accents.
+  for (const text of Object.keys(handbookTranslations({runtime:true}))) {
+    all.add(text);
+    runtime.add(text);
+  }
   return { all, runtime };
 }
 export const readCache = () => ({
   ...(fs.existsSync(cachePath) ? JSON.parse(fs.readFileSync(cachePath, 'utf8')) : {}),
   ...JSON.parse(fs.readFileSync(path.join(site, 'src/i18n/en-overrides.json'), 'utf8')),
+  ...handbookTranslations(),
 });

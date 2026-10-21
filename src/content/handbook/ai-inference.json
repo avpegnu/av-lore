@@ -1,0 +1,896 @@
+{
+  "id": "ai-inference",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "LLM Inference: hiểu prefill, decode và ngân sách phục vụ",
+    "en": "LLM inference: understanding prefill, decode and serving budgets"
+  },
+  "summary": {
+    "vi": "Đi từ token đến GPU, phân biệt TTFT với TPOT, tính KV cache và học cách bảo vệ latency khi nhiều request dùng chung một inference engine.",
+    "en": "Follow tokens onto the GPU, distinguish TTFT from TPOT, calculate KV memory and protect latency when many requests share an inference engine."
+  },
+  "prerequisites": [],
+  "takeaways": [
+    {
+      "vi": "Inference của autoregressive Transformer gồm prefill cho prompt và decode lặp để sinh output; hai giai đoạn có đặc tính tài nguyên khác nhau.",
+      "en": "Autoregressive Transformer inference includes prompt prefill and iterative output decoding; the phases have different resource profiles."
+    },
+    {
+      "vi": "KV cache tiết kiệm tính lại key/value của token cũ nhưng tăng theo số token đang sống và số sequence đồng thời.",
+      "en": "KV caches avoid recomputing previous keys/values but grow with live tokens and concurrent sequences."
+    },
+    {
+      "vi": "Throughput cao không tự tạo trải nghiệm nhanh: phải đo queue time, TTFT và TPOT theo phân phối độ dài request.",
+      "en": "High throughput does not automatically make an application fast: measure queue time, TTFT and TPOT across request lengths."
+    },
+    {
+      "vi": "Admission control và scheduler bảo vệ memory lẫn latency; một request dài không được chiếm hết tài nguyên của những người khác.",
+      "en": "Admission control and scheduling protect both memory and latency; one long request must not monopolize other users’ resources."
+    }
+  ],
+  "sections": [
+    {
+      "id": "tokens",
+      "title": {
+        "vi": "1. Model thực sự nhận và trả gì?",
+        "en": "1. What does the model receive and return?"
+      },
+      "paragraphs": [
+        {
+          "vi": "LLM nhận chuỗi token ID, không trực tiếp nhận chuỗi ký tự như API của ứng dụng. Tokenizer ánh xạ text sang các đơn vị phụ thuộc vocabulary; một từ tiếng Việt hoặc emoji có thể tách thành nhiều token. Không dùng số từ hoặc số ký tự như token count chính xác để kiểm tra context limit hay tính chi phí.",
+          "en": "An LLM consumes token IDs rather than the character strings seen by an application API. A tokenizer maps text to vocabulary-dependent units; a Vietnamese word or emoji may span several tokens. Word or character counts are not exact token counts for context validation or cost accounting."
+        },
+        {
+          "vi": "Chat messages được serialize qua chat template: role, nội dung, tool result và special token thành một prompt. Token count phải tính cả system instructions, lịch sử, retrieval context, schema và template overhead. Hai model khác template có thể đếm khác và hiểu role boundary khác; không ghép chuỗi tùy tiện rồi kỳ vọng hành vi giống nhau.",
+          "en": "A chat template serializes message roles, content, tool results and special tokens into a prompt. Count system instructions, history, retrieval context, schemas and template overhead. Different model templates may count and interpret role boundaries differently; arbitrary string concatenation does not preserve the same behavior."
+        },
+        {
+          "vi": "Với causal autoregressive model, mỗi bước dự đoán phân phối token kế tiếp dựa vào prefix. Sampling chọn token từ phân phối theo cấu hình temperature/top-p hoặc quy tắc khác. Output tốt không có nghĩa model truy vấn database nội bộ đáng tin cậy: factual grounding, tool access và authorization là trách nhiệm của hệ thống ứng dụng.",
+          "en": "A causal autoregressive model predicts the next-token distribution from the prefix. Sampling chooses a token using temperature/top-p or another rule. Fluent output does not mean the model queried a reliable internal database: grounding, tools and authorization belong to the application system."
+        }
+      ]
+    },
+    {
+      "id": "prefill-decode",
+      "title": {
+        "vi": "2. Prefill và decode khác nhau ở đâu?",
+        "en": "2. How do prefill and decode differ?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Prefill xử lý prompt và tạo KV cache cho các token đầu vào. Các vị trí của prompt có thể được tính song song trong kernel phù hợp với causal mask; output token tương lai vẫn chưa biết. Prompt dài làm tăng lượng tính toán attention và có thể làm request khác chờ nếu scheduler xử lý cả prompt trong một lượt quá lớn.",
+          "en": "Prefill processes the prompt and builds the input-token KV cache. Prompt positions can be processed in parallel with the appropriate causal mask; future output tokens remain unknown. Long prompts increase attention work and can delay other requests if the scheduler handles the entire prompt in one large turn."
+        },
+        {
+          "vi": "Decode lặp: dùng token mới nhất cùng KV đã có để tính token tiếp theo, append key/value mới rồi tiếp tục tới stop condition. Với một sequence, bước sau phụ thuộc token vừa chọn nên không thể sinh toàn bộ câu song song như prefill. Nhiều sequence độc lập có thể batch cùng một forward pass.",
+          "en": "Decode repeats: use the newest token and existing KV to compute the next token, append its key/value and continue until a stop condition. Within a sequence, the next step depends on the selected token, so the full answer cannot be generated in parallel like prefill. Independent sequences can share a batched forward pass."
+        },
+        {
+          "vi": "Prefill thường có arithmetic intensity cao; decode ở batch nhỏ thường bị giới hạn bởi memory bandwidth khi đọc weights và KV. Đây là xu hướng cần profile, không phải định luật cho mọi model/GPU/batch. Context dài, quantization, tensor parallel communication, kernels và batch size đều có thể đổi bottleneck.",
+          "en": "Prefill often has high arithmetic intensity; small-batch decode is often limited by memory bandwidth while reading weights and KV. These are profiling hypotheses, not universal rules for all models, GPUs and batches. Long contexts, quantization, tensor-parallel communication, kernels and batch size can change the bottleneck."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Giai đoạn",
+            "en": "Phase"
+          },
+          {
+            "vi": "Đầu vào / đầu ra",
+            "en": "Input / output"
+          },
+          {
+            "vi": "Điều cần đo",
+            "en": "What to measure"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Prefill",
+              "en": "Prefill"
+            },
+            {
+              "vi": "Prompt tokens → KV và logits cho token đầu",
+              "en": "Prompt tokens → KV and first-token logits"
+            },
+            {
+              "vi": "Prompt tokens/s, queue wait, TTFT, ảnh hưởng tới active decodes",
+              "en": "Prompt tokens/s, queue wait, TTFT and impact on active decodes"
+            }
+          ],
+          [
+            {
+              "vi": "Decode",
+              "en": "Decode"
+            },
+            {
+              "vi": "Một token mới mỗi sequence → token kế tiếp",
+              "en": "One new token per sequence → the next token"
+            },
+            {
+              "vi": "Output tokens/s, inter-token latency, memory bandwidth, KV usage",
+              "en": "Output tokens/s, inter-token latency, memory bandwidth and KV usage"
+            }
+          ],
+          [
+            {
+              "vi": "Streaming",
+              "en": "Streaming"
+            },
+            {
+              "vi": "Các token/chunk đã sinh → client",
+              "en": "Generated tokens/chunks → client"
+            },
+            {
+              "vi": "Buffering, backpressure, disconnect, end-to-end TTFT",
+              "en": "Buffering, backpressure, disconnections and end-to-end TTFT"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "metrics",
+      "title": {
+        "vi": "3. Đo latency theo trải nghiệm người dùng",
+        "en": "3. Measure latency as the user experiences it"
+      },
+      "paragraphs": [
+        {
+          "vi": "TTFT (time to first token) đo từ mốc request được chấp nhận hoặc client gửi tới khi nhận token đầu; luôn nói rõ mốc đo. Nó bao gồm network, auth, queue, tokenization, prefill và flush stream tùy vị trí quan sát. Chỉ đo GPU prefill không đại diện cho TTFT end-to-end.",
+          "en": "TTFT measures from a declared start, such as request acceptance or client send, to the first token. Depending on the observation point it includes network, authentication, queuing, tokenization, prefill and stream flushing. GPU prefill time alone is not end-to-end TTFT."
+        },
+        {
+          "vi": "TPOT là time per output token trung bình theo định nghĩa đã chọn; ITL là latency giữa hai token liên tiếp và cho thấy các lần đứng hình mà số trung bình che mất. Với output N token, ước lượng đơn giản E2E ≈ TTFT + (N−1) × TPOT, khi không có tool round và các phần overhead khác đáng kể. Chunk nhiều token cần timestamp ở engine hoặc quy ước đo riêng, không coi mỗi SSE event là đúng một token.",
+          "en": "TPOT is average time per output token under a declared definition; inter-token latency reveals stalls that an average can hide. For N output tokens, a simple approximation is E2E ≈ TTFT + (N−1) × TPOT when tool rounds and other overhead are negligible. Multi-token chunks require engine timestamps or another measurement convention; an SSE event is not necessarily one token."
+        },
+        {
+          "vi": "Ví dụ giả định TTFT 0,8 s, TPOT 0,04 s và 200 output tokens thì thời gian gần 8,76 s. Một cấu hình tăng batch có thể tăng tổng tokens/s nhưng làm TPOT thành 0,08 s, khiến cùng câu trả lời gần 16,72 s. Chọn SLO theo tác vụ: autocomplete ngắn cần TTFT rất thấp; batch summarization có thể ưu tiên throughput và cost.",
+          "en": "For an assumed 0.8 s TTFT, 0.04 s TPOT and 200 output tokens, completion takes about 8.76 s. A larger batch may increase aggregate tokens/s while pushing TPOT to 0.08 s, making the same response about 16.72 s. Choose task-specific SLOs: short autocomplete needs very low TTFT, while batch summarization may prioritize throughput and cost."
+        },
+        {
+          "vi": "Goodput đếm các request/tác vụ hoàn tất trong SLO đã định nghĩa. Một cấu hình có aggregate tokens/s cao nhưng phần lớn request trễ có thể có goodput thấp. Báo throughput cùng workload, queue/admission policy và tỷ lệ đạt TTFT/TPOT; không so hai con số peak mà bỏ latency.",
+          "en": "Goodput counts requests/tasks completed within declared SLOs. A high aggregate tokens/s configuration can have low goodput if most requests are late. Report throughput with workload, admission/queue policy and TTFT/TPOT compliance rather than comparing peaks without latency."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "TTFT · Chờ token đầu",
+            "en": "TTFT · Wait for the first token"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Từ mốc request đã định nghĩa đến token đầu tiên.",
+              "en": "From a defined request boundary to the first token."
+            },
+            {
+              "vi": "Có thể gồm queueing, network và prefill tùy boundary đo.",
+              "en": "May include queueing, network time and prefill, depending on the measurement boundary."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "ITL / TPOT · Nhịp sinh tiếp",
+            "en": "ITL / TPOT · Subsequent generation pace"
+          },
+          "icon": "chart",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "ITL đo khoảng cách giữa token liên tiếp.",
+              "en": "ITL measures the gap between consecutive tokens."
+            },
+            {
+              "vi": "TPOT trung bình thường loại TTFT; nêu rõ cách tính và số token.",
+              "en": "Mean TPOT commonly excludes TTFT; state the calculation and token count."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Goodput · Làm được trong SLO",
+            "en": "Goodput · Work meeting the SLO"
+          },
+          "icon": "check",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Đếm công việc hoàn thành đáp ứng các ngưỡng đã chọn.",
+              "en": "Count completed work meeting the selected thresholds."
+            },
+            {
+              "vi": "Throughput tăng nhưng latency vượt SLO có thể không tăng goodput.",
+              "en": "Higher throughput may not improve goodput if latency exceeds the SLO."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "kv-memory",
+      "title": {
+        "vi": "4. KV cache: tính memory trước khi tăng concurrency",
+        "en": "4. KV cache: budget memory before increasing concurrency"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi attention layer lưu key và value của các token đã xử lý. Với kiến trúc attention thông thường, payload KV mỗi token = 2 × layers × KV heads × head dimension × bytes per element. Hệ số 2 là K và V; không phải batch hay số replica. GQA/MQA có KV heads ít hơn query heads, vì vậy dùng nhầm query heads có thể phóng đại ngân sách. Các kiến trúc như latent attention cần công thức phù hợp riêng.",
+          "en": "Each attention layer stores keys and values for processed tokens. For a conventional attention architecture, KV payload per token is 2 × layers × KV heads × head dimension × bytes per element. The factor two represents K and V, not batch size or replicas. GQA/MQA use fewer KV heads than query heads, so substituting query heads can overestimate memory. Architectures such as latent attention require their own formula."
+        },
+        {
+          "vi": "Với 32 layers, 8 KV heads, head dimension 128 và BF16 2 byte: mỗi token dùng 131.072 byte = 128 KiB. Một sequence 8.192 token dùng 1 GiB payload; 16 sequence dùng 16 GiB, tương đương khoảng 17,18 GB thập phân. Bài tính phải thống nhất GB/GiB và tính token đầu vào cộng token đầu ra còn sống.",
+          "en": "With 32 layers, eight KV heads, head dimension 128 and two-byte BF16, each token needs 131,072 bytes, or 128 KiB. An 8,192-token sequence needs 1 GiB of payload; 16 sequences need 16 GiB, about 17.18 decimal GB. Keep GB/GiB consistent and count both input and generated tokens still retained."
+        },
+        {
+          "vi": "GPU memory còn phải chứa weights, activations/workspace, runtime buffers và dự phòng allocator. Model 8 tỷ parameter dùng 2 byte/parameter có khoảng 16 GB weights trước overhead; không được lấy toàn bộ dung lượng card chia cho KV rồi gọi là concurrency thực. Tensor/pipeline parallel có thể phân chia một phần memory nhưng cần xét KV replication, head divisibility và communication của implementation.",
+          "en": "GPU memory also holds weights, activations/workspace, runtime buffers and allocator reserve. An eight-billion-parameter model at two bytes per parameter has about 16 GB of weights before overhead; dividing the full device capacity by KV size does not give realistic concurrency. Tensor/pipeline parallelism may distribute memory, but implementation-specific KV replication, head divisibility and communication matter."
+        }
+      ],
+      "experiment": "kv-budget"
+    },
+    {
+      "id": "paging",
+      "title": {
+        "vi": "5. Vì sao paged KV giúp sử dụng memory tốt hơn?",
+        "en": "5. Why does paged KV improve memory utilization?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu reserve một vùng liên tục đủ max context cho từng request, prompt ngắn và output kết thúc sớm để lại nhiều chỗ không dùng. Cấp phát động vùng liên tục cũng gây external fragmentation. Paged KV chia bộ nhớ thành block, ánh xạ logical token block sang physical block qua block table; sequence có thể tăng mà không cần một vùng vật lý liên tục lớn.",
+          "en": "Reserving a contiguous maximum-context buffer per request wastes space for short prompts and early finishes. Dynamically growing contiguous buffers also fragments memory. Paged KV allocates blocks and maps logical token blocks to physical blocks through a block table, so a sequence can grow without one large contiguous physical region."
+        },
+        {
+          "vi": "Paging không làm payload KV của cùng token tự nhỏ đi. Nó giảm waste do reserve và fragmentation; block cuối vẫn có internal fragmentation. Prefix caching có thể cho nhiều request dùng chung block prefix bất biến rồi copy-on-write khi phân nhánh. Điều kiện reuse gồm token prefix, model/tokenizer/adapters và các trạng thái ảnh hưởng KV; cùng chuỗi text chưa chắc là cùng tensor.",
+          "en": "Paging does not inherently shrink the KV payload for the same tokens. It reduces reservation and fragmentation waste; the final block can still have internal fragmentation. Prefix caching can share immutable prefix blocks and copy on write when sequences branch. Reuse depends on token prefixes, model/tokenizer/adapters and other KV-affecting state; identical text does not always imply identical tensors."
+        },
+        {
+          "vi": "Prefix cache có isolation và privacy implications. Cache key cần phân biệt tenant khi dữ liệu không được chia sẻ; hit/miss timing có thể làm lộ thông tin về prefix đã dùng. TTL, eviction và memory budget phải cạnh tranh hợp lý với active KV; giữ nhiều prefix cũ có thể làm request đang chạy thiếu chỗ.",
+          "en": "Prefix caches have isolation and privacy implications. Keys should separate tenants where data must not be shared; hit/miss timing can reveal prior prefix use. TTL, eviction and memory budgeting must balance cached prefixes against active KV; retaining old prefixes can starve running requests."
+        }
+      ]
+    },
+    {
+      "id": "roofline",
+      "title": {
+        "vi": "5a. Roofline: giải thích vì sao decode có thể chờ memory",
+        "en": "5a. Roofline: understanding memory-limited decoding"
+      },
+      "paragraphs": [
+        {
+          "vi": "Xét model dense autoregressive đơn giản. Một decode step đọc weights và KV của các sequence đang chạy, rồi thực hiện matrix operations. Ước lượng phần linear layers khoảng 2 × parameter count × batch FLOPs; memory traffic tối giản là weight bytes + batch × context length × KV bytes/token. Đây là mô hình giới hạn để suy luận, không mô tả mọi kernel hoặc attention architecture.",
+          "en": "Consider a simplified dense autoregressive model. A decode step reads weights and active sequences’ KV and performs matrix operations. Linear layers require roughly 2 × parameter count × batch FLOPs; minimal memory traffic is weight bytes + batch × context length × KV bytes/token. This is a reasoning bound, not a description of every kernel or attention architecture."
+        },
+        {
+          "vi": "Arithmetic intensity là FLOPs trên mỗi byte di chuyển. Roofline giới hạn attainable FLOPs/s bởi min(peak compute, bandwidth × intensity). Với batch nhỏ, cùng weights phục vụ ít sequence nên intensity thấp; tăng batch dùng lại weights tốt hơn, nhưng KV traffic và thời gian mỗi bước cũng tăng. Context dài kéo intensity xuống khi phải đọc nhiều KV hơn.",
+          "en": "Arithmetic intensity is FLOPs per byte moved. Roofline bounds attainable FLOPs/s by min(peak compute, bandwidth × intensity). Small batches reuse weights across few sequences and have low intensity; larger batches improve reuse while increasing KV traffic and step time. Long contexts reduce intensity through more KV reads."
+        },
+        {
+          "vi": "Các giả định này bỏ attention FLOPs, communication, launch overhead, cache effects và hiệu suất kernel. Vì vậy max(memory time, compute time) là lower bound latency trong mô hình, không phải dự đoán latency thực. Ngay cả khi throughput ceiling đẹp, cấu hình không vừa memory hoặc không đạt TTFT/TPOT thì không thể coi là serving capacity.",
+          "en": "These assumptions omit attention FLOPs, communication, launch overhead, cache effects and kernel efficiency. Therefore max(memory time, compute time) is a model latency lower bound, not a real-latency prediction. Attractive throughput ceilings do not constitute serving capacity when memory does not fit or TTFT/TPOT targets fail."
+        }
+      ],
+      "experiment": "roofline"
+    },
+    {
+      "id": "scheduling",
+      "title": {
+        "vi": "6. Static batch, continuous batching và fairness",
+        "en": "6. Static batches, continuous batching and fairness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Static batching gom một nhóm request rồi chờ cả nhóm kết thúc trước khi đổi batch. Một sequence dài làm nhiều slot đã xong bị để trống. Continuous batching cập nhật tập active sequence giữa các bước: request xong rời batch, request mới có thể vào theo budget. Điều này tăng utilization nhưng vẫn cần policy để prompt dài không làm decode đang chạy giật cục.",
+          "en": "Static batching groups requests and waits for the whole group to finish before replacing it. One long sequence leaves finished slots idle. Continuous batching updates active sequences between steps: finished requests leave and new ones enter within budget. Utilization can improve, but a policy is still needed to prevent long prompts from stalling active decodes."
+        },
+        {
+          "vi": "Chunked prefill chia prompt dài thành nhiều phần, xen kẽ với decode. Đổi lại có overhead lập lịch và có thể ảnh hưởng throughput/TTFT của prompt dài. Token budget mỗi bước khác với max sequence count: 64 request rất ngắn và 64 prompt dài không tạo cùng lượng công việc hoặc KV demand.",
+          "en": "Chunked prefill splits long prompts into pieces interleaved with decoding. It adds scheduling overhead and may affect long-prompt throughput/TTFT. A per-step token budget differs from a sequence-count cap: 64 short requests and 64 long prompts do not create equal work or KV demand."
+        },
+        {
+          "vi": "Fairness có thể dùng per-tenant concurrency cap, token-weighted admission và hàng ưu tiên interactive/batch. Deadline hết thì hủy request, giải phóng KV và không tiếp tục đốt GPU vì client đã rời đi. Client timeout mà engine không nhận cancellation tạo ghost work, khiến queue càng nghẽn.",
+          "en": "Fairness can use per-tenant concurrency caps, token-weighted admission and separate interactive/batch priorities. Expired deadlines should cancel requests and reclaim KV rather than spending GPU time after a client leaves. A client timeout without engine cancellation creates ghost work and worsens queuing."
+        }
+      ],
+      "diagram": {
+        "id": "inference-cycle",
+        "title": {
+          "vi": "Vòng lặp một request trong inference engine",
+          "en": "A request’s loop inside an inference engine"
+        },
+        "caption": {
+          "vi": "Đây là kiến trúc logic để học, không phải bảo đảm implementation cụ thể. Decode đi qua scheduler nhiều lần cho tới khi stop.",
+          "en": "This is a logical teaching architecture, not a guarantee about a particular implementation. Decode revisits the scheduler until stopping."
+        },
+        "width": 1080,
+        "height": 430,
+        "nodes": [
+          {
+            "id": "request",
+            "label": {
+              "vi": "Request / tokens",
+              "en": "Request / tokens"
+            },
+            "kind": "client",
+            "x": 110,
+            "y": 100,
+            "detail": {
+              "vi": "Prompt đã qua tokenization và budget validation. Mang deadline, max output và tenant identity.",
+              "en": "A tokenized, budget-validated prompt carrying a deadline, output cap and tenant identity."
+            }
+          },
+          {
+            "id": "queue",
+            "label": {
+              "vi": "Admission queue",
+              "en": "Admission queue"
+            },
+            "kind": "queue",
+            "x": 390,
+            "y": 100,
+            "detail": {
+              "vi": "Giới hạn queue và tách ưu tiên; reject sớm thay vì để latency tăng vô hạn.",
+              "en": "Bounds queue size and separates priorities; reject early instead of allowing unbounded latency."
+            }
+          },
+          {
+            "id": "scheduler",
+            "label": {
+              "vi": "Scheduler",
+              "en": "Scheduler"
+            },
+            "kind": "service",
+            "x": 680,
+            "y": 100,
+            "detail": {
+              "vi": "Chọn prefill chunk và active decode theo token/KV budget; fairness và deadline là policy có thể đo.",
+              "en": "Chooses prefill chunks and active decodes within token/KV budgets; fairness and deadlines are measurable policies."
+            }
+          },
+          {
+            "id": "gpu",
+            "label": {
+              "vi": "GPU / forward",
+              "en": "GPU / forward"
+            },
+            "kind": "model",
+            "x": 970,
+            "y": 100,
+            "detail": {
+              "vi": "Thực hiện kernels cho batch; profile compute, bandwidth và communication trước khi tối ưu.",
+              "en": "Runs kernels for the batch; profile compute, bandwidth and communication before optimizing."
+            }
+          },
+          {
+            "id": "kv",
+            "label": {
+              "vi": "Paged KV pool",
+              "en": "Paged KV pool"
+            },
+            "kind": "store",
+            "x": 970,
+            "y": 310,
+            "detail": {
+              "vi": "Cấp block cho token sống, chia sẻ prefix khi hợp lệ và thu hồi khi request kết thúc/hủy.",
+              "en": "Allocates blocks for live tokens, shares eligible prefixes and reclaims memory on completion/cancellation."
+            }
+          },
+          {
+            "id": "sampler",
+            "label": {
+              "vi": "Sample / stop",
+              "en": "Sample / stop"
+            },
+            "kind": "service",
+            "x": 680,
+            "y": 310,
+            "detail": {
+              "vi": "Chọn token, kiểm tra stop/EOS/max output. Stop không phải bằng chứng câu trả lời đúng.",
+              "en": "Selects a token and checks stop/EOS/output limits. Stopping does not prove answer correctness."
+            }
+          },
+          {
+            "id": "stream",
+            "label": {
+              "vi": "Stream / cancel",
+              "en": "Stream / cancel"
+            },
+            "kind": "edge",
+            "x": 390,
+            "y": 310,
+            "detail": {
+              "vi": "Flush chunk theo budget, xử lý slow client và truyền cancellation về engine.",
+              "en": "Flushes chunks within a budget, handles slow clients and propagates cancellation to the engine."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "prefill",
+            "label": {
+              "vi": "Prefill",
+              "en": "Prefill"
+            },
+            "steps": [
+              {
+                "from": "request",
+                "to": "queue",
+                "description": {
+                  "vi": "Validate token budget rồi enqueue với deadline.",
+                  "en": "Validate the token budget and enqueue with a deadline."
+                }
+              },
+              {
+                "from": "queue",
+                "to": "scheduler",
+                "description": {
+                  "vi": "Chỉ admit khi còn budget và quyền ưu tiên.",
+                  "en": "Admit only within available budget and priority policy."
+                }
+              },
+              {
+                "from": "scheduler",
+                "to": "gpu",
+                "description": {
+                  "vi": "Chạy prompt hoặc một chunk prompt.",
+                  "en": "Run the prompt or one prompt chunk."
+                }
+              },
+              {
+                "from": "gpu",
+                "to": "kv",
+                "description": {
+                  "vi": "Lưu key/value cho prompt trong block pool.",
+                  "en": "Store prompt keys/values in the block pool."
+                }
+              },
+              {
+                "from": "gpu",
+                "to": "sampler",
+                "description": {
+                  "vi": "Từ logits chọn token output đầu tiên.",
+                  "en": "Select the first output token from logits."
+                }
+              },
+              {
+                "from": "sampler",
+                "to": "stream",
+                "description": {
+                  "vi": "Đẩy token đầu ra client và ghi mốc TTFT.",
+                  "en": "Send the first token to the client and record TTFT."
+                }
+              }
+            ]
+          },
+          {
+            "id": "decode",
+            "label": {
+              "vi": "Decode / release",
+              "en": "Decode / release"
+            },
+            "steps": [
+              {
+                "from": "scheduler",
+                "to": "gpu",
+                "description": {
+                  "vi": "Batch các sequence đang chạy, mỗi sequence tiến thêm một bước decode.",
+                  "en": "Batch active sequences and advance each by a decode step."
+                }
+              },
+              {
+                "from": "gpu",
+                "to": "kv",
+                "description": {
+                  "vi": "Đọc KV prefix và append KV mới; phải còn block trống.",
+                  "en": "Read prefix KV and append new KV; free blocks must remain."
+                }
+              },
+              {
+                "from": "gpu",
+                "to": "sampler",
+                "description": {
+                  "vi": "Chọn token tiếp theo và kiểm tra stop condition.",
+                  "en": "Select the next token and check stopping conditions."
+                }
+              },
+              {
+                "from": "sampler",
+                "to": "stream",
+                "description": {
+                  "vi": "Flush token/chunk theo streaming policy.",
+                  "en": "Flush the token/chunk under the streaming policy."
+                }
+              },
+              {
+                "from": "stream",
+                "to": "scheduler",
+                "description": {
+                  "vi": "Nếu chưa stop, request tham gia vòng tiếp; hủy thì remove khỏi active set.",
+                  "en": "If not stopped, schedule the next turn; cancellation removes the active request."
+                }
+              },
+              {
+                "from": "scheduler",
+                "to": "kv",
+                "description": {
+                  "vi": "Khi kết thúc, release block không còn tham chiếu.",
+                  "en": "On completion, release blocks with no remaining references."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "7. Capacity planning không chỉ là requests/s",
+        "en": "7. Capacity planning requires more than requests/s"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hai workload đều 10 requests/s có thể khác nhau hàng trăm lần về token demand. Ghi rõ phân phối input/output length, tỷ lệ prefix reuse, burst, model mix, concurrency và SLO. Benchmark dùng prompt/output quá ngắn sẽ dự báo sai khi production chứa tài liệu dài và tool history.",
+          "en": "Two workloads at ten requests/s can differ by orders of magnitude in token demand. Specify input/output-length distributions, prefix reuse, bursts, model mix, concurrency and SLOs. Benchmarks with very short prompts/outputs mispredict production with long documents and tool histories."
+        },
+        {
+          "vi": "Giả định 20 requests/s, trung bình 1.000 input và 200 output tokens: input demand 20.000 tokens/s, output demand 4.000 tokens/s. Không cộng hai số rồi chia cho một throughput đo ở workload khác; prefill và decode tranh tài nguyên theo batch và scheduler. Đo trên workload đại diện rồi tìm vùng đạt cả TTFT và TPOT SLO.",
+          "en": "Assume 20 requests/s averaging 1,000 input and 200 output tokens: input demand is 20,000 tokens/s and output demand is 4,000 tokens/s. Do not add them and divide by throughput measured on an unrelated workload; prefill and decode compete through batches and scheduling. Benchmark a representative workload and find the region satisfying both TTFT and TPOT SLOs."
+        },
+        {
+          "vi": "Little’s Law cho hệ ổn định: số request trong hệ trung bình L = arrival rate λ × thời gian ở hệ W. Với 20 requests/s và 10 s trung bình, khoảng 200 request ở trong hệ, gồm queue và đang chạy. Đây không phải số sequence phải đồng thời trên một GPU; cần tách queue wait với active residency và tính KV theo độ dài đang sống.",
+          "en": "Little’s Law for a stable system gives average requests in the system L = arrival rate λ × mean time in system W. At 20 requests/s and ten seconds, about 200 requests are in the system, including queued and running requests. This is not the number of sequences that must fit on one GPU; separate queue waiting from active residency and budget KV by live lengths."
+        }
+      ]
+    },
+    {
+      "id": "optimization",
+      "title": {
+        "vi": "8. Các đòn bẩy tối ưu và điều kiện áp dụng",
+        "en": "8. Optimization levers and when they apply"
+      },
+      "paragraphs": [
+        {
+          "vi": "Quantization weights giảm memory weights và có thể giảm bandwidth, nhưng tốc độ phụ thuộc kernel/hardware và chất lượng phải được đánh giá trên task thật. KV quantization là quyết định khác, ảnh hưởng memory của context và có thể ảnh hưởng chất lượng dài hạn. Không suy ra rằng weights 4-bit thì KV cũng 4-bit.",
+          "en": "Weight quantization reduces weight memory and may reduce bandwidth, but speed depends on kernels/hardware and quality must be evaluated on real tasks. KV quantization is a separate choice affecting context memory and potentially long-context quality. Four-bit weights do not imply four-bit KV."
+        },
+        {
+          "vi": "Speculative decoding dùng draft model hoặc cơ chế đề xuất để tạo một nhóm token, rồi target model kiểm chứng. Lợi ích tùy acceptance rate và overhead draft/verification; không có speedup cố định. Các thuật toán exact sampling được thiết kế để giữ phân phối target khi triển khai đúng, nhưng không đồng nghĩa mọi chế độ speculative trong mọi engine đều có cùng semantics.",
+          "en": "Speculative decoding proposes a group of tokens using a draft model or another mechanism, then verifies them with the target. Benefit depends on acceptance and draft/verification overhead; there is no fixed speedup. Exact-sampling algorithms are designed to preserve the target distribution when implemented correctly, but not every speculative mode in every engine has identical semantics."
+        },
+        {
+          "vi": "Disaggregated prefill/decode tách tài nguyên hai giai đoạn, giúp lập lịch độc lập nhưng phải truyền KV qua network và xử lý ownership/failover. Chỉ có lợi khi chi phí truyền và độ phức tạp thấp hơn lợi ích isolation/utilization. Một engine đơn giản trên ít GPU thường dễ vận hành và có thể tốt hơn ở quy mô ban đầu.",
+          "en": "Disaggregating prefill and decode separates their resources and scheduling, but requires transferring KV over the network and handling ownership/failover. It helps only when transfer and operational costs are outweighed by isolation/utilization benefits. A simpler engine on a few GPUs is often easier to operate and may be preferable initially."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đòn bẩy",
+            "en": "Lever"
+          },
+          {
+            "vi": "Có thể cải thiện",
+            "en": "Potential improvement"
+          },
+          {
+            "vi": "Phải kiểm tra",
+            "en": "Validate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Prefix caching",
+              "en": "Prefix caching"
+            },
+            {
+              "vi": "Prefill lặp cho prefix chung",
+              "en": "Repeated prefill for shared prefixes"
+            },
+            {
+              "vi": "Reuse eligibility, tenant isolation, eviction và cache pressure",
+              "en": "Reuse eligibility, tenant isolation, eviction and cache pressure"
+            }
+          ],
+          [
+            {
+              "vi": "Continuous batching",
+              "en": "Continuous batching"
+            },
+            {
+              "vi": "Utilization và throughput hỗn hợp",
+              "en": "Utilization and mixed-workload throughput"
+            },
+            {
+              "vi": "TTFT/TPOT tails, fairness, KV admission",
+              "en": "TTFT/TPOT tails, fairness and KV admission"
+            }
+          ],
+          [
+            {
+              "vi": "Quantization",
+              "en": "Quantization"
+            },
+            {
+              "vi": "Memory và đôi khi latency/cost",
+              "en": "Memory and sometimes latency/cost"
+            },
+            {
+              "vi": "Task quality, kernels, hardware support",
+              "en": "Task quality, kernels and hardware support"
+            }
+          ],
+          [
+            {
+              "vi": "Speculative decode",
+              "en": "Speculative decode"
+            },
+            {
+              "vi": "Decode latency khi acceptance đủ cao",
+              "en": "Decode latency when acceptance is high enough"
+            },
+            {
+              "vi": "Acceptance, draft overhead, target semantics",
+              "en": "Acceptance, draft overhead and target semantics"
+            }
+          ],
+          [
+            {
+              "vi": "Tensor parallel",
+              "en": "Tensor parallel"
+            },
+            {
+              "vi": "Fit model lớn hoặc chia compute",
+              "en": "Fit larger models or distribute compute"
+            },
+            {
+              "vi": "Interconnect, collective communication, batch regime",
+              "en": "Interconnect, collectives and batch regime"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "9. Failure modes và giới hạn an toàn",
+        "en": "9. Failure modes and safe limits"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đừng chờ CUDA OOM mới kiểm soát tải. Admission cần budget input + output reserve hoặc chính sách tăng KV có khả năng preempt rõ ràng. Max output, max context, queue cap và tenant quota là giới hạn khác nhau. Trả overload sớm với retry hint thường tốt hơn nhận request rồi timeout hàng loạt.",
+          "en": "Do not wait for CUDA OOM to control load. Admission needs input-plus-output reserve or an explicit preemption policy for KV growth. Output caps, context limits, queue caps and tenant quotas are distinct limits. Early overload rejection with retry hints is often preferable to accepting requests that all time out."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sự cố",
+            "en": "Failure"
+          },
+          {
+            "vi": "Nguyên nhân cần điều tra",
+            "en": "Investigate"
+          },
+          {
+            "vi": "Phản ứng",
+            "en": "Response"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "OOM sau vài token",
+              "en": "OOM after several tokens"
+            },
+            {
+              "vi": "Output làm KV tăng; budget chỉ tính prompt hoặc có fragmentation/workspace thiếu dự phòng.",
+              "en": "Output grows KV; admission counted only prompts or omitted fragmentation/workspace reserve."
+            },
+            {
+              "vi": "Giới hạn output, giảm admission, reclaim hủy/xong, đo KV high-water mark.",
+              "en": "Cap output, lower admission, reclaim cancelled/completed requests and measure KV high-water marks."
+            }
+          ],
+          [
+            {
+              "vi": "TTFT tăng, GPU vẫn bận",
+              "en": "TTFT rises while GPU stays busy"
+            },
+            {
+              "vi": "Queue wait hoặc prompt dài chặn scheduling.",
+              "en": "Queue waiting or long prompts block scheduling."
+            },
+            {
+              "vi": "Token-weighted admission, chunked prefill, tách batch/interactive và đo queue age.",
+              "en": "Use token-weighted admission, chunked prefill, batch/interactive separation and queue-age metrics."
+            }
+          ],
+          [
+            {
+              "vi": "Stream khựng theo đợt",
+              "en": "Streaming stalls in bursts"
+            },
+            {
+              "vi": "Proxy buffering, slow client, GC hoặc scheduler jitter.",
+              "en": "Proxy buffering, slow clients, GC or scheduler jitter."
+            },
+            {
+              "vi": "Đo engine token time và network chunk time riêng; giới hạn output buffer và propagate cancellation.",
+              "en": "Measure engine-token and network-chunk timestamps separately; bound output buffers and propagate cancellation."
+            }
+          ],
+          [
+            {
+              "vi": "GPU worker chết giữa response",
+              "en": "GPU worker dies mid-response"
+            },
+            {
+              "vi": "Phần answer đã phát không thể thu hồi bằng retry im lặng.",
+              "en": "Already-streamed text cannot be retracted by a silent retry."
+            },
+            {
+              "vi": "Đánh dấu incomplete, lưu generation state; retry là generation mới có identity riêng, không nối mù hai output.",
+              "en": "Mark incomplete and persist generation state; retry is a new identified generation, not blind concatenation."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "benchmark",
+      "title": {
+        "vi": "10. Benchmark có thể tái lập",
+        "en": "10. Make benchmarks reproducible"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lưu model revision, tokenizer/chat template, engine version, quantization, GPU topology, driver/runtime và scheduling parameters cùng kết quả. Workload cần phân phối prompt/output lengths và arrival pattern thực tế, gồm burst, cancellation và long-context tail. Warm-up và prefix cache state phải được công bố để không so cold run với warm run.",
+          "en": "Record model revision, tokenizer/chat template, engine version, quantization, GPU topology, driver/runtime and scheduler parameters. Workloads should capture realistic prompt/output lengths and arrivals, including bursts, cancellation and long-context tails. Declare warm-up and prefix-cache state so cold and warm runs are not compared as equivalents."
+        },
+        {
+          "vi": "Báo p50/p95/p99 TTFT, TPOT/ITL, end-to-end latency, accepted/rejected requests, input/output tokens/s, active/queued sequences, KV utilization và cost trên tác vụ thành công. Thử tải tới khi SLO bắt đầu thất bại để biết operating envelope; peak tokens/s sau khi latency vỡ không phải capacity phục vụ interactive.",
+          "en": "Report p50/p95/p99 TTFT, TPOT/ITL, end-to-end latency, accepted/rejected requests, input/output tokens/s, active/queued sequences, KV utilization and cost per successful task. Increase load until SLOs begin failing to find the operating envelope; peak tokens/s after latency collapses is not interactive serving capacity."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "11. Kiểm tra hiểu biết và lời giải",
+        "en": "11. Check your understanding"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "KV cache có lưu câu trả lời cũ không?",
+            "en": "Does a KV cache store old answers?"
+          },
+          "answer": [
+            {
+              "vi": "KV là tensor key/value của token prefix để attention dùng lại. Nó khác response cache trả nguyên câu trả lời đã lưu. Prefix KV reuse có thể giảm prefill trong request mới nhưng request vẫn cần decode; response cache có semantics freshness, identity và policy riêng.",
+              "en": "KV holds prefix-token key/value tensors for attention reuse. It differs from a response cache returning a saved answer. Prefix reuse can reduce prefill for a new request that still needs decoding; response caching has separate freshness, identity and policy semantics."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tăng context từ 8K lên 32K làm KV tăng bao nhiêu?",
+            "en": "How does growing context from 8K to 32K affect KV?"
+          },
+          "answer": [
+            {
+              "vi": "Với cùng layers/KV heads/dtype và sequence count, payload KV tăng bốn lần. Thời gian không nhất thiết tăng đúng bốn lần: attention work, kernels, cache locality và scheduling có thể thay đổi. Với ví dụ 128 KiB/token, 32.768 token dùng 4 GiB KV cho một sequence.",
+              "en": "With the same layers, KV heads, dtype and sequence count, KV payload grows fourfold. Time need not scale by exactly four: attention work, kernels, cache locality and scheduling can change. At 128 KiB/token, 32,768 tokens need 4 GiB of KV per sequence."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao GPU utilization 100% mà người dùng vẫn thấy chậm?",
+            "en": "Why can users see slow responses at 100% GPU utilization?"
+          },
+          "answer": [
+            {
+              "vi": "Utilization không nói deadline của từng request. Batch lớn, prompt dài và queue có thể tối đa hóa công việc trong GPU nhưng làm TTFT/TPOT xấu. Cần xem phân phối latency theo input length/tenant và điều chỉnh admission, scheduling hoặc tài nguyên.",
+              "en": "Utilization says nothing about individual deadlines. Large batches, long prompts and queues can maximize GPU work while worsening TTFT/TPOT. Inspect latency by input length/tenant and adjust admission, scheduling or resources."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bài tập: 131.072 byte/token, 16K token và 24 sequence cần bao nhiêu KV?",
+            "en": "Exercise: 131,072 bytes/token, 16K tokens and 24 sequences need how much KV?"
+          },
+          "answer": [
+            {
+              "vi": "Nếu 16K là 16.384 token, mỗi sequence cần 2 GiB; 24 sequence cần 48 GiB, khoảng 51,54 GB thập phân. Đây chỉ là payload KV, chưa có weights/workspace/padding. Ngân sách KV 40 GB trong worksheet không đủ.",
+              "en": "If 16K means 16,384 tokens, each sequence needs 2 GiB; 24 need 48 GiB, about 51.54 decimal GB. This is only KV payload, excluding weights/workspace/padding. The worksheet’s 40 GB KV budget is insufficient."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể retry tự động khi stream bị đứt không?",
+            "en": "Can we automatically retry a broken stream?"
+          },
+          "answer": [
+            {
+              "vi": "Trước byte đầu có thể retry theo policy và idempotency thích hợp. Sau khi đã phát text, retry có thể tạo output khác và lặp nội dung; cần generation ID, trạng thái incomplete và hành vi UI rõ ràng. Hủy generation cũ để tránh vừa mất kết nối vừa tiếp tục tính phí GPU.",
+              "en": "Before the first byte, retry under an appropriate policy and idempotency contract. After text has streamed, a retry may generate different or repeated content; use generation IDs, incomplete state and explicit UI behavior. Cancel the old generation to avoid disconnected work continuing to consume GPU resources."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "relatedTopics": [
+    "os",
+    "observability"
+  ],
+  "overview": {
+    "title": {
+      "vi": "Vòng đời một lượt sinh token",
+      "en": "The lifecycle of a generation"
+    },
+    "caption": {
+      "vi": "Luồng autoregressive minh họa: prefill xử lý prompt và tạo KV/logits ban đầu; các bước decode tiếp tục sinh token. Chi tiết scheduling và kernel tùy serving stack.",
+      "en": "Illustrative autoregressive flow: prefill processes the prompt and creates initial KV/logits; decode steps continue generation. Scheduling and kernels depend on the serving stack."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Chuẩn bị input",
+          "en": "Prepare input"
+        },
+        "detail": {
+          "vi": "Tokenizer, template, token budget.",
+          "en": "Tokenizer, template and token budget."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Prefill prompt",
+          "en": "Prefill the prompt"
+        },
+        "detail": {
+          "vi": "Xử lý context, tạo KV cache.",
+          "en": "Process context and build the KV cache."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Lặp decode",
+          "en": "Repeat decoding"
+        },
+        "detail": {
+          "vi": "Đọc KV, sinh token, cập nhật state.",
+          "en": "Read KV, generate a token and update state."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Stream và đo trải nghiệm",
+          "en": "Stream and measure UX"
+        },
+        "detail": {
+          "vi": "TTFT, ITL/TPOT, goodput.",
+          "en": "TTFT, ITL/TPOT and goodput."
+        },
+        "icon": "gauge"
+      }
+    ]
+  }
+}
