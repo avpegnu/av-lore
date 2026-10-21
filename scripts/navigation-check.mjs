@@ -20,11 +20,13 @@ try {
   await page.goto(origin + '/handbook/system-design/url-shortener/', { waitUntil: 'networkidle' });
   await expect(page.locator('.sidebar a[aria-current=page]')).toHaveCount(1);
   await expect(page.locator('.sidebar a[aria-current=page]')).toContainText('URL Shortener');
-  expect(await page.locator('.sidebar [data-active=true]').count()).toBe(4);
+  expect(await page.locator('.sidebar [data-active=true]').count()).toBe(1);
   for (const e of await page.locator('.sidebar [data-active=true]').all())
     await expect(e).toHaveAttribute('open', '');
-  await expect(page.locator('.breadcrumb')).toContainText('Notes & Interview');
-  await expect(page.locator('.breadcrumb')).toContainText('System Design');
+  await expect(page.locator('.breadcrumb')).toContainText('Case Studies');
+  await expect(page.locator('.breadcrumb')).not.toContainText('Notes & Interview');
+  await expect(page.locator('.sidebar nav > [data-nav-id=system-design-cases]')).toHaveCount(1);
+  await expect(page.locator('[data-nav-id=handbook]')).not.toHaveAttribute('open');
   await expect(page.locator('.breadcrumb li').last()).toHaveText('URL Shortener');
   await page.locator('[data-nav-id=system-design-cases]>summary').click();
   await expect(page.locator('[data-nav-id=system-design-cases]')).not.toHaveAttribute('open');
@@ -33,8 +35,19 @@ try {
   await page.locator('[data-nav-id=system-design-cases]>summary').click();
   await page.locator('.sidebar a[href$="/handbook/system-design/chat/"]').click();
   await expect(page.locator('.sidebar a[aria-current=page]')).toContainText('Chat');
+  await page.locator('[data-nav-id=system-design-cases] .nav-overview').click();
+  await expect(page).toHaveURL(origin + '/case-studies/');
+  await expect(page.locator('.case-study-grid a')).toHaveCount(26);
+  await expect(page.locator('.sidebar a[aria-current=page]')).toContainText('Tất cả case studies');
+  await page.locator('#language-menu>summary').click();
+  await page.locator('[data-language=en]').click();
+  await expect(page).toHaveURL(origin + '/en/case-studies/');
+  await expect(page.locator('main h1')).toHaveText('From requirements to design decisions.');
+  await expect(page.locator('.case-study-grid a')).toHaveCount(26);
+  await expect(page.locator('.sidebar a[aria-current=page]')).toContainText('All case studies');
+  await page.goto(origin + '/handbook/system-design/url-shortener/', { waitUntil: 'networkidle' });
   report.checks.push(
-    'Active case, expanded ancestors, breadcrumb, fold persistence and navigation',
+    'Top-level case navigation, dedicated bilingual catalog, breadcrumb and fold persistence',
   );
   for (const theme of ['dark', 'latte', 'github-dimmed', 'midnight', 'light']) {
     await page.locator('#theme-toggle').click();

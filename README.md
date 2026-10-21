@@ -10,7 +10,7 @@ AV Lore là website học tập và tra cứu kiến thức công nghệ: từ n
 
 - **Lộ trình học:** 15 lộ trình với 198 chương, điều hướng theo chủ đề và chương học.
 - **Notes & Interview:** 31 topic, 147 notes và 387 câu hỏi chính cùng các câu hỏi đào sâu; câu hỏi liên kết với phần kiến thức tương ứng.
-- **System Design:** 26 case study với requirements, capacity estimation, API, data model, sơ đồ luồng, failure mode và trade-off.
+- **Case Studies:** thư viện riêng với 26 bài System Design với requirements, capacity estimation, API, data model, sơ đồ luồng, failure mode và trade-off.
 - **Học trực quan:** sơ đồ minh họa, tóm tắt ghi nhớ và 31 bài thử tương tác để quan sát hành vi của hệ thống.
 - **Luyện tập:** lọc câu hỏi theo vai trò, xem gợi ý trả lời và đánh dấu nội dung cần ôn.
 - **Tra cứu:** tìm kiếm toàn văn với chỉ mục riêng cho từng ngôn ngữ, mục lục trong bài và breadcrumb.

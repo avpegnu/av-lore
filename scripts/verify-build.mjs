@@ -110,8 +110,9 @@ assert.ok(
   fs.existsSync(path.join(dist, 'en/pagefind/pagefind.js')),
   'English search index missing',
 );
-assert.equal(htmlFiles.length, 556, 'Both languages must contain all 278 pages');
-assert.equal(htmlFiles.filter((f) => path.relative(dist, f).startsWith('en/')).length, 278);
+assert.ok(pages.has(path.join(dist, 'case-studies/index.html')), 'Case Studies index missing');
+assert.equal(htmlFiles.length, 558, 'Both languages must contain all 279 pages');
+assert.equal(htmlFiles.filter((f) => path.relative(dist, f).startsWith('en/')).length, 279);
 for (const [file, { $ }] of pages) {
   if (!path.relative(dist, file).startsWith('en/')) continue;
   const original = pages.get(path.join(dist, path.relative(path.join(dist, 'en'), file)));
