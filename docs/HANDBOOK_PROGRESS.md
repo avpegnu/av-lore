@@ -1,13 +1,13 @@
 # Tiến độ System Design & AI
 
-Cập nhật ngày 22/10/2026. Checkpoint 41 gồm bài Netflix và cải tiến BuildTimeline, đã được chủ sở hữu yêu cầu commit/push; tiếp tục tự triển khai các bài sau theo từng đợt, không dừng sau mỗi mục. Không coi phạm vi 73 bài/công cụ đã hoàn tất.
+Cập nhật ngày 22/10/2026. Checkpoint 41 (Netflix/BuildTimeline) đã commit/push; Stripe, Uber, Community Chat và Photo Platform được triển khai tiếp ở local; tiếp tục tự triển khai các bài sau theo từng đợt, không dừng sau mỗi mục. Không coi phạm vi 73 bài/công cụ đã hoàn tất.
 
 ## Tình trạng hiện tại
 
-- **41/73 bài đã biên soạn Việt–Anh**, gồm đủ bản mở rộng cho **26 Case Studies**.
-- Tất cả 41 bài giữ `status: review`; **0 bài complete**. Số section, unit tests hoặc build thành công không thay vòng review độ phủ/kỹ thuật/English cuối.
-- **32 mục chưa biên soạn**: 10 Build Stories, 14 AI Systems, 3 Practice và 5 Interview tools.
-- Main preview: `http://127.0.0.1:4322/av-lore/`, snapshot 41 bài đã qua kiểm tra và publish local.
+- **45/73 bài đã biên soạn Việt–Anh**, gồm đủ bản mở rộng cho **26 Case Studies**.
+- Tất cả 45 bài giữ `status: review`; **0 bài complete**. Số section, unit tests hoặc build thành công không thay vòng review độ phủ/kỹ thuật/English cuối.
+- **28 mục chưa biên soạn**: 6 Build Stories, 14 AI Systems, 3 Practice và 5 Interview tools.
+- Main preview: `http://127.0.0.1:4322/av-lore/`, snapshot 45 bài đã qua kiểm tra và publish local.
 - Giữ nguyên 198 chương/15 lộ trình, 31 topic Notes & Interview, ID và dữ liệu học tập hiện có.
 
 | Nhóm | Số bài | Canonical IDs |
@@ -15,7 +15,7 @@ Cập nhật ngày 22/10/2026. Checkpoint 41 gồm bài Netflix và cải tiến
 | Nền tảng | 4 | estimation, framework, networking, scaling |
 | Building Blocks | 8 | caching, consistency, databases, load-balancing, messaging, rate-limiting, reliability, unique-ids |
 | Case Studies | 26 | ad-clicks, autocomplete, chat, collaborative-editor, digital-wallet, email-service, exchange, file-sync, job-scheduler, key-value-store, leaderboard, llm-serving, maps-routing, message-queue, metrics-alerts, nearby-friends, news-feed, notifications, object-storage, payments, proximity, reservations, search-engine, url-shortener, video-platform, web-crawler |
-| Build Stories | 2 | ep-chatgpt, ep-netflix |
+| Build Stories | 6 | ep-chatgpt, ep-netflix, ep-stripe, ep-uber, ep-discord, ep-instagram |
 | AI Systems | 1 | ai-inference |
 
 ## Các bài bổ sung trong checkpoint 40
@@ -44,25 +44,30 @@ Cập nhật ngày 22/10/2026. Checkpoint 41 gồm bài Netflix và cải tiến
 
 Preview: `http://127.0.0.1:4322/av-lore/episodes/ep-netflix/` và `/av-lore/en/episodes/ep-netflix/`.
 
+## Bổ sung local sau checkpoint 41
+
+- Stripe: 17 phần, 12 stages, 5 main traces, 3 labs, 8 câu có lời giải. Processor ambiguity/cross-provider routing, verified inbox/business guards và versioned store cutover. Phân biệt authorization/capture/settlement, provider evidence với stale NOT_FOUND.
+- Uber: 15 phần, 12 stages, 5 main traces, 3 labs, 8 câu. Geo epoch/seq/TTL, matching theo total/fairness/batch delay và trip-driver/current-offer invariants.
+- Community Chat: 15 phần, 12 stages, 5 main traces, 3 labs, 8 câu. Scope/cursor/version-safe query coalescing, active audience/relay backpressure và snapshot/live/deletion replay.
+- Photo Platform: 15 phần, 12 stages, 5 main traces, 3 labs, 8 câu. ID capacity/clock/ownership/exact serialization, publication/outbox/generation races và Story eligibility/viewed-state holes.
+- Canonical English được biên tập cùng nội dung Việt, runtime strings có manual dictionary. Các mô hình offline ghi rõ assumptions/limits; không gọi payment providers, production storage hoặc social APIs.
+- Đã đối chiếu full chapter/stage/demo theo learning purposes khi biên soạn; vòng review độc lập cuối vẫn chưa hoàn tất. Không nâng status bằng số lượng blocks hoặc tests.
+
 ## Snapshot đã kiểm tra cuối
 
-- `npm run check`: **219 files, 0 errors/warnings/hints**.
-- `npm test`: **112 tests đạt**.
-- `npm run build` và `npm run verify`: **592 pages, 254864 links/assets**, 198 chương, 31 topics, 26 cases.
-- Dedicated Netflix: 14 stages/keyboard, 3 lab boundary scenarios, VI/EN, desktop/mobile, 9 theme accessibility và ep-chatgpt timeline regression đạt. Generic: 4 routes VI/EN của Netflix/ChatGPT đạt. Đã xem screenshots, sau đó chỉnh selected buttons, curve labels và scope stage CSS; snapshot cuối đã xác nhận lại dedicated suite, kể cả regression cho controls trong diagram.
-- Runtime/localization dictionary không thiếu key; English build offline từ canonical pairs và từ điển đã lưu.
-- IT Basic: **41 bài/84 HTML files**, **970 internal links** đạt. Browser 4 static pages VI/EN Netflix/ChatGPT xác nhận canonical sections, stage text, nodes, mobile và language. Baseline trước: toàn bộ 80 trang của 40 bài đạt desktop/mobile overflow regression.
-- Full IT Basic link scan còn **49 broken links cũ** trong AI indexes và JavaScript chapter8; đã kiểm các source này giống HEAD, ngoài diff công việc. Không chỉnh chúng hoặc `Test/Python/test.py`.
-- Course visuals giữ baseline 792 page/viewport combinations và 30 contrast checks; lượt này không sửa courses.
-
-Logs trong `.cache/handbook-expansion/`: `netflix-last-check.log`, `netflix-last-unit.log`, `netflix-final-build.log`, `netflix-final-verify.log`, `netflix-final-browser.log`, `netflix-generic-browser.log`, `netflix-legacy-browser.log`, `netflix-legacy-links.log`. Screenshots/reports trong `artifacts/`. Các folder này ignored nhưng nằm bền trong repo local, không dùng `/tmp`.
+- `npm run check`: **234 files, 0 errors/warnings/hints**. `npm test`: **124 tests đạt**.
+- `npm run build` + `npm run verify`: **600 pages, 260682 links/assets**, 198 chương, 31 topics và 26 cases.
+- Cả bốn bài mới đều qua dedicated browser VI/EN, 12 stages, keyboard, boundary scenarios, desktop/mobile và 9 theme accessibility; generic 6 routes Stripe/Uber/Community và 2 routes Photo Platform đạt. Đã xem screenshots desktop/mobile, gồm diagrams, results và publication/Story states. Uber đã chạy lại sau chỉnh label FREE trên mobile.
+- IT Basic: **45 bài / 92 HTML files, 1072 internal links** đạt. Browser 8 static pages VI/EN của bốn bài mới kiểm canonical sections/stages/headings/tables/diagrams, mobile và language.
+- Runtime dictionary không thiếu key trên built snapshot; English build offline. Main preview4322 đã publish local45; staging4323 dừng sau kiểm tra.
+- Full IT Basic scan baseline còn49 broken links cũ ở AI indexes/JS chapter8, ngoài diff; không sửa `Test/Python/test.py`. Courses giữ baseline792 viewport checks/30 contrast checks, lượt này không đổi courses.
+- Logs/research nằm bền trong `.cache/handbook-expansion/`, screenshots/reports trong `artifacts/`; đều ignored local, không dùng `/tmp`. Browser scripts và canonical sources được track.
 
 ## Điểm tiếp tục
 
-1. Tiếp tục **`ep-stripe`**, rồi `ep-uber`, `ep-discord`, `ep-instagram`, `ep-amazon`, `ep-spotify`, `ep-airbnb`, `ep-whatsapp`, `ep-figma`, `ep-youtube`. Netflix và ChatGPT đã có canonical. Stripe mới research, chưa có lesson/models/labs: đã đọc chapter, 12 stages và routing model; đã kiểm các docs về idempotency, lifecycle, webhook, security, ledger và low-level errors. Lưu `.cache/handbook-expansion/stripe-research.json`; cần đọc body online-migrations/api-versioning và routing-demo trước authoring. Các docs API v1/v2 có replay semantics khác nhau; tránh lấy 24h thành universal contract.
-2. Hoàn thiện 14 AI Systems còn thiếu, bắt đầu `ai-kv-cache`; rồi 8 công cụ Practice/Interview. `npm run content:audit` cho danh sách chính xác.
-3. Review độc lập từng bài theo learning purpose: độ phủ, giải thích dễ hiểu, formulas/units, English, visual meaning và interaction behavior. Không nâng `complete` bằng số lượng blocks/tests. Framework còn cần review product prompt mở và query/model mismatch phát hiện muộn; Exchange có thể bổ sung regional DR/RPO example.
-4. Trong review, lưu ý mô hình: Message Queue là ISR-only, không ELR/full Kafka; Wallet giữ decision/result/hold state, không chỉ total; Scheduler highest-seen fence cần activation và sink idempotence riêng; Search scores/statistics và independence assumptions không phải production benchmark.
+1. Tiếp tục **`ep-amazon`**, sau đó `ep-spotify`, `ep-airbnb`, `ep-whatsapp`, `ep-figma`, `ep-youtube`. Amazon đã đọc full chapter/11 stages/inventory model/demo; primary docs conditional updates/saga/load shedding đã mở. Cần đọc body cells/shuffle sharding/Dynamo và chốt 3 mô hình gốc trước authoring. Không copy pseudo-SQL tách decrement/hold hoặc sweeper thiếu conditional terminal transition; external payment timeout/late auth không được coi như decline. Không hứa always-writable hoặc saga rollback/isolation tuyệt đối.
+2. Hoàn thiện14 AI Systems, bắt đầu `ai-kv-cache`, rồi8 Practice/Interview tools.
+3. Review độc lập độ phủ, dễ hiểu, kỹ thuật/formulas/units, English và visual/interaction purposes cho toàn bộ73. Framework còn cần product prompt/query mismatch review; Exchange có thể bổ sung regional DR/RPO.
 
 ## Source và cách làm tiếp
 
@@ -76,7 +81,7 @@ Main preview phục vụ `dist/`. Dùng staging `.cache/handbook-preview/` trên
 
 Browser generic hỗ trợ `HANDBOOK_IDS` và `HANDBOOK_CONTENT_DIR` để kiểm phần đổi trên validated snapshot. Chạy dedicated checks cho new behavior; range helper phải tôn trọng min/step và hướng ở max. Giữ key dữ liệu học tập hiện có và 9 themes đã chốt.
 
-`npm run content:audit -- --require-complete` hiện cố ý chưa đạt vì mới authored41/reviewed0 trên scope73. Build/verify chạy độc lập, không cần repo IT Basic hoặc dịch online.
+`npm run content:audit -- --require-complete` hiện cố ý chưa đạt vì mới authored45/reviewed0 trên scope73. Build/verify chạy độc lập, không cần repo IT Basic hoặc dịch online.
 
 ## Checkpoint đã push
 
@@ -87,3 +92,7 @@ Checkpoint trước ngày 21/10: AV Lore `12e9038bff6f5c51bb39059aa8c6427713362e
 ## Checkpoint 40 đã push theo yêu cầu mới
 
 AV Lore `243167f548a0a2a6add8a9adf6c98d9e263f8f4a`, IT Basic `4cd80c94c25287d217e12e5fb53c0a4cf50836af`. Pages đã thành công: https://github.com/avpegnu/av-lore/actions/runs/39740983441 . Workflow VPS của IT Basic dừng ở `ssh-keyscan` trong Setup SSH key, vẫn lỗi sau một lần retry: https://github.com/avpegnu/it-basic/actions/runs/39740981336 . Không sửa workflows/secrets để đoán khắc phục; source đã push thành công. Công việc Build Stories tiếp theo được giữ local.
+
+## Checkpoint 41 đã push
+
+AV Lore `9c9eb33130ed313af9ae319c676130c4efef2058`, IT Basic `29492f5d7127605f5c870447dfc6f03db5a57b18`. Pages thành công: https://github.com/avpegnu/av-lore/actions/runs/39745514081 . Workflow VPS IT Basic thất bại: https://github.com/avpegnu/it-basic/actions/runs/39745517763 . Không sửa workflows/settings/secrets. Bốn bài mới phía trên được kiểm tra trong checkpoint 45; chủ sở hữu đã cho phép commit/push và tiếp tục triển khai.

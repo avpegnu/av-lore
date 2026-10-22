@@ -1,0 +1,3164 @@
+{
+  "id": "ep-discord",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Community Chat: guild ownership, fan-out và hot history",
+    "en": "Building Community Chat: guild ownership, fan-out and hot history"
+  },
+  "summary": {
+    "vi": "12 giai đoạn để tách archive, gateway và media; thử safe coalescing, relay backpressure và snapshot/live replay với deletion versions cho cộng đồng lớn.",
+    "en": "Twelve stages separate archives, gateways and media, with safe read merging, relay backpressure and versioned snapshot/live replay for large communities."
+  },
+  "prerequisites": [
+    "chat",
+    "search-engine",
+    "caching",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "messaging",
+    "storage-search",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Durable commit, live delivery và client apply là các ACK khác nhau.",
+      "en": "Durable commits, live delivery and application are different ACKs."
+    },
+    {
+      "vi": "Guild owner/relays cần permissions và ownership versions; socket subscription không là quyền vĩnh viễn.",
+      "en": "Owners/relays need permission and ownership versions; subscriptions are not permanent grants."
+    },
+    {
+      "vi": "Affinity key không phải full merge key; scope/cursor/version quyết định query có tương đương không.",
+      "en": "Affinity and merge keys differ; scopes, cursors and versions establish equivalence."
+    },
+    {
+      "vi": "Relays chia owner work; egress và catch-up demand vẫn phải tính riêng.",
+      "en": "Relays distribute owner work while egress and catch-up need separate budgets."
+    },
+    {
+      "vi": "Replay horizon, snapshot/live bridge và deletion versions ngăn silent gaps/resurrection.",
+      "en": "Replay horizons, live bridges and deletion versions prevent silent gaps/resurrection."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Giữ đúng state trước khi giảm số copies",
+      "en": "Preserve state while reducing copies"
+    },
+    "caption": {
+      "vi": "Ba plane và mỗi authority đều cần failure/recovery contract rõ.",
+      "en": "Each plane and authority needs explicit failure/recovery contracts."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Lưu",
+          "en": "Persist"
+        },
+        "detail": {
+          "vi": "Current ACL → idempotent send → durable message/event.",
+          "en": "Current ACL → idempotent sends → durable messages/events."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Phân phối · Community Chat",
+          "en": "Distribute"
+        },
+        "detail": {
+          "vi": "Guild owner → audience relays → bounded session queues.",
+          "en": "Guild owners → audience relays → bounded queues."
+        },
+        "icon": "users"
+      },
+      {
+        "title": {
+          "vi": "Đọc",
+          "en": "Read"
+        },
+        "detail": {
+          "vi": "Equivalent-key merge → bucket archive → authorized page.",
+          "en": "Equivalent merging → bucket archives → authorized pages."
+        },
+        "icon": "compare"
+      },
+      {
+        "title": {
+          "vi": "Phục hồi",
+          "en": "Recover"
+        },
+        "detail": {
+          "vi": "Cursor/snapshot watermark → bridge → versioned apply.",
+          "en": "Cursor/snapshot watermarks → bridge → versioned application."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Một community product có nhiều plane",
+        "en": "1. A community product has multiple planes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ta xây hệ thống kiểu Discord: guild/community, channels, membership/roles, durable message history, live updates, search và voice. Guild là không gian cộng đồng; channel là phạm vi hội thoại/quyền. Một user có nhiều device sessions và nhiều guild memberships. Online không đồng nghĩa actively viewing; allowed-to-read cũng không đồng nghĩa nên nhận mọi event payload ngay lúc đó.",
+          "en": "We build a Discord-like community with guilds, channels, roles, durable messages, live updates, search and voice. Guilds group communities; channels bound conversation and permissions. Users have multiple devices and memberships. Online, actively viewing and authorized are different audience properties."
+        },
+        {
+          "vi": "Các bài toán được tổ chức thành 12 giai đoạn học tập với diagrams và labs tự biên soạn. Các ví dụ MongoDB/Cassandra/ScyllaDB, Elixir/Rust và relays minh họa các hướng tiến hóa đã được công bố theo thời điểm, không khẳng định stack hiện tại hay yêu cầu phải dùng cùng products. Giữ bài Chat hiện có làm prerequisite về message identity và offline sync; ở đây đi sâu guild-scale fan-out, archive hot reads và media separation.",
+          "en": "Twelve teaching stages use original diagrams/labs. MongoDB, Cassandra, ScyllaDB, Elixir, Rust and relays illustrate dated architectural directions rather than a current-stack inventory or product mandate. The existing Chat chapter provides identity/offline-sync foundations; this build deepens guild-scale fan-out, archive reads and media separation."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Message archive",
+            "en": "Message archive"
+          },
+          "icon": "scope",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Durable sends, stable pagination và versioned edits/deletes.",
+              "en": "Durable sends, stable pagination and versioned edits/deletes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Live state / audiences",
+            "en": "Live state / audiences"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Guild ownership, current permissions, gateway cursors và relays.",
+              "en": "Guild ownership, current permissions, gateway cursors and relays."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Voice / video",
+            "en": "Voice / video"
+          },
+          "icon": "gauge",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Signaling, secure media transport, jitter/loss và SFU bandwidth.",
+              "en": "Signaling, secure media transport, jitter/loss and SFU bandwidth."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "boundaries",
+      "title": {
+        "vi": "2. ACK nào và authority nào?",
+        "en": "2. Which ACK and which authority?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Client send accepted, durable message commit, event publication, gateway enqueue, socket delivery và client applied là sáu trạng thái khác nhau. Sender ACK phải chỉ rõ durability boundary, còn receiver gap/replay policy chỉ rõ khi nào cần history resync. Stable client nonce scoped theo user/channel ngăn retry tạo duplicate sends; message ID và mutation version riêng giúp edit/delete không lẫn content mới.",
+          "en": "Client acceptance, durable commit, publication, enqueue, socket delivery and application are distinct states. Specify sender durability and receiver gap/resync policies. Scoped send nonces prevent duplicate intent, while message identity and mutation versions separate edits/deletes from new content."
+        },
+        {
+          "vi": "Guild actor có thể serialize state locally nhưng owner recovery cần durable config và fenced routing; lease đơn thuần không tự ngăn old owner ghi nếu sinks chưa enforce epoch. Permissions phải có freshness/revocation semantics cho HTTP reads, search và relay delivery. User membership lúc connect không là quyền vĩnh viễn cho cả session.",
+          "en": "Local actor serialization still needs durable recovery and fenced ownership; leases do not fence unaware sinks. Define permission freshness/revocation for reads, search and relays. Membership at connect does not grant lifetime authorization."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Tách store, publish và apply",
+          "en": "Separate persistence, publication and application"
+        },
+        "caption": {
+          "vi": "Chỉ ACK đúng boundary mình chứng minh được; gap phải explicit.",
+          "en": "Acknowledge only proven boundaries and expose gaps."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Authorize / claim",
+              "en": "Authorize / claim"
+            },
+            "detail": {
+              "vi": "Current channel scope và stable send intent.",
+              "en": "Current scope and stable send intent."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Commit",
+              "en": "Commit"
+            },
+            "detail": {
+              "vi": "Message/mutation + result + durable event intent.",
+              "en": "Messages/mutations, results and durable event intent."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Fan out",
+              "en": "Fan out"
+            },
+            "detail": {
+              "vi": "Owner → relays → gateways → allowed audience.",
+              "en": "Owner → relays → gateways → allowed audience."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Apply / resync",
+              "en": "Apply / resync"
+            },
+            "detail": {
+              "vi": "Version/cursor checks hoặc authoritative catch-up.",
+              "en": "Version/cursor checks or authoritative catch-up."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 12 giai đoạn: ai sở hữu state, copies tăng ở đâu?",
+        "en": "3. 12 stages: state ownership and copy amplification"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi stage có diagram, pressure, decision, trade-off và exit criteria. Hỏi hai câu ở mọi bước: state nào cần durable authority, và một event tạo bao nhiêu copies/queries? Phân biệt mitigation ở request layer, runtime layer, storage engine và disks; một rewrite ngôn ngữ không thay được permission hoặc delivery contract.",
+          "en": "Each stage includes diagrams, pressures, decisions, trade-offs and exit criteria. Ask who owns durable state and how one event amplifies copies/queries. Distinguish request, runtime, engine and disk mitigations; language rewrites do not replace permissions or delivery contracts."
+        }
+      ],
+      "stages": [
+        {
+          "id": "mvp",
+          "title": {
+            "vi": "Chat nhỏ với durable history",
+            "en": "Small chat with durable history"
+          },
+          "description": {
+            "vi": "MVP gom sockets, auth, channel permissions và message writes trong một modular service. Store cần index theo channel/order và message mutation version; commit message/idempotent send result trước ACK. History và live delivery là hai contracts, không một loop gửi thành công thì coi data đã durable.",
+            "en": "A modular MVP combines sockets, permissions and writes. Index histories by channel/order and retain mutation versions. Commit messages and keyed send results before ACKs; live delivery does not establish durability."
+          },
+          "problem": {
+            "vi": "Nhóm nhỏ cần rooms, history, reconnect và delete có semantics rõ.",
+            "en": "Small groups need rooms, history, reconnect and defined deletion."
+          },
+          "decision": {
+            "vi": "One service + indexed store + bounded session buffers, command IDs và durable event intent.",
+            "en": "Use one service/store with bounded buffers, command IDs and durable event intent."
+          },
+          "tradeoff": {
+            "vi": "Deployment drops sockets; hot history và fan-out tranh resources.",
+            "en": "Deploys interrupt sockets while history/fan-out compete for resources."
+          },
+          "nextPressure": {
+            "vi": "Connections tăng khác API/storage traffic và guild ownership cần rõ.",
+            "en": "Connections scale differently from APIs/storage and need explicit ownership."
+          },
+          "exitCriteria": {
+            "vi": "Retry không duplicate message; lost socket được catch-up từ durable state.",
+            "en": "Retries preserve message identity and disconnected clients catch up durably."
+          },
+          "diagram": {
+            "id": "community-stage-mvp",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Một indexed SQL/document store có thể phù hợp MVP; không bắt đầu bằng full scan.",
+              "en": "Indexed relational/document storage may fit the MVP; full scans are not required."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Chat client",
+                  "en": "Chat client"
+                },
+                "detail": {
+                  "vi": "Stable send nonce, cursor và local pending state.",
+                  "en": "Stable send nonces, cursors and pending state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "app",
+                "label": {
+                  "vi": "Modular chat server",
+                  "en": "Modular chat server"
+                },
+                "detail": {
+                  "vi": "Permissions, writes và session lifecycle.",
+                  "en": "Permissions, writes and session lifecycles."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "store",
+                "label": {
+                  "vi": "Indexed history",
+                  "en": "Indexed history"
+                },
+                "detail": {
+                  "vi": "Channel/order indexes, mutation versions và durability.",
+                  "en": "Channel/order indexes, versions and durability."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Committed event intent",
+                  "en": "Committed event intent"
+                },
+                "detail": {
+                  "vi": "Outbox hoặc coherent log boundary.",
+                  "en": "Outbox or coherent log boundaries."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "app",
+                    "description": {
+                      "vi": "Send với nonce và authenticated channel context.",
+                      "en": "Send with nonces and authenticated channel context."
+                    }
+                  },
+                  {
+                    "from": "app",
+                    "to": "store",
+                    "description": {
+                      "vi": "Authorize và commit message/result.",
+                      "en": "Authorize and commit messages/results."
+                    }
+                  },
+                  {
+                    "from": "store",
+                    "to": "events",
+                    "description": {
+                      "vi": "Durably record delivery intent.",
+                      "en": "Durably record delivery intent."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "events",
+                    "to": "client",
+                    "description": {
+                      "vi": "Push hoặc catch up theo current permission.",
+                      "en": "Push or catch up under current permissions."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "ownership",
+          "title": {
+            "vi": "Gateway tách khỏi guild ownership",
+            "en": "Separate gateways from guild ownership"
+          },
+          "description": {
+            "vi": "Gateway giữ WebSockets, heartbeats, session cursors và compression. Guild owner quản lý membership/role/channel projections và event routing theo ownership epoch; durable config/message history nằm trong stores có recovery contract. Single-process logic giúp serialize local decisions nhưng không tự bảo vệ split-brain sau partition.",
+            "en": "Gateways hold sockets, heartbeats, cursors and compression. Guild owners manage membership/roles and route events under epochs; durable stores support recovery. Local serialized logic does not independently prevent split-brain."
+          },
+          "problem": {
+            "vi": "Socket holding, request validation và guild event work có scale/failure profiles khác.",
+            "en": "Socket holding, validation and guild event work scale/fail differently."
+          },
+          "decision": {
+            "vi": "Stateless write API, gateway sessions và fenced/recoverable guild actors.",
+            "en": "Use write APIs, gateway sessions and fenced recoverable guild actors."
+          },
+          "tradeoff": {
+            "vi": "Owner hotspots, handoff/resume và permission propagation cần đo.",
+            "en": "Owner hotspots, handoff, resume and permission propagation need measurement."
+          },
+          "nextPressure": {
+            "vi": "History vượt working set và hot query cần layout/partition riêng.",
+            "en": "History outgrows working sets and needs query-driven placement."
+          },
+          "exitCriteria": {
+            "vi": "Owner restart/handoff không có two active writers; session reconnect không skip committed events.",
+            "en": "Restarts/handoffs preserve exclusive writers and reconnect covers committed events."
+          },
+          "diagram": {
+            "id": "community-stage-ownership",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Actor memory có ownership nhưng không tự là backup hoặc permanent permission authority.",
+              "en": "Actor memory has ownership but is not automatically durable authority or backup."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Connected sessions",
+                  "en": "Connected sessions"
+                },
+                "detail": {
+                  "vi": "User/device session và applied cursor.",
+                  "en": "User/device sessions and applied cursors."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "WebSocket gateway",
+                  "en": "WebSocket gateway"
+                },
+                "detail": {
+                  "vi": "Heartbeats, bounded replay và backpressure.",
+                  "en": "Heartbeats, bounded replay and backpressure."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Write API",
+                  "en": "Write API"
+                },
+                "detail": {
+                  "vi": "Auth/rate limits/idempotency tách socket scaling.",
+                  "en": "Authentication, rate limits and idempotency."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Guild owner",
+                  "en": "Guild owner"
+                },
+                "detail": {
+                  "vi": "Membership/ACL projection và owner epoch.",
+                  "en": "Membership/ACL projections and ownership epochs."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "store",
+                "label": {
+                  "vi": "Durable guild state",
+                  "en": "Durable guild state"
+                },
+                "detail": {
+                  "vi": "Roles/config/ownership phục hồi được.",
+                  "en": "Recoverable roles, configuration and ownership."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Send authenticated scoped write.",
+                      "en": "Send authenticated scoped writes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "owner",
+                    "description": {
+                      "vi": "Route committed event tới owner epoch đúng.",
+                      "en": "Route committed events to current owners."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "owner",
+                    "to": "store",
+                    "description": {
+                      "vi": "Persist configuration/ownership dưới contract.",
+                      "en": "Persist configuration/ownership under contract."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Select permission-appropriate sessions.",
+                      "en": "Select appropriately authorized sessions."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "client",
+                    "description": {
+                      "vi": "Deliver theo per-session sequence/backpressure.",
+                      "en": "Deliver under session sequencing/backpressure."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "archive",
+          "title": {
+            "vi": "Archive theo channel và bounded buckets",
+            "en": "Archive by channel and bounded buckets"
+          },
+          "description": {
+            "vi": "Dominant query là latest N hoặc before-cursor trong một channel. Partition theo channel + bounded time bucket, cluster theo sortable message key; SQL/document/wide-column đều có thể được đánh giá. Bucket boundaries, deleted rows và sparse history có thể cần nhiều reads; một “latest page” không luôn một partition query.",
+            "en": "Dominant queries read latest pages or before-cursor history within channels. Partition by channel/bucket and order by stable keys, evaluating engines against workloads. Boundaries, deletion and sparse history can require multiple reads."
+          },
+          "problem": {
+            "vi": "History lớn, partition skew và retained indexes làm tail latency xấu.",
+            "en": "Large histories, skew and indexes harm tail latency."
+          },
+          "decision": {
+            "vi": "Bounded buckets, stable cursor/tie-breaks, versioned edits/deletes và explicit consistency.",
+            "en": "Use bounded buckets, stable cursors/ties, versioned mutations and explicit consistency."
+          },
+          "tradeoff": {
+            "vi": "Small buckets tăng fan-out; large buckets/tombstones tăng scan/compaction debt.",
+            "en": "Small buckets increase fan-out; large buckets/tombstones increase scan/compaction debt."
+          },
+          "nextPressure": {
+            "vi": "Search cần index khác history primary layout.",
+            "en": "Search needs a separate index."
+          },
+          "exitCriteria": {
+            "vi": "Boundary pagination, deletion và clock skew không duplicate/skip history ngoài declared snapshot semantics.",
+            "en": "Pagination, deletion and skew obey declared snapshot semantics without accidental skips/duplicates."
+          },
+          "diagram": {
+            "id": "community-stage-archive",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Snowflake-like IDs là sortable identifiers, không tự là per-channel causal commit sequence.",
+              "en": "Sortable IDs do not establish per-channel causal commit sequences."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "History reader",
+                  "en": "History reader"
+                },
+                "detail": {
+                  "vi": "Cursor và min consistency requirements.",
+                  "en": "Cursors and consistency requirements."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "History API",
+                  "en": "History API"
+                },
+                "detail": {
+                  "vi": "Current ACL và query shape.",
+                  "en": "Current ACL and query shapes."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "router",
+                "label": {
+                  "vi": "Bucket router",
+                  "en": "Bucket router"
+                },
+                "detail": {
+                  "vi": "Boundaries/tie-breaks và sparse scan bounds.",
+                  "en": "Boundaries, ties and sparse-scan bounds."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "archive",
+                "label": {
+                  "vi": "Channel-bucket store",
+                  "en": "Channel-bucket store"
+                },
+                "detail": {
+                  "vi": "Mutation versions, replication và tombstones.",
+                  "en": "Mutation versions, replication and tombstones."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Request channel/page bằng valid cursor.",
+                      "en": "Request channel pages with valid cursors."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "router",
+                    "description": {
+                      "vi": "Authorize rồi resolve bucket range.",
+                      "en": "Authorize and resolve bucket ranges."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "archive",
+                    "description": {
+                      "vi": "Read bounded partitions và merge stable order.",
+                      "en": "Read bounded partitions and merge stable order."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "client",
+                    "description": {
+                      "vi": "Return page/next cursor/freshness theo contract.",
+                      "en": "Return pages, next cursors and freshness."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "search",
+          "title": {
+            "vi": "Search index tách khỏi message commit",
+            "en": "Separate search indexing from commits"
+          },
+          "description": {
+            "vi": "Outbox/CDC chuyển committed messages/mutations tới indexers. Route guild/channel queries tới owned search partitions để bound blast radius; search results cần current permissions và deletion/version checks. Eventual indexing không được trở thành lý do lộ revoked content. Backfill history có checkpoints và không resurrect deleted messages.",
+            "en": "Outbox/CDC drives indexing. Route searches to owned partitions, enforce current permissions and mutation versions and checkpoint backfills. Eventual indexing never justifies revoked-content leaks or deleted-message resurrection."
+          },
+          "problem": {
+            "vi": "History layout không đáp ứng full-text/filter queries.",
+            "en": "History storage cannot efficiently serve full-text/filter searches."
+          },
+          "decision": {
+            "vi": "Async bulk indexing, owned cluster routing và versioned deletion propagation.",
+            "en": "Use asynchronous bulk indexing, owned routing and versioned deletion propagation."
+          },
+          "tradeoff": {
+            "vi": "Index lag, mapping upgrades, ACL consistency và rebalancing thuộc app responsibility.",
+            "en": "Lag, mappings, permissions and rebalancing remain responsibilities."
+          },
+          "nextPressure": {
+            "vi": "Guild events làm session fan-out thành bottleneck riêng.",
+            "en": "Guild event fan-out becomes another bottleneck."
+          },
+          "exitCriteria": {
+            "vi": "Replay/migration giữ document versions; stale search không bypass ACL/delete authority.",
+            "en": "Replay/migration preserves versions and stale results never bypass ACL/deletion authority."
+          },
+          "diagram": {
+            "id": "community-stage-search",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Index ownership theo cluster và guild actor ownership là hai routing maps khác nhau.",
+              "en": "Search placement and guild actors use distinct routing maps."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Committed mutations",
+                  "en": "Committed mutations"
+                },
+                "detail": {
+                  "vi": "Stable message/version và event identity.",
+                  "en": "Stable message/versions and event identity."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "log",
+                "label": {
+                  "vi": "Index change log",
+                  "en": "Index change log"
+                },
+                "detail": {
+                  "vi": "Retention và replay/checkpoint boundaries.",
+                  "en": "Retention and replay/checkpoint boundaries."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "indexer",
+                "label": {
+                  "vi": "Bulk indexer",
+                  "en": "Bulk indexer"
+                },
+                "detail": {
+                  "vi": "Version-monotonic apply và tombstones.",
+                  "en": "Version-monotonic application and tombstones."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "index",
+                "label": {
+                  "vi": "Routed search shards",
+                  "en": "Routed search shards"
+                },
+                "detail": {
+                  "vi": "Bound query fan-out và current permission filters.",
+                  "en": "Bound query fan-out and current permission filters."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "history",
+                    "to": "log",
+                    "description": {
+                      "vi": "Publish committed change through durable intent.",
+                      "en": "Publish committed changes through durable intent."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "log",
+                    "to": "indexer",
+                    "description": {
+                      "vi": "Replay stable IDs và mutation versions.",
+                      "en": "Replay stable identities and versions."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "indexer",
+                    "to": "index",
+                    "description": {
+                      "vi": "Bulk upsert/delete có version guard.",
+                      "en": "Bulk upsert/delete under version guards."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "fanout",
+          "title": {
+            "vi": "Batch theo node và bound concurrency",
+            "en": "Batch by destination and bound concurrency"
+          },
+          "description": {
+            "vi": "Nhóm target sessions theo gateway/node để owner gửi một payload mỗi destination rồi fan out locally. Content recipient copies vẫn tồn tại, nhưng owner serialization/network work giảm. Presence/typing có thể debounce/coalesce dưới semantics ephemeral; durable message events cần history/resume path khi queue vượt bound.",
+            "en": "Group targets by gateway/node, then fan out locally. Recipient copies remain while owner serialization/network work falls. Coalesce ephemeral presence/typing under explicit semantics; durable content needs history/resume when queues reach bounds."
+          },
+          "problem": {
+            "vi": "Owner CPU/mailbox và dependency calls saturate trong guild lớn.",
+            "en": "Large guilds saturate owner CPUs/mailboxes and dependencies."
+          },
+          "decision": {
+            "vi": "Destination batching, bounded semaphores và per-guild/session backpressure.",
+            "en": "Use batching, bounded concurrency and per-guild/session backpressure."
+          },
+          "tradeoff": {
+            "vi": "Shared state, cache invalidation và fair scheduling vẫn cần vận hành.",
+            "en": "Shared state, invalidation and fairness still need operations."
+          },
+          "nextPressure": {
+            "vi": "Voice/media có loss/latency/capacity khác message events.",
+            "en": "Voice/media differ in loss, latency and capacity."
+          },
+          "exitCriteria": {
+            "vi": "Slow consumer không làm owner mailbox grow vô hạn hoặc starve small guilds.",
+            "en": "Slow consumers do not create endless mailboxes or starve small guilds."
+          },
+          "diagram": {
+            "id": "community-stage-fanout",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Rate limits cần guild skew; global average không bảo vệ một owner nóng.",
+              "en": "Limits must account for guild skew; global averages do not protect hot owners."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Guild event owner",
+                  "en": "Guild event owner"
+                },
+                "detail": {
+                  "vi": "Permission context và ordered event intent.",
+                  "en": "Permission context and ordered event intent."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "batch",
+                "label": {
+                  "vi": "Destination batches",
+                  "en": "Destination batches"
+                },
+                "detail": {
+                  "vi": "One copy mỗi gateway destination có recipients.",
+                  "en": "One copy per gateway destination with recipients."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "gw1",
+                "label": {
+                  "vi": "Gateway group A",
+                  "en": "Gateway group A"
+                },
+                "detail": {
+                  "vi": "Bounded session queues và local fan-out.",
+                  "en": "Bounded queues and local fan-out."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "gw2",
+                "label": {
+                  "vi": "Gateway group B",
+                  "en": "Gateway group B"
+                },
+                "detail": {
+                  "vi": "Independent queues/capacity.",
+                  "en": "Independent queues/capacity."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Catch-up history",
+                  "en": "Catch-up history"
+                },
+                "detail": {
+                  "vi": "Gap-marked sessions resync khi authorized.",
+                  "en": "Gap-marked authorized sessions resynchronize."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "owner",
+                    "to": "batch",
+                    "description": {
+                      "vi": "Group targets theo destination node.",
+                      "en": "Group targets by destination node."
+                    }
+                  },
+                  {
+                    "from": "batch",
+                    "to": "gw1",
+                    "description": {
+                      "vi": "Send shared payload/authorized target metadata.",
+                      "en": "Send shared payloads and authorized targets."
+                    }
+                  },
+                  {
+                    "from": "batch",
+                    "to": "gw2",
+                    "description": {
+                      "vi": "Send independent batch, không loop remote once per user.",
+                      "en": "Send another batch instead of remote per-user loops."
+                    }
+                  },
+                  {
+                    "from": "gw1",
+                    "to": "history",
+                    "description": {
+                      "vi": "On bounded overflow, mark gap and provide cursor resync.",
+                      "en": "Bound overflow, mark gaps and provide cursor resync."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "voice",
+          "title": {
+            "vi": "Voice signaling và SFU là plane riêng",
+            "en": "Separate voice signaling and SFU media"
+          },
+          "description": {
+            "vi": "Join voice cần auth/permissions, region selection và ephemeral media session credentials. Signaling có thể đi qua gateway; audio/video đi trực tiếp qua media fleet phù hợp. SFU forward selected encoded streams thay vì mix mọi thứ; client decoding/bandwidth và SFU egress vẫn tăng theo subscriptions. Transport encryption và application end-to-end encryption là lựa chọn threat-model/key-management riêng.",
+            "en": "Voice joins authorize, select regions and issue scoped media sessions. Gateways may signal while media uses separate fleets. SFUs forward selected encoded streams rather than mix everything; subscriber decoding/egress still scale. Transport protection and application E2EE have distinct key/threat models."
+          },
+          "problem": {
+            "vi": "Text round-trip requirements khác jitter/loss/NAT và device behavior của media.",
+            "en": "Text differs from media jitter, loss, NAT and device requirements."
+          },
+          "decision": {
+            "vi": "Independent media region/capacity, secure signaling, selective forwarding và congestion/quality monitoring.",
+            "en": "Use independent media placement/capacity, secure signaling, selective forwarding and quality monitoring."
+          },
+          "tradeoff": {
+            "vi": "Một fleet/network path khác, client decode load, TURN/fallback và region failover cần test.",
+            "en": "Another fleet/path, decoding, relay fallback and regional recovery need testing."
+          },
+          "nextPressure": {
+            "vi": "Member lists/presence vẫn tạo large hot state ở guild owner.",
+            "en": "Large member/presence state remains hot at guild owners."
+          },
+          "exitCriteria": {
+            "vi": "Permission revocation, mute/deafen, jitter/loss và media-region reconnect được rehearsal.",
+            "en": "Rehearse revocation, mute/deafen, loss/jitter and media-region reconnect."
+          },
+          "diagram": {
+            "id": "community-stage-voice",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ không khẳng định codec/crypto/protocol hiện tại của Discord.",
+              "en": "This does not assert Discord’s current codec, crypto or media protocol."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Media client",
+                  "en": "Media client"
+                },
+                "detail": {
+                  "vi": "Codec/capture/playout buffers và session auth.",
+                  "en": "Codecs, capture/playout buffers and session auth."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "signal",
+                "label": {
+                  "vi": "Voice signaling",
+                  "en": "Voice signaling"
+                },
+                "detail": {
+                  "vi": "Current permissions và region/session credentials.",
+                  "en": "Current permissions and regional credentials."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "sfu",
+                "label": {
+                  "vi": "Regional SFU",
+                  "en": "Regional SFU"
+                },
+                "detail": {
+                  "vi": "Authorized subscriptions, congestion và forwarding.",
+                  "en": "Authorized subscriptions, congestion and forwarding."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "peer",
+                "label": {
+                  "vi": "Receiving clients",
+                  "en": "Receiving clients"
+                },
+                "detail": {
+                  "vi": "Decode/mix/playout và quality feedback.",
+                  "en": "Decode, mix, playout and quality feedback."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "signal",
+                    "description": {
+                      "vi": "Join channel bằng current account/ACL.",
+                      "en": "Join under current account/ACL."
+                    }
+                  },
+                  {
+                    "from": "signal",
+                    "to": "sfu",
+                    "description": {
+                      "vi": "Authorize scoped session/subscription.",
+                      "en": "Authorize scoped sessions/subscriptions."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "sfu",
+                    "description": {
+                      "vi": "Send media theo negotiated secure protocol.",
+                      "en": "Send media through negotiated secure protocols."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "sfu",
+                    "to": "peer",
+                    "description": {
+                      "vi": "Forward selected streams, không proxy qua message database.",
+                      "en": "Forward selected streams without message-database transit."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "member-windows",
+          "title": {
+            "vi": "Chỉ subscribe member-list window cần xem",
+            "en": "Subscribe only to visible member windows"
+          },
+          "description": {
+            "vi": "Large sorted member lists cần stable ordering, range/snapshot version và incremental diffs. Client scroll đổi window; insert/delete trước viewport có thể dịch ranks nên không chỉ gửi update khi old index nằm trong range. Native sorted structures có thể tối ưu CPU/allocation sau profiling, nhưng NIF/native code cần bounded scheduler time và failure isolation.",
+            "en": "Large sorted lists need stable order, range versions and diffs. Inserts/deletes can shift ranks across a viewport; old-index-only filtering is insufficient. Profile before native optimization, and bound native scheduler work and failures."
+          },
+          "problem": {
+            "vi": "Full member snapshot/presence diffs tốn memory/network cho users chỉ nhìn vài rows.",
+            "en": "Full snapshots and presence updates waste resources for small visible windows."
+          },
+          "decision": {
+            "vi": "Versioned range subscriptions, lazy loading và profiled sorted data structure.",
+            "en": "Use versioned ranges, lazy loading and profiled sorted structures."
+          },
+          "tradeoff": {
+            "vi": "Partial views, rank shifts, native safety và resync protocol tăng complexity.",
+            "en": "Partial views, shifting ranks, native safety and resync add complexity."
+          },
+          "nextPressure": {
+            "vi": "Read markers/session caches có tail latency do runtime/cache behavior.",
+            "en": "Read-marker caches develop runtime/cache latency tails."
+          },
+          "exitCriteria": {
+            "vi": "Scroll/insert/delete race giữ stable viewport hoặc explicit resync, không lộ invisible members.",
+            "en": "Scroll/mutation races preserve windows or resync without exposing hidden members."
+          },
+          "diagram": {
+            "id": "community-stage-member-windows",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Native speed không bảo đảm native safety hoặc đúng window semantics.",
+              "en": "Native speed does not establish native safety or correct windows."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Member-list viewport",
+                  "en": "Member-list viewport"
+                },
+                "detail": {
+                  "vi": "Window + list version, không toàn guild list.",
+                  "en": "Window and list version rather than full lists."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Guild list owner",
+                  "en": "Guild list owner"
+                },
+                "detail": {
+                  "vi": "Permissions, sorting và mutation sequence.",
+                  "en": "Permissions, ordering and mutation sequence."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "sorted",
+                "label": {
+                  "vi": "Sorted member structure",
+                  "en": "Sorted member structure"
+                },
+                "detail": {
+                  "vi": "Range/rank operations và measured allocation.",
+                  "en": "Range/rank operations and measured allocation."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "diff",
+                "label": {
+                  "vi": "Window diff worker",
+                  "en": "Window diff worker"
+                },
+                "detail": {
+                  "vi": "Rank-shift-aware versioned deltas.",
+                  "en": "Versioned deltas that account for rank shifts."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "owner",
+                    "description": {
+                      "vi": "Subscribe range gắn list generation.",
+                      "en": "Subscribe to a versioned range."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "sorted",
+                    "description": {
+                      "vi": "Read sorted authorized window.",
+                      "en": "Read sorted authorized windows."
+                    }
+                  },
+                  {
+                    "from": "sorted",
+                    "to": "diff",
+                    "description": {
+                      "vi": "Track mutations/rank shifts.",
+                      "en": "Track mutations and shifted ranks."
+                    }
+                  },
+                  {
+                    "from": "diff",
+                    "to": "client",
+                    "description": {
+                      "vi": "Apply compatible deltas hoặc require fresh snapshot.",
+                      "en": "Apply compatible deltas or require snapshots."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "hot-runtime",
+          "title": {
+            "vi": "Tối ưu hot cache sau khi đo runtime",
+            "en": "Optimize hot caches after profiling"
+          },
+          "description": {
+            "vi": "Read-state service quản lý per-user/channel markers và dirty writeback. Monotonic marker/versions, crash durability và explicit unread semantics quan trọng hơn language choice. Rust tránh tracing-GC pauses nhưng vẫn có allocator/deallocation spikes, locks, I/O và memory limits; historical Go behavior không phải benchmark cho runtime hiện tại.",
+            "en": "Read states need versioned markers, dirty-writeback durability and unread semantics. Rust avoids tracing GC but not allocator, deallocation, lock or I/O tails. Historical runtime results do not benchmark today’s versions."
+          },
+          "problem": {
+            "vi": "Huge cache có latency spikes liên hệ measured runtime/allocation profile.",
+            "en": "Large caches show measured runtime/allocation-linked tails."
+          },
+          "decision": {
+            "vi": "Bound cache/dirty queues, profile runtime; rewrite bounded service khi evidence và team ownership phù hợp.",
+            "en": "Bound caches/dirty queues, profile and rewrite narrowly when evidence and ownership justify it."
+          },
+          "tradeoff": {
+            "vi": "Maintenance/migration cost và memory lifetime bugs; rewrite không sửa lost writeback semantics.",
+            "en": "Maintenance, migration and lifetime bugs remain; rewrites do not fix lost-writeback semantics."
+          },
+          "nextPressure": {
+            "vi": "History hot partitions và compaction tăng tail độc lập runtime API.",
+            "en": "Hot partitions and compaction create independent storage tails."
+          },
+          "exitCriteria": {
+            "vi": "Crash/replay dirty markers, memory pressure và versioned writeback không regress read state.",
+            "en": "Crashes, pressure and writeback do not regress versioned state."
+          },
+          "diagram": {
+            "id": "community-stage-hot-runtime",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Display read marker và accounting/audit state có thể cần retention khác.",
+              "en": "Read displays and audit state can have different retention."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Read marker command",
+                  "en": "Read marker command"
+                },
+                "detail": {
+                  "vi": "User/channel scope, marker và expected semantics.",
+                  "en": "User/channel scope, markers and semantics."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "service",
+                "label": {
+                  "vi": "Read-state service",
+                  "en": "Read-state service"
+                },
+                "detail": {
+                  "vi": "Versioned cache và policy cho unread/reset.",
+                  "en": "Versioned caches and unread/reset policy."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Bounded hot cache",
+                  "en": "Bounded hot cache"
+                },
+                "detail": {
+                  "vi": "Eviction/dirty queue với durability boundary.",
+                  "en": "Eviction/dirty queues with durability boundaries."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "writeback",
+                "label": {
+                  "vi": "Writeback worker",
+                  "en": "Writeback worker"
+                },
+                "detail": {
+                  "vi": "Monotonic/version-guarded persistence.",
+                  "en": "Monotonic version-guarded persistence."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Durable read state",
+                  "en": "Durable read state"
+                },
+                "detail": {
+                  "vi": "Restore/catch-up source.",
+                  "en": "Restore/catch-up source."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "service",
+                    "description": {
+                      "vi": "Validate marker scope/operation.",
+                      "en": "Validate marker scope/operations."
+                    }
+                  },
+                  {
+                    "from": "service",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Update dưới declared ACK durability.",
+                      "en": "Update under declared ACK durability."
+                    }
+                  },
+                  {
+                    "from": "cache",
+                    "to": "writeback",
+                    "description": {
+                      "vi": "Drain bounded dirty intents.",
+                      "en": "Drain bounded dirty intent."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "writeback",
+                    "to": "db",
+                    "description": {
+                      "vi": "Persist version guarded để retries không regress.",
+                      "en": "Persist with guards against retry regression."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "hot-partitions",
+          "title": {
+            "vi": "Đo skew trước khi đổi database",
+            "en": "Measure skew before changing databases"
+          },
+          "description": {
+            "vi": "Một announcement làm nhiều readers chạm cùng channel/bucket; adding nodes không mặc định chia một hot partition. Phân biệt partition size, identical read stampede, tombstone scans, compaction debt, queueing và GC/allocation. Mỗi nguyên nhân có mitigation khác; smaller buckets không tự giảm cùng-page hot burst.",
+            "en": "Announcements concentrate reads on one bucket. More nodes do not automatically split that partition. Distinguish size, identical reads, tombstones, compaction, queues and runtime pauses; smaller buckets alone do not solve same-page bursts."
+          },
+          "problem": {
+            "vi": "Average latency đẹp nhưng hot guild p99/mailbox/storage queues tăng mạnh.",
+            "en": "Averages hide hot-guild p99 and queue spikes."
+          },
+          "decision": {
+            "vi": "Per-key metrics, bounded concurrency, safe coalescing/cache và workload-specific storage evaluation.",
+            "en": "Use per-key metrics, bounded concurrency, safe merging/caching and workload-based evaluation."
+          },
+          "tradeoff": {
+            "vi": "Backpressure tăng visible lag; replication/compaction có limits và pending recovery debt.",
+            "en": "Backpressure adds lag; replication and compaction have finite capacity."
+          },
+          "nextPressure": {
+            "vi": "Cần data-service affinity/coalescing và staged engine migration.",
+            "en": "Data-service affinity and staged migration may be needed."
+          },
+          "exitCriteria": {
+            "vi": "Replay hot-key burst và deletion-heavy partition đo tail/quota/debt, không chỉ aggregate throughput.",
+            "en": "Test hot bursts and deletion-heavy partitions by tails, quotas and debt."
+          },
+          "diagram": {
+            "id": "community-stage-hot-partitions",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Hot partition là workload/placement problem, không một engine-name diagnosis.",
+              "en": "Hot partitions are workload/placement issues rather than engine-name diagnoses."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "clients",
+                "label": {
+                  "vi": "Announcement readers",
+                  "en": "Announcement readers"
+                },
+                "detail": {
+                  "vi": "Skewed same-page requests.",
+                  "en": "Skewed same-page requests."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "data",
+                "label": {
+                  "vi": "Read data service",
+                  "en": "Read data service"
+                },
+                "detail": {
+                  "vi": "Concurrency/key shaping.",
+                  "en": "Concurrency and key shaping."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "partition",
+                "label": {
+                  "vi": "Hot partition replicas",
+                  "en": "Hot partition replicas"
+                },
+                "detail": {
+                  "vi": "Read queue, tombstones và compaction.",
+                  "en": "Read queues, tombstones and compaction."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "metrics",
+                "label": {
+                  "vi": "Per-key evidence",
+                  "en": "Per-key evidence"
+                },
+                "detail": {
+                  "vi": "Tail, queue depth, scanned/live rows và IO.",
+                  "en": "Tails, queues, scanned/live rows and I/O."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "clients",
+                    "to": "data",
+                    "description": {
+                      "vi": "Burst same channel/page trong bounded interval.",
+                      "en": "Burst within a bounded interval."
+                    }
+                  },
+                  {
+                    "from": "data",
+                    "to": "partition",
+                    "description": {
+                      "vi": "Không bounded/merged thì repeated reads saturate replicas.",
+                      "en": "Unbounded duplicate reads saturate replicas."
+                    }
+                  },
+                  {
+                    "from": "partition",
+                    "to": "metrics",
+                    "description": {
+                      "vi": "Correlate key/tombstones/IO với p99.",
+                      "en": "Correlate keys, tombstones and I/O with p99."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "data-migration",
+          "title": {
+            "vi": "Safe coalescing và verified store migration",
+            "en": "Safe coalescing and verified migration"
+          },
+          "description": {
+            "vi": "Channel affinity tạo local convergence; merge chỉ requests tương đương về query/scope/cursor và consistency. Một result snapshot trước user write có thể không đáp ứng min-version read. Engine migration cần coherent write capture, versioned backfill/tombstones, shadow compare và cutover/rollback readiness; thay store không sửa permission-key bugs.",
+            "en": "Affinity converges reads locally; merge only equivalent query/scope/cursor/consistency requests. Pre-write snapshots may violate minimum-version reads. Migrations need change capture, versioned backfills, tombstones, comparisons and verified cutover/rollback. Engines do not repair bad authorization keys."
+          },
+          "problem": {
+            "vi": "Hot queries và store tail cần giải pháp ở cả request layer và storage layer.",
+            "en": "Hot queries and storage tails need request and storage solutions."
+          },
+          "decision": {
+            "vi": "Owned routing, bounded singleflight keyed đúng semantics và verified new-store rollout.",
+            "en": "Use owned routing, bounded semantic singleflight and verified store rollout."
+          },
+          "tradeoff": {
+            "vi": "Owner failure/stall cần deadlines/cancellation; migration load có thể starve live traffic.",
+            "en": "Owners need deadlines/cancellation; migration load can starve live work."
+          },
+          "nextPressure": {
+            "vi": "Disk latency/failure semantics là limit tiếp theo sau request layer.",
+            "en": "Disk latency/failure semantics can bind next."
+          },
+          "exitCriteria": {
+            "vi": "Coalesced responses đúng ACL/cursor/version; migration không resurrect deletes hoặc lose accepted writes.",
+            "en": "Merged results honor scope/cursors/versions; migrations preserve deletions and accepted writes."
+          },
+          "diagram": {
+            "id": "community-stage-data-migration",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Coalescing không có cache result sau completion trừ khi thêm cache policy riêng.",
+              "en": "Singleflight has no completed-result cache unless separately designed."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "History requests",
+                  "en": "History requests"
+                },
+                "detail": {
+                  "vi": "Auth-equivalent scopes và min-version requirements.",
+                  "en": "Auth-equivalent scopes and minimum versions."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "data",
+                "label": {
+                  "vi": "Affinity / singleflight",
+                  "en": "Affinity / singleflight"
+                },
+                "detail": {
+                  "vi": "Full query identity, bounded wait và result scope.",
+                  "en": "Full identity, bounded waiting and result scope."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "old",
+                "label": {
+                  "vi": "Old message store",
+                  "en": "Old message store"
+                },
+                "detail": {
+                  "vi": "Source versions và change capture.",
+                  "en": "Source versions and change capture."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "new",
+                "label": {
+                  "vi": "New message store",
+                  "en": "New message store"
+                },
+                "detail": {
+                  "vi": "Conditional apply và validated readability.",
+                  "en": "Conditional application and validated reads."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "verify",
+                "label": {
+                  "vi": "Backfill / compare",
+                  "en": "Backfill / compare"
+                },
+                "detail": {
+                  "vi": "Checkpoints, delete versions và cutover proofs.",
+                  "en": "Checkpoints, deletion versions and cutover proofs."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "data",
+                    "description": {
+                      "vi": "Route by channel nhưng merge key giàu hơn channel ID.",
+                      "en": "Route by channel but merge using richer keys."
+                    }
+                  },
+                  {
+                    "from": "data",
+                    "to": "old",
+                    "description": {
+                      "vi": "Read snapshot theo version/scope contract.",
+                      "en": "Read under snapshot/version/scope contracts."
+                    }
+                  },
+                  {
+                    "from": "old",
+                    "to": "new",
+                    "description": {
+                      "vi": "Replicate live changes có version và tombstones.",
+                      "en": "Replicate versioned changes and tombstones."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "verify",
+                    "to": "new",
+                    "description": {
+                      "vi": "Backfill/compare với version guards trước cutover.",
+                      "en": "Backfill/compare under guards before cutover."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "storage-io",
+          "title": {
+            "vi": "Local speed và durable write path",
+            "en": "Local read speed and durable writes"
+          },
+          "description": {
+            "vi": "Một design kết hợp fast local media với durable network storage phải định nghĩa write acknowledgment, flush/order, mirror degradation, resync và restart. Write-mostly mirror member thiên reads sang fast side; không làm network durability miễn latency. RAID không phải backup và local data sau host loss không được tự coi trusted current copy.",
+            "en": "Combining local and network storage needs ACK, ordering, flush, degradation, resync and restart contracts. Write-mostly mirroring favors fast reads without free durable writes. RAID is not backup, and surviving local bytes are not automatically trusted current state."
+          },
+          "problem": {
+            "vi": "Measured IO queue/tail là bottleneck sau khi request load đã bounded.",
+            "en": "Measured I/O queues/tails bind after load is bounded."
+          },
+          "decision": {
+            "vi": "Evaluate local/read cache + durable mirror/tier dưới failure injection và recovery tests.",
+            "en": "Evaluate local reads and durable tiers with failures and recovery tests."
+          },
+          "tradeoff": {
+            "vi": "Complex storage operations, integrity/resync, durability loss nếu ACK/degraded mode sai.",
+            "en": "Operational, integrity and resync complexity can threaten durability under wrong ACK/degraded policies."
+          },
+          "nextPressure": {
+            "vi": "Một guild rất lớn vẫn cần phân phối audience work qua relays.",
+            "en": "Huge guilds still need audience work distributed through relays."
+          },
+          "exitCriteria": {
+            "vi": "Host loss, bad sectors, durable-side failure và resync không violate advertised ACK contract.",
+            "en": "Host loss, bad sectors, durable-side faults and resync preserve advertised ACK semantics."
+          },
+          "diagram": {
+            "id": "community-stage-storage-io",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Mirrored disks, database replication và backups là các lớp khác nhau.",
+              "en": "Mirrors, database replication and backups are distinct layers."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Message engine",
+                  "en": "Message engine"
+                },
+                "detail": {
+                  "vi": "WAL/flush và replication contract.",
+                  "en": "WAL, flush and replication contracts."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "mirror",
+                "label": {
+                  "vi": "Storage mirror / tier",
+                  "en": "Storage mirror / tier"
+                },
+                "detail": {
+                  "vi": "ACK policy, ordering và degraded state.",
+                  "en": "ACK policy, ordering and degraded state."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "local",
+                "label": {
+                  "vi": "Fast local volume",
+                  "en": "Fast local volume"
+                },
+                "detail": {
+                  "vi": "Read-preferred nhưng ephemeral failure domain.",
+                  "en": "Read-preferred but potentially ephemeral."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "durable",
+                "label": {
+                  "vi": "Durable network volume",
+                  "en": "Durable network volume"
+                },
+                "detail": {
+                  "vi": "Persistence dưới provider/flush contract.",
+                  "en": "Persistence under provider/flush contracts."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "recovery",
+                "label": {
+                  "vi": "Integrity / resync",
+                  "en": "Integrity / resync"
+                },
+                "detail": {
+                  "vi": "Trusted generation, rebuild và monitoring.",
+                  "en": "Trusted generations, rebuild and monitoring."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "db",
+                    "to": "mirror",
+                    "description": {
+                      "vi": "Write theo engine durability requirements.",
+                      "en": "Write under engine durability requirements."
+                    }
+                  },
+                  {
+                    "from": "mirror",
+                    "to": "local",
+                    "description": {
+                      "vi": "Maintain local copy theo mirror ordering.",
+                      "en": "Maintain local copies under mirror ordering."
+                    }
+                  },
+                  {
+                    "from": "mirror",
+                    "to": "durable",
+                    "description": {
+                      "vi": "ACK durability chờ required persistent boundary.",
+                      "en": "ACK only after required persistent boundaries."
+                    }
+                  },
+                  {
+                    "from": "durable",
+                    "to": "recovery",
+                    "description": {
+                      "vi": "Recover/resync verified data sau local loss.",
+                      "en": "Recover/resync verified data after local loss."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "relays",
+          "title": {
+            "vi": "Relays, passive sessions và quyền hiện tại",
+            "en": "Relays, passive sessions and current permissions"
+          },
+          "description": {
+            "vi": "Giảm full content delivery cho online sessions không actively viewing và dùng history/resync khi focus. Không có nghĩa bỏ mọi unread/mention/notification; mỗi loại event có audience contract riêng. Relays chia fan-out và permission checks; owner giữ durable membership/role version, relay cần freshness/revocation policy để stale subscription không lộ content.",
+            "en": "Reduce full content for passive sessions and reconcile on focus. Unread, mentions and notifications retain separate audiences. Relays share fan-out and permission checks under role/version and revocation policies; stale subscriptions must not expose content."
+          },
+          "problem": {
+            "vi": "Single owner CPU và per-session copying không theo kịp giant guild.",
+            "en": "One owner cannot sustain giant-guild copying and audience work."
+          },
+          "decision": {
+            "vi": "Active-content subscriptions, partitioned relays, shared immutable metadata và bounded queues/catch-up.",
+            "en": "Use active subscriptions, relay partitions, shared metadata and bounded queues/catch-up."
+          },
+          "tradeoff": {
+            "vi": "Relay permissions/state versions, handoff và resync demand tăng; copies/bytes tới recipients vẫn còn.",
+            "en": "Versioning, handoff and catch-up add work; recipient copies/bytes remain."
+          },
+          "nextPressure": {
+            "vi": "Tiếp tục quản lý skew, permission changes và catch-up storms thay vì chỉ tăng guild limit.",
+            "en": "Keep managing skew, permissions and catch-up storms rather than only raising limits."
+          },
+          "exitCriteria": {
+            "vi": "Slow relay, role revoke, passive→active và owner handoff giữ no-leak/no-silent-gap contracts.",
+            "en": "Relay failures, revocations, focus and handoff preserve no-leak and no-silent-gap contracts."
+          },
+          "diagram": {
+            "id": "community-stage-relays",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Một content event fan-out O(recipients); O(N²) chỉ phát sinh khi cả event rate và audience cùng tăng theo N.",
+              "en": "One event has O(recipients) work; quadratic growth requires event rates and audiences both scale with N."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Versioned guild owner",
+                  "en": "Versioned guild owner"
+                },
+                "detail": {
+                  "vi": "Roles/membership/current event generation.",
+                  "en": "Roles, membership and event generation."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Audience relays",
+                  "en": "Audience relays"
+                },
+                "detail": {
+                  "vi": "Session slices và current ACL checks.",
+                  "en": "Session slices and current ACL checks."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "active",
+                "label": {
+                  "vi": "Active viewers",
+                  "en": "Active viewers"
+                },
+                "detail": {
+                  "vi": "Full content và applied cursor.",
+                  "en": "Full content and applied cursors."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "passive",
+                "label": {
+                  "vi": "Passive sessions",
+                  "en": "Passive sessions"
+                },
+                "detail": {
+                  "vi": "Separate unread/mention/invalidation policy.",
+                  "en": "Separate unread, mention and invalidation policies."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              },
+              {
+                "id": "history",
+                "label": {
+                  "vi": "Authorized catch-up",
+                  "en": "Authorized catch-up"
+                },
+                "detail": {
+                  "vi": "Snapshot/live barrier và deletion-aware replay.",
+                  "en": "Snapshot/live barriers and deletion-aware replay."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "owner",
+                    "to": "relay",
+                    "description": {
+                      "vi": "Emit event với permission/state generation.",
+                      "en": "Emit events with permission/state generations."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "active",
+                    "description": {
+                      "vi": "Authorized content tới active subscriptions.",
+                      "en": "Deliver authorized content to active subscriptions."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "passive",
+                    "description": {
+                      "vi": "Chỉ permitted coarse events theo audience policy.",
+                      "en": "Deliver permitted coarse events under audience policy."
+                    }
+                  },
+                  {
+                    "from": "passive",
+                    "to": "history",
+                    "description": {
+                      "vi": "Focus/reconnect reauthorize rồi catch up từ cursor/snapshot.",
+                      "en": "On focus, reauthorize and catch up from cursors/snapshots."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "4. Đếm writes, connections, copies và bytes riêng",
+        "en": "4. Count writes, connections, copies and bytes separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định một tỷ messages/ngày, 1 KB payload+metadata mỗi message và replication factor 3: average khoảng 11.574 messages/s và 3 TB raw replicated bytes/ngày, trước indexes, attachments, edits, tombstones, compression và retained copies. Peak factor 5 cho khoảng 57.870 writes/s nhưng guild/channel skew có thể làm một partition quá tải ngay khi cluster average còn thấp. Không gọi write rate “nhỏ” nếu chưa có workload/hardware evidence.",
+          "en": "Assume a billion messages/day at one KB each with three copies: about 11,574 messages/second and three decimal TB/day before indexes, attachments, mutations, tombstones and compression. A fivefold peak is about 57,870 writes/second; one channel can overload despite low cluster averages. Calling this modest needs workload evidence."
+        },
+        {
+          "vi": "Hai triệu connections, chỉ tính 16 KB raw session/buffer metadata đã là 32 GB trước TLS, protocol state, queues và runtime overhead. Mỗi user có nhiều sessions/guild memberships nên đếm users không thay session/subscription counts. Một message cho 5.000 active eligible viewers tạo 5.000 recipient copies; owner dùng 4 relays có thể chỉ gửi 4 upstream copies nhưng last-mile payload vẫn khoảng 5 MB/message ở 1 KB/copy.",
+          "en": "Two million connections with sixteen KB raw state already require 32 GB before TLS, queues and runtime overhead. Multiple devices/memberships make user counts insufficient. A message to 5,000 eligible viewers has 5,000 recipient copies; four relays reduce owner copies to four, not the roughly five MB of viewer payload."
+        },
+        {
+          "vi": "O(N²) không đúng cho một message đơn lẻ. Nếu mỗi N users phát một presence event mỗi phút và mọi user quan sát mọi người khác, recipient operations ≈ N(N−1)/60 mỗi giây. Phân loại audiences, debounce ephemeral state và lazy member ranges có thể giảm work; permissions/mention/unread semantics vẫn phải giữ. Reconnect/catch-up là workload chuyển chỗ, không biến mất.",
+          "en": "One message is not quadratic. If N users each emit a presence update per minute to all others, work is approximately N(N−1)/60 operations/second. Audience selection, ephemeral coalescing and lazy ranges reduce work while retaining permissions, mentions and unread semantics. Catch-up shifts work rather than removing it."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Budget",
+            "en": "Budget"
+          },
+          {
+            "vi": "Đo theo gì",
+            "en": "Measurement"
+          },
+          {
+            "vi": "Tail / skew",
+            "en": "Tail / skew"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Archive",
+              "en": "Archive"
+            },
+            {
+              "vi": "Committed writes, partition sizes, scanned/live rows và compaction.",
+              "en": "Writes, partition size, scanned/live rows and compaction."
+            },
+            {
+              "vi": "Hot channel/bucket, tombstones và bucket-crossing pagination.",
+              "en": "Hot buckets, tombstones and cross-bucket pagination."
+            }
+          ],
+          [
+            {
+              "vi": "Gateway",
+              "en": "Gateway"
+            },
+            {
+              "vi": "Connections, subscriptions, buffers và reconnect rate.",
+              "en": "Connections, subscriptions, buffers and reconnect rates."
+            },
+            {
+              "vi": "Slow sessions, mobile loss và resume storms.",
+              "en": "Slow sessions, mobile loss and resume storms."
+            }
+          ],
+          [
+            {
+              "vi": "Fan-out",
+              "en": "Fan-out"
+            },
+            {
+              "vi": "Owner copies, recipient copies và actual wire bytes.",
+              "en": "Owner copies, recipient copies and wire bytes."
+            },
+            {
+              "vi": "Giant guild, ACL updates và relay imbalance.",
+              "en": "Large guilds, ACL updates and relay imbalance."
+            }
+          ],
+          [
+            {
+              "vi": "Media",
+              "en": "Media"
+            },
+            {
+              "vi": "Concurrent speakers, subscriptions, bitrate và network path.",
+              "en": "Speakers, subscriptions, bitrates and network paths."
+            },
+            {
+              "vi": "Jitter/loss/NAT, region failover và client decode limits.",
+              "en": "Jitter, loss, NAT, region failover and decoding limits."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Theo dõi Send, fan-out, history và media",
+        "en": "5. Trace sending, fan-out, history and media"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn Persist để kiểm durable boundary; chọn Fan-out để thấy audience selection nằm ở đâu. Session resume sequence không nhất thiết là message ID hoặc channel total order: define mapping/session stream và retention riêng. Một public API sequence có semantics cụ thể không được dùng để suy private storage ordering. Diagram dưới dùng generic teaching contracts.",
+          "en": "Persistence traces expose durability; fan-out locates audience selection. Session sequences need not equal message identities or channel total order. Define mappings, streams and retention rather than infer private ordering from public APIs. These diagrams use teaching contracts."
+        },
+        {
+          "vi": "Chọn Resume để thấy snapshot watermark và bridge live; chọn Voice/Search để thấy media và indexing không nằm trong message commit callback. Search/indexers dùng durable committed mutations với versions; voice dùng current channel permissions và scoped media credentials. Cả hai không được bypass authorization vì dependency còn cache.",
+          "en": "Resume traces expose watermarks/live bridging; voice/search stay outside commit callbacks. Indexers consume versioned committed mutations; media uses current permissions and scoped credentials. Cached dependencies never justify bypassing authorization."
+        }
+      ],
+      "diagram": {
+        "id": "community-three-planes",
+        "title": {
+          "vi": "Messages, gateway events và voice dùng ba đường khác nhau",
+          "en": "Messages, gateway events and voice use different paths"
+        },
+        "caption": {
+          "vi": "Durable write ACK, socket delivery, client apply và media playout là các boundary khác nhau. Đây là architecture học tập, không private topology hiện tại.",
+          "en": "Durable ACKs, socket delivery, client application and media playout have distinct boundaries. This is a teaching architecture rather than current private topology."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "sender",
+            "label": {
+              "vi": "Sending client",
+              "en": "Sending client"
+            },
+            "detail": {
+              "vi": "Authenticated send nonce, pending UI và current channel scope.",
+              "en": "Authenticated send nonces, pending UI and channel scope."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Message / permission API",
+              "en": "Message / permission API"
+            },
+            "detail": {
+              "vi": "Auth/rate limits, authoritative ACL/version và query semantics.",
+              "en": "Authentication, limits, authoritative permissions/versions and query semantics."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "data",
+            "label": {
+              "vi": "Read / write data tier",
+              "en": "Read / write data tier"
+            },
+            "detail": {
+              "vi": "Channel affinity, full-key coalescing, concurrency và consistency floor.",
+              "en": "Channel affinity, full-key merging, concurrency and consistency floors."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "archive",
+            "label": {
+              "vi": "Message archive",
+              "en": "Message archive"
+            },
+            "detail": {
+              "vi": "Channel/bucket/order, mutation versions và committed intent.",
+              "en": "Channels, buckets, ordering, mutation versions and committed intent."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "viewer",
+            "label": {
+              "vi": "Viewing / reconnecting client",
+              "en": "Viewing / reconnecting client"
+            },
+            "detail": {
+              "vi": "Applied cursor, versioned local state và explicit snapshot gaps.",
+              "en": "Applied cursors, versioned state and explicit gaps."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Session gateway",
+              "en": "Session gateway"
+            },
+            "detail": {
+              "vi": "WebSocket, heartbeat, replay limits, compression và backpressure.",
+              "en": "Sockets, heartbeats, replay bounds, compression and backpressure."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "edge"
+          },
+          {
+            "id": "relay",
+            "label": {
+              "vi": "Audience relays",
+              "en": "Audience relays"
+            },
+            "detail": {
+              "vi": "Current permissions, active-content subscriptions và bounded per-session queues.",
+              "en": "Current permissions, active subscriptions and bounded queues."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "guild",
+            "label": {
+              "vi": "Guild state owner",
+              "en": "Guild state owner"
+            },
+            "detail": {
+              "vi": "Fenced ownership, durable role/channel versions và audience intent.",
+              "en": "Fenced ownership, durable role/channel versions and audience intent."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "media",
+            "label": {
+              "vi": "Media client",
+              "en": "Media client"
+            },
+            "detail": {
+              "vi": "Secure negotiated media session, codec/buffer/congestion feedback.",
+              "en": "Secure media sessions, codecs, buffers and feedback."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "client"
+          },
+          {
+            "id": "voice",
+            "label": {
+              "vi": "Voice signaling / SFU",
+              "en": "Voice signaling / SFU"
+            },
+            "detail": {
+              "vi": "Authorized voice join, regional forwarding và independent capacity.",
+              "en": "Authorized joins, regional forwarding and independent capacity."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "service"
+          },
+          {
+            "id": "log",
+            "label": {
+              "vi": "Committed mutation log",
+              "en": "Committed mutation log"
+            },
+            "detail": {
+              "vi": "Outbox/CDC, stable event IDs và versioned deletes.",
+              "en": "Outbox/CDC, stable event identities and versioned deletes."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "queue"
+          },
+          {
+            "id": "search",
+            "label": {
+              "vi": "Search / read projections",
+              "en": "Search / read projections"
+            },
+            "detail": {
+              "vi": "Versioned indexing, ACL filter và eventual freshness.",
+              "en": "Versioned indexing, ACL filtering and eventual freshness."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "send",
+            "label": {
+              "vi": "Persist trước acknowledge",
+              "en": "Persist before acknowledging"
+            },
+            "steps": [
+              {
+                "from": "sender",
+                "to": "api",
+                "description": {
+                  "vi": "Send scoped nonce, content và channel identity; retry giữ same intent.",
+                  "en": "Send scoped nonces, content and channel identity, preserving retry intent."
+                }
+              },
+              {
+                "from": "api",
+                "to": "guild",
+                "description": {
+                  "vi": "Validate current permissions/state version, không chỉ stale UI subscription.",
+                  "en": "Validate current permission/state versions rather than stale subscriptions."
+                }
+              },
+              {
+                "from": "api",
+                "to": "data",
+                "description": {
+                  "vi": "Route write tới owned data path; không merge writes bằng singleflight read key.",
+                  "en": "Route writes through data ownership without merging writes by read keys."
+                }
+              },
+              {
+                "from": "data",
+                "to": "archive",
+                "description": {
+                  "vi": "Commit message/mutation, send-result identity và event intent.",
+                  "en": "Commit messages/mutations, result identities and event intent."
+                }
+              },
+              {
+                "from": "archive",
+                "to": "sender",
+                "description": {
+                  "vi": "ACK theo durable boundary đã công bố; chưa đồng nghĩa mọi receiver đã apply.",
+                  "en": "ACK declared durability without claiming all receivers applied it."
+                }
+              }
+            ]
+          },
+          {
+            "id": "deliver",
+            "label": {
+              "vi": "Fan-out có audience và quyền",
+              "en": "Fan out under audiences and permissions"
+            },
+            "steps": [
+              {
+                "from": "archive",
+                "to": "log",
+                "description": {
+                  "vi": "Relay committed mutation qua outbox/CDC.",
+                  "en": "Relay committed mutations through outbox/CDC."
+                },
+                "async": true
+              },
+              {
+                "from": "log",
+                "to": "guild",
+                "description": {
+                  "vi": "Apply stable event/version dưới owner epoch.",
+                  "en": "Apply stable events/versions under ownership epochs."
+                },
+                "async": true
+              },
+              {
+                "from": "guild",
+                "to": "relay",
+                "description": {
+                  "vi": "Send once per destination relay cùng policy/version context.",
+                  "en": "Send once per destination relay with policy/version context."
+                }
+              },
+              {
+                "from": "relay",
+                "to": "gateway",
+                "description": {
+                  "vi": "Select authorized active viewers; passive notifications có policy riêng.",
+                  "en": "Select authorized active viewers under distinct passive policies."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "viewer",
+                "description": {
+                  "vi": "Push session-sequenced event hoặc mark gap khi queue bound vượt.",
+                  "en": "Push sequenced events or mark bounded-queue gaps."
+                }
+              }
+            ]
+          },
+          {
+            "id": "history",
+            "label": {
+              "vi": "History và safe coalescing",
+              "en": "History and safe read merging"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "api",
+                "description": {
+                  "vi": "Request cursor/query cùng min-version/consistency needs.",
+                  "en": "Request cursors/queries with consistency requirements."
+                }
+              },
+              {
+                "from": "api",
+                "to": "data",
+                "description": {
+                  "vi": "Authorize scope và route by channel; merge full equivalent identity.",
+                  "en": "Authorize and route by channel; merge full equivalent identities."
+                }
+              },
+              {
+                "from": "data",
+                "to": "archive",
+                "description": {
+                  "vi": "Read bounded buckets/snapshot, honor minimum version.",
+                  "en": "Read bounded buckets/snapshots honoring minimum versions."
+                }
+              },
+              {
+                "from": "data",
+                "to": "viewer",
+                "description": {
+                  "vi": "Return correct scope/cursor/generation; revalidate policy nếu contract đòi.",
+                  "en": "Return correct scope/cursors/generations and required policy validation."
+                }
+              }
+            ]
+          },
+          {
+            "id": "resume",
+            "label": {
+              "vi": "Resume hoặc snapshot rồi bridge live",
+              "en": "Resume or snapshot and bridge live"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "gateway",
+                "description": {
+                  "vi": "Reconnect session/cursor; check validity và retained replay coverage.",
+                  "en": "Reconnect sessions/cursors and check validity/replay coverage."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "guild",
+                "description": {
+                  "vi": "Reauthorize current membership/ACL, kể cả token cũ còn format hợp lệ.",
+                  "en": "Reauthorize current membership/ACL despite valid-looking old tokens."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "data",
+                "description": {
+                  "vi": "Gap quá retention thì fetch authoritative snapshot có watermark.",
+                  "en": "Fetch watermarked authoritative snapshots for expired gaps."
+                }
+              },
+              {
+                "from": "guild",
+                "to": "gateway",
+                "description": {
+                  "vi": "Bridge events sau snapshot watermark với bounded buffer/gap detection.",
+                  "en": "Bridge events after snapshot watermarks with bounded buffers/gap detection."
+                },
+                "async": true
+              },
+              {
+                "from": "gateway",
+                "to": "viewer",
+                "description": {
+                  "vi": "Apply monotonic mutations/tombstones; ACK chỉ applied contiguous cursor.",
+                  "en": "Apply monotonic mutations/tombstones and ACK applied contiguous cursors."
+                }
+              }
+            ]
+          },
+          {
+            "id": "voice-search",
+            "label": {
+              "vi": "Voice và search tách critical path",
+              "en": "Separate voice and search"
+            },
+            "steps": [
+              {
+                "from": "media",
+                "to": "api",
+                "description": {
+                  "vi": "Voice join kiểm scope và media-session permissions.",
+                  "en": "Authorize voice/media-session scope."
+                }
+              },
+              {
+                "from": "api",
+                "to": "voice",
+                "description": {
+                  "vi": "Issue scoped session/region và negotiated secure signaling.",
+                  "en": "Issue scoped regional sessions and secure signaling."
+                }
+              },
+              {
+                "from": "media",
+                "to": "voice",
+                "description": {
+                  "vi": "Media đi trực tiếp qua selected forwarding path.",
+                  "en": "Send media directly through forwarding paths."
+                },
+                "async": true
+              },
+              {
+                "from": "log",
+                "to": "search",
+                "description": {
+                  "vi": "Async index committed creates/edits/deletes với versions và current ACL constraints.",
+                  "en": "Asynchronously index committed mutations with versions and current ACL constraints."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "6. API và ordering contracts của ví dụ",
+        "en": "6. Example APIs and ordering contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các endpoints sau thuộc platform minh họa, không là Discord SDK/API guide. POST dùng scoped nonce + fingerprint/result retention; query cursor phải opaque hoặc validate được, include ordering/tie-break và generation nếu cần. Message ID có thể time-sortable nhưng concurrent generators/clock skew không chứng minh causal commit order; nếu product cần per-channel order thì phải có ordering authority/protocol rõ.",
+          "en": "These example endpoints are not Discord API guidance. Scope nonce/fingerprint/replay contracts and validate cursors carrying ordering, ties and generations as required. Time-sortable IDs do not establish causal commits under concurrent generators/skew; per-channel order requires explicit authority/protocols."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/channels/{id}/messages",
+          "description": {
+            "vi": "Authorize và commit một message theo user/channel nonce.",
+            "en": "Authorize and commit a scoped message."
+          },
+          "request": "{ \"nonce\":\"send-17\", \"content\":\"hello\", \"attachmentRefs\":[] }",
+          "response": "201 { messageId, mutationVersion, committedAt, deliveryStatus: \"queued\" }",
+          "notes": [
+            {
+              "vi": "Nonce reuse với changed payload bị reject; queued delivery chưa chứng minh mọi client nhận.",
+              "en": "Reject changed keyed payloads; queued delivery does not establish client receipt."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/channels/{id}/messages?before={cursor}&limit=50",
+          "description": {
+            "vi": "History page dưới current permission và declared snapshot/read floor.",
+            "en": "Read history under current permissions and snapshot/read floors."
+          },
+          "response": "200 { items, nextCursor, observedGeneration, watermark }",
+          "notes": [
+            {
+              "vi": "Coalescing key gồm query/permission-equivalent scope; user chưa thấy write của mình có thể yêu cầu min version.",
+              "en": "Merge only equivalent queries/scopes; read-your-writes may require minimum versions."
+            }
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/messages/{id}",
+          "description": {
+            "vi": "Edit/delete có mutation version và permission check riêng.",
+            "en": "Versioned edits/deletes have separate permission checks."
+          },
+          "request": "{ \"expectedVersion\":7, \"operationNonce\":\"edit-4\", \"content\":\"updated\" }",
+          "response": "200 { messageId, mutationVersion:8 } | conflict / forbidden",
+          "notes": [
+            {
+              "vi": "Delete là durable mutation/tombstone cần tới index/history/projections; không chỉ remove DOM node.",
+              "en": "Deletion is a durable mutation propagated to history/index/projections, not just DOM removal."
+            }
+          ]
+        },
+        {
+          "method": "WS",
+          "path": "/gateway (illustrative protocol)",
+          "description": {
+            "vi": "Identify/resume, heartbeat, subscribe và session-sequenced dispatch.",
+            "en": "Identify/resume, heartbeat, subscription and sequenced dispatch."
+          },
+          "request": "{ op:\"resume\", sessionId, lastAppliedSeq, subscriptionsVersion }",
+          "response": "{ replay | snapshotRequired | invalidSession | forbidden, watermark }",
+          "notes": [
+            {
+              "vi": "Reauthorize khi resume/focus; replay retention và heartbeats/session liveness không là message durability.",
+              "en": "Reauthorize on resume/focus; heartbeats/liveness and replay retention do not establish durability."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "history",
+      "title": {
+        "vi": "7. Buckets, cursor và mutation/deletion versions",
+        "en": "7. Buckets, cursors and mutation/deletion versions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn bucket theo workload distribution và target partition size/scan cost, không một fixed số ngày cho mọi channel. Quiet channel cần negative caching/index metadata để không scan vô hạn empty buckets; busy channel có thể cần adaptive splits hoặc dedicated admission. Stable pagination dùng ordered keys và tie-break; concurrent new writes, edits/deletes và cross-bucket pages phải có snapshot/freshness semantics rõ.",
+          "en": "Choose buckets by distribution, partition size and scan costs rather than one universal day count. Quiet channels need empty-bucket bounds/metadata; busy channels may need splits or dedicated admission. Pagination needs stable ordering/ties and declared behavior under concurrent writes/mutations and bucket crossings."
+        },
+        {
+          "vi": "Deletes tạo tombstones hoặc versioned records; compaction/garbage collection phải tôn trọng replication/replay horizons để không resurrect stale copies. Search backfill và client old-page merge cũng cần versions. Một engine có consistency knobs phải chọn theo contract: replication factor không tự là durable ACK hoặc read-your-writes. Repair, node failure và restore cần kiểm accepted message survival theo stated RPO.",
+          "en": "Deletion evidence must survive replication/replay horizons to avoid resurrection. Backfills and stale client pages need versions too. Replication counts do not independently define ACK durability or read-your-writes. Test repair, failures and restore against accepted-message/RPO contracts."
+        },
+        {
+          "vi": "Một channel nhiều readers cùng page tạo hot-read work khác write partition growth. Caching recent pages giúp repeated completed reads; singleflight chỉ merge overlapping equivalent reads. Hai cơ chế có staleness/invalidation và cancellation khác nhau. Không đổi store để che permission-key bug hoặc local queue không bound.",
+          "en": "Same-page read storms differ from partition growth. Cached results and in-flight merging have different staleness, invalidation and cancellation rules. Engine changes do not repair authorization keys or unbounded queues."
+        }
+      ]
+    },
+    {
+      "id": "coalescing",
+      "title": {
+        "vi": "8. Coalescing: full query identity và consistency floor",
+        "en": "8. Coalescing needs full query identity and consistency floors"
+      },
+      "paragraphs": [
+        {
+          "vi": "Channel ID là affinity key để nhiều reads có cơ hội gặp nhau. Merge key cần đủ tenant/channel, cursor/range/limit, filters/schema và authorization-equivalent scope/permission version. Nếu upstream chỉ merge raw storage rows chưa filter, downstream vẫn phải authorize từng response trước delivery. Không dùng role name đơn lẻ làm proof hai users thấy cùng dữ liệu khi có private history, blocks hoặc per-user filtering.",
+          "en": "Channel IDs create affinity, while merge keys include tenants, ranges, cursors/limits, filters/schema and equivalent authorization scope/version. Raw-storage merging still requires per-response authorization. A role name alone cannot establish identical visibility under private history, blocking or personal filters."
+        },
+        {
+          "vi": "Read-your-writes yêu cầu snapshot trả ít nhất known version; inflight read bắt đầu trước write có thể không đạt. Đừng để user mới yêu cầu minVersion2 join worker đang giữ snapshot1. Có thể đợi một query mới, đọc authority hoặc explicit stale response theo approved policy. Worker timeout/cancellation cần bounded lifetime và waiter count; client hủy không nên làm mất work của waiters khác trừ shared cancellation contract.",
+          "en": "Read-your-writes may require a known version; pre-write in-flight snapshots can fail it. Do not join minimum-version-two readers to version-one work. Start/read suitable authority or expose approved staleness. Bound worker lifetimes/waiters, with cancellation policies that account for other waiters."
+        },
+        {
+          "vi": "Lab dùng mixed requests để thấy query count thấp có thể là kết quả sai. Một distributed coordinator/shared cache cũng có thể merge cross-instance work; consistent hashing là một cách localize, không mathematical requirement duy nhất. Với arrivals kéo dài qua nhiều latency windows, cùng key vẫn tạo nhiều queries theo thời gian; không hứa một query/channel vĩnh viễn.",
+          "en": "The mixed fixture shows that low query counts can be wrong. Shared coordination can merge across instances; hashing is one localization choice rather than the only possibility. Multiple arrival windows create multiple queries even for one key, not one perpetual channel query."
+        }
+      ],
+      "experiment": "community-reads"
+    },
+    {
+      "id": "fanout",
+      "title": {
+        "vi": "9. Active audiences, relays và bounded slow consumers",
+        "en": "9. Active audiences, relays and bounded slow consumers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Phân loại content messages, unread counters, mentions, typing, presence và member diffs. Active-viewers policy có thể bỏ full content tới passive sessions, nhưng product vẫn có thể cần coarse unread/notification updates. Permissions phải check cho cả cached/current subscription; revocation cần propagation/freshness policy và reauthorize history/search. Audience contract sai có thể làm user missed notification hoặc lộ restricted content.",
+          "en": "Distinguish content, unread, mentions, typing, presence and member diffs. Passive sessions may skip content while retaining coarse notifications. Cached subscriptions still need permission freshness/revocation and reauthorized history/search. Wrong audience contracts cause omissions or leaks."
+        },
+        {
+          "vi": "Relay fan-out chia CPU/serialization và node-level copies, không xóa per-recipient egress. Slow consumer queue cần bytes/event/age bounds. Ephemeral updates có thể latest-value coalesce; durable content được gap-mark để client catch-up theo cursor/history. Không tự drop message rồi ACK như đã apply. Catch-up load và resubscribe storm cần quota/backoff/fairness để overload không đổi từ relay sang archive.",
+          "en": "Relays distribute copying without removing recipient egress. Bound queues by bytes, count and age. Coalesce ephemeral state where valid; mark durable-content gaps for cursor/history reconciliation rather than silently dropping with applied ACKs. Bound catch-up and resubscribe load so overload does not simply move to storage."
+        }
+      ],
+      "experiment": "community-fanout"
+    },
+    {
+      "id": "resume",
+      "title": {
+        "vi": "10. Resume, snapshot watermark và race với live",
+        "en": "10. Resume watermarks and live races"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một replay buffer hữu hạn chỉ đủ khi session/cursor hợp lệ và gap còn retained. Cursor ngoài horizon cần authoritative snapshot/current history, không chỉ replay suffix rồi coi đủ. Snapshot có watermark; events sau watermark trong lúc snapshot đang tải phải buffer/bridge hoặc phát explicit gap. ACK last received không thay last applied contiguous cursor, nhất là client song song apply events hoặc có holes.",
+          "en": "Finite buffers cover only valid sessions/cursors and retained gaps. Expired gaps require snapshots/history, not an incomplete suffix. Watermarks bridge live arrivals during snapshot transfer or expose gaps. Last received is not applied contiguous progress under parallel application or holes."
+        },
+        {
+          "vi": "Version guard/tombstones ngăn late old-page fetch resurrect deleted content. Retention của deletion evidence cần bao phủ stale reads/replay/backfill hoặc một generation barrier bắt resync. Authoritative channel permission tại resume có thể deny dù old token/session valid format; server không thể thu hồi data/screenshots users đã lưu trước đó. Cần phân biệt no-new-delivery policy với guarantee xóa mọi bản copy ngoài tầm kiểm soát.",
+          "en": "Versions/tombstones prevent stale-page resurrection, retained through relevant horizons or replaced by resync generations. Current permissions may deny valid-looking old sessions. Servers cannot reclaim previously saved data/screenshots, so no-new-delivery differs from universal erasure."
+        }
+      ],
+      "experiment": "community-resume"
+    },
+    {
+      "id": "search-members",
+      "title": {
+        "vi": "11. Search, member ranges và read markers",
+        "en": "11. Search, member ranges and read markers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Search tiêu thụ committed edits/deletes, bulk index với object versions và checkpoints; query phải enforce current scope trước trả results. If stale index candidate bị deleted/revoked, revalidate/filter theo policy và fill page/recall có ý thức. Application-level cluster routing giúp blast radius nhưng cần versioned mapping, rebalance/read completeness và migration guards. Index lag là feature trade-off, không quyền bỏ deletion hoặc ACL correctness.",
+          "en": "Search consumes committed mutations, versioned bulk indexing and checkpoints, enforcing current scope. Filter stale/deleted candidates with explicit recall/page behavior. Cluster routing needs versioned mappings and complete rebalances. Index lag never waives deletion/permission correctness."
+        },
+        {
+          "vi": "Member list lazy ranges cần snapshot/list version, stable sort và rank-shift handling. Insert phía trước visible window có thể dịch mọi row; client cần diffs hoặc rebase snapshot chứ không chỉ update old-rank-in-range. Read markers thường monotonic theo channel order nhưng “mark unread” là operation khác có semantics/version; dirty-cache writeback không được làm rollback current read state khi worker retry.",
+          "en": "Lazy member windows need versions, stable ordering and rank-shift handling; insertions before a viewport may require rebasing. Read markers may be monotonic while mark-unread is a separate operation. Version dirty writeback so retries cannot regress current state."
+        },
+        {
+          "vi": "Profiling có thể dẫn tới sorted mutable structures/native code hoặc hot-service rewrite. Native calls cần scheduler budget, safe lifetime/FFI và failure testing; Rust không làm mọi native boundary crash-free hoặc latency-free. Historical read-state GC findings phản ánh workload/runtime thời điểm đó, không kết luận Go/Elixir hiện tại luôn chậm hơn Rust.",
+          "en": "Profiles may justify native sorted structures or narrow rewrites, with scheduler, lifetime/FFI and failure testing. Rust does not make every boundary crash/latency free. Historical GC results describe dated workloads rather than universal language rankings."
+        }
+      ]
+    },
+    {
+      "id": "voice",
+      "title": {
+        "vi": "12. Voice/media: bandwidth, subscriptions và failure budget",
+        "en": "12. Voice/media bandwidth, subscriptions and failures"
+      },
+      "paragraphs": [
+        {
+          "vi": "Signaling kiểm permission/join/mute/deafen và cấp media session scoped theo channel/device/region. Media fleet forward streams qua negotiated secure transport, có congestion control, packet loss recovery/jitter buffers và NAT/relay behavior. SFU forward encoded streams, MCU decode/mix/encode; choice phụ thuộc devices, group size, recording/processing và latency. SFU không có nghĩa mọi CPU work bằng zero hoặc egress không tăng.",
+          "en": "Signaling authorizes scoped media sessions. Media forwarding needs negotiated security, congestion handling, jitter/loss policies and NAT/relays. SFUs forward encoded streams while MCUs mix; device, group, processing and latency requirements guide choices. Forwarding still costs CPU and egress."
+        },
+        {
+          "vi": "Ví dụ 12 participants, 3 active speakers, mỗi stream 32 Kbps: ingress SFU ≈96 Kbps; nếu mọi speaker stream tới 11 người còn lại thì egress≈3×11×32=1056 Kbps trước overhead/redundancy. Selective subscriptions/silence suppression có thể giảm; video simulcast/layers có budgets khác. Media latency cần capture/encode/network/jitter/decode/playout; không dùng text-message p99 làm voice SLA.",
+          "en": "For twelve participants and three 32-Kbps speakers, SFU ingress is about 96 Kbps; forwarding each stream to eleven others needs about 1056 Kbps egress before overhead/redundancy. Selection/silence suppression can reduce this; video layers differ. Measure capture, encode, network, buffering, decode and playout rather than text p99."
+        },
+        {
+          "vi": "Transport encryption bảo vệ đường truyền theo trust boundary; E2EE thêm client key distribution, membership changes, device verification và recording/moderation trade-offs. Forwarding có thể hoạt động với application-encrypted media nhưng signaling/traffic metadata và authorization vẫn tồn tại. Bài này không mô tả crypto/protocol hiện tại của Discord; tránh dùng historical implementation làm security guidance hiện hành.",
+          "en": "Transport and end-to-end security have different trust/key boundaries. E2EE needs membership/device key management and affects processing. Forwarding encrypted media still involves signaling, metadata and authorization. Historical protocol choices are not current product-security guidance."
+        }
+      ]
+    },
+    {
+      "id": "storage-migration",
+      "title": {
+        "vi": "13. Store migration và disk optimization không phải một bước",
+        "en": "13. Store migration and disk optimization are distinct"
+      },
+      "paragraphs": [
+        {
+          "vi": "MongoDB→Cassandra→ScyllaDB là một lịch sử workload-driven, không chứng minh một engine luôn tốt hơn engine khác. Query layout, compaction/tombstones, replica/read/write settings và actual workload phải đo. Coalescing/admission giảm amplification trước khi benchmark store mới. Migration cần change capture/dual-write có recovery, source versions, delete tombstones, checkpointed backfill và shadow verification; counts bằng nhau chưa đủ content/order correctness.",
+          "en": "The dated store evolution does not rank engines universally. Measure layouts, tombstones/compaction, replica settings and workload. Bound amplification before evaluating engines. Migrations need recoverable change capture, versions, tombstones, checkpointed backfills and comparisons; equal counts do not prove correct content/order."
+        },
+        {
+          "vi": "Cutover phải verify readiness/frontier và old/new read semantics. Rollback sau new-only mutations cần reverse sync/freeze-repair; đặc biệt deletes không được resurrect. Backfill throughput có thể giảm do tombstone-heavy ranges hoặc uneven partitions; checkpoint/backoff và live-traffic reserves quan trọng hơn peak rows/s trên range dễ. TTL/retention và moderation deletions phải được áp đồng nhất qua stores/indexes/backups theo product policy.",
+          "en": "Verify cutover frontiers and read semantics. Rolling back new-only mutations needs reverse sync/repair without resurrection. Tombstone-heavy ranges and skew can dominate backfills, so checkpoints, backoff and live reserves matter more than easy-range peak throughput. Apply retention/deletion policies across projections and copies."
+        },
+        {
+          "vi": "Storage tier có local SSD read preference và durable backing cần write-order/flush/ACK semantics, bad-sector handling, rebuild trust và degraded-mode alerts. Mirror giảm một số failure classes, không thay database replication hoặc backups. Các kỹ thuật RAID/write-mostly là ví dụ để hiểu IO behavior; không chạy commands thiết lập disks ở lab hoặc khuyên áp chung khi chưa review data-loss modes.",
+          "en": "Local read tiers with durable backing need ordering, flush/ACK semantics, bad-sector handling, trusted rebuilds and degraded alerts. Mirroring does not replace replication/backups. RAID/write-mostly illustrates I/O behavior, not executable universal disk guidance."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Kỹ thuật / ví dụ",
+            "en": "Technique / example"
+          },
+          {
+            "vi": "Mục đích",
+            "en": "Purpose"
+          },
+          {
+            "vi": "Giới hạn · Community Chat",
+            "en": "Limit"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Guild actors / Elixir",
+              "en": "Guild actors / Elixir"
+            },
+            {
+              "vi": "Local ownership, lightweight sessions và event routing.",
+              "en": "Local ownership, lightweight sessions and routing."
+            },
+            {
+              "vi": "Ownership epochs/recovery và hot mailboxes vẫn cần kiểm.",
+              "en": "Test epochs, recovery and hot mailboxes."
+            }
+          ],
+          [
+            {
+              "vi": "Node batching / Manifold-style",
+              "en": "Node batching / Manifold-style"
+            },
+            {
+              "vi": "Giảm upstream remote copies.",
+              "en": "Reduce upstream remote copies."
+            },
+            {
+              "vi": "Recipient egress và ACL checks vẫn còn.",
+              "en": "Recipient egress and ACL checks remain."
+            }
+          ],
+          [
+            {
+              "vi": "Lazy ranges / native sorted sets",
+              "en": "Lazy ranges / native sorted sets"
+            },
+            {
+              "vi": "Bound member view và tối ưu measured mutation cost.",
+              "en": "Bound views and optimize measured mutation cost."
+            },
+            {
+              "vi": "Rank shifts, FFI/scheduler safety và snapshot consistency.",
+              "en": "Rank shifts, FFI/scheduler safety and snapshot consistency."
+            }
+          ],
+          [
+            {
+              "vi": "Data services / singleflight",
+              "en": "Data services / singleflight"
+            },
+            {
+              "vi": "Affinity + equivalent overlapping queries.",
+              "en": "Affinity and equivalent overlapping queries."
+            },
+            {
+              "vi": "Full key, consistency floor, bounded lifetime/cancellation.",
+              "en": "Full keys, floors, bounded lifetime and cancellation."
+            }
+          ],
+          [
+            {
+              "vi": "Cassandra / ScyllaDB",
+              "en": "Cassandra / ScyllaDB"
+            },
+            {
+              "vi": "Partitioned channel history và measured engine choices.",
+              "en": "Partitioned histories and measured engine choices."
+            },
+            {
+              "vi": "Skew/tombstones/migration/repair không biến mất theo engine name.",
+              "en": "Skew, tombstones, repair and migration remain."
+            }
+          ],
+          [
+            {
+              "vi": "Local + durable storage",
+              "en": "Local + durable storage"
+            },
+            {
+              "vi": "Fast read path với declared durable write boundary.",
+              "en": "Fast reads with declared durable write boundaries."
+            },
+            {
+              "vi": "ACK/rebuild/integrity, replication và backups là layers riêng.",
+              "en": "ACKs, rebuilds, replication and backups are separate layers."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "14. Failure matrix: hot guild, ACL và recovery",
+        "en": "14. Failure matrix: hot guilds, permissions and recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Track tail delivery lag theo guild-size bucket/channel/session cohort; average toàn cụm che large-community failures. Metrics cần owner mailbox, relay queue bytes/age, history scans/tombstones, coalescing waiters, resume gap/full snapshot rate và permission freshness. Dùng correlation IDs thay vì log toàn content/private membership data.",
+          "en": "Segment delivery tails by guild size/channel/session; global averages hide large-community failures. Observe mailboxes, queue bytes/age, scans/tombstones, waiters, resume gaps/snapshots and permission freshness. Correlate using IDs without logging private content/memberships."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Required behavior",
+            "en": "Required behavior"
+          },
+          {
+            "vi": "Evidence",
+            "en": "Evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Lost send reply",
+              "en": "Lost send reply"
+            },
+            {
+              "vi": "Same nonce replay, committed content vẫn đọc được.",
+              "en": "Replay the same nonce and preserve readable committed content."
+            },
+            {
+              "vi": "Durable result/content và event intent.",
+              "en": "Durable results/content and event intent."
+            }
+          ],
+          [
+            {
+              "vi": "Owner/relay restart",
+              "en": "Owner/relay restart"
+            },
+            {
+              "vi": "Fence old owner, rebuild versions và explicit replay gaps.",
+              "en": "Fence old owners, rebuild versions and expose gaps."
+            },
+            {
+              "vi": "Epochs, durable config, session cursors và coverage.",
+              "en": "Epochs, configuration, cursors and coverage."
+            }
+          ],
+          [
+            {
+              "vi": "Wrong coalescing key",
+              "en": "Wrong coalescing key"
+            },
+            {
+              "vi": "No shared data vượt scope/cursor/freshness contract.",
+              "en": "No scope, cursor or freshness violations."
+            },
+            {
+              "vi": "Mixed role/personal filter/cursor/min-version fixtures.",
+              "en": "Mixed scopes, filters, cursors and version floors."
+            }
+          ],
+          [
+            {
+              "vi": "Slow viewer / catch-up storm",
+              "en": "Slow viewer / catch-up storm"
+            },
+            {
+              "vi": "Bound queue; retained history và reauthorized resync.",
+              "en": "Bound queues and preserve authorized history/resync."
+            },
+            {
+              "vi": "Queue age/bytes, gap watermark và archive admission.",
+              "en": "Queue age/bytes, gaps and archive admission."
+            }
+          ],
+          [
+            {
+              "vi": "Late edit/delete / old page",
+              "en": "Late edit/delete / old page"
+            },
+            {
+              "vi": "Monotonic mutation versions/tombstones hoặc generation resync.",
+              "en": "Monotonic versions/tombstones or generation resync."
+            },
+            {
+              "vi": "Replay plus backfill/late-page deleted-message test.",
+              "en": "Replay, backfill and stale-page deletion tests."
+            }
+          ],
+          [
+            {
+              "vi": "Media region loss",
+              "en": "Media region loss"
+            },
+            {
+              "vi": "Secure resignal/rejoin theo current channel permissions.",
+              "en": "Secure rejoin under current permissions."
+            },
+            {
+              "vi": "Packet/quality stats, device cohorts và credential expiry.",
+              "en": "Quality, device cohorts and credential expiry."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Luyện deep dives bằng các phản ví dụ",
+        "en": "15. Practice deep dives through counterexamples"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một câu trả lời dễ kiểm là một Send trace, một giant-guild workload và ba fault windows. Nêu audience của từng event và ACK nghĩa gì trước khi liệt kê products. Những câu dưới dùng teaching contracts; implementation/protocol của sản phẩm thật phải kiểm riêng theo version.",
+          "en": "Ground answers in one send trace, one large-guild workload and fault windows. Define audiences and ACKs before listing products. These answers use teaching contracts; actual product protocols need version-specific validation."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Một message tới guild một triệu members là O(N²)?",
+            "en": "Is one message to a million-member guild quadratic?"
+          },
+          "answer": [
+            {
+              "vi": "Không, content copy work là O(actual recipients). Quadratic cần event rate cũng tăng O(N), ví dụ mỗi user gửi presence tới mọi user. Active audiences giảm full content; relays giảm owner work nhưng bytes tới recipients vẫn còn.",
+              "en": "No. One message scales with recipients. Quadratic work requires event rate also grow with users, such as all-to-all presence. Audience selection reduces content and relays distribute ownership work without removing recipient bytes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Coalescing key chỉ channel ID có sao không?",
+            "en": "Why is channel-only merging unsafe?"
+          },
+          "answer": [
+            {
+              "vi": "Same channel có scope, cursor, limit, filters và min consistency khác. Mod result có thể leak sang member; old page trả sai cursor; inflight snapshot trước write không đủ minVersion. Affinity key có thể channel nhưng merge identity phải đầy đủ hoặc post-authorize raw rows theo contract.",
+              "en": "Scopes, cursors, filters and consistency differ. Moderator data can leak, pages can mismatch and old snapshots can violate write visibility. Affinity can use channels while merging needs full equivalence or explicit per-response authorization."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Không affinity có merge được không?",
+            "en": "Can merging work without affinity?"
+          },
+          "answer": [
+            {
+              "vi": "Local-only singleflight merge ít hơn khi same key bị split giữa instances. Shared coordinator/cache cũng có thể merge cross-instance nên affinity không mathematical requirement. Cost/availability/deadlines và full-key semantics vẫn phải giải quyết; multi-window arrivals vẫn tạo nhiều queries.",
+              "en": "Local merging loses effectiveness across instances; shared coordination can merge globally, so affinity is not a mathematical requirement. Costs, availability, deadlines and equivalence remain, and multiple time windows still create multiple queries."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Passive session có bỏ mọi notification không?",
+            "en": "Does passive mode suppress every notification?"
+          },
+          "answer": [
+            {
+              "vi": "Không mặc định. Full content, unread, mention, presence và push có audiences riêng. Rejoin/focus cần reauthorize và snapshot/live bridge; không silent skip committed content rồi claim cursor caught-up.",
+              "en": "No. Content, unread, mentions, presence and push have separate audiences. Rejoining requires authorization and bridged catch-up without silent cursor gaps."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "History snapshot xong nối live socket có thể thiếu gì?",
+            "en": "What can a snapshot followed by live subscription miss?"
+          },
+          "answer": [
+            {
+              "vi": "Events giữa snapshot watermark và subscription activation. Subscribe/buffer trước snapshot hoặc bridge log sau watermark; bounded retention gap thì resync. ACK chỉ applied contiguous seq, và version/tombstone guard ngăn old page resurrect delete.",
+              "en": "It can miss events between watermark and subscription activation. Buffer first or bridge the log after the watermark, resynchronizing expired gaps. ACK applied contiguous progress and retain mutation/deletion guards."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đổi Go sang Rust là hết p99 spikes?",
+            "en": "Does rewriting Go into Rust eliminate p99 spikes?"
+          },
+          "answer": [
+            {
+              "vi": "Không. GC profile lịch sử có thể là một nguyên nhân; allocator/free/locks/IO/queues vẫn tồn tại. Profile đúng workload/runtime, bound service/memory và benchmark canary. Native code/NIF cũng cần scheduler và failure safety.",
+              "en": "No. Historical GC profiles identify one cause; allocation, freeing, locks, I/O and queues remain. Profile current workloads, bound memory and test canaries. Native boundaries need scheduler and failure safety."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "SFU gửi một stream mỗi sender thì bandwidth constant?",
+            "en": "Does one uploaded SFU stream make bandwidth constant?"
+          },
+          "answer": [
+            {
+              "vi": "Ingress mỗi sender có thể một stream, nhưng egress tăng theo receiver subscriptions. Ví dụ3speakers×11receivers×32Kbps≈1056Kbps. Selection/video layers/clientdecode, jitter và encryption/key model đều cần budgets riêng.",
+              "en": "Per-sender ingress can be one stream, while egress scales with subscriptions. Three speakers, eleven receivers each and 32 Kbps require about 1056 Kbps. Selection, layers, decoding, jitter and key models need separate budgets."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "RAID mirror hoặc RF3 đã đủ durability chưa?",
+            "en": "Does mirroring or three replicas establish durability?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa đủ nếu không biết write ACK/flush/order, replica consistency, correlated failure, repair/rebuild và backup contract. Test host/disk/region loss cùng pending writes; số copies không thay evidence của committed message survival.",
+              "en": "Not without ACKs, ordering/flush, consistency, correlated failures, repair and backups. Test pending writes under host/disk/region loss rather than infer durability from copy counts."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

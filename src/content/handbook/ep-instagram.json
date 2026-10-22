@@ -1,0 +1,3334 @@
+{
+  "id": "ep-instagram",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Photo Platform: từ upload đến feed, Stories và Reels",
+    "en": "Building a Photo Platform: from uploads to feeds, Stories and Reels"
+  },
+  "summary": {
+    "vi": "12 giai đoạn kiến trúc, upload/read/delete traces, exact ID fields, publication races và Story expiry/seen holes; giữ metadata authority tách media và projections.",
+    "en": "Twelve architecture stages, upload/read/delete traces, exact ID fields, publication races and Story expiry/viewed-state holes separate metadata authority from media and projections."
+  },
+  "prerequisites": [
+    "news-feed",
+    "object-storage",
+    "unique-ids",
+    "video-platform"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "database",
+    "cache",
+    "storage-search"
+  ],
+  "takeaways": [
+    {
+      "vi": "Bytes ở storage/CDN; durable metadata quyết readiness, audience và delete.",
+      "en": "Storage/CDN hold bytes; durable metadata authorizes readiness, audiences and deletion."
+    },
+    {
+      "vi": "Logical identity tách physical placement; shard move cần cutover/fencing.",
+      "en": "Separate logical identity from physical placement; shard moves need cutover/fencing."
+    },
+    {
+      "vi": "ID bit layout không thay allocator protocol, exact transport hoặc commit ordering.",
+      "en": "ID layouts do not replace allocation protocols, exact transport or commit ordering."
+    },
+    {
+      "vi": "Cache TTL không là serving expiry hoặc physical deletion proof.",
+      "en": "Cache TTL is neither serving expiry nor proof of physical deletion."
+    },
+    {
+      "vi": "Feed/ranking và Stories có pagination/viewed-state contracts riêng.",
+      "en": "Feeds, ranking and Stories need explicit pagination/viewed-state contracts."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Theo dõi bytes và authority riêng",
+      "en": "Track bytes and authority separately"
+    },
+    "caption": {
+      "vi": "Một shared post có nhiều representations với consistency khác nhau.",
+      "en": "A shared post has representations with distinct consistency."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Upload",
+          "en": "Upload"
+        },
+        "detail": {
+          "vi": "Scoped staging bytes chưa public.",
+          "en": "Scoped staging bytes remain private."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Process",
+          "en": "Process"
+        },
+        "detail": {
+          "vi": "Durable intent → guarded complete generations.",
+          "en": "Durable intent → guarded complete generations."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Discover",
+          "en": "Discover"
+        },
+        "detail": {
+          "vi": "Candidates → eligibility → ranking/hydration.",
+          "en": "Candidates → eligibility → ranking/hydration."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Expire / delete",
+          "en": "Expire / delete"
+        },
+        "detail": {
+          "vi": "Current serving policy trước async cleanup.",
+          "en": "Current serving policy before asynchronous cleanup."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Từ photo app đến nhiều product surfaces",
+        "en": "1. From a photo app to multiple product surfaces"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài này xây một photo/video social platform kiểu Instagram theo pressures: media volume, metadata placement, feed latency, ephemeral surfaces và geography. Các giai đoạn là teaching design có giả định rõ; không khẳng định đây là sơ đồ production hiện tại. Một stack quen thuộc vẫn có thể đi xa nếu access pattern, durability và ownership được thiết kế tốt.",
+          "en": "This lesson builds an Instagram-style photo/video platform around media volume, metadata placement, feed latency, ephemeral surfaces and geography. Stages are teaching designs with explicit assumptions rather than a current production inventory. Familiar tools can scale when access patterns, durability and ownership are sound."
+        },
+        {
+          "vi": "Phạm vi có publish ảnh/video, follow/private audiences, feed, Stories, delete và retries. Ads, messaging và copyright enforcement là domains khác cần contracts riêng; mention chúng không đồng nghĩa thiết kế đầy đủ từng domain. Mọi bài toán sizing dưới đây là fixture để luyện reasoning.",
+          "en": "Scope includes photo/video publishing, following/private audiences, feeds, Stories, deletion and retries. Advertising, messaging and copyright enforcement need separate contracts; naming them does not fully design them. Sizing below is illustrative reasoning."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Post authority",
+            "en": "Post authority"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Author, current generation, visibility, readiness và tombstone là durable state.",
+              "en": "Authors, current generations, visibility, readiness and tombstones are durable state."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Media plane",
+            "en": "Media plane"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Bytes immutable ở storage/CDN, scoped authorization và lifecycle.",
+              "en": "Immutable storage/CDN bytes with scoped authorization and lifecycle."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Projections",
+            "en": "Projections"
+          },
+          "icon": "chart",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Feed/search/tray/cache có lag, replay và rebuild; không thay current permission.",
+              "en": "Feeds, search, trays and caches have lag/rebuild semantics and never replace current permissions."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "invariants",
+      "title": {
+        "vi": "2. State machine và ACK boundary trước service list",
+        "en": "2. State machines and ACK boundaries before service lists"
+      },
+      "paragraphs": [
+        {
+          "vi": "Upload session và published post không cùng lifecycle. Upload slot chỉ cho phép ghi một staging key; PROCESSING ACK nghĩa metadata/intent durable, không nghĩa post đã playable. READY chỉ sau validated authorized renditions; failed processing có visible pending/error contract. Retry cùng finalize ID trả cùng post/result, payload conflict bị reject.",
+          "en": "Uploads and posts have distinct lifecycles. Slots permit staging writes; PROCESSING acknowledgements promise durable metadata/intent, not playability. READY requires validated authorized renditions, and failures have explicit pending/error behavior. Finalization retries preserve post/results and reject payload conflicts."
+        },
+        {
+          "vi": "Mọi downstream worker/index update giữ mutation/generation version. Tombstone chặn stale work sau delete; latest job completion không tự thắng latest business mutation. Caption edit, audience change và media replacement có thể cần versions khác: define field ownership/merge thay vì một integer tăng tùy tiện ở mọi service.",
+          "en": "Workers and projections retain generation/mutation versions. Tombstones block stale work; the last job to finish does not override the latest business mutation. Captions, audiences and media may need distinct version domains with explicit ownership and merges."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Publish lifecycle",
+          "en": "Publish lifecycle"
+        },
+        "caption": {
+          "vi": "Chỉ có quyền serve khi state và audience đều cho phép.",
+          "en": "Serving requires both state and audience authorization."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Upload",
+              "en": "Upload"
+            },
+            "detail": {
+              "vi": "Scoped staging object, chưa public.",
+              "en": "Scoped staging objects remain private."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Commit",
+              "en": "Commit"
+            },
+            "detail": {
+              "vi": "PROCESSING + idempotent result + durable intent.",
+              "en": "PROCESSING, keyed results and durable intent."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Ready",
+              "en": "Ready"
+            },
+            "detail": {
+              "vi": "Conditional generation transition sau processing.",
+              "en": "Conditional generation transitions after processing."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Serve / delete",
+              "en": "Serve / delete"
+            },
+            "detail": {
+              "vi": "Current permission/expiry; tombstone trước cleanup.",
+              "en": "Current permissions/expiry; tombstones precede cleanup."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 12 giai đoạn tiến hóa có exit criteria",
+        "en": "3. Twelve evolutionary stages with exit criteria"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đọc từng giai đoạn theo problem → decision → cost → next pressure. Không tách thêm service chỉ để tăng số boxes. Trước thay đổi kiến trúc, nêu baseline p99/error/cost và failure behavior cần giữ; sau thay đổi cần drill ở boundary mới.",
+          "en": "Read each stage as problem, decision, cost and next pressure. Additional boxes alone do not justify services. State baseline tails, errors, costs and required failure behavior, then drill new boundaries."
+        }
+      ],
+      "stages": [
+        {
+          "id": "mvp",
+          "title": {
+            "vi": "MVP: một app, metadata có transaction",
+            "en": "MVP: one app and transactional metadata"
+          },
+          "description": {
+            "vi": "Bắt đầu từ upload, profile, follow và chronological feed. Modular app dùng relational store cho metadata, object storage cho bytes, auth và indexed queries. Thử upload interrupted và lost finalize reply trước khi tách services; hai máy app cũng cần cùng source of truth cho session/upload state.",
+            "en": "Start with uploads, profiles, follows and a chronological feed. A modular app uses relational metadata, object storage, authorization and indexed queries. Test interrupted uploads and lost finalize replies before splitting services; even two app nodes need shared upload/session authority."
+          },
+          "problem": {
+            "vi": "Nhóm nhỏ cần release/debug nhanh với durable posts và predictable pagination.",
+            "en": "A small team needs fast delivery/debugging with durable posts and predictable pagination."
+          },
+          "decision": {
+            "vi": "Modular Django-style API, relational metadata và immutable blob keys; index author/time/id.",
+            "en": "Use a modular API, relational metadata and immutable blob keys with author/time/ID indexes."
+          },
+          "tradeoff": {
+            "vi": "Một deployment/database có blast radius lớn; giới hạn upload/body và quotas vẫn cần từ đầu.",
+            "en": "One deployment/database has a broad blast radius; upload/body limits and quotas are still required."
+          },
+          "nextPressure": {
+            "vi": "Download bytes và image processing chiếm app capacity.",
+            "en": "Downloads and processing consume application capacity."
+          },
+          "exitCriteria": {
+            "vi": "Retry finalize không tạo hai posts; pagination và restore có tests.",
+            "en": "Finalize retries preserve post identity; pagination and restore are tested."
+          },
+          "diagram": {
+            "id": "photo-stage-mvp",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "objects",
+                "label": {
+                  "vi": "Versioned media",
+                  "en": "Versioned media"
+                },
+                "detail": {
+                  "vi": "Originals/renditions với scoped access và lifecycle policy.",
+                  "en": "Originals/renditions with scoped access and lifecycle policies."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Finalize upload bằng stable request ID.",
+                      "en": "Finalize uploads with stable request IDs."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "objects",
+                    "description": {
+                      "vi": "Validate owned upload trước commit.",
+                      "en": "Validate owned uploads before commit."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Commit metadata và retained result.",
+                      "en": "Commit metadata and retained results."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "bytes",
+          "title": {
+            "vi": "Stateless APIs và CDN cho bytes",
+            "en": "Stateless APIs and CDN delivery"
+          },
+          "description": {
+            "vi": "Tách control-plane authorization khỏi media delivery. API cấp upload slot giới hạn owner/key/size/expiry; client upload trực tiếp, finalize kiểm tồn tại/checksum/type/ownership. CDN cache immutable renditions; private content cần serving authorization chứ URL khó đoán chưa đủ.",
+            "en": "Separate authorization from media delivery. APIs issue scoped upload slots; clients upload directly and finalization validates existence, integrity, type and ownership. CDNs cache immutable renditions; unguessable URLs alone do not authorize private content."
+          },
+          "problem": {
+            "vi": "Popular photos tạo nhiều byte traffic hơn metadata API.",
+            "en": "Popular photos generate far more byte traffic than metadata calls."
+          },
+          "decision": {
+            "vi": "LB + stateless app replicas, versioned object keys và CDN cache policy theo visibility.",
+            "en": "Use load-balanced replicas, versioned keys and visibility-aware CDN policies."
+          },
+          "tradeoff": {
+            "vi": "Signed URL/cache policy, origin egress, invalidation và abuse costs cần observability.",
+            "en": "Signed URLs, cache policy, origin egress, invalidation and abuse require observability."
+          },
+          "nextPressure": {
+            "vi": "Resize, safety scan và fan-out vẫn kéo dài publish path.",
+            "en": "Resizing, safety checks and fan-out still lengthen publication."
+          },
+          "exitCriteria": {
+            "vi": "App không proxy hot downloads; private URL không sống vượt revocation contract.",
+            "en": "Hot downloads bypass apps; private URLs obey the revocation contract."
+          },
+          "diagram": {
+            "id": "photo-stage-bytes",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "objects",
+                "label": {
+                  "vi": "Versioned media",
+                  "en": "Versioned media"
+                },
+                "detail": {
+                  "vi": "Originals/renditions với scoped access và lifecycle policy.",
+                  "en": "Originals/renditions with scoped access and lifecycle policies."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media CDN",
+                  "en": "Media CDN"
+                },
+                "detail": {
+                  "vi": "Cache generations theo visibility/expiry, không thay permission authority.",
+                  "en": "Caches generations under visibility/expiry without replacing permissions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Xin scoped media authorization.",
+                      "en": "Request scoped media authorization."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "objects",
+                    "description": {
+                      "vi": "Upload vào owned staging key.",
+                      "en": "Upload into owned staging keys."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Fetch permitted published rendition.",
+                      "en": "Fetch permitted published renditions."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "objects",
+                    "description": {
+                      "vi": "Cache miss tới correct generation.",
+                      "en": "Fetch the correct generation on misses."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "async",
+          "title": {
+            "vi": "Durable intent, workers và feed projections",
+            "en": "Durable intent, workers and feed projections"
+          },
+          "description": {
+            "vi": "Commit post processing state với outbox; workers validate/decode/resize rồi publish immutable generations. Readiness transition phát fan-out intent, worker retries dùng stable post/generation IDs. Feed lists là projections có rebuild path; hot cache không phải nơi duy nhất giữ post đã ACK.",
+            "en": "Commit processing state with an outbox. Workers validate and resize, then publish immutable generations. Readiness transitions emit fan-out intent; retries retain post/generation identity. Feed lists are rebuildable projections rather than the only durable copies."
+          },
+          "problem": {
+            "vi": "Slow CPU/I/O và follower fan-out không nên giữ connection finalize mở.",
+            "en": "Slow processing and fan-out should not hold finalization connections open."
+          },
+          "decision": {
+            "vi": "Queue + bounded workers; separate processing readiness và feed materialization.",
+            "en": "Use queues and bounded workers with separate readiness and feed materialization."
+          },
+          "tradeoff": {
+            "vi": "Lag, duplicate jobs, dead letters và orphan blobs cần recovery/drills.",
+            "en": "Lag, duplicate jobs, dead letters and orphan blobs need recovery and drills."
+          },
+          "nextPressure": {
+            "vi": "Metadata primary/index hoặc write throughput vượt measured budget.",
+            "en": "Metadata storage or write load exceeds measured budgets."
+          },
+          "exitCriteria": {
+            "vi": "Crash giữa commit và publish intent không làm post kẹt vĩnh viễn.",
+            "en": "Crashes between commits and event publication do not permanently strand posts."
+          },
+          "diagram": {
+            "id": "photo-stage-async",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Processing log",
+                  "en": "Processing log"
+                },
+                "detail": {
+                  "vi": "Durable jobs với stable identity, retention và replay bounds.",
+                  "en": "Durable jobs with stable identities, retention and replay bounds."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "workers",
+                "label": {
+                  "vi": "Media workers",
+                  "en": "Media workers"
+                },
+                "detail": {
+                  "vi": "Bounded validation/transcode/fan-out, stale generation rejected.",
+                  "en": "Bounded validation/transcoding/fan-out rejecting stale generations."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "objects",
+                "label": {
+                  "vi": "Versioned media",
+                  "en": "Versioned media"
+                },
+                "detail": {
+                  "vi": "Originals/renditions với scoped access và lifecycle policy.",
+                  "en": "Originals/renditions with scoped access and lifecycle policies."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "feeds",
+                "label": {
+                  "vi": "Feed projection",
+                  "en": "Feed projection"
+                },
+                "detail": {
+                  "vi": "IDs có rebuild/catch-up, dedup và authorization recheck.",
+                  "en": "Rebuildable IDs, catch-up, deduplication and permission rechecks."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Commit PROCESSING với durable intent.",
+                      "en": "Commit PROCESSING with durable intent."
+                    }
+                  },
+                  {
+                    "from": "metadata",
+                    "to": "events",
+                    "description": {
+                      "vi": "Publish committed intent qua outbox/CDC.",
+                      "en": "Publish committed intent through outbox/CDC."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "events",
+                    "to": "workers",
+                    "description": {
+                      "vi": "Deliver/retry cùng job identity.",
+                      "en": "Deliver/retry the same job identity."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "workers",
+                    "to": "objects",
+                    "description": {
+                      "vi": "Write immutable rendition generation.",
+                      "en": "Write immutable rendition generations."
+                    }
+                  },
+                  {
+                    "from": "workers",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Guard readiness bằng current generation.",
+                      "en": "Guard readiness by current generation."
+                    }
+                  },
+                  {
+                    "from": "workers",
+                    "to": "feeds",
+                    "description": {
+                      "vi": "Materialize only eligible post IDs.",
+                      "en": "Materialize eligible post IDs only."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "shards",
+          "title": {
+            "vi": "Logical shards và ID gắn routing",
+            "en": "Logical shards and routing-aware IDs"
+          },
+          "description": {
+            "vi": "Giữ tập logical buckets ổn định rồi map buckets tới physical hosts. Một ID có time/shard/sequence hỗ trợ routing nhưng không tự enforce ownership. Per-shard allocator phải xử lý burst overflow, clock rollback, restart và failover; writer epoch/fence ngăn hai owners tái sử dụng cùng sequence/time.",
+            "en": "Keep logical buckets stable and map them to physical hosts. Time/shard/sequence IDs aid routing but do not enforce ownership. Allocation must handle bursts, clock rollback, restart and failover; ownership fencing prevents competing allocators."
+          },
+          "problem": {
+            "vi": "Một database không đủ working set/write load; local autoincrements có thể trùng giữa databases.",
+            "en": "One database cannot hold the working set/load, and local autoincrements collide across databases."
+          },
+          "decision": {
+            "vi": "Author-affine placement, shard directory có epoch và allocator kiểm capacity.",
+            "en": "Use author-affine placement, epoch-aware shard directories and guarded allocation."
+          },
+          "tradeoff": {
+            "vi": "Cross-author access cần projections/scatter-gather; hot author vẫn có giới hạn.",
+            "en": "Cross-author reads need projections or scatter-gather; hot authors retain limits."
+          },
+          "nextPressure": {
+            "vi": "Long lists/events không cần relational transaction nhưng tổng dung lượng tăng.",
+            "en": "Long lists/events outgrow memory without needing every relational transaction."
+          },
+          "exitCriteria": {
+            "vi": "Move shard giữ stable IDs; stale old writer bị reject sau cutover.",
+            "en": "Shard moves preserve IDs and reject stale writers after cutover."
+          },
+          "diagram": {
+            "id": "photo-stage-shards",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "directory",
+                "label": {
+                  "vi": "Shard directory",
+                  "en": "Shard directory"
+                },
+                "detail": {
+                  "vi": "Logical-to-host mapping có ownership epoch và migration barrier.",
+                  "en": "Logical-to-host maps with ownership epochs and migration barriers."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "allocator",
+                "label": {
+                  "vi": "Shard allocator",
+                  "en": "Shard allocator"
+                },
+                "detail": {
+                  "vi": "Exclusive state, sequence capacity, clock/restart guards và exact strings.",
+                  "en": "Exclusive state, capacity, clock/restart guards and exact string transport."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "feeds",
+                "label": {
+                  "vi": "Feed projection",
+                  "en": "Feed projection"
+                },
+                "detail": {
+                  "vi": "IDs có rebuild/catch-up, dedup và authorization recheck.",
+                  "en": "Rebuildable IDs, catch-up, deduplication and permission rechecks."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "directory",
+                    "description": {
+                      "vi": "Resolve logical shard và current epoch.",
+                      "en": "Resolve logical shards and current epochs."
+                    }
+                  },
+                  {
+                    "from": "directory",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Route tới fenced current owner.",
+                      "en": "Route to fenced current owners."
+                    }
+                  },
+                  {
+                    "from": "metadata",
+                    "to": "allocator",
+                    "description": {
+                      "vi": "Allocate trong exclusive shard domain.",
+                      "en": "Allocate in the exclusive shard domain."
+                    }
+                  },
+                  {
+                    "from": "metadata",
+                    "to": "feeds",
+                    "description": {
+                      "vi": "Project committed READY post.",
+                      "en": "Project committed READY posts."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "large-data",
+          "title": {
+            "vi": "Tách hot set khỏi durable large datasets",
+            "en": "Separate hot sets from large durable datasets"
+          },
+          "description": {
+            "vi": "Giữ cache cho active feeds/objects, đánh giá disk-based partitioned stores cho long inboxes/activity/events. Chọn partition/query/retention trước engine; Cassandra-style replication và consistency level không tự giải mọi concurrent update. Metadata quan hệ vẫn có thể ở SQL.",
+            "en": "Cache active feeds/objects and evaluate partitioned disk storage for long histories and events. Choose queries, partitions and retention before engines. Replication/consistency levels do not solve every conflicting update, and relational metadata can remain in SQL."
+          },
+          "problem": {
+            "vi": "Giữ toàn bộ history trong RAM làm chi phí phụ thuộc total size thay vì hot set.",
+            "en": "All-history RAM costs scale with total data rather than the hot set."
+          },
+          "decision": {
+            "vi": "Separate durable archive và bounded caches; benchmark skew, compaction, tombstones và repair.",
+            "en": "Separate durable archives and bounded caches; benchmark skew, compaction, tombstones and repair."
+          },
+          "tradeoff": {
+            "vi": "Thêm storage engine tăng on-call, data model constraints và migration cost.",
+            "en": "Additional engines add operations, data-model constraints and migration cost."
+          },
+          "nextPressure": {
+            "vi": "Hạ tầng mới hoặc datacenter move cần giữ service liên tục.",
+            "en": "Infrastructure moves must preserve service continuity."
+          },
+          "exitCriteria": {
+            "vi": "Cold read/rebuild hoạt động sau cache loss; durability/ACK policy rõ.",
+            "en": "Cold reads/rebuilds work after cache loss with explicit durability/ACK policy."
+          },
+          "diagram": {
+            "id": "photo-stage-large-data",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "feeds",
+                "label": {
+                  "vi": "Feed projection",
+                  "en": "Feed projection"
+                },
+                "detail": {
+                  "vi": "IDs có rebuild/catch-up, dedup và authorization recheck.",
+                  "en": "Rebuildable IDs, catch-up, deduplication and permission rechecks."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "archive",
+                "label": {
+                  "vi": "Large data store",
+                  "en": "Large data store"
+                },
+                "detail": {
+                  "vi": "Query-driven partitioning, retention, compaction và repair.",
+                  "en": "Query-driven partitions, retention, compaction and repair."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "feeds",
+                    "description": {
+                      "vi": "Read hot candidate IDs.",
+                      "en": "Read hot candidate IDs."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "api",
+                    "to": "archive",
+                    "description": {
+                      "vi": "Cold-history read khi cần.",
+                      "en": "Read cold history when needed."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Hydrate/check current post eligibility.",
+                      "en": "Hydrate/check current post eligibility."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "migration",
+          "title": {
+            "vi": "Migrate mà không có hai write authorities",
+            "en": "Migrate without two write authorities"
+          },
+          "description": {
+            "vi": "Thiết lập network/identity và contract tương thích giữa môi trường cũ/mới. Backfill có version và CDC checkpoint, so shadow reads, catch up lag rồi activate new owner epoch. Rollback sau nhận writes ở target phải có reverse capture hoặc protocol rõ, không đơn giản đổi DNS về source cũ.",
+            "en": "Establish networking, identity and compatible contracts across environments. Version backfills and change checkpoints, compare shadow reads, then activate new ownership. Once the target accepts writes, rollback needs reverse capture or an explicit protocol rather than just old DNS."
+          },
+          "problem": {
+            "vi": "Big-bang migration làm rollback/data divergence không kiểm soát.",
+            "en": "Big-bang moves make rollback and divergence difficult to control."
+          },
+          "decision": {
+            "vi": "Incremental traffic/data cohorts, explicit cutover barriers và writer fencing.",
+            "en": "Use incremental cohorts, cutover barriers and fenced writers."
+          },
+          "tradeoff": {
+            "vi": "Dual-running capacity, replication load và stale connections kéo dài cost.",
+            "en": "Dual capacity, replication load and stale connections extend cost."
+          },
+          "nextPressure": {
+            "vi": "Một site vẫn là failure domain và xa nhiều users.",
+            "en": "One site remains a failure domain and is far from many users."
+          },
+          "exitCriteria": {
+            "vi": "Lost reply, backfill-after-delete và old-owner writes đều được fault-inject.",
+            "en": "Inject lost replies, backfill-after-delete and old-owner writes."
+          },
+          "diagram": {
+            "id": "photo-stage-migration",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "directory",
+                "label": {
+                  "vi": "Shard directory",
+                  "en": "Shard directory"
+                },
+                "detail": {
+                  "vi": "Logical-to-host mapping có ownership epoch và migration barrier.",
+                  "en": "Logical-to-host maps with ownership epochs and migration barriers."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "archive",
+                "label": {
+                  "vi": "Large data store",
+                  "en": "Large data store"
+                },
+                "detail": {
+                  "vi": "Query-driven partitioning, retention, compaction và repair.",
+                  "en": "Query-driven partitions, retention, compaction and repair."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Processing log",
+                  "en": "Processing log"
+                },
+                "detail": {
+                  "vi": "Durable jobs với stable identity, retention và replay bounds.",
+                  "en": "Durable jobs with stable identities, retention and replay bounds."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "directory",
+                    "description": {
+                      "vi": "Read authoritative routing epoch.",
+                      "en": "Read authoritative routing epochs."
+                    }
+                  },
+                  {
+                    "from": "metadata",
+                    "to": "events",
+                    "description": {
+                      "vi": "Capture committed changes ở source.",
+                      "en": "Capture committed source changes."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "events",
+                    "to": "archive",
+                    "description": {
+                      "vi": "Apply target versions/tombstones và verify.",
+                      "en": "Apply and verify target versions/tombstones."
+                    }
+                  },
+                  {
+                    "from": "directory",
+                    "to": "archive",
+                    "description": {
+                      "vi": "Activate target ownership sau barrier.",
+                      "en": "Activate target ownership after barriers."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "multi-site",
+          "title": {
+            "vi": "Nhiều sites: global metadata, regional work",
+            "en": "Multiple sites: global metadata and regional work"
+          },
+          "description": {
+            "vi": "Phân loại identity/graph/post authority, rebuildable caches và region-local jobs. Route write tới owner; read-your-writes có min version hoặc bounded primary route khi replica lag. Replication không thay backup; region failure cần writer fence và surviving capacity.",
+            "en": "Classify authoritative identity/graph/posts, rebuildable caches and regional work. Route writes to owners; preserve read-your-writes through version floors or bounded primary routing. Replication does not replace backups, and region recovery needs fencing and capacity."
+          },
+          "problem": {
+            "vi": "Site outage và cross-site latency ảnh hưởng product theo nhiều cách.",
+            "en": "Site failures and cross-site latency affect different product operations."
+          },
+          "decision": {
+            "vi": "Explicit ownership/replication/RPO cho từng dataset thay vì multi-master mọi thứ.",
+            "en": "Define ownership, replication and RPO per dataset rather than universal multi-master writes."
+          },
+          "tradeoff": {
+            "vi": "Lag, failover, delayed deletes và cross-region joins cần product semantics.",
+            "en": "Lag, failover, delayed deletions and remote joins need product semantics."
+          },
+          "nextPressure": {
+            "vi": "Feed chronological không tận dụng candidate relevance.",
+            "en": "Chronological feeds do not prioritize candidate relevance."
+          },
+          "exitCriteria": {
+            "vi": "Failover không có double writer; permission revoke không bị cache bypass.",
+            "en": "Failover preserves exclusive writers and caches never bypass permission revocation."
+          },
+          "diagram": {
+            "id": "photo-stage-multi-site",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "directory",
+                "label": {
+                  "vi": "Shard directory",
+                  "en": "Shard directory"
+                },
+                "detail": {
+                  "vi": "Logical-to-host mapping có ownership epoch và migration barrier.",
+                  "en": "Logical-to-host maps with ownership epochs and migration barriers."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "replica",
+                "label": {
+                  "vi": "Regional replica",
+                  "en": "Regional replica"
+                },
+                "detail": {
+                  "vi": "Version/lag metadata và explicit RPO, không tự write authority.",
+                  "en": "Version/lag evidence and explicit RPO without automatic write authority."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "feeds",
+                "label": {
+                  "vi": "Feed projection",
+                  "en": "Feed projection"
+                },
+                "detail": {
+                  "vi": "IDs có rebuild/catch-up, dedup và authorization recheck.",
+                  "en": "Rebuildable IDs, catch-up, deduplication and permission rechecks."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Request với principal và min version.",
+                      "en": "Request with principals and minimum versions."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "directory",
+                    "description": {
+                      "vi": "Locate current write owner.",
+                      "en": "Locate current write owners."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Write tại owner theo transaction contract.",
+                      "en": "Write at owners under transaction contracts."
+                    }
+                  },
+                  {
+                    "from": "metadata",
+                    "to": "replica",
+                    "description": {
+                      "vi": "Replicate với explicit lag/RPO.",
+                      "en": "Replicate with explicit lag/RPO."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "api",
+                    "to": "feeds",
+                    "description": {
+                      "vi": "Read rebuildable regional candidates.",
+                      "en": "Read rebuildable regional candidates."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "ranking",
+          "title": {
+            "vi": "Candidate generation rồi ranking",
+            "en": "Candidate generation followed by ranking"
+          },
+          "description": {
+            "vi": "Gather IDs từ following projections và bounded pulls cho high-fanout authors, dedup rồi enforce eligibility. Features/model version đi cùng request snapshot; rank bounded candidates và hydrate top items. Cursor phải có snapshot/session hoặc stable ranking context để pages không duplicate khi scores đổi.",
+            "en": "Gather IDs from following projections and bounded pulls for high-fan-out authors. Deduplicate and enforce eligibility, then rank a bounded candidate set using versioned features/models. Pagination needs stable context so changing scores do not duplicate pages."
+          },
+          "problem": {
+            "vi": "Chỉ time order bỏ qua relevance; scoring toàn bộ corpus mỗi request không khả thi.",
+            "en": "Time order omits relevance, but scoring the entire corpus per request is impractical."
+          },
+          "decision": {
+            "vi": "Two-stage retrieval/ranking, cached features và bounded fallback.",
+            "en": "Use two-stage retrieval/ranking, cached features and bounded fallback."
+          },
+          "tradeoff": {
+            "vi": "Model latency, bias/diversity, feature lag và experiment contamination cần đo.",
+            "en": "Measure model latency, diversity/bias, feature lag and experiment contamination."
+          },
+          "nextPressure": {
+            "vi": "Short-lived Stories cần expiry và seen semantics riêng.",
+            "en": "Short-lived Stories need separate expiry and viewed-state semantics."
+          },
+          "exitCriteria": {
+            "vi": "Fallback bỏ ranking được nhưng không bỏ ACL/delete filters.",
+            "en": "Fallbacks may omit ranking, never permission/deletion filters."
+          },
+          "diagram": {
+            "id": "photo-stage-ranking",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "feeds",
+                "label": {
+                  "vi": "Feed projection",
+                  "en": "Feed projection"
+                },
+                "detail": {
+                  "vi": "IDs có rebuild/catch-up, dedup và authorization recheck.",
+                  "en": "Rebuildable IDs, catch-up, deduplication and permission rechecks."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "ranker",
+                "label": {
+                  "vi": "Candidate ranker",
+                  "en": "Candidate ranker"
+                },
+                "detail": {
+                  "vi": "Bounded retrieval, feature/model versions và safe fallback.",
+                  "en": "Bounded retrieval, feature/model versions and safe fallback."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "model"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media CDN",
+                  "en": "Media CDN"
+                },
+                "detail": {
+                  "vi": "Cache generations theo visibility/expiry, không thay permission authority.",
+                  "en": "Caches generations under visibility/expiry without replacing permissions."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "edge"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Open feed bằng stable page context.",
+                      "en": "Open feeds with stable page context."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "feeds",
+                    "description": {
+                      "vi": "Gather bounded IDs.",
+                      "en": "Gather bounded IDs."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "feeds",
+                    "to": "ranker",
+                    "description": {
+                      "vi": "Dedup/filter và rank candidates.",
+                      "en": "Deduplicate/filter and rank candidates."
+                    }
+                  },
+                  {
+                    "from": "ranker",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Hydrate/revalidate top IDs.",
+                      "en": "Hydrate/revalidate top IDs."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Fetch authorized media.",
+                      "en": "Fetch authorized media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "stories",
+          "title": {
+            "vi": "Stories: thời hạn không phải mất durability",
+            "en": "Stories: expiry does not require losing durability"
+          },
+          "description": {
+            "vi": "Durable metadata giữ expires_at, owner/audience, archive policy và deletion version; hot index/cache giữ active tray. Serving kiểm expiry bằng server time trước cấp media authorization. TTL dọn cache giúp cost nhưng không chứng minh data bị xóa khỏi archive/backups; viewed state có thể dùng bitmap/set hoặc watermark với holes.",
+            "en": "Durable metadata owns expiry, audience, archive policy and deletion versions; hot indexes serve trays. Check server-time expiry before media authorization. Cache TTL controls cost without proving deletion from archives/backups. Viewed state needs exact sets or hole-aware watermarks."
+          },
+          "problem": {
+            "vi": "Burst reads trong thời gian ngắn và seen state lớn hơn content metadata.",
+            "en": "Short-lived read bursts and viewed state exceed content metadata."
+          },
+          "decision": {
+            "vi": "Dedicated active index, authoritative expiry và multi-device seen merge contract.",
+            "en": "Use an active index, authoritative expiry and an explicit cross-device viewed-state merge contract."
+          },
+          "tradeoff": {
+            "vi": "Expiry storms, out-of-order playback và reconnect cần tests.",
+            "en": "Test synchronized expiry, out-of-order playback and reconnect."
+          },
+          "nextPressure": {
+            "vi": "Runtime memory/CPU và fleet efficiency trở thành cost lớn.",
+            "en": "Runtime memory/CPU and fleet efficiency become major costs."
+          },
+          "exitCriteria": {
+            "vi": "Expired/deleted content không quay lại do stale cache hoặc replay; archive tách tray.",
+            "en": "Expired/deleted content stays hidden despite stale caches/replay; archives remain separate."
+          },
+          "diagram": {
+            "id": "photo-stage-stories",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "stories",
+                "label": {
+                  "vi": "Stories active index",
+                  "en": "Stories active index"
+                },
+                "detail": {
+                  "vi": "Expiry-aware tray, viewed holes và archive separation.",
+                  "en": "Expiry-aware trays, viewed-state holes and separate archives."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media CDN",
+                  "en": "Media CDN"
+                },
+                "detail": {
+                  "vi": "Cache generations theo visibility/expiry, không thay permission authority.",
+                  "en": "Caches generations under visibility/expiry without replacing permissions."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "objects",
+                "label": {
+                  "vi": "Versioned media",
+                  "en": "Versioned media"
+                },
+                "detail": {
+                  "vi": "Originals/renditions với scoped access và lifecycle policy.",
+                  "en": "Originals/renditions with scoped access and lifecycle policies."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Request tray/current seen state.",
+                      "en": "Request trays/current viewed state."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "stories",
+                    "description": {
+                      "vi": "Read active candidates.",
+                      "en": "Read active candidates."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Check expiry/audience/deletion.",
+                      "en": "Check expiry/audience/deletion."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Fetch permitted nonexpired rendition.",
+                      "en": "Fetch permitted unexpired renditions."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "objects",
+                    "description": {
+                      "vi": "Fetch same immutable generation on miss.",
+                      "en": "Fetch the same immutable generation on misses."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "runtime",
+          "title": {
+            "vi": "Profile Python và rollout runtime có kiểm soát",
+            "en": "Profile Python and control runtime rollouts"
+          },
+          "description": {
+            "vi": "Pre-fork workers chia sẻ pages qua copy-on-write nhưng runtime metadata writes có thể phá sharing. Đo private/shared RSS, allocation/GC và p99 trước tối ưu. Disable cyclic GC chỉ phù hợp workload/ownership được chứng minh; reference cycles, leaks và process recycling vẫn cần xử lý. Language upgrade dùng compatibility tests và traffic cohorts.",
+            "en": "Pre-fork workers share copy-on-write pages, but runtime metadata writes can break sharing. Measure memory, allocation, GC and tails before optimization. Disabling cycle collection needs workload evidence, leak controls and recycling; language upgrades need compatibility tests and traffic cohorts."
+          },
+          "problem": {
+            "vi": "Scale app fleet khiến memory/CPU tiết kiệm nhỏ cũng có giá trị.",
+            "en": "Small memory/CPU improvements matter across a large fleet."
+          },
+          "decision": {
+            "vi": "Profile, optimize bounded hot paths và canary interpreter/runtime changes.",
+            "en": "Profile and optimize bounded paths; canary interpreter/runtime changes."
+          },
+          "tradeoff": {
+            "vi": "Tối ưu implementation-specific có thể đổi behavior hoặc tạo leak dài hạn.",
+            "en": "Implementation-specific tuning can change behavior or create long-lived leaks."
+          },
+          "nextPressure": {
+            "vi": "Địa lý write locality trở thành limit dù runtime nhanh.",
+            "en": "Write locality remains a limit even after runtime improvements."
+          },
+          "exitCriteria": {
+            "vi": "So p99/error/RSS và steady-state memory qua dài hạn, không chỉ microbenchmark.",
+            "en": "Compare tails, errors and steady-state memory over time rather than only microbenchmarks."
+          },
+          "diagram": {
+            "id": "photo-stage-runtime",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "feeds",
+                "label": {
+                  "vi": "Feed projection",
+                  "en": "Feed projection"
+                },
+                "detail": {
+                  "vi": "IDs có rebuild/catch-up, dedup và authorization recheck.",
+                  "en": "Rebuildable IDs, catch-up, deduplication and permission rechecks."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "workers",
+                "label": {
+                  "vi": "Media workers",
+                  "en": "Media workers"
+                },
+                "detail": {
+                  "vi": "Bounded validation/transcode/fan-out, stale generation rejected.",
+                  "en": "Bounded validation/transcoding/fan-out rejecting stale generations."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Trace real request cohort.",
+                      "en": "Trace real request cohorts."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Measure DB/network versus CPU time.",
+                      "en": "Measure DB/network versus CPU time."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "feeds",
+                    "description": {
+                      "vi": "Bound read dependencies.",
+                      "en": "Bound read dependencies."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "api",
+                    "to": "workers",
+                    "description": {
+                      "vi": "Queue expensive work under durable boundary.",
+                      "en": "Queue expensive work under durable boundaries."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "regional",
+          "title": {
+            "vi": "Home region và write locality",
+            "en": "Home regions and write locality"
+          },
+          "description": {
+            "vi": "Chọn home region theo data authority/latency policy, không chỉ nearest LB. Đặt quorum/transaction gần write owner khi contract cho phép, replicate views/global indexes asynchronously. User travel, ownership transfer và region evacuation cần directory epoch; privacy residency không suy từ geographic nearest.",
+            "en": "Choose home regions by authority and latency policy, not just nearest load balancers. Keep transactions local where allowed and replicate views/indexes. Travel, handoff and evacuation need directory epochs; geographic proximity does not establish residency compliance."
+          },
+          "problem": {
+            "vi": "Ocean RTT áp lên mọi write nếu authority luôn xa users.",
+            "en": "Ocean RTT affects every write when authority remains remote."
+          },
+          "decision": {
+            "vi": "Regional partitions và explicit consistency/replication scopes theo dataset.",
+            "en": "Use regional partitions and dataset-specific consistency/replication scopes."
+          },
+          "tradeoff": {
+            "vi": "Global graph reads, travel và recovery có remote dependencies.",
+            "en": "Global graph reads, travel and recovery retain remote dependencies."
+          },
+          "nextPressure": {
+            "vi": "Video/Reels đổi bottleneck sang encoding, storage và media egress.",
+            "en": "Video changes bottlenecks toward encoding, storage and media egress."
+          },
+          "exitCriteria": {
+            "vi": "Move user/shard không mất accepted writes hoặc mở hai allocators.",
+            "en": "Moving users/shards preserves accepted writes and exclusive allocators."
+          },
+          "diagram": {
+            "id": "photo-stage-regional",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "directory",
+                "label": {
+                  "vi": "Shard directory",
+                  "en": "Shard directory"
+                },
+                "detail": {
+                  "vi": "Logical-to-host mapping có ownership epoch và migration barrier.",
+                  "en": "Logical-to-host maps with ownership epochs and migration barriers."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "metadata",
+                "label": {
+                  "vi": "Post authority",
+                  "en": "Post authority"
+                },
+                "detail": {
+                  "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+                  "en": "Author placement, versions, readiness, deletion and durable intent."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "replica",
+                "label": {
+                  "vi": "Regional replica",
+                  "en": "Regional replica"
+                },
+                "detail": {
+                  "vi": "Version/lag metadata và explicit RPO, không tự write authority.",
+                  "en": "Version/lag evidence and explicit RPO without automatic write authority."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Processing log",
+                  "en": "Processing log"
+                },
+                "detail": {
+                  "vi": "Durable jobs với stable identity, retention và replay bounds.",
+                  "en": "Durable jobs with stable identities, retention and replay bounds."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Authenticate region-local ingress.",
+                      "en": "Authenticate regional ingress."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "directory",
+                    "description": {
+                      "vi": "Resolve home owner/epoch.",
+                      "en": "Resolve home owners/epochs."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "metadata",
+                    "description": {
+                      "vi": "Commit at current owner.",
+                      "en": "Commit at current owners."
+                    }
+                  },
+                  {
+                    "from": "metadata",
+                    "to": "replica",
+                    "description": {
+                      "vi": "Replicate under dataset contract.",
+                      "en": "Replicate under dataset contracts."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "metadata",
+                    "to": "events",
+                    "description": {
+                      "vi": "Emit committed intent for regional work.",
+                      "en": "Emit committed intent for regional work."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "video",
+          "title": {
+            "vi": "Reels: encode budget, ABR và recommendation feedback",
+            "en": "Reels: encoding budgets, ABR and recommendation feedback"
+          },
+          "description": {
+            "vi": "Basic renditions cho phép playable sớm sau validation; advanced codec jobs được ưu tiên theo expected delivery savings/compute cost và device support. Player ABR chọn chất lượng theo buffer/network chứ model popularity không quyết định current bitrate. Completion events/metrics cần sampling/retention và feedback-loop review.",
+            "en": "Basic renditions enable early playback after validation; advanced encoding is prioritized by expected delivery benefit, compute cost and device support. Player ABR uses current buffers/networks rather than popularity. Playback feedback requires retention, sampling and loop review."
+          },
+          "problem": {
+            "vi": "Video volume và watch-time skew khiến encode-everything-best lãng phí.",
+            "en": "Video volume and watch-time skew make universal expensive encoding wasteful."
+          },
+          "decision": {
+            "vi": "Versioned media DAG, adaptive ladder và measured benefit-per-cost scheduling.",
+            "en": "Use versioned media DAGs, adaptive ladders and measured benefit-per-cost scheduling."
+          },
+          "tradeoff": {
+            "vi": "Prediction sai, queue starvation, codec compatibility và safety rechecks cần guardrails.",
+            "en": "Guard against bad forecasts, queue starvation, incompatible codecs and missing safety rechecks."
+          },
+          "nextPressure": {
+            "vi": "Tiếp tục theo cost/QoE/privacy/abuse evidence; không có final architecture bất biến.",
+            "en": "Continue using cost, QoE, privacy and abuse evidence rather than a permanent final architecture."
+          },
+          "exitCriteria": {
+            "vi": "Manifest chỉ trỏ complete authorized generation; viral workload không starve new uploads.",
+            "en": "Manifests reference complete authorized generations, and viral loads do not starve new uploads."
+          },
+          "diagram": {
+            "id": "photo-stage-video",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Theo dõi boundaries và authority; các branches không phải một synchronous call chain.",
+              "en": "Follow boundaries and authority; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 740,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Photo client",
+                  "en": "Photo client"
+                },
+                "detail": {
+                  "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+                  "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Photo API",
+                  "en": "Photo API"
+                },
+                "detail": {
+                  "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+                  "en": "Authentication, audience, idempotency, deadlines and state machines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Processing log",
+                  "en": "Processing log"
+                },
+                "detail": {
+                  "vi": "Durable jobs với stable identity, retention và replay bounds.",
+                  "en": "Durable jobs with stable identities, retention and replay bounds."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "workers",
+                "label": {
+                  "vi": "Media workers",
+                  "en": "Media workers"
+                },
+                "detail": {
+                  "vi": "Bounded validation/transcode/fan-out, stale generation rejected.",
+                  "en": "Bounded validation/transcoding/fan-out rejecting stale generations."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "objects",
+                "label": {
+                  "vi": "Versioned media",
+                  "en": "Versioned media"
+                },
+                "detail": {
+                  "vi": "Originals/renditions với scoped access và lifecycle policy.",
+                  "en": "Originals/renditions with scoped access and lifecycle policies."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media CDN",
+                  "en": "Media CDN"
+                },
+                "detail": {
+                  "vi": "Cache generations theo visibility/expiry, không thay permission authority.",
+                  "en": "Caches generations under visibility/expiry without replacing permissions."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "ranker",
+                "label": {
+                  "vi": "Candidate ranker",
+                  "en": "Candidate ranker"
+                },
+                "detail": {
+                  "vi": "Bounded retrieval, feature/model versions và safe fallback.",
+                  "en": "Bounded retrieval, feature/model versions and safe fallback."
+                },
+                "x": 140,
+                "y": 640,
+                "kind": "model"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Finalize validated video upload.",
+                      "en": "Finalize validated video uploads."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "events",
+                    "description": {
+                      "vi": "Commit/emit transcode intent.",
+                      "en": "Commit/emit transcoding intent."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "events",
+                    "to": "workers",
+                    "description": {
+                      "vi": "Schedule cost-bounded DAG.",
+                      "en": "Schedule cost-bounded DAGs."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "workers",
+                    "to": "objects",
+                    "description": {
+                      "vi": "Publish completed rendition generation.",
+                      "en": "Publish completed rendition generations."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "ABR fetches playable segments.",
+                      "en": "ABR fetches playable segments."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "ranker",
+                    "description": {
+                      "vi": "Retrieve eligible video candidates.",
+                      "en": "Retrieve eligible video candidates."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "4. Đếm bytes, API, feed writes và hot skew riêng",
+        "en": "4. Count bytes, APIs, feed writes and skew separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 200M DAU, 40M posts/day, 6 feed opens/user/day, 3 MB stored/post gồm derivatives, average 120 eligible push recipients/post cho nhóm push. Decimal units và average không có peak headroom. Đây không là traffic Instagram công bố.",
+          "en": "Assume 200M DAU, 40M posts/day, six feed opens/user/day, 3 MB stored/post including derivatives and 120 eligible push recipients for the push cohort. Decimal averages omit peak headroom and are not reported Instagram traffic."
+        },
+        {
+          "vi": "Media bandwidth phục vụ viewer khác stored ingest; fan-out writes khác post commits. Với video, use duration × bitrate × renditions và workload cohorts thay average photo bytes. Hot author/follower distribution có thể khiến một partition nghẽn dù tổng average thấp.",
+          "en": "Viewer delivery bandwidth differs from stored ingest, and fan-out writes differ from post commits. Size video by duration, bitrate and renditions rather than photo averages. Skew can saturate one partition despite modest aggregate load."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Metric",
+            "en": "Metric"
+          },
+          {
+            "vi": "Calculation",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Result / caveat",
+            "en": "Result / caveat"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Post commits",
+              "en": "Post commits"
+            },
+            {
+              "vi": "40M / 86400",
+              "en": "40M / 86400"
+            },
+            {
+              "vi": "≈463/s average, chưa retries/jobs.",
+              "en": "≈463/s average, excluding retries/jobs."
+            }
+          ],
+          [
+            {
+              "vi": "Feed opens",
+              "en": "Feed opens"
+            },
+            {
+              "vi": "200M × 6 / 86400",
+              "en": "200M × 6 / 86400"
+            },
+            {
+              "vi": "≈13,889/s; rank/hydrate/cache operations lớn hơn.",
+              "en": "≈13,889/s; ranking/hydration/cache operations add load."
+            }
+          ],
+          [
+            {
+              "vi": "New media",
+              "en": "New media"
+            },
+            {
+              "vi": "40M × 3 MB",
+              "en": "40M × 3 MB"
+            },
+            {
+              "vi": "120 TB/day trước replication/retention overhead.",
+              "en": "120 TB/day before replication/retention overhead."
+            }
+          ],
+          [
+            {
+              "vi": "Push entries",
+              "en": "Push entries"
+            },
+            {
+              "vi": "40M × 120 / 86400",
+              "en": "40M × 120 / 86400"
+            },
+            {
+              "vi": "≈55,556/s nếu toàn bộ posts thuộc push cohort.",
+              "en": "≈55,556/s if all posts belong to the push cohort."
+            }
+          ],
+          [
+            {
+              "vi": "Raw candidate memory",
+              "en": "Raw candidate memory"
+            },
+            {
+              "vi": "200M × 300 IDs × 8 bytes",
+              "en": "200M × 300 IDs × 8 bytes"
+            },
+            {
+              "vi": "480 GB raw, chưa object/allocator/replica overhead.",
+              "en": "480 GB raw, excluding allocation/replication overhead."
+            }
+          ],
+          [
+            {
+              "vi": "ID sequence",
+              "en": "ID sequence"
+            },
+            {
+              "vi": "2¹⁰ / shard / ms",
+              "en": "2¹⁰ / shard / ms"
+            },
+            {
+              "vi": "1024 slots; physical QPS còn phụ thuộc transactions/IO.",
+              "en": "1024 slots; actual throughput depends on transactions/I/O."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Theo dõi upload, feed, Stories và delete",
+        "en": "5. Trace uploads, feeds, Stories and deletion"
+      },
+      "paragraphs": [
+        {
+          "vi": "Click trace rồi step để xem authority của từng operation. Một async arrow không bảo đảm đúng một lần; phải có retained intent/identity/version và recovery. Edges quay lại metadata là conditional state transition, không worker tự public bất kỳ object nào vừa tạo.",
+          "en": "Select and step through traces to inspect authority. Asynchronous arrows do not imply exactly-once behavior: retain intent, identities, versions and recovery. Metadata transitions are conditional, not permission for workers to publish arbitrary outputs."
+        }
+      ],
+      "diagram": {
+        "id": "photo-lifecycle",
+        "title": {
+          "vi": "Theo dõi một post qua upload, readiness và serving",
+          "en": "Trace a post through upload, readiness and serving"
+        },
+        "caption": {
+          "vi": "Metadata quyết định visibility; objects giữ bytes, feed/search là projections. Đường delete cần chặn serving trước khi asynchronous physical cleanup hoàn tất.",
+          "en": "Metadata authorizes visibility; objects hold bytes and feeds/search are projections. Deletion must block serving before asynchronous physical cleanup finishes."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Photo client",
+              "en": "Photo client"
+            },
+            "detail": {
+              "vi": "Stable finalize ID, pending UI, feed cursor và media/player state.",
+              "en": "Stable finalization IDs, pending UI, feed cursors and playback state."
+            },
+            "x": 130,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Photo API",
+              "en": "Photo API"
+            },
+            "detail": {
+              "vi": "Auth, audience, idempotency, deadlines và metadata state machine.",
+              "en": "Authentication, audience, idempotency, deadlines and state machines."
+            },
+            "x": 440,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "meta",
+            "label": {
+              "vi": "Post authority",
+              "en": "Post authority"
+            },
+            "detail": {
+              "vi": "Author placement, versions, readiness, deletion và durable event intent.",
+              "en": "Author placement, versions, readiness, deletion and durable intent."
+            },
+            "x": 760,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "objects",
+            "label": {
+              "vi": "Versioned media",
+              "en": "Versioned media"
+            },
+            "detail": {
+              "vi": "Originals/renditions với scoped access và lifecycle policy.",
+              "en": "Originals/renditions with scoped access and lifecycle policies."
+            },
+            "x": 1060,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "log",
+            "label": {
+              "vi": "Processing log",
+              "en": "Processing log"
+            },
+            "detail": {
+              "vi": "Durable jobs với stable identity, retention và replay bounds.",
+              "en": "Durable jobs with stable identities, retention and replay bounds."
+            },
+            "x": 130,
+            "y": 380,
+            "kind": "queue"
+          },
+          {
+            "id": "workers",
+            "label": {
+              "vi": "Media workers",
+              "en": "Media workers"
+            },
+            "detail": {
+              "vi": "Bounded validation/transcode/fan-out, stale generation rejected.",
+              "en": "Bounded validation/transcoding/fan-out rejecting stale generations."
+            },
+            "x": 440,
+            "y": 380,
+            "kind": "worker"
+          },
+          {
+            "id": "feeds",
+            "label": {
+              "vi": "Feed projection",
+              "en": "Feed projection"
+            },
+            "detail": {
+              "vi": "IDs có rebuild/catch-up, dedup và authorization recheck.",
+              "en": "Rebuildable IDs, catch-up, deduplication and permission rechecks."
+            },
+            "x": 760,
+            "y": 380,
+            "kind": "store"
+          },
+          {
+            "id": "rank",
+            "label": {
+              "vi": "Candidate ranker",
+              "en": "Candidate ranker"
+            },
+            "detail": {
+              "vi": "Bounded retrieval, feature/model versions và safe fallback.",
+              "en": "Bounded retrieval, feature/model versions and safe fallback."
+            },
+            "x": 1060,
+            "y": 380,
+            "kind": "model"
+          },
+          {
+            "id": "cdn",
+            "label": {
+              "vi": "Media CDN",
+              "en": "Media CDN"
+            },
+            "detail": {
+              "vi": "Cache generations theo visibility/expiry, không thay permission authority.",
+              "en": "Caches generations under visibility/expiry without replacing permissions."
+            },
+            "x": 130,
+            "y": 680,
+            "kind": "edge"
+          },
+          {
+            "id": "story",
+            "label": {
+              "vi": "Stories active index",
+              "en": "Stories active index"
+            },
+            "detail": {
+              "vi": "Expiry-aware tray, viewed holes và archive separation.",
+              "en": "Expiry-aware trays, viewed-state holes and separate archives."
+            },
+            "x": 440,
+            "y": 680,
+            "kind": "store"
+          },
+          {
+            "id": "delete",
+            "label": {
+              "vi": "Delete coordinator",
+              "en": "Delete coordinator"
+            },
+            "detail": {
+              "vi": "Current visibility/tombstones, index invalidation và scoped media revocation; purge tracking riêng.",
+              "en": "Current visibility/tombstones, index invalidation, scoped media revocation and separate purge tracking."
+            },
+            "x": 760,
+            "y": 680,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "upload",
+            "label": {
+              "vi": "Upload và finalize",
+              "en": "Upload and finalize"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Authenticated slot request giữ stable upload ID, byte/type quota và expiry.",
+                  "en": "Authenticated slot requests retain upload identity, quotas and expiry."
+                }
+              },
+              {
+                "from": "client",
+                "to": "objects",
+                "description": {
+                  "vi": "Upload scoped staging object; checksum là integrity, không moderation.",
+                  "en": "Upload scoped staging objects; checksums establish integrity, not moderation."
+                }
+              },
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Finalize cùng request identity; lost reply retry không tạo post mới.",
+                  "en": "Finalize with the same identity; lost-reply retries do not create new posts."
+                }
+              },
+              {
+                "from": "api",
+                "to": "objects",
+                "description": {
+                  "vi": "Validate owned complete object, type/limits và generation.",
+                  "en": "Validate owned complete objects, types, limits and generations."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Commit PROCESSING metadata + keyed response + processing intent.",
+                  "en": "Commit PROCESSING metadata, keyed responses and processing intent."
+                }
+              }
+            ]
+          },
+          {
+            "id": "processing",
+            "label": {
+              "vi": "Ready rồi fan-out",
+              "en": "Ready, then fan out"
+            },
+            "steps": [
+              {
+                "from": "meta",
+                "to": "log",
+                "description": {
+                  "vi": "Outbox/CDC đưa committed intent vào replayable log.",
+                  "en": "Outbox/CDC places committed intent in a replayable log."
+                },
+                "async": true
+              },
+              {
+                "from": "log",
+                "to": "workers",
+                "description": {
+                  "vi": "Retry job với stable post/generation ID.",
+                  "en": "Retry jobs with stable post/generation identities."
+                },
+                "async": true
+              },
+              {
+                "from": "workers",
+                "to": "objects",
+                "description": {
+                  "vi": "Validate/decode, scan và write immutable renditions.",
+                  "en": "Validate, decode, scan and write immutable renditions."
+                }
+              },
+              {
+                "from": "workers",
+                "to": "meta",
+                "description": {
+                  "vi": "Conditional readiness chỉ nếu current generation chưa deleted.",
+                  "en": "Condition readiness on current undeleted generations."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "feeds",
+                "description": {
+                  "vi": "Durable ready-event intent materialize eligible IDs idempotently.",
+                  "en": "Durable readiness intent materializes eligible IDs idempotently."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "feed",
+            "label": {
+              "vi": "Open feed",
+              "en": "Open feed"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Cursor chứa stable ranking/page context, không chỉ offset.",
+                  "en": "Cursors retain stable page/ranking context rather than only offsets."
+                }
+              },
+              {
+                "from": "api",
+                "to": "feeds",
+                "description": {
+                  "vi": "Gather materialized IDs và bounded pull candidates.",
+                  "en": "Gather materialized IDs and bounded pull candidates."
+                }
+              },
+              {
+                "from": "feeds",
+                "to": "rank",
+                "description": {
+                  "vi": "Dedup IDs, filter eligibility và score bounded candidates.",
+                  "en": "Deduplicate IDs, filter eligibility and score bounded candidates."
+                }
+              },
+              {
+                "from": "rank",
+                "to": "meta",
+                "description": {
+                  "vi": "Hydrate và recheck current visibility/deletion cho top items.",
+                  "en": "Hydrate and recheck visibility/deletion for top items."
+                }
+              },
+              {
+                "from": "client",
+                "to": "cdn",
+                "description": {
+                  "vi": "Fetch scoped rendition; CDN origin policy không bypass permissions.",
+                  "en": "Fetch scoped renditions under permission-aware origin policies."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "objects",
+                "description": {
+                  "vi": "Miss fetch exact published generation.",
+                  "en": "Misses fetch exact published generations."
+                }
+              }
+            ]
+          },
+          {
+            "id": "stories",
+            "label": {
+              "vi": "Tray và viewed state",
+              "en": "Trays and viewed state"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Xin active tray theo principal và server time.",
+                  "en": "Request active trays under current principals/server time."
+                }
+              },
+              {
+                "from": "api",
+                "to": "story",
+                "description": {
+                  "vi": "Lấy candidate authors/items và seen set có holes.",
+                  "en": "Read candidate authors/items and hole-aware viewed state."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Enforce expires_at, current audience và deletion version trước URL.",
+                  "en": "Enforce expiry, current audience and deletion versions before URLs."
+                }
+              },
+              {
+                "from": "client",
+                "to": "cdn",
+                "description": {
+                  "vi": "Chỉ fetch trong serving capability window đã chọn.",
+                  "en": "Fetch only within the selected serving-capability window."
+                }
+              }
+            ]
+          },
+          {
+            "id": "delete",
+            "label": {
+              "vi": "Delete và stale work",
+              "en": "Deletion and stale work"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Delete authenticated owner, idempotent request.",
+                  "en": "Delete with authenticated ownership and stable request identity."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Commit tombstone v2 và durable invalidation intent.",
+                  "en": "Commit v2 tombstones and durable invalidation intent."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "delete",
+                "description": {
+                  "vi": "Invalidate indexes/caches; revoke serving theo contract.",
+                  "en": "Invalidate projections/caches and revoke serving under contract."
+                },
+                "async": true
+              },
+              {
+                "from": "delete",
+                "to": "objects",
+                "description": {
+                  "vi": "Purge tracked originals/derivatives khi retention/legal policy cho phép.",
+                  "en": "Track original/derivative purges under retention policy."
+                },
+                "async": true
+              },
+              {
+                "from": "workers",
+                "to": "meta",
+                "description": {
+                  "vi": "Late v1 worker bị reject, không resurrect READY.",
+                  "en": "Reject late v1 workers rather than resurrecting READY."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "6. API và schema tối thiểu giữ semantics",
+        "en": "6. Minimal APIs and schemas preserve semantics"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ dùng decimal string cho 64-bit IDs; không để JavaScript JSON Number làm tròn. Post row có author_id, logical_shard, state, generation, audience_version, created_at, deleted_version; index (author_id, created_at DESC, id DESC). Sortable ID hữu ích nhưng index ordering/direction/filter predicates phải khớp query.",
+          "en": "Examples transport 64-bit IDs as decimal strings rather than lossy JavaScript numbers. Post rows retain author/shard, state, generation, audience version, creation time and deletion version. Match author/time/ID indexes to predicates and ordering; a sortable ID alone does not create every required index."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/uploads",
+          "description": {
+            "vi": "Cấp owned staging capability.",
+            "en": "Issue owned staging capabilities."
+          },
+          "request": "{clientUploadId, mediaType, byteLength, checksum}",
+          "response": "201 {uploadId, uploadUrl, requiredHeaders, expiresAt}",
+          "notes": [
+            {
+              "vi": "Validate limits/owner, không cho overwrite published object key.",
+              "en": "Validate limits/ownership and prohibit overwriting published keys."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/posts",
+          "description": {
+            "vi": "Finalize idempotent; expose processing state.",
+            "en": "Finalize idempotently and expose processing state."
+          },
+          "request": "Idempotency-Key: publish-42\n{uploadId, caption, audience, expectedUploadVersion}",
+          "response": "202 {postId:\"…\", state:\"PROCESSING\", generation:1}",
+          "notes": [
+            {
+              "vi": "ACK sau durable state/intent; pending UI poll/events bằng stable postId.",
+              "en": "ACK follows durable state/intent; pending UI uses stable post IDs."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/v1/feed?cursor=opaque&limit=20",
+          "description": {
+            "vi": "Bounded candidate/rank/hydrate dưới current permissions.",
+            "en": "Bounded retrieval/ranking/hydration under current permissions."
+          },
+          "response": "200 {items:[{postId:\"…\", generation, media}], nextCursor, rankingContext}",
+          "notes": [
+            {
+              "vi": "Cursor bind principal/session/query và expiry; không dùng offset trên live rescoring.",
+              "en": "Bind cursors to principals, sessions, queries and expiry rather than offsets on live rescoring."
+            }
+          ]
+        },
+        {
+          "method": "DELETE",
+          "path": "/v1/posts/{postId}",
+          "description": {
+            "vi": "Owner delete có retained result/tombstone.",
+            "en": "Owner-authorized deletion retains results and tombstones."
+          },
+          "request": "Idempotency-Key: delete-42\nIf-Match: generation-1",
+          "response": "202 {state:\"DELETED\", mutationVersion:2, purgeState:\"PENDING\"}",
+          "notes": [
+            {
+              "vi": "Serving block và physical purge khác ACK; current policy quyết retention.",
+              "en": "Serving blocks and physical purges have distinct acknowledgements and retention policy."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ids",
+      "title": {
+        "vi": "7. ID layout: time, shard và sequence",
+        "en": "7. ID layout: time, shard and sequence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với layout minh họa 41/13/10, id = (elapsed_ms << 23) | (logical_shard << 10) | sequence. 13 bits chứa tối đa8192 labels, không bắt buộc chọn đúng8192 logical buckets. 41 bits milliseconds khoảng69.7 năm, không41 năm. PostgreSQL bigint là signed: positive IDs trong layout đầy64bits này chỉ có40 positive time bits, khoảng34.8 năm; phải chọn sign/epoch/format migration rõ trước khi hết range.",
+          "en": "In the illustrative 41/13/10 layout, shift elapsed milliseconds by23, the logical shard by10, then OR the sequence. Thirteen bits permit8192 labels without requiring that bucket count. Forty-one milliseconds bits span about69.7 years. Positive signed PostgreSQL bigint values permit only40 time bits here, about34.8 years; plan sign, epoch and format transitions."
+        },
+        {
+          "vi": "Sequence modulo1024 không tự ngăn duplicates: same timestamp/shard/sequence tạo cùng ID. Wait/reject sau capacity, monotonic clock strategy và exclusive allocator ownership là ba guards khác nhau. Uniqueness domain có thể là per-table; nếu media và comment dùng independent sequences cùng layout thì đừng tuyên bố global unique xuyên entity types.",
+          "en": "Modulo1024 alone does not prevent duplicates: equal timestamp/shard/sequence fields collide. Capacity waiting/rejection, clock handling and exclusive ownership are separate guards. Independent table sequences may define per-table rather than global cross-entity uniqueness."
+        },
+        {
+          "vi": "ID encode wall time không là trusted user timestamp, causality hoặc commit sequence. Cross-shard clock skew, long transaction và delayed writes làm larger ID chưa chắc later commit. UUIDv4 vẫn có thể paginate bằng composite created_at/id index; UUIDv7/ULID là options có time locality. Đánh đổi là index locality/width/routing và threat model, không tuyên bố mọi UUID sai.",
+          "en": "Wall-time IDs do not establish trusted creation time, causality or commit order. Skew, transactions and delays break that inference. UUIDv4 can paginate through composite indexes; UUIDv7/ULID offer time locality. Evaluate width, locality, routing and threat models rather than declaring UUIDs universally wrong."
+        }
+      ],
+      "experiment": "photo-ids"
+    },
+    {
+      "id": "placement",
+      "title": {
+        "vi": "8. Logical-to-physical mapping và move shard",
+        "en": "8. Logical-to-physical mapping and shard moves"
+      },
+      "paragraphs": [
+        {
+          "vi": "user_id % fixed_logical_count chọn bucket chỉ là một policy. Directory map bucket→host/epoch tách placement khỏi identity; scale hosts không đổi modulo denominator. Nhưng số logical buckets không “free”: catalog/schema count, connection pools, backup tasks và cross-shard queries có overhead. Hot creator có thể cần per-dataset subpartition; không thay user bucket tùy tiện vì ID routing đã public.",
+          "en": "A fixed-bucket user modulo is one policy. Directories separate bucket identity from physical hosts/epochs, so host count changes do not change the modulo denominator. Buckets still cost schemas, pools, backups and cross-shard queries. Hot authors may need dataset-specific subdivision without silently changing public routing identities."
+        },
+        {
+          "vi": "Move protocol: choose target capacity; snapshot/backfill có version; capture/apply changes kể cả deletes; drain/catch up to barrier; activate target owner và fence source tại commit sink; publish directory epoch; redirect/retry stale routes bằng cùng request identity. Old source giữ read/rollback policy rõ; “change mapping” đơn thuần có thể split writes hoặc lose accepted changes.",
+          "en": "Move by validating target capacity, backfilling versioned snapshots, replaying changes including deletions, catching up to a barrier, activating target ownership while fencing the source, then publishing the directory epoch. Stale requests retain identities. Mapping changes alone risk split writes or lost changes."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một shard move an toàn",
+          "en": "A safe shard move"
+        },
+        "caption": {
+          "vi": "IDs ổn định không tự làm data migration atomic.",
+          "en": "Stable IDs do not make migration atomic."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Copy",
+              "en": "Copy"
+            },
+            "detail": {
+              "vi": "Versioned snapshot + retained change capture.",
+              "en": "Versioned snapshots and retained change capture."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Verify",
+              "en": "Verify"
+            },
+            "detail": {
+              "vi": "Rows, deletes, lag và actual invariants.",
+              "en": "Rows, deletions, lag and actual invariants."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Fence",
+              "en": "Fence"
+            },
+            "detail": {
+              "vi": "Activate ownership epoch ở write authority.",
+              "en": "Activate ownership epochs at write authority."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Route",
+              "en": "Route"
+            },
+            "detail": {
+              "vi": "Publish map; stale callers retry cùng identity.",
+              "en": "Publish maps; stale callers retry with stable identities."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "publication",
+      "title": {
+        "vi": "9. Media DAG và visibility boundary",
+        "en": "9. Media DAGs and visibility boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hash/checksum chứng minh bytes tới đủ không chứng minh decode safe, nội dung được phép hay audience đúng. Isolate decoders, cap pixels/duration/expansion, reject decompression bombs và giữ malware/content checks theo policy. Job DAG ghi input generation và output keys; partial output không xuất hiện trong published manifest.",
+          "en": "Integrity checks do not establish safe decoding, permitted content or correct audiences. Isolate decoders and bound pixels, duration and expansion. Retain policy checks and generation-bound job inputs/outputs; partial outputs never enter published manifests."
+        },
+        {
+          "vi": "Ready transition và feed intent cần coherent boundary như initial finalize. Một worker có thể thành công rồi mất reply; retry dùng conditional upsert/immutable keys. Delete đổi serving eligibility trước cleanup; stale ready job bị reject bằng current mutation/generation. Failed work có retry budget và DLQ/repair UI, không để PROCESSING vô hạn mà không cảnh báo.",
+          "en": "Readiness and feed intent need a coherent boundary. Workers may finish and lose replies; retries use conditional updates and immutable keys. Deletion changes serving eligibility before cleanup and rejects stale readiness. Failed work needs bounded retries, repair queues and visible stuck-processing detection."
+        }
+      ],
+      "experiment": "photo-publish"
+    },
+    {
+      "id": "feed",
+      "title": {
+        "vi": "10. Feed: push, pull, ranking và pagination",
+        "en": "10. Feeds: push, pull, ranking and pagination"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với normal authors, push IDs giảm common read cost; high-fanout authors có bounded pull/merge hoặc separate channel. Threshold dựa post rate, active followers, read frequency và amplification chứ không một follower count vĩnh viễn. Cùng post có thể qua push/pull/retry nên dedup bằng post ID trước rank/hydrate. Follow/unfollow/private/block/delete cần current eligibility tại serving.",
+          "en": "Push IDs for ordinary authors and use bounded pull/merge for high-fan-out authors. Choose thresholds using posting, active readership and amplification rather than a permanent follower count. Deduplicate posts across push, pull and retries, then enforce following, audience, blocks and deletion during serving."
+        },
+        {
+          "vi": "Ranking tối ưu nhiều outcomes dưới latency/diversity/safety constraints. Separate candidate recall, scorer calibration và final policy filtering. Stable session snapshot hoặc retained candidate order giúp pagination; nếu product chấp nhận feed refresh reorders thì expose semantics thay vì hứa no skip trên live mutable ranking. Feature outage có chronological fallback đã filtered, không fallback raw public object IDs.",
+          "en": "Ranking optimizes multiple outcomes within latency, diversity and safety constraints. Distinguish recall, calibration and policy filtering. Retained ordering/snapshots stabilize pages; otherwise declare refresh/reordering semantics. Feature failures may use an authorized chronological fallback, never unfiltered object IDs."
+        }
+      ]
+    },
+    {
+      "id": "stories",
+      "title": {
+        "vi": "11. Stories: eligibility, archive và seen holes",
+        "en": "11. Stories: eligibility, archives and viewed-state holes"
+      },
+      "paragraphs": [
+        {
+          "vi": "expires_at là product rule kiểm bằng server time; cache TTL/lazy cleanup có thể trễ. Trước URL/capability, check now < expires_at, audience và tombstone; long-lived signed URLs/cache phải phù hợp expiry/revocation window. Archive/highlights là retained authorized view riêng, không biến deleted/expired item thành active story. “Disappears from tray” khác physical erasure.",
+          "en": "Server-time expiry is a product predicate even when cache cleanup lags. Before issuing capabilities, validate expiry, audience and tombstones; URL/cache lifetimes must honor serving windows. Archives/highlights are separate authorized views, and disappearing from trays is not proof of erasure."
+        },
+        {
+          "vi": "Seen state exact cần account/device merge: max sequence chỉ đúng nếu tất cả items trước marker đã xem hoặc product cho approximate. Jump tới story102 khi101 chưa xem tạo hole. Giữ sparse set/bitmap hoặc contiguous watermark+holes với bounded retention; multi-device union của observed identities không tự làm mọi lower sequence observed. Edit/delete và new story arrival cần stable IDs/generations.",
+          "en": "Exact cross-device viewed state cannot generally use only a maximum sequence: viewing102 before101 leaves a hole. Use sparse sets, bitmaps or contiguous watermarks with holes and bounded retention. Union observed identities across devices without assuming lower sequences were viewed; preserve identities across edits, deletion and arrivals."
+        }
+      ],
+      "experiment": "photo-stories"
+    },
+    {
+      "id": "runtime-region",
+      "title": {
+        "vi": "12. Runtime, geography và recovery có scope khác nhau",
+        "en": "12. Runtime, geography and recovery have distinct scopes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Pre-fork sharing có thể giảm memory nhưng GC/refcount writes tạo copy-on-write. Profile private/shared RSS, allocations và long-lived cycles trước thay runtime knobs. Disable cyclic GC không tắt refcounts hoặc làm mọi object immutable; có leak/recycling trade-off. Immortal-object work là hướng khác để giảm runtime metadata writes, không lý do copy một production flag vào mọi Python app.",
+          "en": "Pre-fork sharing can reduce memory while GC/reference metadata writes trigger copy-on-write. Profile memory, allocations and cycles before tuning. Disabling cycle collection neither disables reference counts nor makes all objects immutable. Immortal objects offer another mechanism, not a reason to copy a flag into every Python app."
+        },
+        {
+          "vi": "Home-region writes giảm network coordination khi authority/replication locality đúng. Global follows/privacy metadata có thể cần cross-region reads hoặc replicated versions; eventual projections không được tự grant quyền. Failover nêu RPO/RTO theo metadata/media/events riêng, surviving capacity, replay effects và owner fencing. Client travel khác home-data migration; proximity routing không tự quyết data residency.",
+          "en": "Home-region writes reduce coordination only when authority and replication are local. Global relationships/privacy still need appropriate reads or versions, and eventual projections never grant permission. Define separate recovery contracts for metadata, media and events with capacity, replay and fencing. Travel differs from data migration; proximity is not residency policy."
+        }
+      ]
+    },
+    {
+      "id": "video-cost",
+      "title": {
+        "vi": "13. Reels: media pipeline và feedback loop",
+        "en": "13. Reels: media pipelines and feedback loops"
+      },
+      "paragraphs": [
+        {
+          "vi": "Video làm ingest/encode/egress cost tăng theo duration và watch distribution. Build basic playable ladder sau validation, rồi schedule advanced encodes khi expected saved bytes × future views đáng compute/storage cost. Benefit model cần codec/device support, quality metric và prediction uncertainty; viral videos có preemption/priority nhưng phải chống starvation cho new uploads.",
+          "en": "Video costs depend on duration and viewing distribution. Produce basic playable ladders after validation, then schedule advanced encodes when expected delivery savings justify compute/storage. Account for codecs, devices, quality and forecast uncertainty. Viral priorities need protections against starving new uploads."
+        },
+        {
+          "vi": "Adaptive bitrate là player feedback loop theo measured throughput/buffer; recommendation là content-selection loop theo user/model features. Chúng tương tác qua QoE và observed watch time nhưng không cùng controller. Instrument startup, rebuffer, skip, completion và CPU/battery; experiment phải tránh future leakage và optimize narrow metric gây harmful feedback.",
+          "en": "ABR controls playback using throughput/buffers; recommendation selects content using user/model features. They interact through QoE and viewing observations but are distinct controllers. Measure startup, stalls, skipping, completion and device costs while avoiding leakage and harmful single-metric feedback."
+        }
+      ]
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "14. Failure matrix và bằng chứng cần có",
+        "en": "14. Failure matrix and required evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo upload-finalize latency, processing age, ready-to-feed lag, missing/forbidden media, duplicate posts, deleted resurrection và p99 theo cohorts. Logs nối upload/post/generation/request/event IDs nhưng hạn chế sensitive media URLs và personal content. Mỗi metric cần action/owner, không chỉ dashboard.",
+          "en": "Measure finalization, processing age, feed lag, missing/forbidden media, duplicates, resurrection and cohort tails. Correlate upload, post, generation, request and event identities without leaking sensitive URLs/content. Metrics need actions and owners."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Expected behavior",
+            "en": "Expected behavior"
+          },
+          {
+            "vi": "Test",
+            "en": "Test"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Lost finalize response",
+              "en": "Lost finalize response"
+            },
+            {
+              "vi": "Same post/result; changed payload conflict.",
+              "en": "Same post/result; conflicting payload rejected."
+            },
+            {
+              "vi": "Commit rồi disconnect trước reply.",
+              "en": "Disconnect after commit before reply."
+            }
+          ],
+          [
+            {
+              "vi": "Commit/queue crash gap",
+              "en": "Commit/queue crash gap"
+            },
+            {
+              "vi": "Durable intent eventual repair có bound/alert.",
+              "en": "Durable intent supports bounded monitored repair."
+            },
+            {
+              "vi": "Crash ở từng boundary/outbox checkpoint.",
+              "en": "Crash at boundaries/outbox checkpoints."
+            }
+          ],
+          [
+            {
+              "vi": "Late transcode after delete",
+              "en": "Late transcode after delete"
+            },
+            {
+              "vi": "Tombstone/generation không bị READY ghi đè.",
+              "en": "Tombstones/generations resist stale readiness."
+            },
+            {
+              "vi": "Deletev2 rồi completev1/replaybackfill.",
+              "en": "Deletev2 before completev1/replayed backfill."
+            }
+          ],
+          [
+            {
+              "vi": "Two shard owners",
+              "en": "Two shard owners"
+            },
+            {
+              "vi": "Sink rejects stale epoch; sequence state không đủ.",
+              "en": "Sinks reject stale epochs; sequences alone are insufficient."
+            },
+            {
+              "vi": "Partition old host rồi activate new.",
+              "en": "Partition old hosts before activation."
+            }
+          ],
+          [
+            {
+              "vi": "Expired story in cache",
+              "en": "Expired story in cache"
+            },
+            {
+              "vi": "Server eligibility reject dù bytes/entry còn tồn tại.",
+              "en": "Reject expired serving despite retained bytes/entries."
+            },
+            {
+              "vi": "Delay cleanup, cached URL và replica lag.",
+              "en": "Delay cleanup, URLs and replicas."
+            }
+          ],
+          [
+            {
+              "vi": "Out-of-order viewed state",
+              "en": "Out-of-order viewed state"
+            },
+            {
+              "vi": "Preserve holes hoặc declare approximation.",
+              "en": "Preserve holes or declare approximation."
+            },
+            {
+              "vi": "View102 trên phone,101 unseen trên tablet.",
+              "en": "View102 on a phone while101 remains unseen."
+            }
+          ],
+          [
+            {
+              "vi": "Region outage",
+              "en": "Region outage"
+            },
+            {
+              "vi": "Explicit RPO, fenced authority, bounded degradation.",
+              "en": "Explicit RPO, fencing and bounded degradation."
+            },
+            {
+              "vi": "Lagged replica promotion + stale routing + saturated backup.",
+              "en": "Lagged promotion, stale routes and backup saturation."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Luyện end-to-end và phản biện assumptions",
+        "en": "15. Practice end-to-end reasoning and assumptions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bắt đầu với một upload và một feed read, rồi chọn deep dive theo bottleneck. Dưới đây là worked answers cho design reasoning, không một kiến trúc duy nhất bắt buộc. Nói rõ authority, lost reply và deleted-data behavior trước khi thêm cache/database mới.",
+          "en": "Trace one upload and feed read, then choose bottleneck-driven deep dives. These worked answers support reasoning rather than mandate one architecture. Explain authority, lost replies and deletion before adding stores."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao uploadURL thành công vẫn chưa được public post?",
+            "en": "Why does a successful upload URL not imply a public post?"
+          },
+          "answer": [
+            {
+              "vi": "Bytes có thể thiếu validation/safety/derivatives; finalize phải verify ownership/generation rồi commit PROCESSING/result/intent. READY sau checked outputs và current audience. Object exists không là authorization hay readiness.",
+              "en": "Bytes may lack validation, safety checks or renditions. Finalization verifies ownership/generation and commits processing/result/intent; readiness follows checked outputs and current audiences. Existence establishes neither authorization nor readiness."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Modulo sequence có bảo đảm unique không?",
+            "en": "Does a modulo sequence guarantee uniqueness?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Same ms/shard lặp1024slots là collision; clock rollback/restart và two owners thêm failure modes. Need capacity wait/reject, retained monotonic state/exclusive ownership, fencing và string serialization. ID namespace per-table hay global phải rõ.",
+              "en": "No. Reusing1024slots in one shard/millisecond collides; clock rollback, restarts and competing owners add failures. Bound capacity, preserve state/ownership, fence writers and serialize exactly. Define per-table versus global namespaces."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "41-bit timestamp có 41 năm và positive bigint luôn đủ không?",
+            "en": "Does a 41-bit timestamp mean41 years and always fit positive bigint?"
+          },
+          "answer": [
+            {
+              "vi": "Không:2⁴¹milliseconds khoảng69.7years. Với23lowbits, positive signed64bit chỉ chứa40timebits≈34.8years. Chọn epoch/sign/storage/order và migration policy. JS Number còn chỉ exact tới2⁵³−1, nên truyền decimal string/BigInt boundary.",
+              "en": "No. Two to the41 milliseconds spans about69.7years. With23low bits, positive signed64bit leaves40time bits, about34.8years. Plan epoch, sign, order and migration; JavaScript integers require exact transport beyond the safe limit."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Thêm hosts có cần đổi user modulo không?",
+            "en": "Does adding hosts require changing user modulo?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu fixed logical buckets. Đổi mapping sau copy/CDC/verify/fence/cutover; chỉ sửa mapping không đủ. Hot author/data pattern có thể yêu cầu thiết kế subpartition có migration riêng.",
+              "en": "Not with fixed logical buckets. Change placement after copying, capture, verification, fencing and cutover; editing the map alone is insufficient. Hot datasets may need separately migrated subpartitions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Story TTL24h có chứng minh không ai xem sau24h?",
+            "en": "Does a24-hour TTL prove nobody can view after24hours?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cache cleanup có thể trễ, replica/URL/CDN còn serve. Check expires_at/current ACL ở serving và align capability lifetime. Archive/backup retention khác active eligibility; không hứa xóa screenshot người dùng đã lưu.",
+              "en": "No. Cleanup may lag and replicas, URLs or CDNs may still serve. Validate expiry/permissions and align capability lifetimes. Archives/backups differ from active eligibility, and saved screenshots cannot be revoked."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể dùng max viewed ID cho Stories không?",
+            "en": "Can Stories use a maximum viewed ID?"
+          },
+          "answer": [
+            {
+              "vi": "Có nếu contract là contiguous consumed prefix hoặc approximate được chấp nhận. Out-of-order view102 bỏ101 làm max-only đánh dấu nhầm. Giữ holes/bitmap/set và define multi-device merge/retention.",
+              "en": "Only for contiguous consumed prefixes or explicitly approximate behavior. Viewing102 before101 makes a maximum falsely mark101. Retain holes/sets/bitmaps and define cross-device merging and retention."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "UUIDv4 không paginate được đúng không?",
+            "en": "Is pagination impossible with UUIDv4?"
+          },
+          "answer": [
+            {
+              "vi": "Vẫn paginate bằng created_at+id composite stable index/cursor. Random IDs có locality/width trade-off, không mất capability pagination. UUIDv7/ULID/time-shard layout có properties khác và clock/security considerations.",
+              "en": "Composite creation-time/ID indexes and cursors still paginate UUIDv4. Random keys have locality/width costs, not an inability to paginate. Time-based alternatives have different properties and clock/security considerations."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Advanced encode nên chạy cho mọi video?",
+            "en": "Should every video receive expensive encoding?"
+          },
+          "answer": [
+            {
+              "vi": "Không mặc định. So expected future byte/QoE benefit với compute/storage/device support và uncertainty; basic ladder phải ready sớm. Re-evaluate viral cohorts, fairness/starvation và actual quality thay giả equal-quality saving.",
+              "en": "Not by default. Compare future delivery/QoE benefits with compute, storage, device support and uncertainty while making basic ladders ready early. Reevaluate viral cohorts, starvation and measured quality rather than assuming equal-quality savings."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

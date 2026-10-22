@@ -1,0 +1,3391 @@
+{
+  "id": "ep-stripe",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Payment Platform: từ một intent đến money movement có thể audit",
+    "en": "Building a Payment Platform: from one intent to auditable money movement"
+  },
+  "summary": {
+    "vi": "12 giai đoạn để hiểu retries, external uncertainty, webhooks, journal/reconciliation, payouts, security, cells và live migrations; ba lab cho evidence, inbox và cutover.",
+    "en": "Twelve stages explain retries, external uncertainty, webhooks, journals, reconciliation, payouts, security, cells and live migrations, with evidence, inbox and cutover labs."
+  },
+  "prerequisites": [
+    "payments",
+    "digital-wallet",
+    "messaging"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "auth",
+    "distributed",
+    "database"
+  ],
+  "takeaways": [
+    {
+      "vi": "Intent, attempt, external evidence và journal event có IDs và authority khác nhau.",
+      "en": "Intents, attempts, evidence and journal events have distinct identities and authority."
+    },
+    {
+      "vi": "Unknown là state phải giải quyết, không một error được đổi thành failed để retry mới.",
+      "en": "Unknown is a state to resolve, not an error to relabel as failure for a new attempt."
+    },
+    {
+      "vi": "Delivery dedup, business idempotence và financial uniqueness giải quyết các failure windows khác nhau.",
+      "en": "Delivery deduplication, business idempotence and financial uniqueness protect different windows."
+    },
+    {
+      "vi": "Balanced journals cần completeness/reconciliation; available funds, capture và payout không đồng nghĩa.",
+      "en": "Balanced journals need completeness/reconciliation; availability, capture and payout differ."
+    },
+    {
+      "vi": "Versioned backfill, verified cutover và activated sink fences cần đi cùng live migration.",
+      "en": "Live migration requires versioned backfill, verified cutover and activated sink fences."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Giữ một ý định qua nhiều hệ thống",
+      "en": "Preserve one intent across systems"
+    },
+    "caption": {
+      "vi": "Mỗi boundary cần định nghĩa ACK, authority, retry identity và recovery.",
+      "en": "Every boundary needs ACK, authority, retry identity and recovery definitions."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Nhận ý định",
+          "en": "Accept intent"
+        },
+        "detail": {
+          "vi": "Auth/scope → unique claim → durable attempt.",
+          "en": "Auth/scope → unique claim → durable attempt."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Resolve external work",
+          "en": "Resolve external work"
+        },
+        "detail": {
+          "vi": "Risk/processor với explicit uncertainty và evidence.",
+          "en": "Risk/processors with explicit uncertainty and evidence."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Record / notify",
+          "en": "Record / notify"
+        },
+        "detail": {
+          "vi": "Journal/outbox → durable inbox → business effect.",
+          "en": "Journal/outbox → durable inbox → business effect."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Evolve / recover",
+          "en": "Evolve / recover"
+        },
+        "detail": {
+          "vi": "Reconciliation, bounded scale, version/cell ownership.",
+          "en": "Reconciliation, bounded scale, version/cell ownership."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Một platform nhận và giải thích money movement",
+        "en": "1. A platform that accepts and explains money movement"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài xây dựng dùng Stripe làm ngữ cảnh để học một payment platform cho merchants và marketplaces. Ta biên soạn kiến trúc minh họa, không mô tả private implementation hoặc hướng dẫn tích hợp một SDK/version cụ thể. API, states và capacity dưới đây là contracts của ví dụ. Đọc Payments và Digital Wallet trước để có nền tảng retry, double-entry, reservations và cross-owner workflows; ở đây tập trung evolution và integration boundaries.",
+          "en": "This build uses Stripe as context for a merchant/marketplace payment platform. It is a teaching architecture, not a private implementation or SDK-version integration guide. APIs, states and capacity below belong to the example. Read Payments and Digital Wallet for retry, journals, reservations and cross-owner workflows; this chapter focuses on evolution and integration boundaries."
+        },
+        {
+          "vi": "Một payment có ba loại sự thật cần liên kết: business intent của merchant, execution evidence ở processor/bank và accounting records mình lưu. Một row succeeded chỉ chứng minh contract mà row đó đại diện. External rails có delays, reversals và disputes; UX cần phân biệt pending, action required, authorized, captured và paid out. Không nhận raw card data hoặc thực hiện charge thật trong các lab.",
+          "en": "A payment links merchant intent, external execution evidence and internal financial records. A succeeded row proves only its declared contract. Rails have delays, reversals and disputes, so UX distinguishes pending, action required, authorization, capture and payout. Labs never collect cards or move real funds."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Merchant intent",
+            "en": "Merchant intent"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Operation key và account scope xác định điều người dùng muốn làm; cùng amount/card/time không đủ xác định intent.",
+              "en": "Operation keys and account scope identify intended work; amount/card/time alone do not."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "External evidence",
+            "en": "External evidence"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Timeout không quyết định tiền đã đi hay chưa; giữ attempt reference và resolve theo authoritative contract.",
+              "en": "Timeouts do not decide external effects; retain attempt references and resolve authoritative evidence."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Accounting truth",
+            "en": "Accounting truth"
+          },
+          "icon": "check",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Journal có uniqueness/completeness controls và reconciliation; balanced sums chỉ là một invariant.",
+              "en": "Journals need uniqueness, completeness and reconciliation; balanced sums are only one invariant."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lifecycle",
+      "title": {
+        "vi": "2. Authentication khác authorization, capture và settlement",
+        "en": "2. Distinguish authentication, authorization, capture and settlement"
+      },
+      "paragraphs": [
+        {
+          "vi": "Authentication xác minh cardholder hoặc principal theo flow; authorization thường tạo hold/approval ở issuer, chưa là chuyển tiền cuối cùng. Capture yêu cầu hoàn tất debit theo payment-method contract. Settlement là clearing/funds movement giữa các bên tài chính; payout đưa available balance ra bank của merchant/seller. Có payment methods gộp hoặc khác các bước này, nên adapter phải khai báo semantics thay vì ép mọi rail vào một boolean approved.",
+          "en": "Authentication verifies a cardholder or principal. Authorization typically approves or holds issuer funds without final transfer. Capture requests collection under method-specific contracts. Settlement clears/moves funds among financial parties; payout sends available balances to merchant/seller banks. Methods may combine or differ from these steps, requiring adapter semantics beyond one approved boolean."
+        },
+        {
+          "vi": "Payment identity có thể giữ qua nhiều attempts và human challenge; attempt identity gắn processor/route và external key. Capture, refund và payout là operations riêng có scope và idempotency riêng. Không reuse một operation key cho amount khác, cũng không tạo key mới chỉ vì request ban đầu timeout. Succeeded ở payment collection không loại trừ refund/dispute về sau; các workflow sau không được sửa lịch sử cũ thành chưa từng có payment.",
+          "en": "Payment identity spans attempts and challenges; attempt identity pins processor, route and external key. Capture, refund and payout have separate operation identities. Do not reuse keys for changed amounts or invent new keys after timeouts. Collection success does not preclude later refunds/disputes; later workflows do not rewrite the original event out of history."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Hai trục: trải nghiệm và evidence",
+          "en": "Two axes: experience and evidence"
+        },
+        "caption": {
+          "vi": "Các bước là logical lifecycle; không khẳng định mọi payment method đi cùng một đường.",
+          "en": "This is a logical lifecycle rather than a universal payment-method sequence."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Intent",
+              "en": "Intent"
+            },
+            "detail": {
+              "vi": "Merchant + amount/currency + account/token context.",
+              "en": "Merchant, amount/currency and account/token context."
+            },
+            "icon": "target"
+          },
+          {
+            "title": {
+              "vi": "Action / authorization",
+              "en": "Action / authorization"
+            },
+            "detail": {
+              "vi": "Customer challenge nếu cần; issuer approval/hold theo contract.",
+              "en": "Challenge if needed, then issuer approval/holds under contract."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Capture / settlement",
+              "en": "Capture / settlement"
+            },
+            "detail": {
+              "vi": "External evidence và financial events phân biệt rõ.",
+              "en": "Separate external evidence and financial events."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Payout / adjustments",
+              "en": "Payout / adjustments"
+            },
+            "detail": {
+              "vi": "Availability, reserves, bank returns và audit.",
+              "en": "Availability, reserves, returns and audits."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 12 giai đoạn: từ endpoint đến global platform",
+        "en": "3. 12 stages: from endpoint to global platform"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi giai đoạn có pressure, decision, trade-off, next pressure và exit criteria cùng sơ đồ. Đây là thứ tự học thiết kế, không phải timeline nội bộ đã được xác nhận. Security, durable identity và unknown handling cần ở MVP; các stages sau làm rõ boundaries khi scale/product mở rộng. Chạy trace, bấm component và thử giải thích fault ở từng external call.",
+          "en": "Each stage has pressures, decisions, trade-offs, next steps, exit criteria and a diagram. The order teaches design rather than asserting private chronology. Security, durable identities and unknown handling belong in the MVP; later stages deepen boundaries as the product grows. Trace requests, inspect components and explain faults at each external call."
+        }
+      ],
+      "stages": [
+        {
+          "id": "first-api",
+          "title": {
+            "vi": "API đầu tiên và một processor",
+            "en": "First API and one processor"
+          },
+          "description": {
+            "vi": "Bắt đầu với một payment operation có merchant, amount/currency, payment-method token và state machine. API gọi một adapter processor; card collection dùng hosted fields/redirect thay vì cho raw PAN đi qua mọi service. MVP vẫn phải ghi attempt trước external side effect và có trạng thái chưa biết kết quả: đây là yêu cầu correctness ban đầu, không phần nâng cấp tùy chọn.",
+            "en": "Start with a merchant-scoped payment operation, amount/currency, payment-method token and state machine. One processor adapter handles external calls, while hosted collection avoids spreading raw PAN. Persist attempts before side effects and represent unknown outcomes from day one; correctness is not an optional later upgrade."
+          },
+          "problem": {
+            "vi": "Merchant muốn tích hợp ít bước nhưng mạng có thể mất response sau khi processor đã xử lý.",
+            "en": "Merchants want few integration steps, but networks can lose responses after processing."
+          },
+          "decision": {
+            "vi": "Giữ API/worker modular, transactional operation store và một processor adapter có explicit retry/status contract.",
+            "en": "Use a modular API/worker, transactional operation store and an adapter with explicit retry/status contracts."
+          },
+          "tradeoff": {
+            "vi": "Một processor là shared dependency; synchronous API không thể biến mọi payment method thành kết quả tức thì.",
+            "en": "One processor is a shared dependency; a synchronous API cannot make every payment method immediate."
+          },
+          "nextPressure": {
+            "vi": "Client retries và concurrent submits xuất hiện; cần một intent ổn định thay vì đoán duplicate bằng amount/time.",
+            "en": "Client retries and concurrent submits require stable intent identity rather than amount/time guesses."
+          },
+          "exitCriteria": {
+            "vi": "Truy vết operation → attempt → processor reference; timeout giữ unknown, không báo failed giả.",
+            "en": "Trace operations to attempts and processor references; preserve unknown on timeouts rather than inventing failure."
+          },
+          "diagram": {
+            "id": "platform-stage-first-api",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Không dùng fictional card data hoặc gọi rails thật; đây là kiến trúc học tập.",
+              "en": "No card data or real rails are used; this is a teaching design."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "merchant",
+                "label": {
+                  "vi": "Merchant server",
+                  "en": "Merchant server"
+                },
+                "detail": {
+                  "vi": "Identity và stable business operation ID.",
+                  "en": "Identity and stable business-operation IDs."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Payment API",
+                  "en": "Payment API"
+                },
+                "detail": {
+                  "vi": "Validate scope/amount/currency và admit bounded work.",
+                  "en": "Validates scope, amounts/currencies and bounded admission."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "store",
+                "label": {
+                  "vi": "Operation / attempt",
+                  "en": "Operation / attempt"
+                },
+                "detail": {
+                  "vi": "Persist trước external submission, có result retention.",
+                  "en": "Persist before submission with retained results."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "adapter",
+                "label": {
+                  "vi": "Processor adapter",
+                  "en": "Processor adapter"
+                },
+                "detail": {
+                  "vi": "Mapping riêng cho authorize/capture/status.",
+                  "en": "Separate authorization, capture and status mappings."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "processor",
+                "label": {
+                  "vi": "External processor",
+                  "en": "External processor"
+                },
+                "detail": {
+                  "vi": "Authority ngoài transactional boundary local.",
+                  "en": "External authority outside local transactions."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "merchant",
+                    "to": "api",
+                    "description": {
+                      "vi": "Create payment với token, merchant scope và operation key.",
+                      "en": "Create with a token, merchant scope and operation key."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "store",
+                    "description": {
+                      "vi": "Commit operation/attempt và command intent.",
+                      "en": "Commit the operation, attempt and command intent."
+                    }
+                  },
+                  {
+                    "from": "store",
+                    "to": "adapter",
+                    "description": {
+                      "vi": "Worker nhận durable command.",
+                      "en": "A worker receives a durable command."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "adapter",
+                    "to": "processor",
+                    "description": {
+                      "vi": "Submit stable downstream attempt identity.",
+                      "en": "Submit with stable downstream attempt identity."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "idempotency",
+          "title": {
+            "vi": "Retry cùng ý định, không tạo ý định mới",
+            "en": "Retry the same intent"
+          },
+          "description": {
+            "vi": "Idempotency scope gồm principal/merchant, endpoint hoặc operation type và key. Fingerprint canonical payload để reject key reuse với amount khác. Unique claim, payment/attempt identity và outbox cần cùng durable boundary hoặc recovery protocol tương đương. Một marker in-flight vĩnh viễn không thay thế ownership recovery sau crash.",
+            "en": "Scope idempotency by merchant/principal, operation type and key. Fingerprint canonical payloads to reject changed amounts. Atomically persist claims, operation/attempt identity and outbox intent, or use an equivalent recovery protocol. An eternal in-flight marker is not crash recovery."
+          },
+          "problem": {
+            "vi": "Hai request cùng intent tới hai API replicas hoặc client retry sau response loss.",
+            "en": "One intent reaches two replicas, or a client retries after response loss."
+          },
+          "decision": {
+            "vi": "Unique claim + persisted response/operation pointer, conditional transitions và downstream idempotency theo provider contract.",
+            "en": "Use unique claims, retained responses/operation references, conditional transitions and downstream idempotency under provider contracts."
+          },
+          "tradeoff": {
+            "vi": "Retention, payload canonicalization và reconciliation sau expiry tốn state; random key mới cho mỗi retry phá intent identity.",
+            "en": "Retention, canonicalization and post-expiry reconciliation require state; new keys per retry destroy identity."
+          },
+          "nextPressure": {
+            "vi": "Nhiều kết quả đến sau API response và phải thông báo cho merchant.",
+            "en": "Outcomes arrive after API responses and need merchant notification."
+          },
+          "exitCriteria": {
+            "vi": "Crash ở mọi boundary không tạo attempt mới khi chỉ retry intent cũ; expired result không được suy ra payment absent.",
+            "en": "Crashes do not turn retries into new attempts; expired responses do not imply absent payments."
+          },
+          "diagram": {
+            "id": "platform-stage-idempotency",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "API replay semantics và payment lifecycle là hai contract, không một cache flag.",
+              "en": "API replay and payment lifecycle are distinct contracts, not one cache flag."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client retries",
+                  "en": "Client retries"
+                },
+                "detail": {
+                  "vi": "Giữ key/payload cho cùng logical operation.",
+                  "en": "Preserves keys/payloads for one logical operation."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Scoped claim",
+                  "en": "Scoped claim"
+                },
+                "detail": {
+                  "vi": "Fingerprint + unique constraint.",
+                  "en": "Fingerprint plus a unique constraint."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "store",
+                "label": {
+                  "vi": "Atomic operation store",
+                  "en": "Atomic operation store"
+                },
+                "detail": {
+                  "vi": "Claim, attempt, result pointer và outbox.",
+                  "en": "Claim, attempt, result references and outbox."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "worker",
+                "label": {
+                  "vi": "Recoverable worker",
+                  "en": "Recoverable worker"
+                },
+                "detail": {
+                  "vi": "Lease/epoch và stable external identity.",
+                  "en": "Leases/epochs and stable external identity."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "provider",
+                "label": {
+                  "vi": "Provider dedup",
+                  "en": "Provider dedup"
+                },
+                "detail": {
+                  "vi": "Scope/retention riêng, không shared giữa providers.",
+                  "en": "Provider-specific scope/retention, not shared across providers."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Concurrent retries cùng principal/key.",
+                      "en": "Concurrent retries share principal/key."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "store",
+                    "description": {
+                      "vi": "Claim hoặc đọc retained operation result atomically.",
+                      "en": "Atomically claim or read retained operation results."
+                    }
+                  },
+                  {
+                    "from": "store",
+                    "to": "worker",
+                    "description": {
+                      "vi": "Resume durable attempt sau worker crash.",
+                      "en": "Resume durable attempts after worker crashes."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "worker",
+                    "to": "provider",
+                    "description": {
+                      "vi": "Retry cùng downstream identity trong provider contract.",
+                      "en": "Retry the same downstream identity within provider contracts."
+                    }
+                  },
+                  {
+                    "from": "store",
+                    "to": "client",
+                    "description": {
+                      "vi": "Replay retained response hoặc operation status rõ.",
+                      "en": "Replay retained responses or explicit operation status."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "events",
+          "title": {
+            "vi": "Thông báo async bằng durable events",
+            "en": "Notify with durable events"
+          },
+          "description": {
+            "vi": "State change và event intent phải cùng commit boundary; relay có thể gửi lặp. Merchant verify raw-body signature/timestamp/context, durable inbox trước ACK rồi dùng business idempotence để fulfill. Event ID dedup không đủ cho hai event IDs khác cùng payment. Delivery order không phải state-machine order.",
+            "en": "Commit state changes with event intent; relays may duplicate sends. Merchants verify raw-body signatures, time and context, durably admit before ACKs and fulfill idempotently. Event-ID dedup does not cover different events for one payment, and delivery order is not state-machine order."
+          },
+          "problem": {
+            "vi": "Payment methods, settlement, refunds và disputes có kết quả đến muộn.",
+            "en": "Payments, settlements, refunds and disputes produce later outcomes."
+          },
+          "decision": {
+            "vi": "Transactional outbox, per-endpoint delivery queues, signed retries có backoff/jitter, inbox và controlled replay.",
+            "en": "Use outboxes, per-endpoint queues, signed jittered retries, inboxes and controlled replay."
+          },
+          "tradeoff": {
+            "vi": "Endpoint chậm cần quotas/DLQ/retention; duplicate và stale notifications phải được xử lý rõ.",
+            "en": "Slow endpoints need quotas, dead-letter handling and retention; duplicates and stale notifications need explicit handling."
+          },
+          "nextPressure": {
+            "vi": "Marketplace cần quản lý nhiều sellers và payout không đồng nhất với charge.",
+            "en": "Marketplaces need seller accounts and payouts distinct from charges."
+          },
+          "exitCriteria": {
+            "vi": "Replay duplicate/out-of-order giữ một fulfillment; ACK chỉ sau durable acceptance, không chờ external shipping.",
+            "en": "Duplicate/reordered replay yields one fulfillment; ACK after durable acceptance rather than external shipping."
+          },
+          "diagram": {
+            "id": "platform-stage-events",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Queue ACK, webhook ACK và fulfillment success không đồng nghĩa.",
+              "en": "Queue ACKs, webhook ACKs and fulfillment success differ."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "state",
+                "label": {
+                  "vi": "Payment state",
+                  "en": "Payment state"
+                },
+                "detail": {
+                  "vi": "Committed state/version và event identity.",
+                  "en": "Committed state/version and event identity."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "outbox",
+                "label": {
+                  "vi": "Outbox relay",
+                  "en": "Outbox relay"
+                },
+                "detail": {
+                  "vi": "At-least-once publication.",
+                  "en": "At-least-once publication."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "hooks",
+                "label": {
+                  "vi": "Webhook delivery",
+                  "en": "Webhook delivery"
+                },
+                "detail": {
+                  "vi": "Endpoint isolation, signatures và retry schedule.",
+                  "en": "Endpoint isolation, signatures and retries."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "inbox",
+                "label": {
+                  "vi": "Merchant inbox",
+                  "en": "Merchant inbox"
+                },
+                "detail": {
+                  "vi": "Verify rồi insert durable unique event.",
+                  "en": "Verifies then durably inserts unique events."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "fulfill",
+                "label": {
+                  "vi": "Business worker",
+                  "en": "Business worker"
+                },
+                "detail": {
+                  "vi": "Conditional fulfillment và downstream identity.",
+                  "en": "Conditional fulfillment and downstream identity."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "state",
+                    "to": "outbox",
+                    "description": {
+                      "vi": "State và outbox intent nằm trong một commit.",
+                      "en": "State and outbox intent share a commit."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "outbox",
+                    "to": "hooks",
+                    "description": {
+                      "vi": "Relay có thể publish lặp stable event ID.",
+                      "en": "Relays may republish stable event IDs."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "hooks",
+                    "to": "inbox",
+                    "description": {
+                      "vi": "Verify + durable inbox trước 2xx.",
+                      "en": "Verify and durably admit before 2xx."
+                    }
+                  },
+                  {
+                    "from": "inbox",
+                    "to": "fulfill",
+                    "description": {
+                      "vi": "Process payment version/state và unique business effect.",
+                      "en": "Process payment versions/state and unique business effects."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "platforms",
+          "title": {
+            "vi": "Connected accounts và payout lifecycle",
+            "en": "Connected accounts and payout lifecycles"
+          },
+          "description": {
+            "vi": "Tách charge nhận tiền, transfer phân bổ trách nhiệm giữa accounts và payout tới ngân hàng. Pending/available/reserved balances có thời điểm chuyển rõ; một authorization chưa phải tiền available cho seller. Seller onboarding, account restrictions và refund/dispute liability cần policy, không chỉ một fee percentage.",
+            "en": "Separate collection, account transfers and bank payouts. Define pending, available and reserved balances; an authorization is not seller-available cash. Onboarding, restrictions and refund/dispute liability need policies beyond a fee percentage."
+          },
+          "problem": {
+            "vi": "Marketplace phải trả nhiều sellers, trừ fees/reserves và xử lý bank returns.",
+            "en": "Marketplaces must pay sellers, apply fees/reserves and handle bank returns."
+          },
+          "decision": {
+            "vi": "Account-scoped ledger, payout eligibility và riêng state machine của bank instruction.",
+            "en": "Use account-scoped ledgers, payout eligibility and independent bank-instruction state machines."
+          },
+          "tradeoff": {
+            "vi": "Không hứa platform transfer/cross-border payout atomic nếu các rails không hỗ trợ; onboarding và dispute responsibilities tăng.",
+            "en": "Do not promise atomic transfers across unsupported rails; onboarding and dispute responsibilities grow."
+          },
+          "nextPressure": {
+            "vi": "Workflow rows không đủ giải thích fees, reserves và external settlement differences.",
+            "en": "Workflow rows cannot fully explain fees, reserves and settlement mismatches."
+          },
+          "exitCriteria": {
+            "vi": "Không double-payout khi retry; bank return tạo adjustment được đối chiếu, không xóa original history.",
+            "en": "Retries do not duplicate payouts; returns create reconciled adjustments without deleting history."
+          },
+          "diagram": {
+            "id": "platform-stage-platforms",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Payout succeeded tại API vẫn cần hiểu external settlement/return contract.",
+              "en": "API payout success must be interpreted under settlement/return contracts."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "platform",
+                "label": {
+                  "vi": "Marketplace",
+                  "en": "Marketplace"
+                },
+                "detail": {
+                  "vi": "Account scopes, allocation và liability policy.",
+                  "en": "Account scopes, allocation and liability policies."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "accounts",
+                "label": {
+                  "vi": "Seller accounts",
+                  "en": "Seller accounts"
+                },
+                "detail": {
+                  "vi": "Eligibility/restrictions và settlement currency.",
+                  "en": "Eligibility, restrictions and settlement currencies."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "ledger",
+                "label": {
+                  "vi": "Account balances",
+                  "en": "Account balances"
+                },
+                "detail": {
+                  "vi": "Pending/available/reserved derived theo journal.",
+                  "en": "Journal-derived pending, available and reserved balances."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "payout",
+                "label": {
+                  "vi": "Payout workflow",
+                  "en": "Payout workflow"
+                },
+                "detail": {
+                  "vi": "Stable bank instruction, pending/paid/returned states.",
+                  "en": "Stable instructions with pending, paid and returned states."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "bank",
+                "label": {
+                  "vi": "Bank rail",
+                  "en": "Bank rail"
+                },
+                "detail": {
+                  "vi": "External authority và delayed returns.",
+                  "en": "External authority and delayed returns."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "platform",
+                    "to": "accounts",
+                    "description": {
+                      "vi": "Select seller/fee allocation dưới account permissions.",
+                      "en": "Select seller/fee allocation under account permissions."
+                    }
+                  },
+                  {
+                    "from": "accounts",
+                    "to": "ledger",
+                    "description": {
+                      "vi": "Record liabilities và availability theo explicit events.",
+                      "en": "Record liabilities and availability under explicit events."
+                    }
+                  },
+                  {
+                    "from": "ledger",
+                    "to": "payout",
+                    "description": {
+                      "vi": "Reserve eligible funds atomically cho payout.",
+                      "en": "Atomically reserve eligible payout funds."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "payout",
+                    "to": "bank",
+                    "description": {
+                      "vi": "Submit stable instruction; timeout giữ unknown.",
+                      "en": "Submit a stable instruction and preserve unknown on timeout."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "ledger",
+          "title": {
+            "vi": "Journal và reconciliation có kiểm chứng",
+            "en": "Auditable journals and reconciliation"
+          },
+          "description": {
+            "vi": "Ledger ghi balanced postings theo currency, transaction ID và economic event. Append-only corrections dùng reversals/adjustments. Balanced không có nghĩa đầy đủ: cả thiếu một transaction và duplicate nguyên balanced transaction đều có thể qua kiểm tổng. Reconciliation so journal/processors/bank evidence theo IDs, amounts, timing và currencies, mở exception có owner và aging.",
+            "en": "Journals record balanced postings by currency, transaction and economic event. Corrections use reversals/adjustments. Balanced does not mean complete: missing or duplicated balanced transactions can pass sum checks. Reconciliation matches journals to processor/bank evidence by identity, amounts, timing and currency, opening owned, aged exceptions."
+          },
+          "problem": {
+            "vi": "Fees, refunds, reserves và settlement timing làm finance không giải thích được balance.",
+            "en": "Fees, refunds, reserves and settlement timing make balances unexplained."
+          },
+          "decision": {
+            "vi": "Immutable journal + unique economic-event identity, atomic account postings và reconciliation cases.",
+            "en": "Use immutable journals, unique economic identities, atomic postings and reconciliation cases."
+          },
+          "tradeoff": {
+            "vi": "Nhiều postings, reference indexes và close/reopen policy; balance projection vẫn cần consistency contract.",
+            "en": "More postings, indexes and close/reopen policies; balance projections still need consistency contracts."
+          },
+          "nextPressure": {
+            "vi": "Fraud pressure tăng; cần decision layer không làm correctness phụ thuộc model uptime.",
+            "en": "Fraud pressure requires decisions without coupling correctness to model uptime."
+          },
+          "exitCriteria": {
+            "vi": "Replay giữ unique economic events; per-currency debit=credit và aged unmatched items được giải thích.",
+            "en": "Replay preserves unique events; currency sums balance and aged unmatched items have explanations."
+          },
+          "diagram": {
+            "id": "platform-stage-ledger",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Không xem mọi clearing account nonzero là lỗi; phải xét in-flight và maturity window.",
+              "en": "Nonzero clearing is not automatically erroneous; account for in-flight work and maturity."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "workflow",
+                "label": {
+                  "vi": "Economic events",
+                  "en": "Economic events"
+                },
+                "detail": {
+                  "vi": "Authority + operation identity và evidence.",
+                  "en": "Authority, operation identities and evidence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "journal",
+                "label": {
+                  "vi": "Atomic journal",
+                  "en": "Atomic journal"
+                },
+                "detail": {
+                  "vi": "Balanced immutable postings; unique references.",
+                  "en": "Balanced immutable postings and unique references."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "reports",
+                "label": {
+                  "vi": "Processor / bank reports",
+                  "en": "Processor / bank reports"
+                },
+                "detail": {
+                  "vi": "Versioned imports và report coverage.",
+                  "en": "Versioned imports and report coverage."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "recon",
+                "label": {
+                  "vi": "Reconciliation",
+                  "en": "Reconciliation"
+                },
+                "detail": {
+                  "vi": "Match IDs/amounts/currency/time, không chỉ totals.",
+                  "en": "Matches identities, amounts, currencies and timing beyond totals."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "cases",
+                "label": {
+                  "vi": "Exception cases",
+                  "en": "Exception cases"
+                },
+                "detail": {
+                  "vi": "Owner, aging, approval và append-only corrections.",
+                  "en": "Owners, aging, approvals and append-only corrections."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "workflow",
+                    "to": "journal",
+                    "description": {
+                      "vi": "Post one balanced economic event với unique identity.",
+                      "en": "Post one balanced event under unique identity."
+                    }
+                  },
+                  {
+                    "from": "reports",
+                    "to": "recon",
+                    "description": {
+                      "vi": "Import/dedup external evidence với coverage metadata.",
+                      "en": "Import/deduplicate external evidence with coverage metadata."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "journal",
+                    "to": "recon",
+                    "description": {
+                      "vi": "Join theo references và expected maturity.",
+                      "en": "Match by references and expected maturity."
+                    }
+                  },
+                  {
+                    "from": "recon",
+                    "to": "cases",
+                    "description": {
+                      "vi": "Mismatches thành owned exceptions; approved correction có audit.",
+                      "en": "Create owned exceptions and audited approved corrections."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "risk",
+          "title": {
+            "vi": "Risk decisions trong latency budget",
+            "en": "Risk decisions within latency budgets"
+          },
+          "description": {
+            "vi": "Model/rules đánh giá trước network submission hoặc theo flow policy; issuer vẫn có quyết định authorization riêng. Nếu model timeout, fallback phải theo merchant/security policy: rules-only, challenge, review hoặc deny có thể phù hợp khác nhau. Không luôn fail open. Labels tới muộn và skew do blocked transactions làm evaluation khó.",
+            "en": "Models and rules act under flow policies before network submission; issuers retain separate authorization decisions. Model timeouts follow merchant/security policy: rules, challenge, review or denial may fit. Never assume universal fail-open. Delayed labels and blocked-transaction selection complicate evaluation."
+          },
+          "problem": {
+            "vi": "Card testing và account abuse làm loss tăng; false declines cũng mất legitimate sales.",
+            "en": "Card testing and abuse increase losses while false declines lose legitimate sales."
+          },
+          "decision": {
+            "vi": "Bounded risk serving, fresh velocity signals, explicit timeout policy và monitored guardrails.",
+            "en": "Bound risk serving, keep velocity signals fresh and specify timeout policies and guardrails."
+          },
+          "tradeoff": {
+            "vi": "Latency, feature privacy, delayed chargeback labels và bias; approval rate alone không là objective.",
+            "en": "Latency, privacy, delayed chargeback labels and bias; approval rate alone is not the objective."
+          },
+          "nextPressure": {
+            "vi": "Card-data exposure cần giảm và quyền dùng tokens phải giới hạn.",
+            "en": "Reduce card-data exposure and scope token permissions."
+          },
+          "exitCriteria": {
+            "vi": "Inject risk latency và stale features; kiểm policy outcome, p99, false-decline/loss cohorts.",
+            "en": "Inject latency/stale features and inspect policy, p99 and loss/false-decline cohorts."
+          },
+          "diagram": {
+            "id": "platform-stage-risk",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Risk approval không phải issuer authorization hoặc money settlement.",
+              "en": "Risk approval is neither issuer authorization nor settlement."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "request",
+                "label": {
+                  "vi": "Payment context",
+                  "en": "Payment context"
+                },
+                "detail": {
+                  "vi": "Minimized merchant/device/payment signals.",
+                  "en": "Minimized merchant, device and payment signals."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "features",
+                "label": {
+                  "vi": "Risk features",
+                  "en": "Risk features"
+                },
+                "detail": {
+                  "vi": "Freshness/consent và anti-abuse counters.",
+                  "en": "Freshness, consent and anti-abuse counters."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "model",
+                "label": {
+                  "vi": "Model + rules",
+                  "en": "Model + rules"
+                },
+                "detail": {
+                  "vi": "Deadline-bound decision và version.",
+                  "en": "Deadline-bound versioned decisions."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "model"
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Fallback policy",
+                  "en": "Fallback policy"
+                },
+                "detail": {
+                  "vi": "Explicit allow/challenge/review/deny choices.",
+                  "en": "Explicit allow, challenge, review or deny choices."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "processor",
+                "label": {
+                  "vi": "Network submission",
+                  "en": "Network submission"
+                },
+                "detail": {
+                  "vi": "Chỉ đi tiếp theo allowed flow state.",
+                  "en": "Proceed only under allowed flow state."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "request",
+                    "to": "features",
+                    "description": {
+                      "vi": "Read bounded fresh features.",
+                      "en": "Read bounded fresh features."
+                    }
+                  },
+                  {
+                    "from": "request",
+                    "to": "model",
+                    "description": {
+                      "vi": "Evaluate trong request deadline.",
+                      "en": "Evaluate within the request deadline."
+                    }
+                  },
+                  {
+                    "from": "model",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Result/timeout chọn approved policy path.",
+                      "en": "Results/timeouts select approved policies."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "processor",
+                    "description": {
+                      "vi": "Submit chỉ khi policy và payment state cho phép.",
+                      "en": "Submit only when policy and payment state permit."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "vault",
+          "title": {
+            "vi": "Thu hẹp vùng xử lý card data",
+            "en": "Reduce the card-data boundary"
+          },
+          "description": {
+            "vi": "Hosted collection gửi sensitive fields trực tiếp tới provider/vault boundary; merchant nhận reference bị scope theo permissions. Token không phải dữ liệu vô hại trong mọi context: ai được charge bằng token vẫn cần authentication, scope và audit. Vault cần encryption/key custody, controlled detokenization, rotation và isolation; logs/support exports cũng trong threat model.",
+            "en": "Hosted collection sends sensitive fields directly into provider/vault boundaries. Merchant references are permission-scoped. Tokens are not universally harmless: charge capability still needs authentication, scope and audits. Vaults need key custody, controlled detokenization, rotation and isolation, including logs and support exports."
+          },
+          "problem": {
+            "vi": "Raw card data lan sang services, logs hoặc support tools làm attack surface lớn.",
+            "en": "Raw card data spreads across services, logs and support tools."
+          },
+          "decision": {
+            "vi": "Hosted fields/redirect + isolated vault, least-privilege tokens và redacted telemetry; review integration-specific scope.",
+            "en": "Use hosted collection, isolated vaults, least-privilege references and redacted telemetry; review integration-specific scope."
+          },
+          "tradeoff": {
+            "vi": "Provider dependency và vault concentration; tokenization không tự chứng nhận compliance hoặc miễn mọi hệ thống ngoài vault.",
+            "en": "Provider dependency and concentrated vault risk; tokenization alone does not certify compliance or exempt every other system."
+          },
+          "nextPressure": {
+            "vi": "Public contracts/storage models cần thay đổi mà không làm integrations cũ hiểu sai.",
+            "en": "Public contracts and data models must evolve without breaking old integrations."
+          },
+          "exitCriteria": {
+            "vi": "Raw sensitive fields không lọt app logs; scoped token misuse và key rotation/failure được thử.",
+            "en": "Sensitive fields do not leak into app logs; test token misuse, rotation and failures."
+          },
+          "diagram": {
+            "id": "platform-stage-vault",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Đây là boundary design, không lời xác nhận một integration đạt yêu cầu compliance.",
+              "en": "This models boundaries rather than certifying an integration."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "browser",
+                "label": {
+                  "vi": "Hosted collection",
+                  "en": "Hosted collection"
+                },
+                "detail": {
+                  "vi": "Sensitive fields nằm trong provider-controlled UI boundary.",
+                  "en": "Sensitive fields remain within a provider-controlled UI boundary."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "vault",
+                "label": {
+                  "vi": "Isolated vault",
+                  "en": "Isolated vault"
+                },
+                "detail": {
+                  "vi": "Encryption/key custody và controlled resolution.",
+                  "en": "Encryption, key custody and controlled resolution."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "merchant",
+                "label": {
+                  "vi": "Merchant backend",
+                  "en": "Merchant backend"
+                },
+                "detail": {
+                  "vi": "Nhận scoped reference, không nhận raw card fields.",
+                  "en": "Receives scoped references rather than raw card fields."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "adapter",
+                "label": {
+                  "vi": "Secure adapter",
+                  "en": "Secure adapter"
+                },
+                "detail": {
+                  "vi": "Permission-checked resolution/submission.",
+                  "en": "Permission-checked resolution and submission."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "processor",
+                "label": {
+                  "vi": "Processor boundary",
+                  "en": "Processor boundary"
+                },
+                "detail": {
+                  "vi": "Contract riêng cho card/network credentials.",
+                  "en": "Separate contracts for card/network credentials."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "browser",
+                    "to": "vault",
+                    "description": {
+                      "vi": "Collect trực tiếp qua secure provider path.",
+                      "en": "Collect directly through a secure provider path."
+                    }
+                  },
+                  {
+                    "from": "vault",
+                    "to": "merchant",
+                    "description": {
+                      "vi": "Trả reference với intended permissions.",
+                      "en": "Return references under intended permissions."
+                    }
+                  },
+                  {
+                    "from": "merchant",
+                    "to": "adapter",
+                    "description": {
+                      "vi": "Request payment bằng token và merchant scope.",
+                      "en": "Request payment using tokens and merchant scope."
+                    }
+                  },
+                  {
+                    "from": "adapter",
+                    "to": "vault",
+                    "description": {
+                      "vi": "Resolve theo policy trong secure zone.",
+                      "en": "Resolve under policy in the secure zone."
+                    }
+                  },
+                  {
+                    "from": "adapter",
+                    "to": "processor",
+                    "description": {
+                      "vi": "Gửi network credential qua authorized connector.",
+                      "en": "Send network credentials through authorized connectors."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "versioning",
+          "title": {
+            "vi": "Đổi API và migrate mà không mất writes",
+            "en": "Evolve APIs and retain live writes"
+          },
+          "description": {
+            "vi": "API presentation version khác storage schema. Additive contract hoặc explicit opt-in version bảo vệ clients; state semantics thay đổi có thể cần logic migration chứ không chỉ JSON transform. Backfill cần source version và CDC ordering/tombstones để không ghi đè live update mới hơn. Cutover có barrier, verification và rollback với authority/fencing rõ.",
+            "en": "Presentation versions differ from storage schemas. Additive or opted-in contracts protect clients; state-semantic changes may require behavior changes beyond JSON transforms. Versioned backfills and ordered CDC/tombstones protect live updates. Cutover needs barriers, verification, rollback and fenced authority."
+          },
+          "problem": {
+            "vi": "Old integrations tồn tại nhiều năm trong khi schema và service boundaries phải đổi.",
+            "en": "Old integrations persist while schemas and boundaries change."
+          },
+          "decision": {
+            "vi": "Expand–migrate–contract, versioned writes/backfill và shadow comparisons; separate API compatibility modules.",
+            "en": "Use expand–migrate–contract, versioned backfills/writes, shadow comparisons and separate compatibility modules."
+          },
+          "tradeoff": {
+            "vi": "Dual writes không tự atomic; added load, retry/delete behavior và rollback semantics tốn công.",
+            "en": "Dual writes are not automatically atomic; added load, retries, deletion and rollback require work."
+          },
+          "nextPressure": {
+            "vi": "Tenant/cell placement và blast radius cần ownership ổn định trên nhiều deployments.",
+            "en": "Tenant/cell placement and blast radius require stable cross-deployment ownership."
+          },
+          "exitCriteria": {
+            "vi": "Late backfill/tombstone/retry không resurrect stale data; switch chỉ sau verified frontier và fence old owners.",
+            "en": "Late backfill, tombstones and retries do not resurrect stale data; switch after verified frontiers and fence old owners."
+          },
+          "diagram": {
+            "id": "platform-stage-versioning",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Backfill thành công không chứng minh zero lost writes nếu không có source log/barrier contract.",
+              "en": "Successful backfill does not establish zero lost writes without log/barrier contracts."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "writer",
+                "label": {
+                  "vi": "Live writer",
+                  "en": "Live writer"
+                },
+                "detail": {
+                  "vi": "Atomic source update + change record.",
+                  "en": "Atomic source updates and change records."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "old",
+                "label": {
+                  "vi": "Old authority",
+                  "en": "Old authority"
+                },
+                "detail": {
+                  "vi": "Versioned rows và cutover epoch.",
+                  "en": "Versioned rows and cutover epochs."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "cdc",
+                "label": {
+                  "vi": "CDC / outbox",
+                  "en": "CDC / outbox"
+                },
+                "detail": {
+                  "vi": "Ordering, dedup và barrier coverage.",
+                  "en": "Ordering, deduplication and barrier coverage."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "new",
+                "label": {
+                  "vi": "New store",
+                  "en": "New store"
+                },
+                "detail": {
+                  "vi": "Conditional version apply, including deletes.",
+                  "en": "Conditional version application including deletion."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "backfill",
+                "label": {
+                  "vi": "Backfill verifier",
+                  "en": "Backfill verifier"
+                },
+                "detail": {
+                  "vi": "Snapshot versions, compare và complete frontier.",
+                  "en": "Snapshot versions, comparisons and completion frontiers."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "writer",
+                    "to": "old",
+                    "description": {
+                      "vi": "Commit live version cùng change record.",
+                      "en": "Commit live versions with change records."
+                    }
+                  },
+                  {
+                    "from": "old",
+                    "to": "cdc",
+                    "description": {
+                      "vi": "Replicate ordered changes theo explicit log boundary.",
+                      "en": "Replicate ordered changes under an explicit log boundary."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "cdc",
+                    "to": "new",
+                    "description": {
+                      "vi": "Apply version-monotonic updates/tombstones.",
+                      "en": "Apply version-monotonic updates/tombstones."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "backfill",
+                    "to": "new",
+                    "description": {
+                      "vi": "Reject snapshot older than already-applied live version.",
+                      "en": "Reject snapshots older than applied live versions."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "backfill",
+                    "to": "old",
+                    "description": {
+                      "vi": "Verify frontier/readiness rồi fence old write authority.",
+                      "en": "Verify readiness/frontiers and fence old authority."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "cells",
+          "title": {
+            "vi": "Ghim merchant vào cell có authority",
+            "en": "Pin merchants to authoritative cells"
+          },
+          "description": {
+            "vi": "Cell là một failure/ownership boundary cho tập accounts, không chỉ tên region. Router dùng authenticated account mapping với epoch và không tự load-balance writes của cùng payment sang cell khác sau timeout. Shared identity/config/router dependencies vẫn có thể tạo global blast radius. Data-placement policy phải bao gồm replicas, logs, backups và analytics.",
+            "en": "Cells bound failures and ownership for account sets, not just regions. Routers use authenticated account mappings and epochs; timeouts do not justify sending one payment’s writes to another cell. Shared identity, config and routers can retain global blast radius. Placement policies include replicas, logs, backups and analytics."
+          },
+          "problem": {
+            "vi": "Một deploy hoặc hot merchant không được kéo mọi accounts xuống; placement constraints có thể khác.",
+            "en": "A deployment or hot merchant should not affect all accounts; placement constraints may vary."
+          },
+          "decision": {
+            "vi": "Stable home-cell routing, cell-local authority/quotas và progressive releases; transfer ownership có freeze/drain/fence.",
+            "en": "Use stable routing, cell-local authority/quotas and progressive releases, with frozen, drained and fenced ownership transfers."
+          },
+          "tradeoff": {
+            "vi": "Cross-cell reports/marketplace workflows phức tạp; data residency là policy-specific và không được suy ra từ một architecture diagram.",
+            "en": "Cross-cell reports and marketplaces become distributed; residency is policy-specific and not proved by a diagram."
+          },
+          "nextPressure": {
+            "vi": "Customer authentication có thể kéo dài hơn một HTTP request và cần resume qua cell.",
+            "en": "Customer authentication can outlast one HTTP request and must resume in the correct cell."
+          },
+          "exitCriteria": {
+            "vi": "Wrong-cell routing bị reject/redirect có bound; rollback/cell outage không tạo hai write authorities.",
+            "en": "Boundedly reject/redirect wrong-cell traffic; outages and rollbacks never create two authorities."
+          },
+          "diagram": {
+            "id": "platform-stage-cells",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Cells giới hạn blast radius khi cả shared dependencies và deploy controls được xét.",
+              "en": "Cells limit blast radius only with shared dependencies and deployment controls considered."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "merchant",
+                "label": {
+                  "vi": "Authenticated account",
+                  "en": "Authenticated account"
+                },
+                "detail": {
+                  "vi": "Tenant identity không chỉ client-supplied header.",
+                  "en": "Tenant identity is more than a supplied header."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "router",
+                "label": {
+                  "vi": "Home-cell router",
+                  "en": "Home-cell router"
+                },
+                "detail": {
+                  "vi": "Mapping version/epoch và bounded dependency.",
+                  "en": "Versioned mappings/epochs and bounded dependencies."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "a",
+                "label": {
+                  "vi": "Cell A",
+                  "en": "Cell A"
+                },
+                "detail": {
+                  "vi": "Owner cho một account set.",
+                  "en": "Owns one account set."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "b",
+                "label": {
+                  "vi": "Cell B",
+                  "en": "Cell B"
+                },
+                "detail": {
+                  "vi": "Independently admitted workload.",
+                  "en": "Independently admitted workloads."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "ownership",
+                "label": {
+                  "vi": "Ownership metadata",
+                  "en": "Ownership metadata"
+                },
+                "detail": {
+                  "vi": "Fenced handoff; source/destination readiness.",
+                  "en": "Fenced handoff and source/destination readiness."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "merchant",
+                    "to": "router",
+                    "description": {
+                      "vi": "Authenticate rồi resolve account mapping.",
+                      "en": "Authenticate before resolving account mappings."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "ownership",
+                    "description": {
+                      "vi": "Read versioned authority mapping.",
+                      "en": "Read versioned authority mappings."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "a",
+                    "description": {
+                      "vi": "Route đúng owner, propagate operation identity/epoch.",
+                      "en": "Route to the owner with operation identity/epoch."
+                    }
+                  },
+                  {
+                    "from": "ownership",
+                    "to": "b",
+                    "description": {
+                      "vi": "Handoff chỉ sau source fencing và destination verification.",
+                      "en": "Handoff after source fencing and destination verification."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "customer-action",
+          "title": {
+            "vi": "Payment chờ người dùng rồi tiếp tục",
+            "en": "Pause for customer action and resume"
+          },
+          "description": {
+            "vi": "Một payment intent có stable business identity qua attempts và customer authentication. Requires-action không phải terminal failed; authentication thành công cũng chưa là capture hoặc bank settlement. Client callback có thể mất, user đóng browser hoặc attempt hết hạn; server authority và async updates quyết định fulfillment theo product contract.",
+            "en": "Intents retain stable identity across attempts and authentication. Required action is not terminal failure; successful authentication is not capture or settlement. Callbacks may be lost, browsers closed and attempts expired; server authority and asynchronous updates govern fulfillment."
+          },
+          "problem": {
+            "vi": "Một synchronous charge response không mô tả được human challenge hoặc async method.",
+            "en": "One synchronous response cannot represent human challenges or asynchronous methods."
+          },
+          "decision": {
+            "vi": "Explicit action-required, processing, authorized/requires-capture và succeeded states; resume same intent theo validation.",
+            "en": "Represent required action, processing, authorization/capture and success states, resuming validated intents."
+          },
+          "tradeoff": {
+            "vi": "Expiry, customer experience, late completion và retries cần contract; không coi mọi payment đều buộc challenge.",
+            "en": "Expiry, UX, late completion and retries need contracts; not every payment requires challenges."
+          },
+          "nextPressure": {
+            "vi": "Một processor outage cần route mới nhưng không được duplicate một attempt còn có thể execute.",
+            "en": "Processor outages motivate routing without duplicating potentially executing attempts."
+          },
+          "exitCriteria": {
+            "vi": "Browser lost callback vẫn reconcile được; authentication/authorization/capture IDs phân biệt rõ.",
+            "en": "Lost callbacks remain recoverable; distinguish authentication, authorization and capture references."
+          },
+          "diagram": {
+            "id": "platform-stage-customer-action",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Không suy authority từ return_url hoặc một UI success screen.",
+              "en": "Return URLs and success screens are not authoritative evidence."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "browser",
+                "label": {
+                  "vi": "Customer UI",
+                  "en": "Customer UI"
+                },
+                "detail": {
+                  "vi": "Shows next action, không là payment authority.",
+                  "en": "Shows actions without being payment authority."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "intent",
+                "label": {
+                  "vi": "Intent service",
+                  "en": "Intent service"
+                },
+                "detail": {
+                  "vi": "Stable identity/state và allowed transition.",
+                  "en": "Stable identity/state and allowed transitions."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "issuer",
+                "label": {
+                  "vi": "Issuer challenge",
+                  "en": "Issuer challenge"
+                },
+                "detail": {
+                  "vi": "Authentication outcome riêng.",
+                  "en": "Separate authentication outcomes."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "processor",
+                "label": {
+                  "vi": "Authorization / capture",
+                  "en": "Authorization / capture"
+                },
+                "detail": {
+                  "vi": "Payment method-specific contract.",
+                  "en": "Payment-method-specific contracts."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Durable result events",
+                  "en": "Durable result events"
+                },
+                "detail": {
+                  "vi": "Server-authoritative updates cho merchant.",
+                  "en": "Server-authoritative merchant updates."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "intent",
+                    "to": "browser",
+                    "description": {
+                      "vi": "Return explicit next action và expiry context.",
+                      "en": "Return explicit actions and expiry context."
+                    }
+                  },
+                  {
+                    "from": "browser",
+                    "to": "issuer",
+                    "description": {
+                      "vi": "Customer hoàn tất supported challenge.",
+                      "en": "The customer completes a supported challenge."
+                    }
+                  },
+                  {
+                    "from": "issuer",
+                    "to": "intent",
+                    "description": {
+                      "vi": "Validate result và resume allowed attempt.",
+                      "en": "Validate results and resume allowed attempts."
+                    }
+                  },
+                  {
+                    "from": "intent",
+                    "to": "processor",
+                    "description": {
+                      "vi": "Proceed authorize/capture theo flow.",
+                      "en": "Proceed under authorization/capture flow."
+                    }
+                  },
+                  {
+                    "from": "intent",
+                    "to": "events",
+                    "description": {
+                      "vi": "Commit state/result và outbox trước notification.",
+                      "en": "Commit state/results and outbox before notification."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "routing",
+          "title": {
+            "vi": "Chuyển processor theo evidence",
+            "en": "Route processors using evidence"
+          },
+          "description": {
+            "vi": "Health chọn route cho attempts mới; outcome authority quyết định attempt đang pending có được chuyển không. Một stale NOT_FOUND, 500 hoặc response timeout không chứng minh không có external effect. Chỉ reroute sau authoritative terminal no-execution hoặc cancellation/fencing contract ngăn execution muộn. Nếu không có proof, giữ unknown và reconcile.",
+            "en": "Health selects routes for new attempts; outcome authority determines whether pending attempts can move. Stale NOT_FOUND, 500s and timeouts do not prove absence. Reroute after authoritative terminal no-execution or cancellation/fencing that prevents late effects. Without proof, preserve unknown and reconcile."
+          },
+          "problem": {
+            "vi": "Processor A chậm, business muốn dùng B ngay nhưng A vẫn có thể authorize muộn.",
+            "en": "A is slow and business wants B, while A may authorize later."
+          },
+          "decision": {
+            "vi": "Separate payment/attempt IDs, provider status contracts, bounded probes và capacity-aware routing của new work.",
+            "en": "Separate payments/attempts, specify status contracts and bound probes and capacity-aware new routing."
+          },
+          "tradeoff": {
+            "vi": "Pending ảnh hưởng UX; hai providers có token portability, fees, declines và settlement reports khác.",
+            "en": "Pending affects UX; providers differ in token portability, fees, decline rules and reports."
+          },
+          "nextPressure": {
+            "vi": "Holiday surge và retries có thể làm primary/backup cùng quá tải.",
+            "en": "Holiday surges and retries can overload both providers."
+          },
+          "exitCriteria": {
+            "vi": "Lost-response và delayed-send fixtures không duplicate holds; status stale không mở blind route B.",
+            "en": "Lost responses and delayed sends do not duplicate holds; stale status never opens blind rerouting."
+          },
+          "diagram": {
+            "id": "platform-stage-routing",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Một connection error chỉ chứng minh non-delivery khi execution path/history thực sự bảo đảm điều đó.",
+              "en": "Connection errors establish non-delivery only under proven execution-path/history guarantees."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "attempt",
+                "label": {
+                  "vi": "Persisted attempt",
+                  "en": "Persisted attempt"
+                },
+                "detail": {
+                  "vi": "Identity, route và execution state trước send.",
+                  "en": "Identity, route and execution state before sending."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "router",
+                "label": {
+                  "vi": "Processor router",
+                  "en": "Processor router"
+                },
+                "detail": {
+                  "vi": "New-work health khác pending-outcome evidence.",
+                  "en": "New-work health differs from pending-outcome evidence."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "a",
+                "label": {
+                  "vi": "Processor A",
+                  "en": "Processor A"
+                },
+                "detail": {
+                  "vi": "Có thể execute sau client timeout.",
+                  "en": "May execute after client timeouts."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "status",
+                "label": {
+                  "vi": "Outcome resolver",
+                  "en": "Outcome resolver"
+                },
+                "detail": {
+                  "vi": "Authoritative receipt/terminal absence vs stale status.",
+                  "en": "Authoritative receipts/terminal absence versus stale status."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "b",
+                "label": {
+                  "vi": "Processor B",
+                  "en": "Processor B"
+                },
+                "detail": {
+                  "vi": "Không share dedup keyspace với A.",
+                  "en": "Does not share A’s deduplication namespace."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "attempt",
+                    "to": "router",
+                    "description": {
+                      "vi": "Resume same attempt identity sau crash/retry.",
+                      "en": "Resume attempt identity after crashes/retries."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "a",
+                    "description": {
+                      "vi": "Submit A; reply loss giữ unknown.",
+                      "en": "Submit to A; lost replies preserve unknown."
+                    }
+                  },
+                  {
+                    "from": "a",
+                    "to": "status",
+                    "description": {
+                      "vi": "Status/evidence theo provider-specific contract.",
+                      "en": "Provide evidence under provider-specific contracts."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "status",
+                    "to": "router",
+                    "description": {
+                      "vi": "Only terminal absent/fenced permits new route.",
+                      "en": "Only terminal fenced absence permits a new route."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "b",
+                    "description": {
+                      "vi": "Reroute sau proof; new requests cũng phải fit capacity.",
+                      "en": "Reroute after proof, respecting capacity for new work."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "peak",
+          "title": {
+            "vi": "Giữ correctness ở giờ cao điểm",
+            "en": "Preserve correctness at peak"
+          },
+          "description": {
+            "vi": "Pre-scale theo database, risk, downstream limits và queues chứ không chỉ API CPU. Admission nhanh trước durable acceptance có thể trả bounded retry advice; sau acceptance hệ thống sở hữu recovery/result. Reporting/export có thể defer trước, nhưng nếu capacity hết vẫn phải reject thêm payment admission thay vì hứa xử lý vô hạn. Idempotency không làm retries miễn CPU/storage.",
+            "en": "Prescale databases, risk, provider limits and queues, not just API CPU. Bounded admission can reject before acceptance; after acceptance the platform owns recovery/results. Defer reports first, but reject excess payment admission rather than promising unbounded work. Idempotency does not make retries free."
+          },
+          "problem": {
+            "vi": "Peak arrival cộng retry amplification đẩy latency vượt checkout deadline.",
+            "en": "Peak arrivals and retries exceed checkout deadlines."
+          },
+          "decision": {
+            "vi": "Per-tenant fairness, queue bounds, dependency bulkheads, jittered retry budget và tested degradation.",
+            "en": "Use tenant fairness, bounded queues, bulkheads, jittered retry budgets and tested degradation."
+          },
+          "tradeoff": {
+            "vi": "Reserve capacity có chi phí; priority policy phải bảo vệ reconciliation/unknown-result recovery, không starve chúng mãi.",
+            "en": "Reserves cost money; priorities must not indefinitely starve reconciliation and recovery."
+          },
+          "nextPressure": {
+            "vi": "Tiếp tục kiểm workload mix và operational evidence khi tăng merchants/providers/features.",
+            "en": "Reassess workload mix and operational evidence as merchants, providers and features grow."
+          },
+          "exitCriteria": {
+            "vi": "Peak test gồm retry/unknown/webhook backlogs và recovery drain; accepted operations vẫn accounted/reconciled.",
+            "en": "Peak tests include retries, unknown outcomes, webhook lag and recovery drain; accepted operations remain accounted and reconciled."
+          },
+          "diagram": {
+            "id": "platform-stage-peak",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Scale target là accepted-work correctness cùng tail latency, không chỉ requests/s.",
+              "en": "Scale targets combine accepted-work correctness with tail latency, not just requests/second."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "tenants",
+                "label": {
+                  "vi": "Merchant traffic",
+                  "en": "Merchant traffic"
+                },
+                "detail": {
+                  "vi": "Bursts, retries và tenant skew.",
+                  "en": "Bursts, retries and tenant skew."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "admit",
+                "label": {
+                  "vi": "Admission / fairness",
+                  "en": "Admission / fairness"
+                },
+                "detail": {
+                  "vi": "Bounds trước acceptance; retry advice có budget.",
+                  "en": "Bounds before acceptance and budgeted retry advice."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "payments",
+                "label": {
+                  "vi": "Accepted operations",
+                  "en": "Accepted operations"
+                },
+                "detail": {
+                  "vi": "Durable ownership và results.",
+                  "en": "Durable ownership and results."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "providers",
+                "label": {
+                  "vi": "Bounded connectors",
+                  "en": "Bounded connectors"
+                },
+                "detail": {
+                  "vi": "Processor/Risk limits và reserved recovery capacity.",
+                  "en": "Processor/risk limits and reserved recovery capacity."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "deferred",
+                "label": {
+                  "vi": "Reports / recovery queues",
+                  "en": "Reports / recovery queues"
+                },
+                "detail": {
+                  "vi": "Deferred work tách critical recovery priority.",
+                  "en": "Separates deferred work from critical recovery priorities."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "tenants",
+                    "to": "admit",
+                    "description": {
+                      "vi": "Classify tenant/work và enforce bounded admission.",
+                      "en": "Classify tenant/work and bound admission."
+                    }
+                  },
+                  {
+                    "from": "admit",
+                    "to": "payments",
+                    "description": {
+                      "vi": "Commit accepted operation, không silently drop sau ACK.",
+                      "en": "Commit accepted operations without silently dropping after ACK."
+                    }
+                  },
+                  {
+                    "from": "payments",
+                    "to": "providers",
+                    "description": {
+                      "vi": "Dispatch trong downstream/concurrency budget.",
+                      "en": "Dispatch within downstream/concurrency budgets."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "payments",
+                    "to": "deferred",
+                    "description": {
+                      "vi": "Event/recovery queues có retry limits và ownership.",
+                      "en": "Events/recovery queues have retry bounds and ownership."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "4. Size accepted work, attempts và backlogs riêng",
+        "en": "4. Size accepted work, attempts and backlogs separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 100 triệu payment operations/ngày, peak factor 8, trung bình 4 journal postings và 3 merchant events cho mỗi operation. Average là 100.000.000 / 86.400 ≈ 1.157 operations/s; peak ≈ 9.259/s. Journal peak ≈ 37.037 postings/s và initial notifications ≈ 27.778/s, chưa retries, refund/payout/dispute operations hoặc indexes. Không dùng payment volume theo tiền để suy ra transaction rate nếu chưa có amount distribution và time interval rõ.",
+          "en": "Assume a hundred million payment operations/day, an eightfold peak, four journal postings and three events per operation. Average rate is roughly 1,157 operations/second, peak about 9,259. This implies around 37,037 postings/second and 27,778 initial notifications/second before retries, other workflows and indexes. Monetary volume does not establish transaction rate without amount distributions and time intervals."
+        },
+        {
+          "vi": "Giả sử một operation giữ connector trong 0,4 s trung bình ở trạng thái steady và không overload, peak 9.259/s cần khoảng 3.704 concurrent calls theo Little’s law. Nếu latency thành 4 s, cần khoảng 37.037 calls in flight nếu arrival không giảm: đó là dấu hiệu phải admission/bulkhead thay vì tăng queue vô hạn. Processor limits và tenant skew có thể là ceiling trước database. Mean/concurrency estimate không dự đoán p99 và không đúng trong transient backlog growth.",
+          "en": "At steady non-overloaded 0.4-second mean connector occupancy, 9,259 operations/second imply roughly 3,704 concurrent calls by Little’s law. Four-second latency would imply about 37,037 in flight if arrivals remain unchanged, motivating admission/bulkheads instead of infinite queues. Provider limits and tenant skew may bind first. Mean estimates do not predict p99 or transient backlog growth."
+        },
+        {
+          "vi": "Nếu lưu 1 KB metadata/result pointer mỗi operation trong một ngày, raw state khoảng 100 GB decimal, trước response bodies, replicas và indexes. Result retention khác ledger retention và external dedup window; hết TTL không chứng minh external attempt không tồn tại. Các notification/reconciliation queues cần backlog age và drain rate: 1 triệu events với spare throughput 500/s cần tối thiểu 2.000 s để drain nếu incoming load giữ nguyên.",
+          "en": "At one KB of metadata/result references per operation for one day, raw state is around 100 decimal GB before bodies, replicas and indexes. Result, journal and provider dedup retention differ; TTL expiry does not establish external absence. Track queue age and drain rates: a million events with 500/second spare throughput take at least 2,000 seconds to drain under steady arrivals."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Workload",
+            "en": "Workload"
+          },
+          {
+            "vi": "Đếm gì",
+            "en": "What to count"
+          },
+          {
+            "vi": "Protection",
+            "en": "Protection"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "API admission",
+              "en": "API admission"
+            },
+            {
+              "vi": "Requests gồm invalid, repeats, status và new operations.",
+              "en": "Requests include invalid, repeated, status and new operations."
+            },
+            {
+              "vi": "Rate limits/fairness, bounded validation và result lookup.",
+              "en": "Rate limits, fairness, bounded validation and result lookup."
+            }
+          ],
+          [
+            {
+              "vi": "Processor",
+              "en": "Processor"
+            },
+            {
+              "vi": "Attempts, probes, status checks và method-specific limits.",
+              "en": "Attempts, probes, status and method-specific limits."
+            },
+            {
+              "vi": "Deadline, stable IDs, connector pools và outcome resolver.",
+              "en": "Deadlines, stable IDs, pools and outcome resolution."
+            }
+          ],
+          [
+            {
+              "vi": "Financial state",
+              "en": "Financial state"
+            },
+            {
+              "vi": "Economic events, postings, balances/indexes và corrections.",
+              "en": "Events, postings, balances/indexes and corrections."
+            },
+            {
+              "vi": "Atomicity, unique economic IDs, reconciliation và restore.",
+              "en": "Atomicity, unique identities, reconciliation and restore."
+            }
+          ],
+          [
+            {
+              "vi": "Notifications",
+              "en": "Notifications"
+            },
+            {
+              "vi": "Events × endpoint fan-out × actual attempts.",
+              "en": "Events times endpoint fan-out times actual attempts."
+            },
+            {
+              "vi": "Endpoint isolation, durable inbox, bounded replay và backlog age.",
+              "en": "Endpoint isolation, durable inboxes, bounded replay and queue age."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Một operation qua các authority boundaries",
+        "en": "5. Trace an operation across authority boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn Submit để thấy atomic local intent dừng ở đâu và external call bắt đầu ở đâu. Khi worker crash sau processor đã xử lý nhưng trước local commit, recovery giữ nguyên downstream identity và resolve attempt thay vì tạo payment mới. Lease/epoch ngăn old worker ghi local state chỉ khi receiver enforce fence; nó không tự hủy external request đang bay.",
+          "en": "The submit trace separates local atomic intent from external execution. A crash after processing but before local commit requires retained downstream identity and outcome resolution rather than a new payment. Leases/epochs prevent stale local writes only when receivers enforce them; they do not cancel in-flight external requests."
+        },
+        {
+          "vi": "Chọn Records để tách authorization evidence khỏi capture/settlement accounting; chọn Reconcile để thấy balanced journal chưa chứng minh completeness. Sơ đồ có logical dependencies và async intent, không hứa một local database transaction bao phủ processor, merchant warehouse hay bank rail. Nếu journal ở service riêng, committed intent + idempotent posting + consistency/availability policy phải thay cho dual write ngây thơ.",
+          "en": "Record traces distinguish authorization from financial events, while reconciliation exposes completeness obligations. Diagrams show logical dependencies and asynchronous intent without claiming one transaction covers processors, merchant systems or banks. A separate journal service needs committed intents, idempotent posting and explicit consistency/availability policies, not naive dual writes."
+        }
+      ],
+      "diagram": {
+        "id": "platform-money-evidence",
+        "title": {
+          "vi": "Theo dõi operation, external outcome và money records",
+          "en": "Trace operations, external outcomes and money records"
+        },
+        "caption": {
+          "vi": "Các sơ đồ là platform minh họa, không khẳng định topology nội bộ Stripe. Authority ngoài hệ thống không nằm trong cùng local transaction.",
+          "en": "These are educational platform diagrams, not Stripe’s private topology. External authority is outside local transaction boundaries."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "merchant",
+            "label": {
+              "vi": "Merchant / customer",
+              "en": "Merchant / customer"
+            },
+            "detail": {
+              "vi": "Stable intent/key, tokenized reference và supported next actions.",
+              "en": "Stable intents/keys, tokenized references and supported actions."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "Auth / home-cell edge",
+              "en": "Auth / home-cell edge"
+            },
+            "detail": {
+              "vi": "Authenticate scope, resolve owner, admit bounded work.",
+              "en": "Authenticate scope, resolve ownership and bound admission."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "operation",
+            "label": {
+              "vi": "Operation store",
+              "en": "Operation store"
+            },
+            "detail": {
+              "vi": "Atomic claim/fingerprint, attempt/result và outbox intent; conditional transitions.",
+              "en": "Atomic claims/fingerprints, attempts/results and outbox intent with conditional transitions."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "risk",
+            "label": {
+              "vi": "Risk policy",
+              "en": "Risk policy"
+            },
+            "detail": {
+              "vi": "Model/rules có deadline và explicit fallback; không thay issuer approval.",
+              "en": "Deadline-bound models/rules with explicit fallbacks, distinct from issuer approval."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "model"
+          },
+          {
+            "id": "vault",
+            "label": {
+              "vi": "Secure token zone",
+              "en": "Secure token zone"
+            },
+            "detail": {
+              "vi": "Permission-scoped references và controlled detokenization.",
+              "en": "Permission-scoped references and controlled detokenization."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "router",
+            "label": {
+              "vi": "Processor adapter",
+              "en": "Processor adapter"
+            },
+            "detail": {
+              "vi": "Persist route/attempt; health cho new work, evidence cho pending work.",
+              "en": "Persists routes/attempts; health guides new work and evidence guides pending work."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "provider",
+            "label": {
+              "vi": "Processor / bank",
+              "en": "Processor / bank"
+            },
+            "detail": {
+              "vi": "External idempotency, result authority và reports theo contract.",
+              "en": "External idempotency, result authority and reports under provider contracts."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "resolver",
+            "label": {
+              "vi": "Outcome resolver",
+              "en": "Outcome resolver"
+            },
+            "detail": {
+              "vi": "Timeout/500/stale absence giữ unresolved; authoritative result qua status/events/reports.",
+              "en": "Timeouts, 500s and stale absence remain unresolved; authoritative evidence comes from status, events and reports."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "inbox",
+            "label": {
+              "vi": "Events / merchant inbox",
+              "en": "Events / merchant inbox"
+            },
+            "detail": {
+              "vi": "Outbox relay, signed delivery và verify/durable inbox/conditional business effects.",
+              "en": "Outbox relay, signed delivery and verification, durable inboxes and conditional effects."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "queue"
+          },
+          {
+            "id": "journal",
+            "label": {
+              "vi": "Immutable journal",
+              "en": "Immutable journal"
+            },
+            "detail": {
+              "vi": "Balanced per-currency economic events, unique identity và correction references.",
+              "en": "Balanced per-currency events, unique identities and correction references."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "store"
+          },
+          {
+            "id": "recon",
+            "label": {
+              "vi": "Reconciliation cases",
+              "en": "Reconciliation cases"
+            },
+            "detail": {
+              "vi": "Import reports, match identities/amounts/timing và human-owned exceptions.",
+              "en": "Imports reports and matches identities, amounts and timing with owned exceptions."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "worker"
+          },
+          {
+            "id": "payout",
+            "label": {
+              "vi": "Payout / reserves",
+              "en": "Payout / reserves"
+            },
+            "detail": {
+              "vi": "Eligible funds, bank instruction identity và delayed return state machine.",
+              "en": "Eligible funds, bank-instruction identity and delayed returns."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "submit",
+            "label": {
+              "vi": "Nhận và submit một payment",
+              "en": "Accept and submit a payment"
+            },
+            "steps": [
+              {
+                "from": "merchant",
+                "to": "edge",
+                "description": {
+                  "vi": "Send merchant-scoped key, amount/currency và token; retry giữ cùng intent.",
+                  "en": "Send a merchant-scoped key, amount/currency and token; retries retain intent."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "operation",
+                "description": {
+                  "vi": "Atomically claim key + persist operation/attempt/outbox hoặc replay existing result.",
+                  "en": "Atomically claim and persist operation/attempt/outbox or replay an existing result."
+                }
+              },
+              {
+                "from": "operation",
+                "to": "risk",
+                "description": {
+                  "vi": "Evaluate bounded risk policy trước permitted external transition.",
+                  "en": "Evaluate bounded risk policy before permitted external transitions."
+                }
+              },
+              {
+                "from": "operation",
+                "to": "router",
+                "description": {
+                  "vi": "Durable command worker giữ stable attempt, route và epoch.",
+                  "en": "The durable-command worker preserves attempts, routes and epochs."
+                },
+                "async": true
+              },
+              {
+                "from": "router",
+                "to": "vault",
+                "description": {
+                  "vi": "Resolve token chỉ trong authorized secure boundary.",
+                  "en": "Resolve tokens only inside authorized secure boundaries."
+                }
+              },
+              {
+                "from": "router",
+                "to": "provider",
+                "description": {
+                  "vi": "Submit stable downstream key theo provider retention/scope contract.",
+                  "en": "Submit stable downstream keys under provider retention/scope contracts."
+                }
+              }
+            ]
+          },
+          {
+            "id": "unknown",
+            "label": {
+              "vi": "Mất response và kết quả chưa rõ",
+              "en": "Lose a response and retain uncertainty"
+            },
+            "steps": [
+              {
+                "from": "provider",
+                "to": "resolver",
+                "description": {
+                  "vi": "Reply mất hoặc error ambiguous; chưa có proof external absence.",
+                  "en": "Reply loss or ambiguous errors do not prove external absence."
+                },
+                "async": true
+              },
+              {
+                "from": "resolver",
+                "to": "operation",
+                "description": {
+                  "vi": "Commit UNKNOWN với pending attempt; không đổi thành FAILED để route B.",
+                  "en": "Persist UNKNOWN with its pending attempt rather than failing to enable B."
+                }
+              },
+              {
+                "from": "resolver",
+                "to": "provider",
+                "description": {
+                  "vi": "Query status/evidence bằng original reference; stale NOT_FOUND không terminal.",
+                  "en": "Query original-reference evidence; stale NOT_FOUND is not terminal."
+                }
+              },
+              {
+                "from": "resolver",
+                "to": "operation",
+                "description": {
+                  "vi": "Apply authoritative receipt hoặc terminal absent/fence proof theo conditional transition.",
+                  "en": "Conditionally apply authoritative receipts or terminal fenced-absence evidence."
+                }
+              }
+            ]
+          },
+          {
+            "id": "records",
+            "label": {
+              "vi": "Capture và record financial events",
+              "en": "Capture and record financial events"
+            },
+            "steps": [
+              {
+                "from": "provider",
+                "to": "resolver",
+                "description": {
+                  "vi": "Nhận capture/settlement evidence riêng authorization; scope/ref phải match.",
+                  "en": "Receive capture/settlement evidence distinct from authorization and validate scope/references."
+                },
+                "async": true
+              },
+              {
+                "from": "resolver",
+                "to": "operation",
+                "description": {
+                  "vi": "Record external result, guard legal transition và durable journal intent.",
+                  "en": "Record results, guard transitions and persist journal intent."
+                }
+              },
+              {
+                "from": "operation",
+                "to": "journal",
+                "description": {
+                  "vi": "Apply one economic event atomically/balanced hoặc idempotent committed workflow.",
+                  "en": "Apply one balanced event atomically or through an idempotent committed workflow."
+                }
+              },
+              {
+                "from": "journal",
+                "to": "payout",
+                "description": {
+                  "vi": "Chỉ eligible/available funds thành payout reservation theo policy.",
+                  "en": "Only eligible available funds become payout reservations."
+                }
+              },
+              {
+                "from": "payout",
+                "to": "provider",
+                "description": {
+                  "vi": "Submit bank instruction với riêng idempotency và return lifecycle.",
+                  "en": "Submit bank instructions with separate idempotency and return lifecycles."
+                }
+              }
+            ]
+          },
+          {
+            "id": "notify",
+            "label": {
+              "vi": "Thông báo và fulfill ở merchant",
+              "en": "Notify and fulfill at the merchant"
+            },
+            "steps": [
+              {
+                "from": "operation",
+                "to": "inbox",
+                "description": {
+                  "vi": "Committed outbox relay publishes stable event; delivery có thể duplicate/reorder.",
+                  "en": "Committed outbox relay publishes stable events that may duplicate or reorder."
+                },
+                "async": true
+              },
+              {
+                "from": "inbox",
+                "to": "merchant",
+                "description": {
+                  "vi": "Verify raw signature/time/context; durable unique inbox trước ACK.",
+                  "en": "Verify raw signatures, time and context, then durably admit before ACK."
+                }
+              },
+              {
+                "from": "merchant",
+                "to": "inbox",
+                "description": {
+                  "vi": "Business worker guard payment transition và stable fulfillment intent.",
+                  "en": "Business workers guard payment transitions and stable fulfillment intent."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "reconcile",
+            "label": {
+              "vi": "Đối chiếu, sửa và audit",
+              "en": "Reconcile, correct and audit"
+            },
+            "steps": [
+              {
+                "from": "provider",
+                "to": "recon",
+                "description": {
+                  "vi": "Import versioned reports/receipts với dedup và coverage metadata.",
+                  "en": "Import versioned reports/receipts with deduplication and coverage metadata."
+                },
+                "async": true
+              },
+              {
+                "from": "journal",
+                "to": "recon",
+                "description": {
+                  "vi": "Match economic IDs, currency, amount và maturity; balanced totals chưa đủ.",
+                  "en": "Match identity, currency, amounts and maturity; balanced totals are insufficient."
+                }
+              },
+              {
+                "from": "recon",
+                "to": "resolver",
+                "description": {
+                  "vi": "Unknown/mismatch có owner, aging và approved action, không blind retry.",
+                  "en": "Unknown/mismatched items have owners, aging and approved actions, not blind retries."
+                },
+                "async": true
+              },
+              {
+                "from": "recon",
+                "to": "journal",
+                "description": {
+                  "vi": "Approved reversal/adjustment giữ original references và uniqueness.",
+                  "en": "Approved reversals/adjustments preserve original references and uniqueness."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "6. API contracts và ownership dữ liệu",
+        "en": "6. API contracts and data ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đây là API minh họa của platform. Version pinning, key retention, in-flight duplicates và result replay được ghi trong contract; không mặc định giống mọi API/phiên bản Stripe. Fingerprint canonical fields theo operation semantics, không hash JSON string chưa normalize. Authentication/account permissions và validation không được bỏ qua khi replay; retained result không được lộ sang principal khác.",
+          "en": "These APIs belong to the teaching platform. Versioning, retention, concurrent duplicates and replay are explicit rather than assumed identical across provider APIs/versions. Fingerprint canonical semantic fields rather than raw unordered JSON. Replays still enforce authentication and account permissions and never disclose another principal’s results."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/payments",
+          "description": {
+            "vi": "Create hoặc replay một payment intent theo merchant-scoped operation key.",
+            "en": "Create or replay an intent under a merchant-scoped operation key."
+          },
+          "request": "Headers: Operation-Key: op-17\n{ \"amountMinor\": 5000, \"currency\": \"USD\", \"paymentMethodRef\": \"pm-demo\" }",
+          "response": "202 { paymentId: \"p1\", state: \"processing\", statusUrl: \"/payments/p1\", operationId: \"op-17\" }",
+          "notes": [
+            {
+              "vi": "Integer minor units với currency metadata; reject invalid amounts và mismatched key payload. Không giả định mọi currency có hai decimal places.",
+              "en": "Use integer minor units and currency metadata; reject invalid amounts or changed keyed payloads. Not every currency has two decimal places."
+            },
+            {
+              "vi": "Same operation trong retention trả retained result hoặc reference theo contract; sau expiry phải reconcile business identity trước submit mới.",
+              "en": "Within retention, return the retained result/reference under contract; after expiry reconcile business identity before new submission."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/payments/{id}",
+          "description": {
+            "vi": "Đọc state và evidence freshness cho account được phép.",
+            "en": "Read state and evidence freshness for authorized accounts."
+          },
+          "response": "200 { state, version, pendingAttempt, nextAction, observedAt, externalEvidenceRef }",
+          "notes": [
+            {
+              "vi": "Local not found không chứng minh external attempt absent. Eventual replicas cần freshness/authority metadata.",
+              "en": "Local absence does not prove external absence. Eventual replicas need freshness/authority metadata."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/payments/{id}/captures",
+          "description": {
+            "vi": "Capture là operation riêng chỉ nhận transition hợp lệ.",
+            "en": "Capture is a separate operation with guarded transitions."
+          },
+          "request": "Headers: Operation-Key: cap-9\n{ \"amountMinor\": 5000, \"expectedPaymentVersion\": 7 }",
+          "response": "202 { captureId, state: \"processing\", statusUrl }",
+          "notes": [
+            {
+              "vi": "Partial/multiple captures theo provider policy và remaining authorized amount; không infer bank-final settlement từ HTTP 202.",
+              "en": "Partial/multiple captures follow provider policy and remaining authorization; HTTP 202 does not prove final settlement."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "https://merchant.example/payment-events",
+          "description": {
+            "vi": "Outbound notification tới registered merchant endpoint.",
+            "en": "Notify registered merchant endpoints."
+          },
+          "request": "Headers: Signature: <fixture-format>; Timestamp: <delivery-time>\n{ eventId, accountId, paymentId, objectVersion, type, payloadVersion }",
+          "response": "2xx after signature/context validation and durable inbox acceptance",
+          "notes": [
+            {
+              "vi": "Raw signature verification, bounded delivery age, secret rotation và event ID dedup khác business fulfillment idempotence.",
+              "en": "Raw verification, delivery-age bounds, rotation and event-ID dedup differ from business idempotence."
+            },
+            {
+              "vi": "Không embed raw PAN hoặc secret keys vào payload/log. Worker dùng stable downstream fulfillment identity nếu effect ngoài transaction.",
+              "en": "Do not embed raw PAN or secrets in payloads/logs. External fulfillment needs stable downstream identity."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "idempotency",
+      "title": {
+        "vi": "7. Crash-safe idempotency không chỉ là một cache key",
+        "en": "7. Crash-safe idempotency is more than a cache key"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một unique insert phải claim intent trước external effect, nhưng crash ngay sau claim có thể để marker mồ côi nếu chưa atomically tạo operation/attempt. Tốt hơn, transaction tạo claim + immutable request fingerprint + payment/attempt + dispatch intent. Worker claim ownership có lease/epoch, kiểm result/attempt state trước send và giữ stable external key. Nếu external provider chỉ dedup trong một window ngắn, recovery sau window cần query/reconciliation hoặc manual resolution chứ không blind resend.",
+          "en": "A unique claim before side effects is necessary, but a crash immediately after a standalone claim can leave an orphan. Atomically create claims, immutable fingerprints, operations/attempts and dispatch intent. Recoverable workers use ownership/epochs, inspect state and preserve external keys. After provider dedup expiry, use evidence, reconciliation or controlled resolution rather than blind resubmission."
+        },
+        {
+          "vi": "Sau processor reply, conditional transition và financial/event intents phải commit coherent. Nếu local journal cùng store, dùng một transaction cho balanced economic event và result; nếu tách store, define accepted/posted visibility và replay-safe protocol. Persist response metadata cũng phải liên kết operation; đừng complete idempotency cache rồi mới ghi financial state. Hai request mua hai món giống nhau cần hai business intents, không bị dedup bằng amount/card/time.",
+          "en": "Commit result transitions coherently with financial/event intents. Shared-store journals can use local transactions; separate stores need replay-safe protocols and explicit accepted/posted visibility. Link replay metadata to operations rather than completing a cache before financial state. Two identical purchases remain separate intents, not amount/card/time duplicates."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Bốn durable checkpoints",
+          "en": "Four durable checkpoints"
+        },
+        "caption": {
+          "vi": "Mỗi checkpoint có crash/retry test và retained identity.",
+          "en": "Each checkpoint needs crash/retry tests and retained identity."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Claim",
+              "en": "Claim"
+            },
+            "detail": {
+              "vi": "Validate principal + fingerprint; unique operation claim.",
+              "en": "Validate principal/fingerprint and uniquely claim the operation."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Record",
+              "en": "Record"
+            },
+            "detail": {
+              "vi": "Atomic attempt/outbox, owner và route trước send.",
+              "en": "Persist attempts/outbox, owners and routes before sending."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Resolve",
+              "en": "Resolve"
+            },
+            "detail": {
+              "vi": "Same external identity; explicit unknown và authority evidence.",
+              "en": "Preserve external identity, uncertainty and authoritative evidence."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Commit / replay",
+              "en": "Commit / replay"
+            },
+            "detail": {
+              "vi": "Result + economic/event intent; replay giữ semantics đã công bố.",
+              "en": "Commit results and intents; replay preserves declared semantics."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "processor-evidence",
+      "title": {
+        "vi": "8. Đừng biến stale status thành proof để reroute",
+        "en": "8. Do not turn stale status into reroute proof"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hãy so ba histories trong lab. A đã authorize nhưng reply mất; A chưa execute và sau đó cho terminal absent/fenced proof; hoặc request A vẫn đang queue rồi execute muộn. Ở bước 3 cả ba đều có stale NOT_FOUND. Reroute B khi chỉ có quan sát đó có thể tạo hai authorization holds. Health breaker chỉ nên đổi route cho new work có identity/attempt ownership phù hợp; nó không rewrite outcome của pending work.",
+          "en": "Compare three histories: A authorized but lost its reply; A never executes and later gives terminal fenced-absence proof; or A queues and executes late. All show stale NOT_FOUND at step three. Rerouting on that observation can create duplicate holds. Breakers guide new work under ownership rules rather than rewriting pending outcomes."
+        },
+        {
+          "vi": "“Connection refused là safe” chỉ đúng khi chứng minh attempt chưa gửi ở bất kỳ tầng nào và không có earlier retry/in-flight worker. Một proxy error hoặc SDK đã retry ở tầng dưới có thể làm suy luận sai. Status endpoint cũng cần consistency/terminal contract; absent-as-of-now chưa ngăn execution tương lai. Khi không có cancellation/fencing proof được provider hỗ trợ, giữ pending/unknown và giải thích cho merchant, có escalation SLA và reconciliation.",
+          "en": "A connection refusal is safe evidence only when the attempt was never submitted anywhere and has no earlier retries or in-flight workers. Proxies and hidden retries can break that inference. Status needs consistency and terminality; current absence does not prevent future execution. Without provider-supported cancellation/fencing proof, preserve uncertainty, inform merchants and resolve through bounded escalation/reconciliation."
+        }
+      ],
+      "experiment": "platform-processor"
+    },
+    {
+      "id": "webhooks",
+      "title": {
+        "vi": "9. Webhook: authenticity, durable inbox và business effect",
+        "en": "9. Webhooks: authenticity, durable inbox and business effects"
+      },
+      "paragraphs": [
+        {
+          "vi": "Receiver xác minh raw bytes và delivery signature/timestamp với đúng endpoint secret; parsing/re-serializing trước verification có thể đổi bytes. Tolerance/time sync, secret rotation và intended account/context là các checks riêng. Valid signature chỉ chứng minh message theo secret/time contract, không chứng minh mới, đúng order hoặc state hiện tại. Delivery retries có thể có signature timestamp mới cho cùng event ID; event-created timestamp không dùng làm duplicate identity.",
+          "en": "Receivers verify raw bytes, signatures and delivery timestamps using the intended secret. Parsing/reserializing can change bytes. Time tolerance, clock sync, rotation and account context are separate checks. Valid signatures establish authenticity under a contract, not novelty, ordering or current state. Retries may refresh delivery timestamps; event creation times are not duplicate identities."
+        },
+        {
+          "vi": "Sau verify, durable unique inbox + ACK sớm để sender không retry vì shipping chậm. Worker apply conditional domain transition và cùng transaction ghi fulfillment intent; relay external fulfillment dùng stable ID theo sink contract. Duplicate e1 cùng event ID bị inbox chặn; e3 khác ID nhưng cùng payment vẫn cần business guard. Late processing không được đẩy succeeded về processing. Refund/dispute là event/workflow riêng và có thể legitimate thay đổi business obligations; đừng dùng rule “succeeded rồi bỏ mọi event về sau”.",
+          "en": "After verification, durably admit a unique inbox record and ACK without waiting for shipping. Workers guard domain transitions and atomically record fulfillment intent; external delivery uses stable sink identities. Inbox dedup blocks repeated event IDs, while different events for one payment need business guards. Late processing cannot regress success. Refunds/disputes remain separate legitimate workflows; success is not permission to ignore all future events."
+        }
+      ],
+      "experiment": "platform-inbox"
+    },
+    {
+      "id": "ledger",
+      "title": {
+        "vi": "10. Balanced không có nghĩa đúng hoặc đầy đủ",
+        "en": "10. Balanced does not establish correctness or completeness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ collection 5000 minor units, merchant net 4850 và fee 150. Trong illustrative journal, debit processor receivable 5000, credit merchant payable 4850 và fee revenue 150; debit=credit. Khi processor thực settle, debit bank cash và credit receivable theo evidence/fee policy. Payout debit merchant payable và credit cash hoặc payout-clearing theo bank workflow. Account chart và revenue recognition phụ thuộc mô hình business; ví dụ để minh họa balancing, không phải accounting policy áp dụng cho mọi tổ chức.",
+          "en": "For a 5000-minor collection, illustrative entries debit processor receivables 5000 and credit merchant payable 4850 plus fee revenue 150. Settlement debits cash and credits receivables under actual evidence/fee policy; payouts reduce payables against cash or clearing under their workflows. Account charts and recognition depend on business models; this illustrates balancing rather than prescribing accounting policy."
+        },
+        {
+          "vi": "Duplicate cả transaction trên hai lần vẫn cân bằng, nhưng liabilities và revenue sai. Bỏ cả transaction cũng cân bằng. Do đó cần unique economic event ID, amount/currency checks, completeness/frontier metadata và reconciliation với external references. Materialized balance có thể hợp lệ nếu update atomic/versioned và rebuild/verify được từ journal; không phải mọi balance column đều gây lost updates. Tổng tiền bảo toàn cũng chưa đủ nếu merchant bị ghi nhầm.",
+          "en": "Duplicating or omitting a whole balanced transaction can preserve balance while misrepresenting liabilities. Enforce unique economic events, amount/currency checks, completeness/frontiers and external reconciliation. Materialized balances are valid with atomic/versioned maintenance and journal verification; a balance column is not inherently unsafe. Conservation also misses wrong-account postings."
+        },
+        {
+          "vi": "Reconciliation import reports có batch/file version, duplicate-line protection, covered interval và report status. Match amount, currency, operation/processor reference, settlement date và fee splits; totals-only có thể che hai lỗi ngược dấu. Clearing nonzero có thể là in-flight bình thường: kiểm aging/maturity và expected completion. Corrections là approved reversal/adjustment có original refs, không UPDATE để audit không thấy.",
+          "en": "Import reports with versions, line deduplication, covered intervals and completion state. Match identities, amounts, currencies, dates and fees; totals can hide offsetting errors. Clearing balances may be normal in-flight state, so use aging/maturity expectations. Approved reversals/adjustments retain references instead of erasing audit history."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Invariant",
+            "en": "Invariant"
+          },
+          {
+            "vi": "Phát hiện",
+            "en": "Detects"
+          },
+          {
+            "vi": "Không tự phát hiện",
+            "en": "Does not alone detect"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Σ debits = Σ credits theo currency",
+              "en": "Σ debits = Σ credits per currency"
+            },
+            {
+              "vi": "Unbalanced postings.",
+              "en": "Unbalanced postings."
+            },
+            {
+              "vi": "Duplicate/missing whole transactions hoặc wrong merchant.",
+              "en": "Duplicated/missing whole transactions or wrong merchants."
+            }
+          ],
+          [
+            {
+              "vi": "Unique economic event ID",
+              "en": "Unique economic event ID"
+            },
+            {
+              "vi": "Replay duplicate cùng economic identity.",
+              "en": "Replayed effects under the same identity."
+            },
+            {
+              "vi": "Một effect đổi ID, missing events, external mismatch.",
+              "en": "Renamed effects, missing events or external mismatches."
+            }
+          ],
+          [
+            {
+              "vi": "Version/frontier completeness",
+              "en": "Version/frontier completeness"
+            },
+            {
+              "vi": "Gaps trong expected source coverage.",
+              "en": "Gaps in expected source coverage."
+            },
+            {
+              "vi": "Covered source bản thân sai hoặc external reality khác.",
+              "en": "Incorrect covered sources or different external reality."
+            }
+          ],
+          [
+            {
+              "vi": "External reconciliation",
+              "en": "External reconciliation"
+            },
+            {
+              "vi": "Unmatched refs, amount/currency/timing differences.",
+              "en": "Unmatched references and amount/currency/timing differences."
+            },
+            {
+              "vi": "Instant finality khi report chưa đến; cần open exceptions.",
+              "en": "Instant finality before reports arrive; open exceptions remain necessary."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "payouts",
+      "title": {
+        "vi": "11. Availability, reserves và bank returns",
+        "en": "11. Availability, reserves and bank returns"
+      },
+      "paragraphs": [
+        {
+          "vi": "Available balance không đơn giản là sum của payment succeeded. Capture/settlement timing, reserve policy, refunds, disputes, currency và account restrictions quyết định eligibility. Payout reservation phải atomic với concurrency của refunds/transfers; retry cùng instruction không lấy funds lần nữa. Bank returns có thể đến sau local sent/paid status; model reversal/return theo rails contract và reconcile vào journal.",
+          "en": "Availability is not simply the sum of successful payments. Settlement timing, reserves, refunds, disputes, currencies and restrictions determine eligibility. Atomically reserve payouts against concurrent refunds/transfers, without spending again on instruction retries. Banks may return sent/paid instructions later; model and reconcile returns under rail contracts."
+        },
+        {
+          "vi": "Platform fees, seller liability và negative balances phải nêu ai gánh chargeback/refund, quyền debit và case escalation. FX conversion cần quote/expiry, rate source, rounding và balanced postings mỗi currency qua conversion/position accounts; không cộng USD với EUR để gọi là balanced. Cross-cell accounts và external rails không có atomicity miễn phí; reference và recovery protocol phải đủ để money ở trạng thái in-flight vẫn được giải thích.",
+          "en": "Define fee, seller, refund/dispute and negative-balance responsibilities and permissions. FX needs quote expiry, rate sources, rounding and balanced per-currency postings through conversion accounts; adding USD to EUR is not balancing. Cross-cell and external workflows need references and recovery so in-flight funds remain explainable."
+        }
+      ]
+    },
+    {
+      "id": "risk-security",
+      "title": {
+        "vi": "12. Risk và tokenization là hai boundary riêng",
+        "en": "12. Risk and tokenization are distinct boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Inline risk có deadline và bounded features; đánh giá approval, fraud loss, false declines, challenge conversion, model/feature freshness và latency theo cohorts. Chargeback labels tới muộn và approved-only samples có selection bias. Model timeout không có fallback đúng cho mọi merchant: rules-only/challenge/review/deny là decisions có business/security owner. Issuer decline vẫn theo network/method policy, không thử mọi processor để né hard decline.",
+          "en": "Inline risk needs bounded features and deadlines, evaluated by approvals, loss, false declines, challenge conversion, freshness and latency by cohort. Delayed labels and approved-only samples create bias. Timeout fallback belongs to owned business/security policy rather than one universal rule. Issuer declines follow method/network policy, not attempts across every processor to evade hard declines."
+        },
+        {
+          "vi": "Hosted collection giữ sensitive fields trong intended provider boundary, giảm exposure của merchant app. Tokens vẫn có thể là charge capability hoặc personal linkage nên cần account scoping, permissions và redacted logs. Vault isolation, key custody, rotation, audit và controlled detokenization cần test. Không coi “chỉ vault nhìn PAN” là bằng chứng mọi service khác ngoài scope; scripts, logs, support access và integration choices vẫn ảnh hưởng threat/security responsibilities.",
+          "en": "Hosted collection reduces app exposure by keeping fields within provider boundaries. Tokens can still confer capabilities or link identities, requiring scope, permissions and redacted logs. Test vault isolation, keys, rotation, auditing and controlled detokenization. PAN isolation alone does not establish every other system’s scope; scripts, logs, support access and integration choices still matter."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Risk outcome",
+            "en": "Risk outcome"
+          },
+          "icon": "decision",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Allow/challenge/review/deny có version, evidence và timeout policy được sở hữu.",
+              "en": "Allow, challenge, review or deny under owned, versioned evidence and timeout policies."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Card-data boundary",
+            "en": "Card-data boundary"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Hosted collection, secure vault và scoped tokens; không log raw sensitive fields.",
+              "en": "Hosted collection, secure vaults and scoped tokens without sensitive-field logging."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Operational proof",
+            "en": "Operational proof"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Latency injection, token misuse, secret rotation, replay và access-log review.",
+              "en": "Test latency, token misuse, rotation, replay and access logging."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "migration",
+      "title": {
+        "vi": "13. Migrate schema và cell trong khi hệ thống vẫn nhận writes",
+        "en": "13. Migrate schemas and cells while writes continue"
+      },
+      "paragraphs": [
+        {
+          "vi": "Expand schema/new store trước, start atomic change capture hoặc reliable write replication, backfill với source versions, compare shadow reads rồi cutover sau verified frontier. Backfill snapshot có thể được đọc trước live update và apply sau CDC: blind upsert sẽ ghi version cũ lên mới. Apply monotonic versions/tombstones và handle equal-version conflicts; version equality chỉ đủ nếu cùng payload/schema semantics. Deletion cần tombstones/retention, không resurrect deleted data từ snapshot.",
+          "en": "Expand schemas/stores, start reliable change capture, backfill source versions, compare reads and cut over after verified frontiers. A snapshot may be read before live updates but applied after CDC; blind upserts overwrite new versions. Use monotonic versions/tombstones and equal-version conflict handling. Equality needs matching payload/schema semantics; retained deletion evidence prevents resurrection."
+        },
+        {
+          "vi": "Cutover readiness gồm backlog/barrier, completed backfill, validation, dependencies và writer fencing, không chỉ count rows bằng nhau. Rollback về old nếu đã có writes chỉ ở new cần reverse synchronization hoặc freeze/repair, không đổi DNS rồi hy vọng. Cell ownership epoch phải được enforce tại mọi write sink; highest-seen token chưa được kích hoạt ở sink không ngăn stale worker trước khi sink biết epoch mới. Lab dùng explicit authority activation để làm điều kiện này rõ.",
+          "en": "Readiness includes change barriers, completed backfill, validation, dependencies and sink fencing, not equal row counts. Rolling back after new-only writes requires reverse sync or freeze/repair, not a routing flip. Every write sink must activate authority epochs; a token unknown to the sink cannot fence earlier work. The fixture explicitly activates authority at handoff."
+        }
+      ],
+      "experiment": "platform-migrate"
+    },
+    {
+      "id": "compatibility",
+      "title": {
+        "vi": "14. Version public contract khác version dữ liệu",
+        "en": "14. Public-contract versions differ from data versions"
+      },
+      "paragraphs": [
+        {
+          "vi": "API version là hình dạng và semantics mà client đã chấp nhận. Schema version là cách store biểu diễn state; object version/epoch dùng concurrency và ownership. Chúng không hoán đổi được. Compatibility layer có thể transform response shape, nhưng đổi side effects, authorization hoặc payment-state meanings cần behavior logic và migration tests. Endpoint webhook payload/version cũng cần được pin và decode đúng khi replay event cũ.",
+          "en": "API versions define agreed client shapes and semantics. Schemas describe stored state; object versions/epochs govern concurrency and ownership. These are not interchangeable. Response transformations help shape changes, while side effects, permissions and state semantics require behavior logic and tests. Decode pinned webhook formats correctly when replaying old events."
+        },
+        {
+          "vi": "Đừng hứa tương thích vô hạn không chi phí. Maintain contract fixtures, opt-in/canary upgrades, clear deprecation windows và rollback responsibility; URL, header hay account pinning đều có thể dùng nếu lifecycle rõ. Giữ SDK/client version tách server API version. Sản phẩm mới có thể dùng hosted checkout thay vì custom state-machine integration; bài này xây platform để học distributed correctness chứ không đề xuất mọi merchant tự viết payment orchestration.",
+          "en": "Compatibility has costs. Maintain contract fixtures, opt-in canaries, deprecation windows and rollback ownership. URLs, headers or account pinning can work under explicit lifecycles. Distinguish SDK versions from API contracts. Merchants may prefer hosted checkout; this chapter teaches platform correctness rather than recommending every merchant build orchestration."
+        }
+      ]
+    },
+    {
+      "id": "cells-peak",
+      "title": {
+        "vi": "15. Cells và admission: bảo vệ accepted work",
+        "en": "15. Cells and admission protect accepted work"
+      },
+      "paragraphs": [
+        {
+          "vi": "Home-cell mapping dùng authenticated tenant identity và ownership epoch; không route cùng in-flight operation tới hai cells sau timeout. Cell boundaries giúp per-account isolation nếu shared control planes/config/identity và deploy rollout cũng có controls. Handoff cần drain/freeze, replicate operation/result/idem state, verify destination và fence source. Chỉ copy payment rows mà quên dedup/attempt/outbox state sẽ tạo duplicate sau failover.",
+          "en": "Home-cell routing uses authenticated tenants and epochs, never sending one in-flight operation to two owners after timeouts. Cells help when shared control planes, identity/config and rollout are controlled. Handoffs drain/freeze, replicate operations/results/idempotency, verify destinations and fence sources. Copying payment rows without dedup, attempts and outboxes can duplicate work after failover."
+        },
+        {
+          "vi": "Data placement là policy cần xác định theo jurisdiction/integration, không một topology tự chứng minh compliance. Đưa cả replicas, backups, logs, traces, analytics, support access và encryption/key policies vào requirements. Không đưa advice pháp lý cụ thể ở đây. Progressive deployment theo cells và account cohorts có thể giới hạn blast radius nhưng shared bad config vẫn có thể phá toàn bộ nếu thiếu validation/canary.",
+          "en": "Placement requirements depend on jurisdiction/integration; topology does not certify compliance. Include replicas, backups, logs, traces, analytics, support access and key policies. This is not jurisdiction-specific legal advice. Cell/cohort rollout can bound impact, while unguarded shared configuration can still cause global failure."
+        },
+        {
+          "vi": "Peak policy cần fairness và bounded queues trước acceptance. Defer exports/reporting, reserve recovery/status capacity và shed excess admission nhanh; accepted work giữ durable ownership và eventual outcome escalation. Processor breaker chuyển new work trong backup capacity, có probes/ramp-up giới hạn. Retry storm vẫn tốn auth, key lookups, DB/CPU dù không duplicate effect; bound attempts/end-to-end deadline và jitter theo documented API semantics.",
+          "en": "Use fairness and bounded admission queues, defer exports, reserve recovery/status capacity and reject excess work promptly. Accepted work retains durable ownership and escalation. Breakers route new work only within backup capacity with bounded probes/ramps. Duplicate-safe retries still cost authentication, lookups, CPU and storage; bound attempts/deadlines and jitter under documented contracts."
+        }
+      ]
+    },
+    {
+      "id": "failure-proof",
+      "title": {
+        "vi": "16. Failure matrix và bằng chứng cần giữ",
+        "en": "16. Failure matrix and retained evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một design review tốt chọn từng ACK boundary rồi crash trước/sau nó. Name accepted intent, committed attempt, external evidence, local economic event, merchant inbox và fulfillment. Không dùng một số success rate để che unknown age, report gaps hoặc per-merchant negative outcomes. Giữ data minimization đồng thời retain references đủ audit; không cần raw card secrets để correlate một operation.",
+          "en": "Review each ACK boundary by crashing before and after it. Name accepted intents, attempts, external evidence, economic events, inboxes and fulfillment. Aggregate success cannot conceal aged uncertainty, report gaps or merchant-specific failures. Retain minimal audit references without raw card secrets."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure",
+            "en": "Failure"
+          },
+          {
+            "vi": "Invariant / response",
+            "en": "Invariant / response"
+          },
+          {
+            "vi": "Evidence",
+            "en": "Evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Crash sau claim trước send",
+              "en": "Crash after claim before send"
+            },
+            {
+              "vi": "Resume cùng operation/attempt; không marker mồ côi vô hạn.",
+              "en": "Resume the operation/attempt without eternal orphan markers."
+            },
+            {
+              "vi": "Atomic durable records, ownership/lease và replay test.",
+              "en": "Atomic records, ownership/leases and replay tests."
+            }
+          ],
+          [
+            {
+              "vi": "External reply loss",
+              "en": "External reply loss"
+            },
+            {
+              "vi": "UNKNOWN giữ original route/reference; không blind B.",
+              "en": "Preserve UNKNOWN and original references; never blindly choose B."
+            },
+            {
+              "vi": "Provider receipts, status contract, terminal/fence proof.",
+              "en": "Receipts, status contracts and terminal/fence proof."
+            }
+          ],
+          [
+            {
+              "vi": "Ledger duplicate / gap",
+              "en": "Ledger duplicate / gap"
+            },
+            {
+              "vi": "Balanced + unique identity + completeness/reconciliation.",
+              "en": "Balance, identity uniqueness, completeness and reconciliation."
+            },
+            {
+              "vi": "Economic IDs, report coverage và exception aging.",
+              "en": "Economic IDs, report coverage and exception aging."
+            }
+          ],
+          [
+            {
+              "vi": "Webhook duplicate/reorder",
+              "en": "Webhook duplicate/reorder"
+            },
+            {
+              "vi": "Durable inbox + legal business transition/effect.",
+              "en": "Durable inboxes and legal business transitions/effects."
+            },
+            {
+              "vi": "Signature admission, event IDs và stable fulfillment references.",
+              "en": "Signature admission, event IDs and fulfillment references."
+            }
+          ],
+          [
+            {
+              "vi": "Stale backfill / owner",
+              "en": "Stale backfill / owner"
+            },
+            {
+              "vi": "Version guard, verified cutover và sink fencing.",
+              "en": "Version guards, verified cutover and sink fencing."
+            },
+            {
+              "vi": "CDC frontier, tombstones, amount comparison và activated epoch.",
+              "en": "CDC frontiers, tombstones, comparisons and active epochs."
+            }
+          ],
+          [
+            {
+              "vi": "Peak / backup overload",
+              "en": "Peak / backup overload"
+            },
+            {
+              "vi": "Bounded admission, reserve recovery và tenant fairness.",
+              "en": "Bound admission and preserve recovery and fairness."
+            },
+            {
+              "vi": "Accepted count, p99, retry amplification và backlog age/drain.",
+              "en": "Accepted counts, p99, retry amplification and backlog age/drain."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "17. Luyện câu hỏi bằng một fault cụ thể",
+        "en": "17. Practice with concrete faults"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn một payment và theo dõi từ merchant intent đến bank evidence rồi merchant fulfillment. Khi interviewer đổi constraint, giải thích authority, retained state và failure window trước khi thêm component. Những câu dưới dựa trên illustrative contracts của bài, không cam kết mọi processor hỗ trợ cùng cancellation/status semantics.",
+          "en": "Follow one intent through external evidence and merchant fulfillment. When constraints change, explain authority, retained state and failure windows before adding components. Answers use this chapter’s contracts rather than assuming all providers support identical status/cancellation semantics."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Claim idempotency key trước charge đã đủ chưa?",
+            "en": "Is claiming an idempotency key before charging sufficient?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Atomic claim phải liên kết operation/attempt và durable dispatch intent, có recovery ownership/result retention. External call cần downstream stable identity theo scope/window; crash sau effect trước result phải resolve thay vì tạo attempt mới. Cache replay không bao phủ processor hoặc fulfillment sink.",
+              "en": "No. Atomically link claims to attempts and dispatch intents with recovery ownership/results. Preserve downstream identity under provider scope/window contracts; resolve crashes after effects rather than inventing attempts. API replay does not cover processors or fulfillment sinks."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Processor status trả NOT_FOUND sau timeout, có route B không?",
+            "en": "Can you route to B after a timeout and NOT_FOUND?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ nếu đó là authoritative terminal absence và attempt cũ không còn có thể execute theo fencing/cancellation contract. Stale replica hoặc pending queue đều có thể trả absence tạm thời. Khi không có proof thì giữ unknown và reconcile. Same ID ở B không mặc định share dedup với A.",
+              "en": "Only with authoritative terminal absence and prevention of old execution. Replicas and queues can report temporary absence. Without proof, preserve uncertainty and reconcile. The same ID at B does not imply cross-provider deduplication."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Authorization approved có book như settled cash luôn không?",
+            "en": "Can approved authorization be recorded as settled cash?"
+          },
+          "answer": [
+            {
+              "vi": "Không đồng nhất. Authorization thường là issuer hold/approval; capture, settlement và payout có evidence và timing riêng. Chart of accounts có thể ghi commitments/pending liabilities theo policy, nhưng không invent final bank movement từ approval hoặc HTTP 202.",
+              "en": "No. Authorization is typically a hold/approval; capture, settlement and payout have separate evidence/timing. Accounting may represent commitments/pending items under policy but cannot invent final bank movement from approval or HTTP 202."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Webhook đã dedup event ID sao vẫn có thể ship hai lần?",
+            "en": "Why can event-ID dedup still ship twice?"
+          },
+          "answer": [
+            {
+              "vi": "Hai events khác ID có thể cùng payment thành công. Durable inbox bảo vệ delivery identity; payment-level transition/unique fulfillment intent bảo vệ business effect. Shipping ngoài DB transaction cần stable sink identity/recovery. Late processing không được regress succeeded.",
+              "en": "Different events can report one successful payment. Inbox dedup protects delivery identity; guarded payment transitions and unique fulfillment intents protect business effects. External shipping needs stable sink identity/recovery, and late processing cannot regress success."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Ledger cân bằng có chứng minh tiền đúng hết?",
+            "en": "Does a balanced ledger prove all money is correct?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Duplicate hoặc missing cả balanced transaction vẫn balance; wrong merchant cũng vậy. Kiểm unique economic IDs, amount/currency/account mapping, source completeness và external reconciliation. Clearing nonzero cần xét maturity/in-flight, không auto zero bằng adjustment thiếu evidence.",
+              "en": "No. Duplicated/missing balanced transactions and wrong merchants can still balance. Check identities, amounts, currencies/accounts, completeness and external reconciliation. Evaluate clearing maturity rather than forcing zero without evidence."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tokenization khiến mọi service ngoài vault vô hại?",
+            "en": "Does tokenization make all non-vault services harmless?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Token có thể là permissioned payment capability hoặc personal linkage; keys, scopes, scripts/logs/support access vẫn cần security review. Hosted collection giảm exposure nhưng không tự chứng minh scope/compliance hay miễn trách nhiệm cho merchant.",
+              "en": "No. Tokens may enable payments or link people; permissions, scripts, logs and support access need review. Hosted collection reduces exposure without independently certifying scope/compliance or removing merchant responsibilities."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dual-write + backfill xong thì switch reads ngay được không?",
+            "en": "Can you switch reads once dual writing and backfill finish?"
+          },
+          "answer": [
+            {
+              "vi": "Cần verify coverage/frontier, version/payload/tombstones, consistency và activated writer fence. Backfill v1 tới sau CDCv2 không được overwrite. Rollback sau new-only writes cần reverse sync/freeze-repair. Row counts bằng nhau không chứng minh readiness.",
+              "en": "Verify frontiers, payloads, versions, tombstones, consistency and active fences. Late v1 cannot overwrite CDCv2. Rolling back new-only writes needs reverse sync or repair; equal row counts are insufficient."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Ưu tiên payment ở peak có nghĩa không được reject payment nào?",
+            "en": "Does prioritizing payments prohibit rejecting any payment?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Trước acceptance phải bound admission để bảo vệ correctness và deadline; sau acceptance giữ ownership/result recovery. Defer reporting nhưng không starve status/reconciliation mãi. Retry idempotent vẫn tiêu tài nguyên, backup cũng có finite capacity.",
+              "en": "No. Bound admission before acceptance, then retain accepted-work ownership and recovery. Defer reports without indefinitely starving status/reconciliation. Idempotent retries and backup providers still consume finite resources."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
