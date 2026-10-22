@@ -1,0 +1,1171 @@
+{
+  "id": "proximity",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Proximity Search: spatial coverage và nearby ranking",
+    "en": "Designing Proximity Search: spatial coverage and nearby ranking"
+  },
+  "summary": {
+    "vi": "Thử cell coverage và adaptive quadtree; phân tích distance, index publication, ranking, moving objects và privacy để thiết kế nearby search có guarantee rõ.",
+    "en": "Explore cell coverage and adaptive quadtrees; examine distances, index publication, ranking, moving objects and privacy to build nearby searches with explicit guarantees."
+  },
+  "prerequisites": [
+    "databases",
+    "caching",
+    "reliability",
+    "networking"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "database",
+    "storage-search",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Candidate coverage và exact distance là hai bước khác; filter không cứu được point chưa retrieve.",
+      "en": "Candidate coverage and exact distances are distinct; filtering cannot recover unretrieved points."
+    },
+    {
+      "vi": "Center + 8 neighbors cần geometric bound; H3 hops không bằng metric radius.",
+      "en": "Center-plus-eight-neighbor searches need geometric bounds; H3 hops are not metric radii."
+    },
+    {
+      "vi": "Replicate full index chỉ sau khi đo memory/query/update/rebuild costs; packed bytes không là resident memory.",
+      "en": "Replicate full indexes after measuring memory/query/update/rebuild costs; packed bytes are not resident memory."
+    },
+    {
+      "vi": "Versioned CDC/snapshots, tombstones và query-bound cursors giữ update/rebuild đúng semantics.",
+      "en": "Versioned CDC/snapshots, tombstones and query-bound cursors preserve update/rebuild semantics."
+    },
+    {
+      "vi": "Static listings và moving drivers có workload khác; privacy không tự có chỉ vì round logs.",
+      "en": "Static listings and moving drivers have different workloads; rounded logs do not automatically provide privacy."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Nearby search: từ coverage tới product behavior",
+      "en": "Nearby search: from coverage to product behavior"
+    },
+    "caption": {
+      "vi": "Đọc hình rồi đối chiếu query invariant; chọn công nghệ sau khi xác định radius, freshness và privacy.",
+      "en": "Read visuals against query invariants; choose technology after defining radius, freshness and privacy."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Cover region",
+          "en": "Cover the region"
+        },
+        "detail": {
+          "vi": "Cell boundaries, density và distance model.",
+          "en": "Understand cell boundaries, density and distance models."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Validate và rank",
+          "en": "Validate and rank"
+        },
+        "detail": {
+          "vi": "Exact distance, eligibility và deterministic top-K.",
+          "en": "Check exact distances/eligibility and deterministic top-K."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Publish changes",
+          "en": "Publish changes"
+        },
+        "detail": {
+          "vi": "CDC, snapshot generation và suppression.",
+          "en": "Manage CDC, snapshot generations and suppression."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Scale đúng workload",
+          "en": "Scale for the workload"
+        },
+        "detail": {
+          "vi": "Hot cells, moving updates, recovery và location privacy.",
+          "en": "Handle hot cells, moving updates, recovery and location privacy."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Hỏi đối tượng có di chuyển và “gần” nghĩa là gì",
+        "en": "1. Ask whether objects move and what nearby means"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline là tìm business tương đối tĩnh trong radius quanh lat/lon, filter category/open-now, sort distance hoặc relevance, xem detail và owner CRUD. Ví dụ target search p99 < 200 ms tại API boundary, 100 triệu DAU và listing thông thường visible trong vài phút/giờ theo policy. Takedown/security removal có freshness bound chặt hơn. Đây là yêu cầu minh họa, không phải benchmark.",
+          "en": "The baseline finds relatively static businesses within a lat/lon radius, filters categories/open-now, sorts by distance or relevance, serves details and supports owner CRUD. Example targets are API p99 below 200 ms, 100 million DAU and ordinary listing visibility within policy-bound minutes/hours. Takedowns/security removals have stricter freshness bounds. These are illustrative requirements, not benchmarks."
+        },
+        {
+          "vi": "Khoảng cách đường chim bay không đồng nghĩa đi bộ 2 km hoặc lái xe 5 phút. Routing time cần road graph/traffic và serving khác. GPS có uncertainty, coordinates phải có units/CRS rõ. Hỏi exact-radius recall hay approximate recommendations, số kết quả và behavior khi thiếu. Moving drivers cần write-heavy freshness/expiry khác; không ép cùng pipeline static listings.",
+          "en": "Straight-line distance differs from two kilometers of walking or five minutes of driving. Travel times need road graphs/traffic and different serving. GPS has uncertainty, and coordinates need explicit units/CRS. Ask whether radius recall must be exact or recommendations may be approximate, how many results are needed and what happens when results are sparse. Moving drivers need different write-heavy freshness/expiry behavior."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Coverage trước ranking",
+            "en": "Coverage before ranking"
+          },
+          "icon": "scope",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Candidate stage không được bỏ business hợp lệ nếu contract yêu cầu exact radius recall.",
+              "en": "Candidate retrieval must not omit eligible businesses under an exact-radius recall contract."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Freshness có lớp",
+            "en": "Layered freshness"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Business update, opening hours, emergency suppression và device position có SLA khác nhau.",
+              "en": "Business updates, hours, emergency suppression and device positions have different SLAs."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Privacy vị trí",
+            "en": "Location privacy"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Consent, retention, access control và precision tối thiểu phải thiết kế từ đầu.",
+              "en": "Design consent, retention, access controls and minimum necessary precision from the start."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Ước lượng index bytes và dense-query work riêng",
+        "en": "2. Estimate index bytes separately from dense-query work"
+      },
+      "paragraphs": [
+        {
+          "vi": "100 triệu DAU × 5 searches/ngày tạo 500 triệu request/ngày, khoảng 5.787/s trung bình và 17.361/s nếu peak ×3. Với 200 triệu listings, packed entry giả định 24 B cho cell+ID+overhead cho ra 4,8 GB raw. Đây không phải resident memory của Redis/tree: allocator, object/array structures, coordinates, multi-resolution entries, replication và old/new rebuild generations có thể tăng đáng kể.",
+          "en": "One hundred million DAU times five searches/day yields 500 million daily requests, about 5,787/second on average and 17,361/second at an assumed threefold peak. For 200 million listings, a hypothetical packed 24 B cell/ID/overhead entry gives 4.8 GB raw. This is not Redis/tree resident memory: allocators, structures, coordinates, multiple resolutions, replication and simultaneous rebuild generations can add substantially."
+        },
+        {
+          "vi": "Nếu mỗi search đọc 1.000 candidates ở peak thì khoảng 17,36 triệu candidate checks/s; chi phí phân phối rất lệch giữa downtown và countryside. Details 1 KB/listing là 200 GB raw trước index/photos. Replicate full index chỉ hợp khi measured memory/build/update/network và hot query CPU phù hợp; không tuyên bố thêm replica luôn scale tuyến tính khi mọi replica còn phụ thuộc cùng details store hoặc hot partition.",
+          "en": "At one thousand candidates/search, the assumed peak requires about 17.36 million candidate checks/second, unevenly distributed between downtown and rural areas. One KB of details per listing is 200 GB raw before indexes/photos. Full-index replication is appropriate only with measured memory/build/update/network and query CPU budgets; replicas do not always scale linearly through shared detail stores or hot partitions."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng proximity",
+            "en": "Proximity quantity"
+          },
+          {
+            "vi": "Giả định tính",
+            "en": "Sizing assumption"
+          },
+          {
+            "vi": "Ước lượng có điều kiện",
+            "en": "Conditional estimate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Average searches/s",
+              "en": "Average searches/s"
+            },
+            {
+              "vi": "100M × 5 / 86.400",
+              "en": "100M × 5 / 86,400"
+            },
+            {
+              "vi": "5.787/s",
+              "en": "5,787/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak searches/s",
+              "en": "Peak searches/s"
+            },
+            {
+              "vi": "Average × 3",
+              "en": "Average × 3"
+            },
+            {
+              "vi": "17.361/s",
+              "en": "17,361/s"
+            }
+          ],
+          [
+            {
+              "vi": "Raw packed geo index",
+              "en": "Raw packed geo index"
+            },
+            {
+              "vi": "200M × 24 B",
+              "en": "200M × 24 B"
+            },
+            {
+              "vi": "4,8 GB; chưa là resident memory",
+              "en": "4.8 GB; not resident memory"
+            }
+          ],
+          [
+            {
+              "vi": "Raw business details",
+              "en": "Raw business details"
+            },
+            {
+              "vi": "200M × 1 KB",
+              "en": "200M × 1 KB"
+            },
+            {
+              "vi": "200 GB trước photos/index",
+              "en": "200 GB before photos/indexes"
+            }
+          ],
+          [
+            {
+              "vi": "Candidate work ở peak",
+              "en": "Peak candidate work"
+            },
+            {
+              "vi": "17.361 × 1.000",
+              "en": "17,361 × 1,000"
+            },
+            {
+              "vi": "17,36M checks/s trước hydration",
+              "en": "17.36M checks/s before hydration"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Contract phải cố định units, filters và cursor context",
+        "en": "3. Contracts fix units, filters and cursor context"
+      },
+      "paragraphs": [
+        {
+          "vi": "Validate latitude [-90,90], normalized longitude policy, finite numbers, radius bounds, filter cardinality và result limits. Các API/location libraries không luôn dùng cùng coordinate order: PostGIS ST_MakePoint nhận longitude rồi latitude. Sự đảo hai số có thể vẫn là valid coordinate nên cần test địa điểm đã biết, không chỉ range validation.",
+          "en": "Validate latitude [-90,90], longitude normalization policies, finite numbers, bounded radii, filter cardinalities and result limits. Location APIs/libraries do not always use identical coordinate order: PostGIS ST_MakePoint takes longitude before latitude. Swapped values can still form valid coordinates, requiring known-location tests rather than range checks alone."
+        },
+        {
+          "vi": "Vị trí chính xác trong GET query dễ đi vào access logs, browser history hoặc analytics. Ví dụ dùng POST search body với log redaction/no-store policy phù hợp; POST không tự bảo đảm bí mật vì body vẫn có thể bị log. Cursor bind query location/radius/filter/sort/index generation; đổi location không được reuse cursor cũ.",
+          "en": "Precise locations in GET queries can enter access logs, browser histories or analytics. The example uses a POST body with appropriate redaction/no-store policies; POST alone does not prevent body logging. Cursors bind locations, radii, filters, sorts and index generations; changing locations invalidates old cursors."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/search/nearby",
+          "description": {
+            "vi": "Nearby query có radius meters, bounded K và query-bound cursor.",
+            "en": "Nearby queries use meter radii, bounded K and query-bound cursors."
+          },
+          "request": "{ lat, lon, radiusM: 2000, category, openNow, sort, limit: 20, cursor? }",
+          "response": "200 { results: [{ id, distanceM, listingVersion }], nextCursor, indexGeneration, partial }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/businesses/{id}",
+          "description": {
+            "vi": "Details theo locale/visibility policy; có version và cache validator.",
+            "en": "Details follow locale/visibility policies with versions and cache validators."
+          },
+          "response": "200 { id, lat, lon, timezone, hours, category, version } | 404"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/businesses",
+          "description": {
+            "vi": "Authenticated owner tạo listing; ACK source write khác search visibility.",
+            "en": "An authenticated owner creates a listing; source-write acknowledgement differs from search visibility."
+          },
+          "request": "{ opId, name, lat, lon, timezone, category, hours }",
+          "response": "201 { id, version, visibilityStatus: \"pending\" }"
+        },
+        {
+          "method": "PATCH",
+          "path": "/v1/businesses/{id}",
+          "description": {
+            "vi": "Owner edit có concurrency guard, moderation và version monotonic.",
+            "en": "Owner edits use concurrency guards, moderation and monotonic versions."
+          },
+          "request": "{ opId, parentVersion, changes }",
+          "response": "200 { version, visibilityStatus } | 409"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Tách read path khỏi index publication",
+        "en": "4. Separate reads from index publication"
+      },
+      "paragraphs": [
+        {
+          "vi": "Location service nhận query, tính covering regions, retrieve candidate IDs/coordinates, exact-filter, kiểm eligibility rồi rank và hydrate fields cần cho response. Thứ tự hydrate phụ thuộc filters/ranker cần fields nào; không ép hydrate toàn bộ ảnh cho mọi candidate. Search worker có thể stateless ở request layer, nhưng fleet vẫn phụ thuộc versioned indexes, caches và freshness state.",
+          "en": "The location service covers query regions, retrieves candidate IDs/coordinates, exact-filters, checks eligibility, ranks and hydrates response fields. Hydration order depends on filter/ranker fields; do not fetch every photo for every candidate. Request workers can be stateless while the fleet still depends on versioned indexes, caches and freshness state."
+        },
+        {
+          "vi": "Listing service persist source records và outbox; indexer apply CDC hoặc build snapshot. Source DB spatial index là baseline hoàn toàn hợp lý nếu workload/SLO cho phép, trước khi thêm distributed cache/index fleet. Query plan, recall và measured latency quyết định chuyển kiến trúc; không phải cứ có geolocation là phải tự viết geohash.",
+          "en": "The listing service persists source records/outboxes; indexers apply CDC or build snapshots. A source-database spatial index is a valid baseline when workload/SLOs permit, before adding distributed index/cache fleets. Query plans, recall and measured latency justify architectural changes; geolocation does not inherently require custom geohash infrastructure."
+        }
+      ],
+      "diagram": {
+        "id": "nearby-candidates-and-truth",
+        "title": {
+          "vi": "Từ vị trí người dùng tới candidate và kết quả đã kiểm tra",
+          "en": "From user location to candidates and validated results"
+        },
+        "caption": {
+          "vi": "Read path dùng spatial index; write path dùng source DB và versioned updates. Geo index không tự là authority của listing status hoặc ACL.",
+          "en": "Reads use a spatial index; writes use a source database and versioned updates. The geo index is not automatically authoritative for listing status or ACLs."
+        },
+        "width": 1180,
+        "height": 800,
+        "nodes": [
+          {
+            "id": "user",
+            "label": {
+              "vi": "Mobile / browser",
+              "en": "Mobile / browser"
+            },
+            "detail": {
+              "vi": "Gửi vị trí theo consent, radius giới hạn và filters. Không gửi precision lớn hơn nhu cầu.",
+              "en": "Sends consented locations, bounded radii and filters without unnecessary precision."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "Search API",
+              "en": "Search API"
+            },
+            "detail": {
+              "vi": "Validate lat/lon, units, auth, budget và cache policy; không log exact coordinates tùy tiện.",
+              "en": "Validates coordinates, units, authentication, budgets and cache policies; avoids indiscriminate exact-location logging."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "search",
+            "label": {
+              "vi": "Location service",
+              "en": "Location service"
+            },
+            "detail": {
+              "vi": "Cover, retrieve, dedup, exact distance, filters, rank và pagination theo query identity.",
+              "en": "Covers, retrieves, deduplicates, checks distances/filters, ranks and paginates within a query identity."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "index",
+            "label": {
+              "vi": "Spatial index",
+              "en": "Spatial index"
+            },
+            "detail": {
+              "vi": "GiST/geohash/S2/H3 hoặc quadtree phù hợp workload; versioned snapshot và incremental overlay.",
+              "en": "Workload-appropriate GiST/geohash/S2/H3 or quadtrees, with versioned snapshots and incremental overlays."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "details",
+            "label": {
+              "vi": "Details / policy cache",
+              "en": "Details / policy cache"
+            },
+            "detail": {
+              "vi": "Batch hydrate ID; TTL/version/critical suppression theo freshness contract.",
+              "en": "Batch-hydrates IDs with TTLs/versions/critical suppression under freshness contracts."
+            },
+            "x": 740,
+            "y": 390,
+            "kind": "store"
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Business source DB",
+              "en": "Business source DB"
+            },
+            "detail": {
+              "vi": "Listing identity, coordinate version, category, hours, owner, deletion và moderation.",
+              "en": "Listing identities, coordinate versions, categories, hours, owners, deletion and moderation."
+            },
+            "x": 1040,
+            "y": 390,
+            "kind": "store"
+          },
+          {
+            "id": "owner",
+            "label": {
+              "vi": "Business owner",
+              "en": "Business owner"
+            },
+            "detail": {
+              "vi": "CRUD có auth và operation identity. ACK source write khác ACK search visibility.",
+              "en": "Authenticated CRUD with operation identities; source-write ACK differs from search-visibility ACK."
+            },
+            "x": 130,
+            "y": 680,
+            "kind": "client"
+          },
+          {
+            "id": "write",
+            "label": {
+              "vi": "Listing service",
+              "en": "Listing service"
+            },
+            "detail": {
+              "vi": "Validate owner/location, persist update cùng change outbox trong baseline.",
+              "en": "Validates ownership/location and persists updates with a change outbox in the baseline."
+            },
+            "x": 430,
+            "y": 680,
+            "kind": "service"
+          },
+          {
+            "id": "builder",
+            "label": {
+              "vi": "Indexer / publisher",
+              "en": "Indexer / publisher"
+            },
+            "detail": {
+              "vi": "Apply monotonic entity versions, tombstones, build watermark và atomic snapshot swap.",
+              "en": "Applies monotonic entity versions/tombstones, tracks build watermarks and atomically swaps snapshots."
+            },
+            "x": 1040,
+            "y": 680,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "nearby",
+            "label": {
+              "vi": "Nearby query đầy đủ",
+              "en": "Complete nearby query"
+            },
+            "steps": [
+              {
+                "from": "user",
+                "to": "edge",
+                "description": {
+                  "vi": "Submit coordinates, radius, category và filter context.",
+                  "en": "Submit coordinates, radius, categories and filter context."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "search",
+                "description": {
+                  "vi": "Validate request và assign deadline/candidate budget.",
+                  "en": "Validate the request and assign deadlines/candidate budgets."
+                }
+              },
+              {
+                "from": "search",
+                "to": "index",
+                "description": {
+                  "vi": "Compute conservative region cover; đọc candidate IDs cùng index generation.",
+                  "en": "Compute a conservative region cover and retrieve candidate IDs with an index generation."
+                }
+              },
+              {
+                "from": "index",
+                "to": "search",
+                "description": {
+                  "vi": "Candidate có thể ngoài circle; budget truncation phải được nhận diện.",
+                  "en": "Candidates can lie outside the circle; budget truncation must be recognized."
+                }
+              },
+              {
+                "from": "search",
+                "to": "details",
+                "description": {
+                  "vi": "Batch hydrate details/status theo version/freshness policy.",
+                  "en": "Batch-hydrate details/status under version/freshness policies."
+                }
+              },
+              {
+                "from": "details",
+                "to": "search",
+                "description": {
+                  "vi": "Trả coordinate/status/hours và suppression; stale records có thể bị loại.",
+                  "en": "Return coordinates, statuses, hours and suppression; stale records may be excluded."
+                }
+              },
+              {
+                "from": "search",
+                "to": "user",
+                "description": {
+                  "vi": "Exact distance + eligibility rồi rank/top-K, trả query-bound cursor và partial flag nếu có.",
+                  "en": "Check distance/eligibility, then rank/top-K and return query-bound cursors and partial-result flags when applicable."
+                }
+              }
+            ]
+          },
+          {
+            "id": "listing",
+            "label": {
+              "vi": "Edit listing tới search visibility",
+              "en": "Listing edit to search visibility"
+            },
+            "steps": [
+              {
+                "from": "owner",
+                "to": "write",
+                "description": {
+                  "vi": "Owner sửa coordinate hoặc hours bằng operation ID.",
+                  "en": "The owner changes coordinates or hours with an operation ID."
+                }
+              },
+              {
+                "from": "write",
+                "to": "db",
+                "description": {
+                  "vi": "Transaction lưu version mới và durable outbox.",
+                  "en": "A transaction stores the new version and durable outbox."
+                }
+              },
+              {
+                "from": "write",
+                "to": "owner",
+                "description": {
+                  "vi": "ACK source revision; visibility có SLA riêng.",
+                  "en": "Acknowledge the source revision; visibility has a separate SLA."
+                }
+              },
+              {
+                "from": "db",
+                "to": "builder",
+                "description": {
+                  "vi": "CDC/outbox publish có retry và ordering per listing.",
+                  "en": "CDC/outbox publishing has retries and per-listing ordering."
+                },
+                "async": true
+              },
+              {
+                "from": "builder",
+                "to": "index",
+                "description": {
+                  "vi": "Move phải bỏ old cell và thêm new cell theo version; query dedup ID.",
+                  "en": "Moves remove old-cell membership and add new-cell membership by version; queries deduplicate IDs."
+                },
+                "async": true
+              },
+              {
+                "from": "builder",
+                "to": "details",
+                "description": {
+                  "vi": "Invalidate/update details theo version; tránh stale refill.",
+                  "en": "Invalidate/update details by version and prevent stale refills."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "cache-miss",
+            "label": {
+              "vi": "Details cache miss",
+              "en": "Details cache miss"
+            },
+            "steps": [
+              {
+                "from": "search",
+                "to": "details",
+                "description": {
+                  "vi": "Batch read IDs; cache key có locale/visibility context cần thiết.",
+                  "en": "Batch-read IDs using keys with necessary locale/visibility context."
+                }
+              },
+              {
+                "from": "details",
+                "to": "db",
+                "description": {
+                  "vi": "Read authorized source/replica theo allowed staleness; single-flight khi hot.",
+                  "en": "Read authorized sources/replicas within allowed staleness; coalesce hot misses."
+                }
+              },
+              {
+                "from": "db",
+                "to": "details",
+                "description": {
+                  "vi": "Return versioned records và negative/delete state theo contract.",
+                  "en": "Return versioned records and negative/deletion state under the contract."
+                }
+              },
+              {
+                "from": "details",
+                "to": "search",
+                "description": {
+                  "vi": "Hydrate rồi kiểm distance/status, không phục hồi listing đã bị suppress.",
+                  "en": "Hydrate and check distance/status without reviving suppressed listings."
+                }
+              }
+            ]
+          },
+          {
+            "id": "rebuild",
+            "label": {
+              "vi": "Publish index generation mới",
+              "en": "Publish a new index generation"
+            },
+            "steps": [
+              {
+                "from": "db",
+                "to": "builder",
+                "description": {
+                  "vi": "Build snapshot tại source watermark, giữ incremental log sau watermark.",
+                  "en": "Build a snapshot at a source watermark and retain subsequent incremental changes."
+                },
+                "async": true
+              },
+              {
+                "from": "builder",
+                "to": "index",
+                "description": {
+                  "vi": "Validate counts, coverage probes, checksum và replay updates trước publish.",
+                  "en": "Validate counts, coverage probes and checksums, and replay updates before publication."
+                },
+                "async": true
+              },
+              {
+                "from": "index",
+                "to": "search",
+                "description": {
+                  "vi": "Reader pin generation cho request/cursor theo retention policy; không trộn nửa hai snapshots.",
+                  "en": "Readers pin generations for requests/cursors under retention policies instead of mixing partial snapshots."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "cell-cover",
+      "title": {
+        "vi": "5. Cell chỉ lấy candidate; circle mới quyết định radius",
+        "en": "5. Cells retrieve candidates; distances decide radius membership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Geohash xen kẽ longitude/latitude bits rồi base32, ánh xạ mỗi prefix tới rectangular angular cell. Nearby points có thể ở hai cell/prefix rất khác nhau khi sát boundary; exact filter không thể cứu point chưa được retrieve. Cần conservative cover đủ toàn query region, dedup IDs rồi distance check. Demo dùng planar fixed grid để tách ý tưởng coverage khỏi encoding.",
+          "en": "Geohash interleaves longitude/latitude bits and base32-encodes rectangular angular cells. Nearby points can have very different prefixes across boundaries, and exact filtering cannot recover points never retrieved. Conservatively cover the entire region, deduplicate IDs and check distances. The demo uses a planar fixed grid to isolate coverage from encoding."
+        },
+        {
+          "vi": "Center cell cộng 8 neighbors chỉ đủ khi đã chứng minh radius và minimum cell dimensions tại vị trí đó nằm trong cover. Không là quy tắc đúng cho mọi radius/latitude. Cell nhỏ hơn radius cần nhiều rings hoặc region coverer; longitude width theo meters co lại ở vĩ độ cao. H3 gridDisk tính hops, không phải circle chính xác theo kilometers.",
+          "en": "A center cell plus eight neighbors suffices only when radius and local minimum cell dimensions are proven to fit the cover. It is not universal across radii/latitudes. Cells smaller than the radius need more rings or a region coverer; longitudinal widths in meters shrink at high latitudes. H3 gridDisk measures hops, not an exact kilometer circle."
+        }
+      ],
+      "experiment": "geo-cover"
+    },
+    {
+      "id": "distance",
+      "title": {
+        "vi": "6. Distance model, dateline và giới hạn của bounding box",
+        "en": "6. Distance models, the dateline and bounding boxes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một latitude/longitude box là coarse prefilter; corners ngoài circle phải bị loại. Qua dateline, longitude interval có thể split thành hai ranges; gần pole, công thức lonDelta = radius/cos(latitude) cần xử lý singularity/large cover. Dùng geospatial library đã kiểm chứng thay vì ghép độ với meters trong production. Haversine tính spherical great-circle approximation, không phải ellipsoidal geodesic chính xác hay road distance.",
+          "en": "A latitude/longitude box is a coarse prefilter whose corners lie outside a circle. Dateline-crossing longitude intervals may split into two ranges; near poles, radius/cos(latitude) formulas require singularity/large-cover handling. Use tested geospatial libraries rather than mixing degrees/meters. Haversine approximates spherical great-circle distances, not exact ellipsoidal geodesics or road distances."
+        },
+        {
+          "vi": "PostGIS geography ST_DWithin dùng meters và spheroid mặc định; geometry dùng đơn vị CRS. SRID 4326 geometry coordinates là degrees, không phải cứ truyền 2000 là 2 km. ST_DWithin có index-aware bounding comparison rồi distance check; index không loại bỏ nhu cầu query plan và dữ liệu đúng CRS. Ví dụ SQL dưới là candidate baseline, cần EXPLAIN và workload test.",
+          "en": "PostGIS geography ST_DWithin uses meters and a spheroid by default; geometry distances use CRS units. SRID 4326 geometry coordinates are degrees, so passing 2000 does not inherently mean two km. ST_DWithin performs index-aware bounding comparisons followed by distance checks; indexes do not replace query-plan and CRS validation. The SQL below is a baseline to inspect with EXPLAIN and workload tests."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "CREATE INDEX business_location_gist ON businesses USING GIST (location);\n-- location is geography(Point, 4326); longitude precedes latitude.\nWITH q AS (\n  SELECT ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography AS p\n)\nSELECT b.id, ST_Distance(b.location, q.p) AS distance_m\nFROM businesses b CROSS JOIN q\nWHERE b.status = 'active'\n  AND ST_DWithin(b.location, q.p, :radius_m)\nORDER BY distance_m, b.id\nLIMIT :limit;",
+        "caption": {
+          "vi": "Illustrative radius query; không chứa open-now/ranking/cursor hoặc production query-plan guarantee.",
+          "en": "Illustrative radius query without open-now/ranking/cursors or production query-plan guarantees."
+        }
+      }
+    },
+    {
+      "id": "quadtree",
+      "title": {
+        "vi": "7. Quadtree thích nghi density nhưng phải có depth cap",
+        "en": "7. Quadtrees adapt to density but require depth caps"
+      },
+      "paragraphs": [
+        {
+          "vi": "Quadtree chia một region thành bốn child khi leaf quá nhiều points; dense area sâu hơn, sparse area giữ leaf lớn. Search chỉ recurse những node giao radius/bounding region rồi exact-check points. Tree structure không tự làm distance đúng trên globe; cần projection hoặc spherical design phù hợp. Region bounds và boundary ownership phải nhất quán để point nằm đúng một leaf.",
+          "en": "A quadtree splits regions into four children when leaves exceed capacity, producing deeper dense areas and larger sparse leaves. Searches recurse only into intersecting nodes before checking point distances. Trees do not make globe distances correct automatically; use suitable projections or spherical designs. Region bounds and boundary ownership must consistently assign each point to one leaf."
+        },
+        {
+          "vi": "Point trùng/cluster cực sát có thể không bao giờ tách được theo threshold, nên cần max depth/min cell size và overflow bucket. Update moving objects cần remove+insert, synchronization/copy-on-write và rebalance/rebuild policy; một tree chỉ đọc dễ hơn tree nhiều writer. Demo cho phép thay threshold, depth và thêm cluster để thấy memory/overfull leaves, không đo performance.",
+          "en": "Duplicate/tightly clustered points may never satisfy capacity through subdivision, requiring maximum depths/minimum sizes and overflow buckets. Moving-object updates need remove/insert operations, synchronization/copy-on-write and rebalance/rebuild policies. Read-only trees are simpler than multi-writer trees. The demo varies thresholds, depth and clustering to show memory/overfull leaves, not performance."
+        }
+      ],
+      "experiment": "geo-quadtree"
+    },
+    {
+      "id": "alternatives",
+      "title": {
+        "vi": "8. So sánh spatial index theo query và vận hành",
+        "en": "8. Compare spatial indexes by queries and operations"
+      },
+      "paragraphs": [
+        {
+          "vi": "B-tree latitude/longitude riêng có thể thu hẹp bands hoặc kết hợp bitmap tùy planner/selectivity, nhưng không bảo đảm radius query hiệu quả khi data lớn/dense. Không nên khẳng định ordinary indexes không thể dùng: composite/range encoding có thể hữu ích, và DB spatial GiST/R-tree families giải bài toán trực tiếp. Chọn bằng EXPLAIN, recall và p99 trên data distribution thật.",
+          "en": "Separate latitude/longitude B-trees can narrow bands or combine bitmaps depending on plans/selectivity, but do not guarantee efficient large/dense radius searches. Ordinary indexes are not inherently unusable: composite/range encodings can help, while spatial GiST/R-tree families address the problem directly. Choose using plans, recall and p99 under real distributions."
+        },
+        {
+          "vi": "S2 dùng hierarchical spherical quadrilateral cells và Hilbert ordering. H3 dùng hierarchical mostly-hexagonal spherical grid có 12 pentagons mỗi resolution; không gọi H3 là Hilbert curve. Hops, average cell area và parent IDs không tự chứng minh exact metric-radius cover; dùng library covering/traversal có semantics đúng rồi kiểm distance.",
+          "en": "S2 combines hierarchical spherical quadrilateral cells with Hilbert ordering. H3 uses a hierarchical mostly-hexagonal spherical grid with twelve pentagons per resolution; H3 is not a Hilbert curve. Hops, average areas and parent IDs do not prove exact metric-radius coverage; use appropriate library covering/traversal semantics and distance checks."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lựa chọn spatial",
+            "en": "Spatial option"
+          },
+          {
+            "vi": "Phù hợp khi",
+            "en": "Useful when"
+          },
+          {
+            "vi": "Chi phí hoặc giới hạn",
+            "en": "Costs or limits"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "PostGIS spatial index",
+              "en": "PostGIS spatial index"
+            },
+            {
+              "vi": "Muốn query/filter transactional gần source DB.",
+              "en": "Queries/filters should remain near a transactional source database."
+            },
+            {
+              "vi": "Đo plans, replica lag và dense-query CPU; scale theo workload.",
+              "en": "Measure plans, replica lag and dense-query CPU; scale to the workload."
+            }
+          ],
+          [
+            {
+              "vi": "Geohash ranges",
+              "en": "Geohash ranges"
+            },
+            {
+              "vi": "Prefix/range scans trên sorted KV/DB.",
+              "en": "Prefix/range scans suit sorted KV/databases."
+            },
+            {
+              "vi": "Boundary, latitude và mixed precision cần cover đúng.",
+              "en": "Boundaries, latitude and mixed precision require correct covers."
+            }
+          ],
+          [
+            {
+              "vi": "Quadtree",
+              "en": "Quadtree"
+            },
+            {
+              "vi": "In-memory density-adaptive queries.",
+              "en": "Density-adaptive in-memory queries."
+            },
+            {
+              "vi": "Depth cap, balancing và concurrent mutation.",
+              "en": "Depth limits, balancing and concurrent mutation."
+            }
+          ],
+          [
+            {
+              "vi": "S2 / H3",
+              "en": "S2 / H3"
+            },
+            {
+              "vi": "Hierarchical spherical cell operations theo library.",
+              "en": "Library-supported hierarchical spherical-cell operations."
+            },
+            {
+              "vi": "S2/H3 khác topology; exact query semantics vẫn cần kiểm.",
+              "en": "Different topologies; exact query semantics still require validation."
+            }
+          ],
+          [
+            {
+              "vi": "Redis GEO",
+              "en": "Redis GEO"
+            },
+            {
+              "vi": "Geo set trong managed in-memory query path.",
+              "en": "Managed in-memory geospatial sets fit the query path."
+            },
+            {
+              "vi": "Key partition, expiry member và query guarantees không tự có.",
+              "en": "Key partitioning, member expiry and query guarantees are not automatic."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "query-pipeline",
+      "title": {
+        "vi": "9. Coverage → exact filter → eligibility → rank",
+        "en": "9. Coverage, exact filtering, eligibility and ranking"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bắt đầu từ conservative cover, retrieve candidates với coordinates/version, dedup theo business ID, exact distance và eligibility trước final top-K. Nếu chỉ lấy K theo khoảng cách rồi bỏ closed/category-blocked items, response có thể thiếu dù còn nhiều business hợp lệ ở candidate set. Overfetch/adaptive widening giúp nhưng finite budget vẫn có thể không bảo đảm exact top-K; expose approximation/partial behavior theo contract.",
+          "en": "Start with conservative covers, retrieve coordinates/versions, deduplicate business IDs, then check exact distances and eligibility before final top-K. Selecting K nearest and only then removing closed/category-blocked items can underfill results despite other eligible candidates. Overfetching/adaptive widening can help, but finite budgets may still preclude exact top-K; expose approximation/partial behavior under the contract."
+        },
+        {
+          "vi": "Open-now cần business timezone, exceptional closures và holiday hours; không dùng timezone của phone cho mọi listing. Relevance score có thể kết hợp distance decay, quality, category, availability và personalization, nhưng popularity có thể đẩy mọi điểm gần xuống dưới. Định nghĩa hard radius/eligibility và tie-breaker trước; đo relevance riêng với coverage và latency.",
+          "en": "Open-now needs business timezones, exceptional closures and holiday hours rather than the phone timezone for every listing. Relevance may combine distance decay, quality, categories, availability and personalization, but popularity can crowd out nearby results. Define hard radius/eligibility and deterministic tie-breakers first, and measure relevance separately from coverage/latency."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một nearby search có kiểm tra đầy đủ",
+          "en": "A validated nearby search"
+        },
+        "caption": {
+          "vi": "Mỗi bước có cardinality/budget metric; final top-K không được che giấu candidate recall thấp.",
+          "en": "Track cardinalities/budgets at each stage; final top-K must not conceal poor candidate recall."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Cover",
+              "en": "Cover"
+            },
+            "detail": {
+              "vi": "Bao phủ circle theo geometry đúng, xử lý boundary/dateline.",
+              "en": "Cover the circle with appropriate geometry and boundary/dateline handling."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Retrieve và exact check",
+              "en": "Retrieve and check"
+            },
+            "detail": {
+              "vi": "Dedup ID, distance, status và filters trên version phù hợp.",
+              "en": "Deduplicate IDs and check distances, statuses and filters at appropriate versions."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Rank và page",
+              "en": "Rank and page"
+            },
+            "detail": {
+              "vi": "Tie-breaker, generation/query context và declared partial semantics.",
+              "en": "Use tie-breakers, generation/query context and declared partial semantics."
+            },
+            "icon": "chart"
+          }
+        ]
+      }
+    },
+    {
+      "id": "publication",
+      "title": {
+        "vi": "10. Update visibility và snapshot swap cần version",
+        "en": "10. Update visibility and snapshot swaps need versions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Owner write có thể đọc source revision ngay trong owner UI, trong khi public search có freshness SLA riêng. CDC/outbox decouple write khỏi mọi search replica; apply monotonic listing version để old retry không hồi sinh deleted listing. Move đổi cells cần remove old/add new và query dedup; thiếu một bước có thể tạo missing hoặc ghost listing.",
+          "en": "Owner interfaces may read source revisions immediately while public searches follow separate freshness SLAs. CDC/outboxes decouple writes from every search replica; monotonic listing versions prevent old retries from reviving deleted listings. Moves require old-cell removal/new-cell insertion plus query deduplication; incomplete updates can create missing or ghost listings."
+        },
+        {
+          "vi": "Full rebuild lấy source snapshot/watermark, replay later changes, validate coverage/count/checksum rồi publish generation atomically cho từng reader. Fleet không đổi toàn cầu cùng nanosecond: request/cursor cần pin generation hoặc explicit expiry. Tombstone/urgent suppression overlay phải tồn tại qua rebuild để snapshot cũ không hồi sinh business bị gỡ. Cache invalidation cần chống stale refill, không chỉ xóa key một lần.",
+          "en": "Full rebuilds capture source snapshots/watermarks, replay later changes, validate coverage/counts/checksums and atomically publish generations per reader. Fleets do not switch globally at one instant: requests/cursors need generation pinning or explicit expiry. Tombstone/urgent-suppression overlays must survive rebuilds to prevent stale snapshots reviving removed businesses. Cache invalidation must resist stale refills rather than merely deleting a key once."
+        }
+      ]
+    },
+    {
+      "id": "ranking-cache",
+      "title": {
+        "vi": "11. Cache và pagination phải gắn với query thực",
+        "en": "11. Cache entries and pagination belong to actual queries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache candidate IDs theo coarse cell có thể share nhiều user rồi exact-filter lại theo actual point. Cache final results chỉ theo cell có thể trả sai distance/radius ở mép hoặc leak personalization/visibility. Key/context cần radius bucket, filters, language, index version và policy; nhiều chiều làm fragmentation nên đo hit rate theo byte/work saved. Không cache sensitive personalized results vào shared CDN một cách mặc định.",
+          "en": "Coarse-cell candidate caches can share work across users before exact filtering at actual points. Caching final results solely by cell can give incorrect edge distances/radius membership or leak personalization/visibility. Context can include radius buckets, filters, languages, index versions and policies; dimensions fragment caches, so measure saved bytes/work. Sensitive personalized results do not belong in shared CDNs by default."
+        },
+        {
+          "vi": "Distance sort cần stable tie-breaker như business ID. Cursor bind immutable query/generation và last score/ID; nếu ranking phụ thuộc current time hoặc changing ratings thì phải pin snapshot/time hoặc chấp nhận documented duplicate/skip behavior. Nearby mobile query đổi theo movement không nên append page cũ vào query mới. Không widen radius âm thầm khi API hứa within 2 km; hỏi hoặc gắn expandedRadius vào response.",
+          "en": "Distance sorts need stable tie-breakers such as business IDs. Cursors bind immutable query/generation contexts and last scores/IDs; current-time or changing-rating ranks require pinned snapshots/times or documented duplicate/skip behavior. Mobile location changes must not append old-query pages to new queries. Do not silently widen a promised two-km radius: ask or return explicit expanded-radius metadata."
+        }
+      ]
+    },
+    {
+      "id": "moving-scale",
+      "title": {
+        "vi": "12. Static listings khác moving drivers",
+        "en": "12. Static listings differ from moving drivers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một triệu driver gửi location mỗi 5 giây là 200.000 updates/s, chưa tính heartbeat/reconnect; khác hoàn toàn vài chục owner edits/s giả định. Dynamic index cần sequence/time validation, stale update rejection, atomic cell membership chuyển vùng và expiry/offline policy. Redis GEO member không tự có per-member TTL chỉ vì bạn đặt TTL cho key; cần timestamp index/cleanup hoặc thiết kế entity state phù hợp.",
+          "en": "One million drivers reporting every five seconds create 200,000 updates/second before heartbeats/reconnects, unlike hypothetical tens of owner edits/second. Dynamic indexes need sequence/time validation, stale-update rejection, atomic cell-membership movement and expiry/offline policies. Redis GEO members do not automatically gain individual TTLs from key expiry; use timestamp indexes/cleanup or suitable entity-state designs."
+        },
+        {
+          "vi": "Shard theo region/cell giảm write concentration nhưng query sát boundary phải đọc đủ neighboring shards và dedup. Metro hotspot có thể cần split/adaptive partitions và replica/search fanout control; raw geohash-prefix shard không luôn cân tải. Chỉ gửi current-state pings tới memory index nếu failure/recovery contract cho phép, và tách trip/audit events cần durable retention. “Không bao giờ ghi location vào durable store” cũng là kết luận quá rộng.",
+          "en": "Region/cell sharding reduces write concentration but boundary queries must read all relevant shards and deduplicate. Metro hotspots may need adaptive splits and bounded search fanout; raw geohash prefixes do not inherently balance load. In-memory current-state pings are appropriate only under explicit failure/recovery contracts, with durable trip/audit events handled separately. “Never persist locations” is also overly broad."
+        }
+      ]
+    },
+    {
+      "id": "privacy-failures",
+      "title": {
+        "vi": "13. Privacy và degradation không phải phần thêm sau",
+        "en": "13. Privacy and degradation are core behavior"
+      },
+      "paragraphs": [
+        {
+          "vi": "Collect minimum precision cần cho feature, consent rõ, retention ngắn phù hợp policy và access control/audit cho location data. Làm tròn logs giảm detail nhưng không tự anonymize repeated trajectories. Tránh high-cardinality metrics mang exact coordinates/user ID; aggregate theo vùng đủ rộng, kiểm lại khi density thấp. Post body/TLS không chặn logging nội bộ; scrub cả trace, exception và third-party analytics.",
+          "en": "Collect the minimum necessary precision under clear consent, retention and audited access controls. Rounding logs reduces detail but does not anonymize repeated trajectories automatically. Avoid exact-coordinate/user-ID metric dimensions; aggregate over sufficiently broad regions and reconsider sparse areas. POST bodies/TLS do not prevent internal logging, so scrub traces, exceptions and third-party analytics too."
+        },
+        {
+          "vi": "Khi một geo shard timeout, thiếu candidates có thể làm nearest result sai; trả partial flag hoặc fail theo contract thay vì giả response exact. Khi details cache hỏng, giữ search bounded bằng bulkheads/single-flight/admission, không tạo hàng trăm DB calls/client. Stale coordinate version có thể làm exact filter dùng nơi cũ: định nghĩa nguồn coordinate cùng listing version và policy drop/refetch.",
+          "en": "A timed-out geo shard can omit candidates and produce incorrect nearest results; return partial flags or fail under the contract rather than claiming exactness. Details-cache outages need bulkheads/coalescing/admission rather than hundreds of DB calls per client. Stale coordinate versions can make exact filters check old locations; define authoritative version matching and drop/refetch policies."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Kiểm tra proximity",
+            "en": "Proximity check"
+          },
+          {
+            "vi": "Invariant/kết quả mong đợi",
+            "en": "Expected invariant/result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Point hai bên cell boundary",
+              "en": "Points across cell boundaries"
+            },
+            {
+              "vi": "Conservative cover không bỏ in-radius point.",
+              "en": "Conservative covers retain in-radius points."
+            }
+          ],
+          [
+            {
+              "vi": "Dateline/pole/units",
+              "en": "Dateline/poles/units"
+            },
+            {
+              "vi": "So kết quả với trusted geometry và known-location fixtures.",
+              "en": "Compare against trusted geometry and known-location fixtures."
+            }
+          ],
+          [
+            {
+              "vi": "Old index update sau tombstone",
+              "en": "Old index update after a tombstone"
+            },
+            {
+              "vi": "Không revive listing đã remove.",
+              "en": "Removed listings are not revived."
+            }
+          ],
+          [
+            {
+              "vi": "Dense city + nhiều filters",
+              "en": "Dense city with many filters"
+            },
+            {
+              "vi": "Đo candidate recall/partial rate, không chỉ response latency.",
+              "en": "Measure candidate recall/partial rates, not only latency."
+            }
+          ],
+          [
+            {
+              "vi": "Rebuild + cursor page 2",
+              "en": "Rebuild during page two"
+            },
+            {
+              "vi": "Pin generation hoặc expire cursor rõ ràng.",
+              "en": "Pin generations or explicitly expire cursors."
+            }
+          ],
+          [
+            {
+              "vi": "No location consent",
+              "en": "No location consent"
+            },
+            {
+              "vi": "Không gọi exact-position APIs; cung cấp region/manual input phù hợp.",
+              "en": "Avoid exact-position APIs and support appropriate region/manual inputs."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi phỏng vấn về coverage và freshness",
+        "en": "14. Interview questions on coverage and freshness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một design tốt giải thích được tại sao candidate đủ, distance đúng và listing update hội tụ trong bound. Dùng đối chiếu brute force trên fixture nhỏ, test boundary và chaos update/rebuild để kiểm chứng, rồi mới tối ưu.",
+          "en": "A good design explains sufficient candidates, correct distances and bounded listing freshness. Validate small fixtures against brute force, test boundaries and inject update/rebuild faults before optimizing."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao query đúng cell rồi exact distance vẫn bỏ sót?",
+            "en": "Why can querying one cell then exact-filtering still miss results?"
+          },
+          "answer": [
+            {
+              "vi": "Point gần query có thể ở bên kia boundary. Exact filter chỉ kiểm những point đã retrieve, không phục hồi point bị thiếu. Dùng conservative cover đủ circle rồi dedup/distance, kiểm dateline/latitude/radius lớn.",
+              "en": "Nearby points can lie across boundaries. Exact filtering only examines retrieved points; it cannot recover missing ones. Conservatively cover the circle, then deduplicate/check distances with dateline/latitude/large-radius handling."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có phải luôn query 9 geohash cells là đủ?",
+            "en": "Are nine geohash cells always enough?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cần chứng minh cover theo radius và local cell dimensions; radius lớn hoặc longitude cell width nhỏ ở high latitude có thể cần nhiều cells. Dùng region coverer và trusted distance model, đừng lấy average area làm worst-case bound.",
+              "en": "No. Prove coverage using the radius and local dimensions. Large radii or narrow high-latitude longitude cells may need more cells. Use region coverers and trusted distances rather than average areas as worst-case bounds."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Index 200M × 24 B có chắc vừa 5 GB RAM không?",
+            "en": "Does a 200M × 24 B index necessarily fit in five GB RAM?"
+          },
+          "answer": [
+            {
+              "vi": "Đó là packed arithmetic 4,8 GB, chưa tính allocator/engine overhead, coordinates, multi-resolution và hai generation khi rebuild. Đo resident memory và CPU/update bandwidth; full replica chỉ là một option có điều kiện.",
+              "en": "That is 4.8 GB of packed arithmetic before engine/allocator overhead, coordinates, multiple resolutions and overlapping rebuild generations. Measure resident memory and CPU/update bandwidth; full replication is conditional."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Owner muốn listing hiện ngay, có cần sync fanout tới mọi replica không?",
+            "en": "Does immediate owner visibility require synchronous fanout to every replica?"
+          },
+          "answer": [
+            {
+              "vi": "Có thể owner read-your-write source revision ngay, public search theo freshness SLA. Dùng CDC/outbox + versioned incremental index và đo lag; urgent removal cần suppression bound riêng. Sync fanout toàn fleet có thể làm write phụ thuộc replica chậm.",
+              "en": "Owners can read source revisions immediately while public search follows a freshness SLA. Use CDC/outboxes, versioned incremental indexes and lag measurements, with separate urgent-suppression bounds. Fleet-wide synchronous fanout can couple writes to slow replicas."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Quadtree threshold 1 có tách được mọi point không?",
+            "en": "Can a quadtree capacity of one separate every point?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu duplicate hoặc quá sát nhau dưới resolution hữu hạn. Cần max depth/min cell size và overflow leaf. Test point nằm trên boundaries và giữ mỗi ID đúng một leaf; threshold không phải guarantee depth O(log n) cho mọi distribution.",
+              "en": "Not for duplicates or points closer than finite resolution permits. Bound depth/minimum sizes and use overflow leaves. Test boundary ownership and single-leaf ID membership; thresholds do not guarantee logarithmic depth for every distribution."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Trả top-20 nearest rồi bỏ closed listings có đúng top-20 open không?",
+            "en": "Does filtering closed listings after selecting twenty nearest yield twenty nearest open listings?"
+          },
+          "answer": [
+            {
+              "vi": "Không; có thể bỏ gần hết trong khi business hợp lệ còn ở phía sau. Đặt eligibility trong search/ranking phù hợp hoặc overfetch/adapt với declared budget/approximation. Giữ radius hard limit, timezone và exceptional hours đúng.",
+              "en": "No: most could be removed despite eligible businesses farther in the candidate set. Apply eligibility appropriately or overfetch/adapt under declared budgets/approximation. Preserve radius limits, timezones and exceptional hours."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đổi sang moving drivers chỉ cần refresh index nhanh hơn?",
+            "en": "Is a faster index refresh enough for moving drivers?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Update rate, staleness, expiry, out-of-order sequence, cross-cell move và regional ownership thay đổi. Tách current-state serving khỏi durable trip/audit history, xử lý stale updates và query boundary across shards.",
+              "en": "No. Update rates, staleness, expiry, out-of-order sequences, cell moves and regional ownership change. Separate current-state serving from durable trip/audit histories, reject stale updates and cover shard boundaries."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Round location trong logs đã anonymize chưa?",
+            "en": "Does rounding locations in logs anonymize them?"
+          },
+          "answer": [
+            {
+              "vi": "Không bảo đảm. Repeated coarse points có thể tạo trajectory có thể liên kết. Cần data minimization, aggregation/retention/access controls và đánh giá privacy theo workload, không chỉ đổi số chữ số.",
+              "en": "Not reliably. Repeated coarse points can form linkable trajectories. Use minimization, aggregation, retention/access controls and workload-specific privacy evaluation rather than merely reducing decimal digits."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

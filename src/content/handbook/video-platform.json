@@ -1,0 +1,1328 @@
+{
+  "id": "video-platform",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Video Platform: upload, ABR và CDN",
+    "en": "Designing a Video Platform: uploads, ABR and CDNs"
+  },
+  "summary": {
+    "vi": "Tách ingest/processing khỏi playback; thử progressive publication, buffer khi bandwidth đổi và viewer/origin bandwidth để hiểu quality, availability và resource trade-off.",
+    "en": "Separate ingestion/processing from playback; explore progressive publication, buffering under changing throughput and viewer/origin bandwidth to understand quality, availability and resource trade-offs."
+  },
+  "prerequisites": [
+    "caching",
+    "messaging",
+    "reliability",
+    "networking"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "storage-search",
+    "network",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Verified upload không đồng nghĩa playable; publish pointer chỉ trỏ tới validated assets sau mandatory gates.",
+      "en": "Verified upload is not playable publication; pointers reference validated assets after mandatory gates."
+    },
+    {
+      "vi": "DAG task identity, immutable outputs và generation guards giữ retry/cancel/publication đúng state.",
+      "en": "Task identities, immutable outputs and generation guards preserve retry/cancel/publication state."
+    },
+    {
+      "vi": "ABR cân bằng quality với startup/stall; network estimate không biết trước bandwidth giảm.",
+      "en": "ABR balances quality with startup/stalls; estimates cannot foresee throughput drops."
+    },
+    {
+      "vi": "CDN giảm origin fills, không xóa viewer bytes; sizing dùng bitrate × watch time và byte hit ratio.",
+      "en": "CDNs reduce origin fills, not viewer bytes; size bitrate × watch time and byte hit ratios."
+    },
+    {
+      "vi": "Codec, ladder, playback auth và multi-CDN đều cần capability/policy/QoE đo được, không có một cấu hình tối ưu chung.",
+      "en": "Codecs, ladders, authorization and multi-CDN choices need measured capabilities/policies/QoE, not one universal optimum."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ một upload tới từng segment playback",
+      "en": "From one upload to each playback segment"
+    },
+    "caption": {
+      "vi": "Học từng durable/authorization boundary rồi mới tối ưu compute và byte.",
+      "en": "Understand durability/authorization boundaries before optimizing compute and bytes."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Upload có thể resume",
+          "en": "Resume uploads"
+        },
+        "detail": {
+          "vi": "Session/scoped parts, integrity và verified source version.",
+          "en": "Use sessions/scoped parts, integrity and verified source versions."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Encode và publish",
+          "en": "Encode and publish"
+        },
+        "detail": {
+          "vi": "DAG, task retry, gate và manifest generation.",
+          "en": "Manage DAGs, retries, gates and manifest generations."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Adapt và deliver",
+          "en": "Adapt and deliver"
+        },
+        "detail": {
+          "vi": "Player chọn compatible bitrate; CDN giữ media bytes.",
+          "en": "Players choose compatible bitrates while CDNs cache media."
+        },
+        "icon": "gauge"
+      },
+      {
+        "title": {
+          "vi": "Đo QoE và tài nguyên",
+          "en": "Measure QoE and resources"
+        },
+        "detail": {
+          "vi": "Startup/stall, storage/compute/egress và recovery.",
+          "en": "Measure startup/stalls, storage/compute/egress and recovery."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Hai hệ thống: ingest và playback",
+        "en": "1. Two systems: ingestion and playback"
+      },
+      "paragraphs": [
+        {
+          "vi": "Video platform gồm pipeline biến upload thành playable assets và delivery path đưa bytes tới viewer. Control API quản lý owner, metadata, state và playback authorization; data plane xử lý object upload, transcoding, CDN và player. Tách hai đường giúp scale/failure độc lập và tránh bắt app server proxy mọi GB. Đây là lựa chọn của baseline, không phải quy luật cấm mọi proxy upload ở mọi sản phẩm.",
+          "en": "A video platform has a pipeline turning uploads into playable assets and a delivery path sending bytes to viewers. Control APIs manage ownership, metadata, state and playback authorization; data planes handle object uploads, transcoding, CDNs and players. Separation supports independent scaling/failures and avoids proxying every GB through app servers in this baseline, rather than universally banning upload proxies."
+        },
+        {
+          "vi": "Baseline là on-demand video, resumable upload, nhiều rendition/codec tương thích thiết bị, title/thumbnail/caption và playback mượt. Live, recommendation, comments, ads là scope khác. Mục tiêu first frame dưới 2 giây và publish trong vài phút phải gắn device/network cohort, file size và processing workload; không hứa đạt trên mọi video 4K và mạng chậm.",
+          "en": "The baseline is on-demand video with resumable uploads, compatible renditions/codecs, titles/thumbnails/captions and smooth playback. Live, recommendations, comments and advertising are separate scopes. Targets such as a first frame under two seconds or publication within minutes need device/network cohorts, file sizes and processing workloads rather than universal promises for all 4K files and slow networks."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Time-to-playable",
+            "en": "Time-to-playable"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Upload hoàn tất khác playable: còn integrity, probe, encode, packaging và publish gate.",
+              "en": "Completed upload is not playable publication: integrity, probing, encoding, packaging and gates remain."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Playback QoE",
+            "en": "Playback QoE"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Startup, rebuffer, chất lượng/switch và lỗi theo device/ISP/region.",
+              "en": "Measure startup, rebuffering, quality/switching and errors by device, ISP and region."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Bytes và quyền",
+            "en": "Bytes and authorization"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "CDN giảm origin load, không xóa viewer egress; cached media vẫn cần access policy phù hợp.",
+              "en": "CDNs reduce origin load without eliminating viewer egress; cached media still needs appropriate access policy."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Egress, ingest và rendition size phải tính riêng",
+        "en": "2. Calculate egress, ingestion and rendition sizes separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ 50 triệu DAU × 5 view × 600 giây/view × 3 Mbit/s cho khoảng 56,25 PB viewer bytes/ngày, tương đương 5,21 Tbit/s trung bình. Watch seconds và delivered bitrate là input có thể khác lớn theo product/device; số view không tự nói được bandwidth. CDN cache hit không loại các bytes đã gửi tới viewer.",
+          "en": "An example of 50 million DAU × five views × 600 seconds/view × 3 Mbit/second yields about 56.25 PB/day or 5.21 Tbit/second average viewer delivery. Watch time and delivered bitrate vary by product/device; views alone do not size bandwidth. CDN cache hits do not eliminate viewer-delivered bytes."
+        },
+        {
+          "vi": "500.000 upload/ngày × 300 MB raw là 150 TB ingest/ngày. Encoded storage không tự bằng 1–1,5 lần raw: tổng gần Σ(duration × rendition bitrate / 8) cộng audio/container/metadata. Với video mẫu dài 600 giây và ladder tổng 11,7 Mbit/s, các rendition tốn khoảng 877,5 MB/video nếu tạo đủ, tức 438,75 TB/ngày ở cùng upload count. Chỉ tạo resolution/codec phù hợp source/client và policy; không upscale nguồn thấp chỉ để đủ ladder.",
+          "en": "Five hundred thousand daily uploads × 300 MB raw gives 150 TB/day ingestion. Encoded storage is not inherently 1–1.5 times raw size: it is roughly Σ(duration × rendition bitrate / 8) plus audio, containers and metadata. A 600-second example and a summed 11.7 Mbit/second ladder produce about 877.5 MB/video or 438.75 TB/day if every rendition is generated. Generate appropriate source/client renditions rather than upscaling merely to fill a ladder."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Hạng mục video",
+            "en": "Video quantity"
+          },
+          {
+            "vi": "Phép tính minh họa",
+            "en": "Illustrative calculation"
+          },
+          {
+            "vi": "Kết quả video",
+            "en": "Video result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Views/ngày",
+              "en": "Daily views"
+            },
+            {
+              "vi": "50 triệu × 5",
+              "en": "50 million × 5"
+            },
+            {
+              "vi": "250 triệu",
+              "en": "250 million"
+            }
+          ],
+          [
+            {
+              "vi": "Viewer egress/ngày",
+              "en": "Daily viewer egress"
+            },
+            {
+              "vi": "250 triệu × 600 × 3 Mbit/s ÷ 8",
+              "en": "250 million × 600 × 3 Mbit/s ÷ 8"
+            },
+            {
+              "vi": "56,25 PB decimal",
+              "en": "56.25 decimal PB"
+            }
+          ],
+          [
+            {
+              "vi": "Average viewer bandwidth",
+              "en": "Average viewer bandwidth"
+            },
+            {
+              "vi": "56,25 PB × 8 / 86.400 s",
+              "en": "56.25 PB × 8 / 86,400 s"
+            },
+            {
+              "vi": "5,21 Tbit/s",
+              "en": "5.21 Tbit/s"
+            }
+          ],
+          [
+            {
+              "vi": "Raw ingest/ngày",
+              "en": "Daily raw ingestion"
+            },
+            {
+              "vi": "500.000 × 300 MB",
+              "en": "500,000 × 300 MB"
+            },
+            {
+              "vi": "150 TB decimal",
+              "en": "150 decimal TB"
+            }
+          ],
+          [
+            {
+              "vi": "Ladder storage mẫu",
+              "en": "Example ladder storage"
+            },
+            {
+              "vi": "600 s × 11,7 Mbit/s ÷ 8",
+              "en": "600 s × 11.7 Mbit/s ÷ 8"
+            },
+            {
+              "vi": "877,5 MB/video trước overhead",
+              "en": "877.5 MB/video before overhead"
+            }
+          ],
+          [
+            {
+              "vi": "Upload session rate",
+              "en": "Upload session rate"
+            },
+            {
+              "vi": "500.000 / 86.400",
+              "en": "500,000 / 86,400"
+            },
+            {
+              "vi": "5,79 session/s; part requests cao hơn",
+              "en": "5.79 sessions/s; part-request rate is higher"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Upload session, completion và playback session",
+        "en": "3. Upload, completion and playback-session contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Create/complete cần idempotency theo owner/session. Signed request bị giới hạn vào đúng object/part/operation và thời hạn; refresh URL không tạo một video mới. Không trả hàng nghìn part URL chưa cần nếu có thể cấp theo page. Complete endpoint kiểm server-side storage result, size, integrity và object version thay vì tin client khai đủ part.",
+          "en": "Create/complete operations use owner/session-scoped idempotency. Signed requests are limited to object/part/operation and expiry; refreshing a URL does not create another video. Issue part URLs in pages when appropriate. Verify storage completion, size, integrity and object version server-side rather than trusting a client’s part list."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/videos",
+          "description": {
+            "vi": "Tạo video/upload session của principal được phép.",
+            "en": "Create an authorized principal’s video/upload session."
+          },
+          "request": "Idempotency-Key: upload-action-42\n{ \"title\": \"Demo\", \"size_bytes\": 300000000, \"content_type\": \"video/mp4\" }",
+          "response": "201 { \"video_id\": \"v42\", \"upload_session_id\": \"u42\", \"state\": \"UPLOADING\" }"
+        },
+        {
+          "method": "POST",
+          "path": "/videos/{id}/upload-parts",
+          "description": {
+            "vi": "Cấp hoặc refresh scoped part requests cho cùng session.",
+            "en": "Issue or refresh scoped part requests for one session."
+          },
+          "request": "{ \"upload_session_id\": \"u42\", \"part_numbers\": [1,2,3] }",
+          "response": "200 { \"parts\": [{ \"number\": 1, \"url\": \"https://upload.example/opaque-signed-request\", \"expires_at\": \"...\" }] }"
+        },
+        {
+          "method": "POST",
+          "path": "/videos/{id}/complete",
+          "description": {
+            "vi": "Complete/verify source rồi ghi processing intent có recovery.",
+            "en": "Complete/verify the source and recoverably record processing intent."
+          },
+          "request": "{ \"upload_session_id\": \"u42\", \"parts\": [{ \"number\": 1, \"etag\": \"opaque\" }], \"checksum\": \"...\" }",
+          "response": "202 { \"state\": \"PROCESSING\", \"source_version\": \"s3\" }",
+          "notes": [
+            {
+              "vi": "ETag không mặc định là MD5/checksum toàn file, đặc biệt multipart; dùng checksum/verification đúng contract storage.",
+              "en": "An ETag is not inherently a whole-file MD5/checksum, particularly with multipart objects; use the storage contract’s integrity mechanisms."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/videos/{id}",
+          "description": {
+            "vi": "Metadata theo visibility/owner; PROCESSING chưa được trả playback như READY.",
+            "en": "Return visibility/owner-appropriate metadata; PROCESSING is not playable READY state."
+          },
+          "response": "200 { \"title\": \"Demo\", \"state\": \"READY\", \"asset_version\": \"a7\", \"available_renditions\": [\"low\",\"mid\"] }"
+        },
+        {
+          "method": "POST",
+          "path": "/videos/{id}/playback-sessions",
+          "description": {
+            "vi": "Kiểm entitlement/device/region rồi cấp manifest/session access.",
+            "en": "Check entitlement/device/region and issue manifest/session access."
+          },
+          "response": "201 { \"manifest_url\": \"https://media.example/v42/a7/master.m3u8\", \"access\": \"opaque-scoped-session\", \"expires_at\": \"...\" }"
+        },
+        {
+          "method": "DELETE",
+          "path": "/videos/{id}",
+          "description": {
+            "vi": "Chuyển desired state, chặn publication cũ và thực hiện takedown/cleanup theo policy.",
+            "en": "Change desired state, reject stale publication and run policy-defined takedown/cleanup."
+          },
+          "response": "202 { \"state\": \"DELETING\" }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Control plane và data plane tách rõ",
+        "en": "4. Separate control and data planes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metadata DB giữ desired/publication state, source version và pipeline generation; raw/encoded bucket không là API public để bypass quyền. Processing jobs dùng stable identity và durable admission; object events có thể trùng hoặc out of order nên consumer phải kiểm source/session version. Outbox/reconciliation liên kết storage completion với database/job state vì chúng thường không nằm trong một transaction chung.",
+          "en": "Metadata stores desired/publication state, source versions and pipeline generations. Raw/encoded buckets are not public authorization bypasses. Stable-identity processing jobs use durable admission; duplicate/out-of-order object events require source/session-version checks. Outboxes/reconciliation connect storage completion to database/job state because these usually lack one shared transaction."
+        },
+        {
+          "vi": "Playback API không proxy mọi segment và viewer không truy cập DB trực tiếp. Nó kiểm quyền và cấp access tới published asset version; CDN/player làm phần media transfer. Mỗi arrow cần định nghĩa retry, deadline và bytes/state owner, đặc biệt khi job cũ hoàn tất sau cancel/delete.",
+          "en": "Playback APIs do not proxy every segment, and viewers do not access databases directly. APIs authorize published asset versions while CDNs/players transfer media. Define retry, deadlines and byte/state ownership at each arrow, especially when stale jobs finish after cancellation/deletion."
+        }
+      ],
+      "diagram": {
+        "id": "video-upload-playback",
+        "title": {
+          "vi": "Upload/processing và playback là hai đường riêng",
+          "en": "Upload/processing and playback are separate paths"
+        },
+        "caption": {
+          "vi": "API quản lý quyền/state, object storage giữ media bytes, CDN phục vụ playback. Publish chỉ sau artifact và gate đủ điều kiện; đây là kiến trúc minh họa.",
+          "en": "APIs control authorization/state, object storage holds media bytes and CDNs serve playback. Publication requires valid artifacts and gates; this is a teaching architecture."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "creator",
+            "label": {
+              "vi": "Creator client",
+              "en": "Creator client"
+            },
+            "detail": {
+              "vi": "Giữ upload session/part progress để resume; client complete không tự chứng minh file đã hợp lệ.",
+              "en": "Retains upload sessions/part progress for resumption; client completion alone does not prove valid media."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "upload",
+            "label": {
+              "vi": "Upload API",
+              "en": "Upload API"
+            },
+            "detail": {
+              "vi": "Authorize owner, tạo session và signed part requests đúng key/size/expiry. Không proxy media bytes trong baseline.",
+              "en": "Authorizes owners, creates sessions and signs appropriately scoped part requests. The baseline does not proxy media bytes."
+            },
+            "x": 420,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "meta",
+            "label": {
+              "vi": "Metadata / state DB",
+              "en": "Metadata / state DB"
+            },
+            "detail": {
+              "vi": "Video ID, source version, pipeline generation, desired state và published manifest pointer. Chỉ service truy cập DB.",
+              "en": "Stores video IDs, source versions, pipeline generations, desired state and published manifest pointers. Only services access the database."
+            },
+            "x": 720,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "playback",
+            "label": {
+              "vi": "Playback API",
+              "en": "Playback API"
+            },
+            "detail": {
+              "vi": "Kiểm visibility/entitlement/region/device, trả playback session/manifest access; không cấp raw bucket access.",
+              "en": "Checks visibility, entitlement, region and devices, then returns playback sessions/manifest access without raw-bucket access."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "raw",
+            "label": {
+              "vi": "Private raw objects",
+              "en": "Private raw objects"
+            },
+            "detail": {
+              "vi": "Multipart upload được hoàn tất, kiểm size/checksum/source object version. Lifecycle xử lý orphan/incomplete uploads.",
+              "en": "Completes multipart uploads and validates size/checksums/source object versions. Lifecycle policies handle orphan/incomplete uploads."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "jobs",
+            "label": {
+              "vi": "Processing jobs",
+              "en": "Processing jobs"
+            },
+            "detail": {
+              "vi": "Durable jobs theo source version + pipeline version; storage events có thể trùng/out of order nên admission idempotent.",
+              "en": "Durable jobs keyed by source/pipeline versions; idempotent admission handles duplicate/out-of-order storage events."
+            },
+            "x": 420,
+            "y": 410,
+            "kind": "queue"
+          },
+          {
+            "id": "transcode",
+            "label": {
+              "vi": "Transcode / package DAG",
+              "en": "Transcode / package DAG"
+            },
+            "detail": {
+              "vi": "Probe, parallel encodes, package, audio/caption/thumbnail; task identity và immutable staged artifacts bảo vệ retry.",
+              "en": "Probes, parallel encodes, packaging, audio/captions/thumbnails; task identity and immutable staged artifacts protect retries."
+            },
+            "x": 720,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "encoded",
+            "label": {
+              "vi": "Encoded origin",
+              "en": "Encoded origin"
+            },
+            "detail": {
+              "vi": "Segments và manifest theo immutable asset version. CDN chỉ đọc origin theo quyền; public URL không bypass gate.",
+              "en": "Segments/manifests have immutable asset versions. CDN origin access is authorized; public URLs do not bypass publication gates."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "gate",
+            "label": {
+              "vi": "Publish gates",
+              "en": "Publish gates"
+            },
+            "detail": {
+              "vi": "Validation, policy/rights và required rendition coverage; READY không được bypass các gate bắt buộc.",
+              "en": "Validation, policy/rights and required rendition coverage; READY cannot bypass mandatory gates."
+            },
+            "x": 720,
+            "y": 720,
+            "kind": "service"
+          },
+          {
+            "id": "cdn",
+            "label": {
+              "vi": "CDN / shield",
+              "en": "CDN / shield"
+            },
+            "detail": {
+              "vi": "Cache bytes theo asset identity; kiểm quyền ở boundary phù hợp, coalesce miss nếu được cấu hình.",
+              "en": "Caches by asset identity with appropriate authorization and configured miss coalescing."
+            },
+            "x": 1040,
+            "y": 720,
+            "kind": "edge"
+          },
+          {
+            "id": "viewer",
+            "label": {
+              "vi": "Viewer / ABR player",
+              "en": "Viewer / ABR player"
+            },
+            "detail": {
+              "vi": "Đọc playlist/manifest, chọn compatible rendition theo throughput/buffer; báo QoE theo sampling policy.",
+              "en": "Reads playlists/manifests, selects compatible renditions by throughput/buffer and reports sampled QoE."
+            },
+            "x": 420,
+            "y": 720,
+            "kind": "client"
+          }
+        ],
+        "traces": [
+          {
+            "id": "upload",
+            "label": {
+              "vi": "Create và resume upload",
+              "en": "Create and resume an upload"
+            },
+            "steps": [
+              {
+                "from": "creator",
+                "to": "upload",
+                "description": {
+                  "vi": "Tạo video với idempotency key, metadata và expected size.",
+                  "en": "Create a video with an idempotency key, metadata and expected size."
+                }
+              },
+              {
+                "from": "upload",
+                "to": "meta",
+                "description": {
+                  "vi": "Commit owner/session ở UPLOADING; key object không trùng upload khác.",
+                  "en": "Commit the owner/session in UPLOADING with an object key isolated from other uploads."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "upload",
+                "description": {
+                  "vi": "Trả video/session identity đã commit.",
+                  "en": "Return the committed video/session identity."
+                }
+              },
+              {
+                "from": "upload",
+                "to": "creator",
+                "description": {
+                  "vi": "Cấp signed part requests có scope/expiry; refresh URL theo cùng session khi cần.",
+                  "en": "Issue scoped expiring part requests; refresh within the same session when needed."
+                }
+              },
+              {
+                "from": "creator",
+                "to": "raw",
+                "description": {
+                  "vi": "PUT các part trực tiếp; retry part lỗi, giữ checksum/progress.",
+                  "en": "Upload parts directly, retry failed parts and retain checksums/progress."
+                }
+              },
+              {
+                "from": "raw",
+                "to": "creator",
+                "description": {
+                  "vi": "Storage xác nhận part; object cuối chỉ tồn tại theo semantics completion của storage.",
+                  "en": "Storage acknowledges parts; final-object availability follows storage completion semantics."
+                }
+              },
+              {
+                "from": "creator",
+                "to": "upload",
+                "description": {
+                  "vi": "Yêu cầu complete; server kiểm ownership/session và verify storage result.",
+                  "en": "Request completion; the server verifies ownership/session and storage results."
+                }
+              },
+              {
+                "from": "upload",
+                "to": "raw",
+                "description": {
+                  "vi": "Complete/verify object size, integrity và exact source version.",
+                  "en": "Complete/verify object size, integrity and exact source version."
+                }
+              },
+              {
+                "from": "raw",
+                "to": "upload",
+                "description": {
+                  "vi": "Object version hợp lệ, không chỉ là lời báo của client.",
+                  "en": "Return a validated object version rather than relying on a client claim."
+                }
+              },
+              {
+                "from": "upload",
+                "to": "meta",
+                "description": {
+                  "vi": "Record verified source + processing intent/outbox theo recovery contract.",
+                  "en": "Record the verified source and processing intent/outbox under the recovery contract."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "jobs",
+                "description": {
+                  "vi": "Relay/admission tạo job stable identity sau durable state.",
+                  "en": "Relay/admission publishes a stable-identity job after durable state."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "process",
+            "label": {
+              "vi": "Encode rồi publish manifest",
+              "en": "Encode before publishing a manifest"
+            },
+            "steps": [
+              {
+                "from": "jobs",
+                "to": "transcode",
+                "description": {
+                  "vi": "Claim source/pipeline version; retry không thay source dưới cùng job ID.",
+                  "en": "Claim a source/pipeline version; retries cannot substitute a different source under one job ID."
+                },
+                "async": true
+              },
+              {
+                "from": "transcode",
+                "to": "raw",
+                "description": {
+                  "vi": "Đọc đúng source object version đã verify.",
+                  "en": "Read the verified source object version."
+                }
+              },
+              {
+                "from": "raw",
+                "to": "transcode",
+                "description": {
+                  "vi": "Trả source cho probe/parallel encode trong resource budget.",
+                  "en": "Return source data for resource-bounded probing/parallel encoding."
+                }
+              },
+              {
+                "from": "transcode",
+                "to": "encoded",
+                "description": {
+                  "vi": "Ghi segments và derivatives vào immutable staging version; validate checksum/decode/timing.",
+                  "en": "Write segments/derivatives into an immutable staging version and validate integrity, decode and timing."
+                }
+              },
+              {
+                "from": "encoded",
+                "to": "transcode",
+                "description": {
+                  "vi": "Artifact đã có và đọc được trước khi manifest tham chiếu.",
+                  "en": "Artifacts exist and are readable before manifest references are published."
+                }
+              },
+              {
+                "from": "transcode",
+                "to": "gate",
+                "description": {
+                  "vi": "Kiểm required ladder, validation và policy/rights gates cho generation hiện tại.",
+                  "en": "Check the required ladder, validation and policy/rights gates for the current generation."
+                }
+              },
+              {
+                "from": "gate",
+                "to": "transcode",
+                "description": {
+                  "vi": "Gate pass; nếu pending/blocked thì không publish dù encode xong.",
+                  "en": "Pass the gate; pending/blocked work cannot publish merely because encoding finished."
+                }
+              },
+              {
+                "from": "transcode",
+                "to": "encoded",
+                "description": {
+                  "vi": "Ghi manifest immutable chỉ trỏ tới assets hợp lệ.",
+                  "en": "Write an immutable manifest referencing valid assets only."
+                }
+              },
+              {
+                "from": "encoded",
+                "to": "transcode",
+                "description": {
+                  "vi": "Manifest version đã sẵn sàng.",
+                  "en": "The manifest version is ready."
+                }
+              },
+              {
+                "from": "transcode",
+                "to": "meta",
+                "description": {
+                  "vi": "CAS published pointer/READY theo generation, không ghi đè DELETED/BLOCKED từ job cũ.",
+                  "en": "CAS the published pointer/READY by generation; stale jobs cannot overwrite DELETED/BLOCKED state."
+                }
+              }
+            ]
+          },
+          {
+            "id": "watch",
+            "label": {
+              "vi": "Authorize và xem segment qua CDN",
+              "en": "Authorize playback and fetch segments through a CDN"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "playback",
+                "description": {
+                  "vi": "Yêu cầu playback với principal/device/context.",
+                  "en": "Request playback with principal/device/context."
+                }
+              },
+              {
+                "from": "playback",
+                "to": "meta",
+                "description": {
+                  "vi": "Đọc desired/publication state và quyền theo policy.",
+                  "en": "Read desired/publication state and authorization policy."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "playback",
+                "description": {
+                  "vi": "Trả manifest version được phép, không tự xem PROCESSING là READY.",
+                  "en": "Return an allowed manifest version without treating PROCESSING as READY."
+                }
+              },
+              {
+                "from": "playback",
+                "to": "viewer",
+                "description": {
+                  "vi": "Cấp manifest/session access phù hợp; expiry và revoke semantics rõ.",
+                  "en": "Issue suitable manifest/session access with explicit expiry/revocation semantics."
+                }
+              },
+              {
+                "from": "viewer",
+                "to": "cdn",
+                "description": {
+                  "vi": "Player yêu cầu manifest/playlist/segment; mỗi resource cần đúng access control.",
+                  "en": "Request manifests/playlists/segments; each resource needs appropriate access control."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "viewer",
+                "description": {
+                  "vi": "Cache hit hợp lệ trả bytes; ABR quyết định request segment tiếp theo.",
+                  "en": "An authorized cache hit returns bytes; ABR decides the next segment request."
+                }
+              }
+            ]
+          },
+          {
+            "id": "miss",
+            "label": {
+              "vi": "CDN miss và origin fill",
+              "en": "CDN miss and origin fill"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "cdn",
+                "description": {
+                  "vi": "Segment đã publish nhưng edge chưa có.",
+                  "en": "Request a published segment absent from the edge."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "encoded",
+                "description": {
+                  "vi": "Sau authorization/cache-key processing, shield/origin request đọc đúng immutable asset.",
+                  "en": "After authorization/cache-key handling, a shield/origin request reads the correct immutable asset."
+                }
+              },
+              {
+                "from": "encoded",
+                "to": "cdn",
+                "description": {
+                  "vi": "Trả segment; cache theo policy. Coalescing là cấu hình, không phải mọi miss đều tự gộp.",
+                  "en": "Return the segment and cache under policy. Coalescing requires configuration rather than happening for every miss."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "viewer",
+                "description": {
+                  "vi": "Trả bytes; player quan sát download time và buffer, không chỉ API latency.",
+                  "en": "Return bytes; the player observes download time/buffer, not merely API latency."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "upload",
+      "title": {
+        "vi": "5. Resumable upload không chỉ là chia file",
+        "en": "5. Resumable uploads are more than splitting files"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giữ session ID, part number/checksum và object identity để resume sau app restart. Retry phần lỗi thay vì cả file, nhưng concurrency và part size phải phù hợp mạng/storage limits. Dùng lifecycle/abort cho multipart bỏ dở và job cleanup có ownership; upload URL hết hạn không có nghĩa storage tự xóa mọi part đã gửi. Không coi part ETag là universal full-file integrity proof.",
+          "en": "Persist session IDs, part numbers/checksums and object identities for app-restart resumption. Retry failed parts rather than full files while tuning concurrency/part sizes to network/storage limits. Clean abandoned multipart uploads through lifecycle/abort policies; URL expiry does not mean every stored part is deleted. Part ETags are not universal whole-file integrity proofs."
+        },
+        {
+          "vi": "Source được verify bằng exact object/version để signed URL cũ hoặc late event không thay file của job đang encode. Nếu object hoàn tất nhưng DB update mất, reconciliation phải tạo/recover processing intent đúng identity. Direct upload không miễn validate ownership, quota, file/container và malicious metadata; probe/decoder chạy trong resource sandbox.",
+          "en": "Verify the exact source object/version so old signed requests or late events cannot substitute a job’s input. If storage completion succeeds but DB updates fail, reconcile the correct processing intent. Direct upload still needs ownership, quota, container/file validation and bounded probing/decoding of malicious metadata."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Vòng đời upload có thể resume",
+          "en": "A resumable upload lifecycle"
+        },
+        "caption": {
+          "vi": "Một sự cố mạng chỉ nên retry phần cần thiết; success của từng part không phải READY.",
+          "en": "A network failure should retry only necessary work; part success is not READY."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Authorize và tạo session",
+              "en": "Authorize and create a session"
+            },
+            "detail": {
+              "vi": "Owner, key, expected size và allowed operations.",
+              "en": "Set ownership, keys, expected size and allowed operations."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Upload các part",
+              "en": "Upload parts"
+            },
+            "detail": {
+              "vi": "Persist progress, retry phần lỗi và refresh scoped URL.",
+              "en": "Persist progress, retry failures and refresh scoped requests."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Verify rồi enqueue",
+              "en": "Verify then enqueue"
+            },
+            "detail": {
+              "vi": "Complete storage, pin source version, durable processing intent.",
+              "en": "Complete storage, pin source versions and durably schedule processing."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "transcoding",
+      "title": {
+        "vi": "6. DAG, retry task và publish progressive",
+        "en": "6. DAGs, task retries and progressive publication"
+      },
+      "paragraphs": [
+        {
+          "vi": "Probe nguồn, validate container/stream, encode các compatible rendition/codec rồi package manifest/segments. Task identity gồm source version, encode parameters và pipeline version. Output staging immutable hoặc mỗi attempt có namespace riêng; chọn winner/manifest pointer theo CAS, không cho hai worker ghi khác bytes vào một segment đã publish. Retry task không nhất thiết bit-for-bit deterministic ở mọi encoder.",
+          "en": "Probe sources, validate containers/streams, encode compatible renditions/codecs and package manifests/segments. Task identity includes source version, parameters and pipeline version. Use immutable staging or per-attempt namespaces with CAS-selected winners/manifest pointers rather than allowing workers to overwrite published bytes. Encoding retries are not inherently bit-for-bit deterministic."
+        },
+        {
+          "vi": "Parallel segment encoding cần keyframe/GOP, timebase, audio sync và packaging compatibility; chia file tại byte offset bất kỳ không bảo đảm decode/seam đúng. Parallelism giảm wall time khi đủ capacity nhưng có scheduler/I/O/overlap overhead, không chứng minh total compute không đổi. Progressive publish có thể đưa minimum validated ladder lên trước và thêm high rendition sau; mọi mandatory policy/rights gate vẫn áp dụng.",
+          "en": "Parallel segment encoding needs compatible keyframes/GOPs, timebases, audio sync and packaging. Arbitrary byte splits do not ensure correct decoding or seams. Parallelism reduces wall time with enough capacity but adds scheduling/I/O/overlap overhead rather than proving unchanged total compute. Progressive publication can expose a minimum validated ladder before high renditions; all mandatory policy/rights gates still apply."
+        },
+        {
+          "vi": "Không mặc định xử lý từ S3 multipart part đang upload: final object thường chỉ sẵn sàng theo completion semantics. Muốn encode trước khi upload xong cần ingest/fragment/container format hỗ trợ và protocol riêng, không chỉ bật một worker sớm hơn. Đo bottleneck trước: ingest, probe, queue, encode, package và publication có thể là các giới hạn khác nhau.",
+          "en": "Do not assume S3 multipart parts are a progressively readable final object. Encoding before upload completion needs suitable ingestion/fragments/container formats and a separate protocol, not simply starting a worker early. Measure ingestion, probing, queues, encoding, packaging and publication separately."
+        }
+      ],
+      "experiment": "video-dag"
+    },
+    {
+      "id": "publication",
+      "title": {
+        "vi": "7. Manifest phải tham chiếu asset đã sẵn sàng",
+        "en": "7. Manifests must reference ready assets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đầu tiên ghi segments/init/audio/caption cần thiết, validate availability/integrity/timing, rồi manifest immutable; cuối cùng đổi metadata pointer/READY bằng generation guard. Nếu đổi READY trước khi segments có thì viewer gặp 404; nếu job cũ publish sau takedown thì content có thể sống lại. Model desired state + processing generation ngăn stale completion ghi đè BLOCKED/DELETED.",
+          "en": "Write required segments/init/audio/captions first, validate availability/integrity/timing, publish immutable manifests and finally update pointer/READY under generation guards. Publishing READY before assets exist causes playback 404s; publishing stale jobs after takedown can revive content. Desired-state and processing generations prevent stale completion from overwriting BLOCKED/DELETED."
+        },
+        {
+          "vi": "Khi thêm rendition, tạo manifest version mới chỉ trỏ tới asset hợp lệ và update pointer có điều kiện. Giữ old assets trong drain/cache lifetime phù hợp để player đang xem không hỏng. Metadata DB, object storage và cache không tự có một transaction toàn cục; reconciliation, manifest validation và rollout/rollback phải được test.",
+          "en": "Adding renditions creates another manifest version with valid references and conditionally updates its pointer. Retain old assets for suitable draining/cache lifetimes so active players do not break. Databases, object storage and caches do not automatically share a global transaction; test reconciliation, validation and rollout/rollback."
+        }
+      ]
+    },
+    {
+      "id": "codec",
+      "title": {
+        "vi": "8. Codec và ladder là tối ưu có điều kiện",
+        "en": "8. Codecs and ladders are conditional optimizations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Codec choice phụ thuộc device/profile/level, hardware decode, quality target, encode latency và storage/egress. H.264, VP9 và AV1 không có một tỷ lệ tiết kiệm byte cố định cho mọi nội dung/encoder. Negotiate compatible playback thay vì hứa một codec universal; giữ fallback cần thiết mà không tạo mọi tổ hợp cho mọi upload.",
+          "en": "Codec choices depend on device/profile/level support, hardware decoding, quality targets, encoding latency and storage/egress. H.264, VP9 and AV1 do not have universal byte-saving ratios across content/encoders. Negotiate compatible playback instead of promising a universal codec, retaining necessary fallbacks without encoding every combination for every upload."
+        },
+        {
+          "vi": "Per-title/per-shot ladder tối ưu bitrate-quality theo complexity: animation, talking-head và sports khác nhau. Metric như VMAF hỗ trợ quality evaluation nhưng không thay mọi human/device/latency concern. Popular content có thể đáng re-encode codec đắt để giảm byte ở nhiều view; long tail có thể dùng cheaper initial ladder. Quyết định từ measured quality, expected watch time và resource/cost budget, không chỉ view-count threshold bất biến.",
+          "en": "Per-title/per-shot ladders adapt bitrate-quality trade-offs to content complexity: animation, talking heads and sports differ. Metrics such as VMAF aid quality assessment without replacing all human/device/latency concerns. Popular titles may justify expensive reencodes to save delivery bytes across many views, while the long tail uses cheaper initial ladders. Use measured quality, expected viewing and resource/cost budgets rather than a universal view threshold."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đòn bẩy video",
+            "en": "Video lever"
+          },
+          {
+            "vi": "Lợi ích tiềm năng của đòn bẩy",
+            "en": "Potential benefit"
+          },
+          {
+            "vi": "Chi phí/ràng buộc cần đo",
+            "en": "Costs/constraints to measure"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Ladder ít rendition hơn",
+              "en": "Fewer renditions"
+            },
+            {
+              "vi": "Ít compute/storage, có thể publish sớm.",
+              "en": "Lower compute/storage and potentially earlier publication."
+            },
+            {
+              "vi": "Ít lựa chọn ABR; không bỏ minimum compatible ladder.",
+              "en": "Fewer ABR choices; preserve a compatible minimum."
+            }
+          ],
+          [
+            {
+              "vi": "Codec hiệu quả hơn",
+              "en": "More efficient codecs"
+            },
+            {
+              "vi": "Có thể giảm bitrate tại quality target.",
+              "en": "Can reduce bitrate at a quality target."
+            },
+            {
+              "vi": "Encode, decoder compatibility/energy và fallback.",
+              "en": "Encoding, decoder compatibility/energy and fallback."
+            }
+          ],
+          [
+            {
+              "vi": "Per-title ladder",
+              "en": "Per-title ladders"
+            },
+            {
+              "vi": "Không lãng phí byte giống nhau trên mọi nội dung.",
+              "en": "Avoids uniform bitrate waste across differing content."
+            },
+            {
+              "vi": "Analysis cost, quality validation và pipeline complexity.",
+              "en": "Analysis cost, quality validation and pipeline complexity."
+            }
+          ],
+          [
+            {
+              "vi": "Shorter segment",
+              "en": "Shorter segments"
+            },
+            {
+              "vi": "Có thể phản ứng/chuyển/seek nhanh hơn.",
+              "en": "Can improve response/switch/seek speed."
+            },
+            {
+              "vi": "Request overhead, encoding efficiency và boundary constraints.",
+              "en": "Request overhead, encoding efficiency and boundaries."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "delivery",
+      "title": {
+        "vi": "9. ABR chọn quality bằng estimate và buffer",
+        "en": "9. ABR chooses quality using estimates and buffers"
+      },
+      "paragraphs": [
+        {
+          "vi": "HLS/DASH phân phối media qua playlist/manifest và segments hoặc byte ranges phù hợp. Player chỉ chọn rendition codec/resolution/device hỗ trợ và chuyển ở boundary tương thích. Throughput estimate là quá khứ, không biết trước mạng sắp giảm; buffer mua thời gian phản ứng. Highest bitrate không luôn tối đa trải nghiệm nếu startup/stall tăng.",
+          "en": "HLS/DASH distribute media through playlists/manifests and suitable segments or byte ranges. Players choose supported renditions and switch at compatible boundaries. Throughput estimates describe the past, not future drops, while buffers buy reaction time. The highest bitrate does not necessarily maximize experience when startup/stalls worsen."
+        },
+        {
+          "vi": "ABR policy tối ưu trade-off quality, startup, stall và switching; heuristic trong lab không phải production player. Segment ngắn có thể phản ứng nhanh nhưng tăng request/container overhead; prefetch giảm startup khi dự đoán đúng và có thể lãng phí byte/data khi đoán sai. Buffer có maximum/pacing ở player thật, còn replay dưới đây chỉ làm rõ phép tính download và drain.",
+          "en": "ABR policies trade quality, startup, stalls and switching; the lab heuristic is not a production player. Short segments can react faster while adding request/container overhead. Prefetch can reduce startup when predictions are right and waste bytes/data when wrong. Real players impose buffer/pacing limits; the replay isolates download and drain arithmetic."
+        }
+      ],
+      "experiment": "video-abr"
+    },
+    {
+      "id": "cdn",
+      "title": {
+        "vi": "10. CDN, shield và cache key",
+        "en": "10. CDNs, shields and cache keys"
+      },
+      "paragraphs": [
+        {
+          "vi": "Immutable asset version giúp cache lâu và rollback pointer an toàn hơn overwrite segment cùng URL. Edge → shield → origin giảm repeated cold fills khi cache-key/coalescing đúng, không bảo đảm mọi concurrent miss tự thành một request. Watch request hit ratio và byte hit ratio riêng; manifest nhỏ hit nhiều không chứng minh segment bytes đã được cache tốt.",
+          "en": "Immutable asset versions support long caching and safer pointer rollbacks than overwriting segments under the same URL. Edge → shield → origin reduces repeated cold fills with suitable keys/coalescing, not automatically one request per concurrent miss. Measure request and byte hit ratios separately; many small manifest hits do not prove good media-byte caching."
+        },
+        {
+          "vi": "Query string/token hoặc vary header có thể làm cache fragmentation. Không đơn giản xóa auth parameter khỏi key rồi bypass quyền: edge phải authorize đúng mọi request theo access design, sau đó mới reuse media bytes chung nếu hợp lệ. Cold cache, new release, multi-CDN failover và origin outage cần capacity/headroom và request-collapse/backoff riêng.",
+          "en": "Query tokens or varying headers can fragment caches. Do not strip authorization parameters and bypass access checks: edge authorization must validate requests before legitimately sharing media bytes. Cold caches, releases, multi-CDN failovers and origin outages require capacity/headroom and appropriate coalescing/backoff."
+        }
+      ],
+      "experiment": "video-bandwidth"
+    },
+    {
+      "id": "security",
+      "title": {
+        "vi": "11. Playback authorization, expiry và takedown",
+        "en": "11. Playback authorization, expiry and takedown"
+      },
+      "paragraphs": [
+        {
+          "vi": "Kiểm visibility/entitlement tại playback session và enforce access trên manifest, playlists, segments, caption/audio và key/license resources cần bảo vệ. Signed URL/cookie có scope/expiry không tự thu hồi bytes đã tải; browser cache cũng không bị xóa chỉ vì metadata đổi. Chọn revoke/takedown delay rõ và phối hợp edge policy, short-lived access, purge hoặc key/license policy phù hợp.",
+          "en": "Authorize playback sessions and protect required manifests, playlists, segments, captions/audio and key/license resources. Scoped expiring URLs/cookies cannot recall downloaded bytes, and metadata changes do not erase browser caches. Define revocation/takedown delay and coordinate edge policy, short-lived access, purges or suitable key/license controls."
+        },
+        {
+          "vi": "CDN authorization có thể được kiểm trước cache hit tùy cấu hình; không coi cache hit mặc định là public hay mặc định đã đúng quyền. DRM/content encryption khác access token: cần key/license lifecycle và device capabilities, cũng không bảo đảm người dùng không thể quay màn hình. Moderation/rights block phải chặn new publication và access theo policy, kể cả job cũ còn chạy.",
+          "en": "Configured CDN authorization can run before cache hits; neither assume hits are public nor assume they are authorized correctly. DRM/content encryption differs from access tokens and needs key/license lifecycle and device capabilities; it cannot universally prevent recording. Moderation/rights blocks must prevent new publication and policy-prohibited access even while old jobs run."
+        }
+      ]
+    },
+    {
+      "id": "metadata",
+      "title": {
+        "vi": "12. Schema và view events",
+        "en": "12. Schemas and view events"
+      },
+      "paragraphs": [
+        {
+          "vi": "Video metadata gồm owner/visibility, desired state, verified source version, generation/pipeline version, rendition capabilities, manifest pointer và timestamps. Task/attempt records có stage, artifact/checksum và error/retry reason; giữ failed attempt riêng thay vì overwrite mọi evidence. Source/encoded asset retention và deletion cần lifecycle cho orphan, incomplete upload, unpublished derivative và old published version.",
+          "en": "Metadata includes owner/visibility, desired state, verified source version, generation/pipeline version, rendition capabilities, manifest pointers and timestamps. Task/attempt records retain stages, artifacts/checksums and retry/errors rather than overwriting all evidence. Lifecycle policies cover orphans, incomplete uploads, unpublished derivatives and old published versions."
+        },
+        {
+          "vi": "Định nghĩa view: play request, first frame hay watched-time threshold? QoE telemetry và product view count là hai loại signal khác nhau; replay/bot/dedup identity cần policy. Async event aggregation tránh hot metadata row ở quy mô lớn, nhưng count exact/auditable có thể cần ledger mạnh hơn. Ở scale nhỏ atomic counter có thể đủ; không biến một tối ưu scale thành quy tắc cấm mọi UPDATE.",
+          "en": "Define a view as a play request, first frame or watched-time threshold. QoE telemetry and product view counts differ, with replay/bot/dedup policies. Asynchronous aggregation avoids hot metadata rows at scale, while exact/auditable counts may need stronger ledgers. Small deployments can use atomic counters; a scaling optimization is not a universal ban on UPDATE."
+        }
+      ]
+    },
+    {
+      "id": "failure",
+      "title": {
+        "vi": "13. Failure matrix của video",
+        "en": "13. Video failure matrix"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách upload availability, time-to-playable và playback availability. Processing chậm không nên làm published content cũ ngừng xem; metadata/control outage có thể dùng bounded cached authorized state nếu contract cho phép. Player fallback đổi CDN/quality phải giữ asset/version/access compatibility; origin không đủ sức nhận toàn bộ viewer traffic khi edge cold.",
+          "en": "Separate upload availability, time-to-playable and playback availability. Slow processing should not stop previously published content. Control outages may use bounded cached authorized state under the contract. Player CDN/quality fallbacks preserve asset/version/access compatibility, and origins cannot be assumed to absorb all viewer traffic after cold edges."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sự cố video",
+            "en": "Video failure"
+          },
+          {
+            "vi": "Invariant cần giữ",
+            "en": "Required invariant"
+          },
+          {
+            "vi": "Recovery/kiểm thử",
+            "en": "Recovery/test"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Upload response mất",
+              "en": "Upload response is lost"
+            },
+            {
+              "vi": "Không tạo thêm video/source version ngoài ý muốn.",
+              "en": "Do not create unintended duplicate videos/source versions."
+            },
+            {
+              "vi": "Resume cùng session, verify storage và idempotent complete.",
+              "en": "Resume the session, verify storage and complete idempotently."
+            }
+          ],
+          [
+            {
+              "vi": "High rendition fail",
+              "en": "A high rendition fails"
+            },
+            {
+              "vi": "Không publish manifest trỏ asset thiếu.",
+              "en": "Never reference missing assets in a published manifest."
+            },
+            {
+              "vi": "Retry task; progressive minimum ladder chỉ sau required gates.",
+              "en": "Retry tasks; publish a minimum ladder only after required gates."
+            }
+          ],
+          [
+            {
+              "vi": "Crash sau blob trước metadata",
+              "en": "Crash after blob writes before metadata"
+            },
+            {
+              "vi": "Không READY tới dangling artifact.",
+              "en": "READY must not reference dangling artifacts."
+            },
+            {
+              "vi": "Reconcile staging/manifest/pointer và collect orphan an toàn.",
+              "en": "Reconcile staging/manifests/pointers and collect orphans safely."
+            }
+          ],
+          [
+            {
+              "vi": "Late job sau delete/block",
+              "en": "A late job finishes after deletion/blocking"
+            },
+            {
+              "vi": "Không làm content sống lại.",
+              "en": "Never revive prohibited content."
+            },
+            {
+              "vi": "Generation/CAS và desired-state guard tại publication.",
+              "en": "Use generation/CAS and desired-state publication guards."
+            }
+          ],
+          [
+            {
+              "vi": "CDN failover cold",
+              "en": "A CDN failover is cold"
+            },
+            {
+              "vi": "Không quá tải origin do cache stampede.",
+              "en": "Do not overload the origin with cache stampedes."
+            },
+            {
+              "vi": "Shield/coalescing, backoff, staged routing và ABR/QoE monitoring.",
+              "en": "Use shields/coalescing, backoff, staged routing and ABR/QoE monitoring."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "14. Đo QoE và chọn đòn bẩy tối ưu",
+        "en": "14. Measure QoE and choose optimization levers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Theo dõi upload completion/abandonment, stage queue age, task retry/waste, time-to-minimum-playable và time-to-full-ladder. Playback đo click-to-first-frame, rebuffer duration/ratio, quality switches, error và delivered bitrate theo device/codec/ISP/region/CDN. Một API response nhanh không chứng minh player decode hoặc first frame nhanh.",
+          "en": "Track upload completion/abandonment, stage queues, retries/waste, minimum-playable time and full-ladder time. Playback measures click-to-first-frame, rebuffer duration/ratio, switches, errors and delivered bitrate by device/codec/ISP/region/CDN. Fast API responses do not prove fast decoding or first frames."
+        },
+        {
+          "vi": "Cost model tách ingest/raw/encoded storage, encode/re-encode compute, CDN viewer bytes và origin fills. Bill tăng không đồng nghĩa traffic view tăng: watch duration, bitrate, geographic mix, cache fragmentation hoặc provider pricing/contract có thể đổi. So sánh cùng cohort/QoE trước khi giảm bitrate; multi-CDN route dựa real-user metrics cần kiểm bias và fallback capacity.",
+          "en": "Separate ingestion/raw/encoded storage, encode/reencode compute, viewer delivery and origin fills. Higher bills need not reflect more views: watch time, bitrates, geography, cache fragmentation or provider contracts can change. Compare equivalent cohorts/QoE before reducing bitrates. Real-user-based multi-CDN routing needs bias checks and fallback capacity."
+        }
+      ]
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "15. Câu hỏi phỏng vấn và reasoning cho video",
+        "en": "15. Video interview questions and worked reasoning"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đi qua upload session tới durable source, một task retry, publication pointer và một segment download. Sau đó thay đổi mạng hoặc làm hỏng high rendition để kiểm tra guarantee.",
+          "en": "Trace an upload session to a durable source, a task retry, a publication pointer and a segment download. Then change network conditions or fail a high rendition to test guarantees."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Video 4K encode chậm: thêm worker có luôn giảm time-to-publish không?",
+            "en": "Does adding workers always reduce slow 4K time-to-publication?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu bottleneck là ingest, serial probe/package hoặc một task không chia được. Profile từng stage, parallelize theo boundary decode/encode đúng, ưu tiên minimum compatible ladder và gates. Progressive publish có thể giảm first-playable time nhưng không bỏ validation hay tự giảm total compute.",
+              "en": "Not when ingestion, serial stages or indivisible tasks bottleneck. Profile stages, parallelize at valid boundaries and prioritize a compatible minimum ladder plus gates. Progressive publication can reduce first-playable time without skipping validation or inherently reducing total compute."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Chỉ metadata READY trước rồi upload segment sau để publish nhanh được không?",
+            "en": "Can READY be set before uploading segments to publish faster?"
+          },
+          "answer": [
+            {
+              "vi": "Không theo contract playable. Viewer có thể lấy manifest và gặp missing assets. Ghi/verify artifacts trước, manifest immutable sau, cuối cùng CAS pointer/READY theo generation. Job cũ không được overwrite delete/block.",
+              "en": "Not under a playable contract. Viewers can fetch a manifest referencing absent assets. Persist/verify artifacts, publish an immutable manifest and finally CAS pointer/READY by generation. Stale jobs must not override deletion/blocking."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "CDN byte hit 95% thì viewer egress chỉ còn 5% đúng không?",
+            "en": "Does a 95% CDN byte hit mean viewer egress drops to 5%?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Viewer vẫn nhận toàn bộ media bytes qua CDN; khoảng 5% là miss bytes tới origin trong mô hình đơn giản. Request hit khác byte hit. Cache/shield giảm origin work, còn bitrate/watch time/codec ảnh hưởng viewer bytes.",
+              "en": "No. Viewers still receive the media bytes through the CDN; five percent represents origin-miss bytes in a simplified model. Request hits differ from byte hits. Caching/shields reduce origin work, while bitrate, watch time and codecs affect viewer bytes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "ABR lấy bitrate bằng network speed estimate có hết stall không?",
+            "en": "Does choosing bitrate from estimated network speed eliminate stalls?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Estimate nhìn về quá khứ; bandwidth có thể drop, audio/overhead/RTT và buffer cũng tác động. Safety margin/buffer-aware rules giúp nhưng không bảo đảm, nhất là khi network thấp hơn rendition nhỏ nhất. Đo startup, rebuffer và quality theo cohort.",
+              "en": "No. Estimates describe the past; bandwidth drops, overhead, RTT and buffers matter. Safety margins/buffer-aware policies can help without guarantees, especially below the lowest rendition. Measure startup, rebuffering and quality by cohort."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể encode S3 multipart parts trước khi complete như file hoàn chỉnh không?",
+            "en": "Can S3 multipart parts be encoded as a complete file before completion?"
+          },
+          "answer": [
+            {
+              "vi": "Không mặc định. Object availability và media container có semantics riêng; partial upload có thể thiếu metadata/index cần decode. Muốn early processing cần ingestion/container/protocol hỗ trợ và validation riêng. Baseline chờ verified final source rồi enqueue.",
+              "en": "Not by default. Object availability and container formats have their own semantics; partial uploads may lack required metadata/indexes. Early processing needs suitable ingestion/containers/protocols and validation. The baseline waits for a verified final source before scheduling."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sử dụng AV1 có luôn giảm cost so với H.264 không?",
+            "en": "Does AV1 always cost less than H.264?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Kết quả phụ thuộc content/quality/encoder, encode cost, watch count, device decode và fallback. Đo byte tiết kiệm trên compatible views so với compute/storage/energy thêm; long-tail và high-popularity title có quyết định khác nhau.",
+              "en": "No. It depends on content/quality/encoders, encode cost, views, device decoding and fallbacks. Compare saved bytes on compatible views against added compute/storage/energy; long-tail and popular titles can justify different decisions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Signed URL hết hạn có thu hồi được mọi segment user đã tải không?",
+            "en": "Can signed-URL expiry recall every downloaded segment?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nó kiểm soát request/access theo provider policy, không xóa bytes đã nhận hoặc browser cache. Takedown/revocation có delay và cần enforce trên resource/key/license phù hợp; metadata đổi một mình không đủ.",
+              "en": "No. It controls requests/access under provider policy, not received bytes or browser caches. Takedown/revocation has a delay and needs appropriate resource/key/license enforcement; metadata changes alone are insufficient."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "View count tăng ít nhưng CDN bill tăng mạnh, tìm gì trước?",
+            "en": "What should you inspect when CDN bills rise much faster than view counts?"
+          },
+          "answer": [
+            {
+              "vi": "Tách byte × unit price và origin fill. Kiểm watch seconds/view, average bitrate, codec/device mix, region/ISP mix, cache-key fragmentation, shield và pricing contract. Đừng chỉ nhìn view count hoặc request hit ratio rồi kết luận.",
+              "en": "Separate bytes × unit price from origin fills. Inspect watch time/view, average bitrate, codecs/devices, geography/ISPs, cache keys, shielding and contracts. Views or request hit ratios alone do not establish the cause."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

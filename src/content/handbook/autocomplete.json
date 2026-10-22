@@ -1,0 +1,1135 @@
+{
+  "id": "autocomplete",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Autocomplete: prefix, top-K và trải nghiệm gõ",
+    "en": "Designing Autocomplete: prefixes, top-K and typing experience"
+  },
+  "summary": {
+    "vi": "Đi qua prefix index, ranking, Unicode, cache và pipeline versioned; thử filter top-K và response race để hiểu cả backend lẫn frontend correctness.",
+    "en": "Explore prefix indexes, ranking, Unicode, caching and versioned pipelines; experiment with top-K filtering and response races to understand backend and frontend correctness."
+  },
+  "prerequisites": [
+    "caching",
+    "load-balancing",
+    "messaging"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "storage-search",
+    "rendering",
+    "api"
+  ],
+  "takeaways": [
+    {
+      "vi": "Serving dùng index chuẩn bị sẵn nhưng vẫn có bounded filtering/reranking; không scan corpus cho mỗi keystroke.",
+      "en": "Serve from prepared indexes with bounded filtering/reranking instead of scanning the corpus per keystroke."
+    },
+    {
+      "vi": "Cached top-K đổi memory lấy latency; filter và personalization làm candidate recall thành một quyết định riêng.",
+      "en": "Cached top-K trades memory for latency; filters and personalization make candidate recall a separate decision."
+    },
+    {
+      "vi": "Input generation guard ngăn response cũ overwrite; abort/debounce không thay guard.",
+      "en": "Input-generation guards prevent stale overwrites; cancellation/debounce cannot replace them."
+    },
+    {
+      "vi": "Build/read phải cùng normalization/context/version; public cache không chứa private history.",
+      "en": "Build/read must share normalization/context/version semantics; public caches must not contain private history."
+    },
+    {
+      "vi": "Trending freshness, urgent removal và snapshot rollout phải tính cả cache và replica readiness.",
+      "en": "Trending freshness, urgent removals and snapshot rollouts must account for caches and replica readiness."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ ký tự đang gõ tới suggestion đáng tin",
+      "en": "From typed characters to trustworthy suggestions"
+    },
+    "caption": {
+      "vi": "Một vòng đời có cả frontend race, index lookup và pipeline cập nhật.",
+      "en": "The lifecycle spans frontend races, index lookups and update pipelines."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Giữ đúng input",
+          "en": "Preserve input identity"
+        },
+        "detail": {
+          "vi": "Normalize theo policy, debounce và guard generation.",
+          "en": "Normalize under policy, debounce and guard generations."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Lấy bounded candidates",
+          "en": "Retrieve bounded candidates"
+        },
+        "detail": {
+          "vi": "Walk prefix hoặc KV lookup rồi filter/rerank có budget.",
+          "en": "Walk/get candidates, then filter/rerank within a budget."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Build score và index",
+          "en": "Build scores and indexes"
+        },
+        "detail": {
+          "vi": "Clean log, decay/trending, validate snapshot có version.",
+          "en": "Clean logs, compute decay/trends and validate versioned snapshots."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Giữ freshness và privacy",
+          "en": "Preserve freshness and privacy"
+        },
+        "detail": {
+          "vi": "Cache đúng context, removal nhanh và rollout coherent.",
+          "en": "Cache by context, remove promptly and roll out coherently."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Autocomplete đang gợi ý query hay entity?",
+        "en": "1. Does autocomplete suggest queries or entities?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Query completion gợi ý chuỗi tìm kiếm phổ biến; entity typeahead gợi ý user, sản phẩm, địa điểm với quyền riêng. Hai bài toán dùng ranking, source và cache khác nhau. Baseline ở đây là public query-prefix completion: tối đa 5 suggestion, locale rõ, popularity có recency, batch freshness theo giờ và mục tiêu end-to-end p99 dưới 100 ms tại boundary đã chốt. Fuzzy match, full search results và private people search là phần mở rộng.",
+          "en": "Query completion suggests popular search strings; entity typeahead suggests users, products or places with their own permissions. They differ in ranking, sources and caching. This baseline is public query-prefix completion: up to five suggestions, explicit locale, popularity with recency, hourly batch freshness and an end-to-end p99 target below 100 ms at a defined boundary. Fuzzy matching, full results and private people search are extensions."
+        },
+        {
+          "vi": "“Tối đa K” không phải lúc nào cũng “đúng K”: prefix hiếm, safety filter hoặc index chưa có dữ liệu có thể trả ít hơn. Chốt minimum prefix length, cách xử lý empty prefix, typo, Unicode và removal delay. Nếu cá nhân hóa, không còn được coi mọi response của cùng prefix là public/identical.",
+          "en": "“Up to K” is not always “exactly K”: rare prefixes, safety filters or missing index data can yield fewer. Define minimum prefix length, empty prefixes, typos, Unicode and removal delay. Personalized responses cannot all be treated as identical public results for one prefix."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Latency giữa các lần gõ",
+            "en": "Latency between keystrokes"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Budget gồm debounce, network, serving và render; debounce 100 ms đã có thể dùng hết mục tiêu 100 ms nếu đo từ input.",
+              "en": "The budget includes debounce, networking, serving and rendering; a 100 ms debounce can consume a 100 ms input-to-results target by itself."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Freshness và safety",
+            "en": "Freshness and safety"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Popularity có thể lag; urgent removal cần đường riêng và bound ở mọi cache.",
+              "en": "Popularity may lag; urgent removals need a separate path bounded across all caches."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Context quyết định cache",
+            "en": "Context determines caching"
+          },
+          "icon": "users",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Locale, region, tenant, policy và private history có thể đổi kết quả của cùng prefix.",
+              "en": "Locale, region, tenant, policy and private history can change one prefix’s results."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Tính request và memory theo đúng đơn vị",
+        "en": "2. Size requests and memory with the right units"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả sử 50 triệu DAU, 10 submitted search/người/ngày và trung bình 20 input change/search: 10 tỷ raw keystroke event/ngày. Nếu debounce/cache loại 50% request thì còn 5 tỷ request/ngày, khoảng 57.870/s; peak ×3 là 173.611/s. Tỷ lệ giảm 50% chỉ là giả định, cần đo theo typing cadence, IME, mạng và UI, không phải thuộc tính bảo đảm của debounce.",
+          "en": "Assume 50 million DAU, ten submitted searches per user per day and twenty input changes per search: ten billion raw keystroke events daily. If debounce/caching removes half of requests, five billion remain, about 57,870/second; a threefold peak is 173,611/second. The 50% reduction is a measurement-dependent assumption affected by typing cadence, IMEs, networking and UI, not a debounce guarantee."
+        },
+        {
+          "vi": "100 triệu query × 20 B chỉ là 2 GB text payload nếu thật sự trung bình 20 byte. Nó chưa tính trie node/edge, scores, IDs, candidate lists, allocator overhead hay replica. Với P distinct prefix node, 5 reference × 8 B tốn 40P byte chỉ cho top-K refs. P có upper bound gần tổng độ dài query; 100 triệu × 20 code point có thể tới khoảng 2 tỷ prefix trước chia sẻ, tức 80 GB refs trong upper-bound minh họa. Nén/radix/FST thay đổi con số lớn, nên phải đo index serialization và loaded heap thực.",
+          "en": "One hundred million queries × 20 B gives only 2 GB of text if the average really is twenty bytes. This excludes trie nodes/edges, scores, IDs, candidate lists, allocator overhead and replicas. For P distinct prefix nodes, five eight-byte references use 40P bytes for references alone. P is bounded near total query length; 100 million twenty-code-point queries can approach two billion prefixes before sharing, or 80 GB of references in this illustrative upper bound. Compression/radix/FST choices change memory substantially, so measure serialization and loaded heap."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng autocomplete",
+            "en": "Autocomplete quantity"
+          },
+          {
+            "vi": "Cách tính ví dụ",
+            "en": "Example arithmetic"
+          },
+          {
+            "vi": "Kết quả và giới hạn",
+            "en": "Result and limits"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Raw input event",
+              "en": "Raw input events"
+            },
+            {
+              "vi": "50 triệu × 10 × 20",
+              "en": "50 million × 10 × 20"
+            },
+            {
+              "vi": "10 tỷ/ngày",
+              "en": "10 billion/day"
+            }
+          ],
+          [
+            {
+              "vi": "Serving sau giảm 50%",
+              "en": "Serving after a 50% reduction"
+            },
+            {
+              "vi": "5 tỷ / 86.400",
+              "en": "5 billion / 86,400"
+            },
+            {
+              "vi": "57.870/s trung bình",
+              "en": "57,870/s average"
+            }
+          ],
+          [
+            {
+              "vi": "Submitted-search log",
+              "en": "Submitted-search log"
+            },
+            {
+              "vi": "500 triệu / 86.400",
+              "en": "500 million / 86,400"
+            },
+            {
+              "vi": "5.787/s; không bằng keystroke rate",
+              "en": "5,787/s; not the keystroke rate"
+            }
+          ],
+          [
+            {
+              "vi": "Text payload giả định",
+              "en": "Assumed text payload"
+            },
+            {
+              "vi": "100 triệu × 20 B",
+              "en": "100 million × 20 B"
+            },
+            {
+              "vi": "2 GB, không phải total index RAM",
+              "en": "2 GB, not total index RAM"
+            }
+          ],
+          [
+            {
+              "vi": "Candidate reference memory",
+              "en": "Candidate reference memory"
+            },
+            {
+              "vi": "P × K × bytes/reference",
+              "en": "P × K × bytes/reference"
+            },
+            {
+              "vi": "Đo P và overhead theo representation thật.",
+              "en": "Measure P and actual representation overhead."
+            }
+          ],
+          [
+            {
+              "vi": "Hot-swap headroom",
+              "en": "Hot-swap headroom"
+            },
+            {
+              "vi": "Index cũ + mới + loader/transient",
+              "en": "Old index + new index + loading/transients"
+            },
+            {
+              "vi": "Không chỉ dung lượng một snapshot.",
+              "en": "More than one snapshot’s capacity."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Contract prefix, context và index version",
+        "en": "3. Prefix, context and index-version contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Server validate length/locale/limit và normalize bằng cùng policy version như builder. Query-string GET có thể xuất hiện trong proxy/access log, nên logging phải theo privacy policy; private history có thể cần endpoint authenticated với cache policy riêng. Không dùng CDN chung cho response private chỉ vì path giống public endpoint.",
+          "en": "Validate length, locale and limits and normalize under the builder’s policy version. GET query strings can appear in proxy/access logs, so apply privacy-aware logging. Private history may need a separate authenticated endpoint and cache policy. A path resembling a public API does not justify shared caching of private results."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/suggest?q=ca&limit=5&locale=vi",
+          "description": {
+            "vi": "Public query completion có max/min input length theo contract.",
+            "en": "Public query completion with contract-defined input length bounds."
+          },
+          "response": "200 { \"query\": \"ca\", \"suggestions\": [{ \"id\": \"q1\", \"text\": \"cache\", \"score\": 110 }], \"index_version\": \"idx-42\", \"policy_version\": \"p7\" }\nCache-Control: public, max-age=15",
+          "notes": [
+            {
+              "vi": "TTL 15 giây chỉ là policy minh họa; chặn bởi freshness/removal SLO. Cache key phải gồm mọi context ảnh hưởng kết quả.",
+              "en": "The 15-second TTL is illustrative and bounded by freshness/removal SLOs. Cache keys include every result-changing context."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/search-events",
+          "description": {
+            "vi": "Ghi submitted search, có event ID, locale và event time; schema không bắt buộc lưu user identity thô.",
+            "en": "Log a submitted search with event ID, locale and event time; raw user identity is not inherently required."
+          },
+          "request": "{ \"event_id\": \"ev42\", \"query\": \"cache aside\", \"locale\": \"vi\", \"event_time\": \"2026-10-22T08:00:00Z\" }",
+          "response": "202 Accepted",
+          "notes": [
+            {
+              "vi": "Input telemetry, submitted search và selected suggestion là ba loại signal khác nhau; không cộng tất cả thành popularity count.",
+              "en": "Input telemetry, submitted searches and selected suggestions are distinct signals; do not add all of them into one popularity count."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Tách serving và pipeline xây index",
+        "en": "4. Separate serving from index construction"
+      },
+      "paragraphs": [
+        {
+          "vi": "Serving lookup một index đã chuẩn bị thay vì scan/sort toàn corpus cho mỗi request. Điều này không có nghĩa “không bao giờ tính toán”: normalization, safety, personalization và merge trending vẫn có thể cần bounded computation. Dùng deadline và candidate budget để dynamic work không phá latency. Bắt đầu đơn giản với một process/index replica; shard khi memory/load hoặc isolation đòi hỏi.",
+          "en": "Serve from a prepared index instead of scanning/sorting the corpus per request. This does not mean “never compute”: normalization, safety, personalization and trending merges can require bounded work. Deadlines and candidate budgets prevent dynamic work from breaking latency. Start with simple process/index replicas and shard when memory, load or isolation requires it."
+        },
+        {
+          "vi": "Submitted-search aggregation là đường write riêng. Một keystroke response không tự chứng minh user muốn query đó; log submitted/selected với event type riêng nếu policy cho phép. Pipeline batch có checksum/version, còn trending overlay có freshness/TTL riêng và cùng safety contract.",
+          "en": "Submitted-search aggregation is a separate write path. A keystroke response does not prove that the user wanted a query; record submission/selection as distinct event types when permitted. Batch snapshots use checksums/versions, while trending overlays have their own freshness/TTLs under the same safety contract."
+        }
+      ],
+      "diagram": {
+        "id": "autocomplete-serving-building",
+        "title": {
+          "vi": "Serving nhanh và pipeline xây index có version",
+          "en": "Fast serving and a versioned index-building pipeline"
+        },
+        "caption": {
+          "vi": "Đường suggestion không chờ batch job; submitted search mới đi vào aggregation. Chọn trace để xem cache hit, lookup, publish snapshot và urgent removal.",
+          "en": "Suggestion reads do not wait for batch jobs; submitted searches feed aggregation. Choose a trace for cache hits, lookups, snapshot publication and urgent removals."
+        },
+        "width": 1180,
+        "height": 800,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Search box",
+              "en": "Search box"
+            },
+            "detail": {
+              "vi": "Input generation, debounce, IME composition và local cache đúng context. Response cũ không được overwrite input mới.",
+              "en": "Uses input generations, debounce, IME composition and context-correct local caching. Old responses cannot overwrite new input."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "Public edge cache",
+              "en": "Public edge cache"
+            },
+            "detail": {
+              "vi": "Chỉ cache public/global result với key gồm prefix, locale và mọi context làm đổi kết quả. Không cache chung private history.",
+              "en": "Caches public/global results with prefix, locale and every result-changing context. Never shares private history across users."
+            },
+            "x": 415,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "service",
+            "label": {
+              "vi": "Suggestion service",
+              "en": "Suggestion service"
+            },
+            "detail": {
+              "vi": "Normalize nhất quán với builder; lookup candidates rồi filter/rerank có bounded cost và version semantics.",
+              "en": "Normalizes consistently with the builder, retrieves candidates and performs bounded filtering/reranking under version semantics."
+            },
+            "x": 720,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "index",
+            "label": {
+              "vi": "Prefix / top-K index",
+              "en": "Prefix / top-K index"
+            },
+            "detail": {
+              "vi": "Trie/radix/FST hoặc prefix KV. Serving pin một index version; top-K memory cần đo thật.",
+              "en": "A trie/radix/FST or prefix KV index. Requests pin an index version; top-K memory requires measurement."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Submitted-search log",
+              "en": "Submitted-search log"
+            },
+            "detail": {
+              "vi": "Có event ID và privacy controls; keystroke telemetry là luồng riêng nếu được phép, không lẫn với popularity count.",
+              "en": "Carries event IDs and privacy controls. Permitted keystroke telemetry is separate from popularity counts."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "queue"
+          },
+          {
+            "id": "aggregate",
+            "label": {
+              "vi": "Clean + aggregate",
+              "en": "Clean + aggregate"
+            },
+            "detail": {
+              "vi": "Dedup bot/session theo policy, time decay, locale và trending signal; xử lý replay/late events.",
+              "en": "Applies bot/session policy, time decay, locale and trending signals, accounting for replay/late events."
+            },
+            "x": 415,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "builder",
+            "label": {
+              "vi": "Versioned builder",
+              "en": "Versioned builder"
+            },
+            "detail": {
+              "vi": "Build index, compute candidate lists, kiểm size/recall/safety và tạo manifest đầy đủ.",
+              "en": "Builds indexes/candidate lists, validates size/recall/safety and produces complete manifests."
+            },
+            "x": 720,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "snapshot",
+            "label": {
+              "vi": "Snapshot store",
+              "en": "Snapshot store"
+            },
+            "detail": {
+              "vi": "Immutable artifacts + checksum/manifest. Warm replicas và giữ last-known-good để rollback có kiểm soát.",
+              "en": "Immutable artifacts with checksums/manifests. Warms replicas and retains last-known-good versions for controlled rollback."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Serving removal policy",
+              "en": "Serving removal policy"
+            },
+            "detail": {
+              "vi": "Urgent blocklist/removal version có freshness SLO; cache response cũ cũng phải purge hoặc hết TTL phù hợp.",
+              "en": "Urgent removals/blocklists have a freshness SLO; cached responses also require suitable purge/TTL behavior."
+            },
+            "x": 720,
+            "y": 690,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "hit",
+            "label": {
+              "vi": "Suggestion public: cache hit",
+              "en": "Public suggestion: cache hit"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "edge",
+                "description": {
+                  "vi": "GET prefix sau debounce; request có locale/context hợp lệ.",
+                  "en": "Request a debounced prefix with valid locale/context."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "client",
+                "description": {
+                  "vi": "Response public còn fresh theo cache/removal policy; không chạm origin.",
+                  "en": "Return a public response that is fresh under cache/removal policy without reaching the origin."
+                }
+              }
+            ]
+          },
+          {
+            "id": "lookup",
+            "label": {
+              "vi": "Cache miss và top-K lookup",
+              "en": "Cache miss and top-K lookup"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "edge",
+                "description": {
+                  "vi": "Client gửi prefix với input generation riêng ở frontend.",
+                  "en": "Send a prefix associated with a frontend input generation."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "service",
+                "description": {
+                  "vi": "Cache miss; chuyển request với context đầy đủ.",
+                  "en": "On a miss, forward the complete request context."
+                }
+              },
+              {
+                "from": "service",
+                "to": "index",
+                "description": {
+                  "vi": "Pin index version, normalize đúng policy và walk/get candidate list.",
+                  "en": "Pin an index version, normalize under its policy and walk/get a candidate list."
+                }
+              },
+              {
+                "from": "index",
+                "to": "service",
+                "description": {
+                  "vi": "Trả bounded candidates + score/ID, không scan cả corpus tại mỗi keystroke.",
+                  "en": "Return bounded candidates with scores/IDs instead of scanning the corpus per keystroke."
+                }
+              },
+              {
+                "from": "service",
+                "to": "policy",
+                "description": {
+                  "vi": "Áp dụng removal policy đủ mới; cần overfetch/empty-result policy khi filter làm thiếu K.",
+                  "en": "Apply sufficiently fresh removal policy; define overfetch/empty-result behavior when filters reduce K."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "service",
+                "description": {
+                  "vi": "Trả decision/version; lỗi policy freshness được xử lý theo contract.",
+                  "en": "Return decisions/version; handle policy freshness failures under the contract."
+                }
+              },
+              {
+                "from": "service",
+                "to": "edge",
+                "description": {
+                  "vi": "Trả result và cache policy chỉ phù hợp public context đã chốt.",
+                  "en": "Return results and cache policy only for the defined public context."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "client",
+                "description": {
+                  "vi": "Client chỉ render nếu generation/context còn khớp; không suy từ thứ tự response.",
+                  "en": "Render only if the input generation/context still matches, regardless of response arrival order."
+                }
+              }
+            ]
+          },
+          {
+            "id": "rebuild",
+            "label": {
+              "vi": "Submitted search tới snapshot mới",
+              "en": "Submitted search to a new snapshot"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "events",
+                "description": {
+                  "vi": "Khi user submit search, phát event theo privacy/consent policy với event ID.",
+                  "en": "On a submitted search, emit an event with an ID under privacy/consent policy."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "aggregate",
+                "description": {
+                  "vi": "Consumer dedup replay và tính count/window theo event semantics.",
+                  "en": "Consumers deduplicate replays and compute event-defined counts/windows."
+                },
+                "async": true
+              },
+              {
+                "from": "aggregate",
+                "to": "builder",
+                "description": {
+                  "vi": "Xuất scored query/entity dataset với locale và policy version.",
+                  "en": "Produce a scored query/entity dataset with locale and policy versions."
+                },
+                "async": true
+              },
+              {
+                "from": "builder",
+                "to": "snapshot",
+                "description": {
+                  "vi": "Ghi tất cả shard, checksum và manifest; validate trước publish.",
+                  "en": "Write all shards, checksums and a manifest; validate before publishing."
+                }
+              },
+              {
+                "from": "snapshot",
+                "to": "index",
+                "description": {
+                  "vi": "Replica load/warm snapshot mới; request chỉ pin version đã ready.",
+                  "en": "Replicas load/warm the new snapshot; requests pin only ready versions."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "remove",
+            "label": {
+              "vi": "Urgent removal và cache cũ",
+              "en": "Urgent removal and old cached results"
+            },
+            "steps": [
+              {
+                "from": "policy",
+                "to": "service",
+                "description": {
+                  "vi": "Policy version mới loại suggestion mà không chờ rebuild đầy đủ.",
+                  "en": "A new policy version removes a suggestion without waiting for a full rebuild."
+                },
+                "async": true
+              },
+              {
+                "from": "service",
+                "to": "edge",
+                "description": {
+                  "vi": "Purge/version cache hoặc giảm TTL để đáp ứng removal delay; origin filter một mình không sửa cache hit cũ.",
+                  "en": "Purge/version caches or bound TTLs to meet removal delay; origin filtering alone cannot fix an old cache hit."
+                },
+                "async": true
+              },
+              {
+                "from": "edge",
+                "to": "client",
+                "description": {
+                  "vi": "Client nhận response còn hợp lệ theo policy; local cache cũng có bound/version.",
+                  "en": "Return a policy-valid response; local caches also need bounds/versions."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "trie",
+      "title": {
+        "vi": "5. Trie, cached top-K và filter làm thiếu kết quả",
+        "en": "5. Tries, cached top-K and filter-induced underfilling"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trie walk tới node của prefix tốn O(p), với p là số symbol theo representation đã chọn. Nếu sau đó duyệt toàn subtree để tìm top-K, chi phí còn phụ thuộc số candidate. Precompute list có thứ tự giúp serving gần O(p + K) với child lookup phù hợp; trả text còn có chi phí byte/serialization. Đừng gọi whole request là constant time chỉ vì K nhỏ.",
+          "en": "A trie walk costs O(p), where p counts symbols in the chosen representation. Traversing its entire subtree to find top-K adds candidate-dependent work. Precomputed ordered lists enable approximately O(p + K) serving with suitable child lookups, plus text bytes/serialization. A small K does not make the whole request constant-time."
+        },
+        {
+          "vi": "Nếu cached list chỉ có đúng K và urgent filter loại một entry, kết quả còn K−1. Overfetch hoặc continuation có thể bổ sung nhưng vẫn bị candidate budget; build-time filtering không thay serving removal của policy vừa đổi. Ranking cá nhân hóa có thể cần ứng viên không có trong global top-K, nên overfetch không chứng minh recall hoàn hảo.",
+          "en": "If a cached list contains exactly K entries and an urgent filter removes one, only K−1 remain. Overfetch/continuation can help within candidate budgets, but build-time filtering cannot replace newly changed serving removals. Personalized ranking can need candidates absent from global top-K, so overfetch does not prove perfect recall."
+        }
+      ],
+      "experiment": "prefix-index",
+      "table": {
+        "headers": [
+          {
+            "vi": "Index representation",
+            "en": "Index representation"
+          },
+          {
+            "vi": "Serving shape",
+            "en": "Serving shape"
+          },
+          {
+            "vi": "Chi phí và vận hành",
+            "en": "Costs and operations"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Trie / radix / FST",
+              "en": "Trie / radix / FST"
+            },
+            {
+              "vi": "Walk prefix và đọc candidate refs.",
+              "en": "Walk a prefix and read candidate references."
+            },
+            {
+              "vi": "Prefix sharing/nén có lợi; loaded memory và update semantics khác nhau theo engine.",
+              "en": "Sharing/compression can help; loaded memory and update semantics vary by engine."
+            }
+          ],
+          [
+            {
+              "vi": "Prefix → top-K KV",
+              "en": "Prefix → top-K KV"
+            },
+            {
+              "vi": "Một lookup theo normalized prefix/context.",
+              "en": "One lookup by normalized prefix/context."
+            },
+            {
+              "vi": "Dup list theo prefix; hash phân bố key không tự phân bố hot-key traffic.",
+              "en": "Duplicates lists across prefixes; hash-distributed keys do not automatically distribute hot-key traffic."
+            }
+          ],
+          [
+            {
+              "vi": "Search-engine suggester",
+              "en": "Search-engine suggester"
+            },
+            {
+              "vi": "Dùng index/API chuyên biệt với analyzer đúng.",
+              "en": "Uses a specialized index/API with a suitable analyzer."
+            },
+            {
+              "vi": "Hiểu memory, refresh, fuzzy/context và filtering thay vì coi như full search thông thường.",
+              "en": "Understand memory, refresh, fuzzy/context and filtering behavior rather than treating it as ordinary full search."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "client",
+      "title": {
+        "vi": "6. Debounce, abort và generation guard ở frontend",
+        "en": "6. Frontend debounce, cancellation and generation guards"
+      },
+      "paragraphs": [
+        {
+          "vi": "Debounce chỉ gửi sau một khoảng yên lặng, nên typing liên tục có thể trì hoãn response; chọn interval theo UX và đo input-to-render. Không có tỷ lệ tiết kiệm request cố định. Abort giảm wasted work nhưng không thay guard: response đã resolve hoặc callback đang chạy vẫn có thể tới sau input mới. Increment generation ngay khi input/context đổi, không chờ timer mới gửi request.",
+          "en": "Debouncing sends after a quiet interval and can delay results during continuous typing. Choose the interval for the UX and measure input-to-render time. It has no fixed request-saving ratio. Cancellation reduces waste but is not a correctness guard: resolved responses or running callbacks can outlive input changes. Increment generations as soon as input/context changes, not only when a timer sends a request."
+        },
+        {
+          "vi": "IME composition không tương đương một keydown = một ký tự cuối. Tránh gửi/commit lựa chọn giữa composition nếu UX không chủ đích; dùng composition events và input state. Arrow navigation, Enter/Escape, focus, screen-reader combobox semantics và trạng thái loading/empty/error là phần của correctness UI, không chỉ trang trí backend diagram.",
+          "en": "IME composition is not one keydown per final character. Avoid sending/committing intermediate composition unless intentionally designed; use composition events and input state. Arrow navigation, Enter/Escape, focus, screen-reader combobox semantics and loading/empty/error states are part of UI correctness, not merely backend-diagram decoration."
+        }
+      ],
+      "experiment": "suggestion-race"
+    },
+    {
+      "id": "unicode",
+      "title": {
+        "vi": "7. Unicode normalization không phải mặc định bỏ dấu",
+        "en": "7. Unicode normalization does not mean removing accents"
+      },
+      "paragraphs": [
+        {
+          "vi": "NFC gộp các dạng canonically equivalent; NFKC thêm compatibility folding nên có thể đổi các phân biệt hiển thị/ý nghĩa mà sản phẩm muốn giữ. Lowercasing, case folding, bỏ dấu, transliteration và tokenization là các bước policy riêng, không được gọi tất cả là normalize rồi dùng khác nhau ở build và read. Với tiếng Việt, đ không đơn giản biến thành d nhờ NFD; nếu muốn fold cần quy tắc riêng và kiểm relevance.",
+          "en": "NFC unifies canonically equivalent forms; NFKC adds compatibility folding that can remove distinctions the product wants to preserve. Lowercasing, case folding, accent stripping, transliteration and tokenization are separate policy steps, not an unspecified normalize operation implemented differently at build/read. Vietnamese đ does not become d simply through NFD; folding needs a separate relevance-tested rule."
+        },
+        {
+          "vi": "Code unit UTF-16, Unicode code point, grapheme cluster và UTF-8 byte là các đơn vị khác nhau. Dùng đơn vị rõ cho prefix walk, max input length, cursor/highlight và memory sizing. CJK word segmentation, emoji sequence và multiword completion cần thiết kế analyzer phù hợp. Giữ display text gốc riêng với normalized lookup key để không phá cách viết khi hiển thị.",
+          "en": "UTF-16 code units, Unicode code points, grapheme clusters and UTF-8 bytes differ. Specify units for prefix walks, input limits, highlighting/cursors and memory sizing. CJK segmentation, emoji sequences and multiword completion need suitable analyzers. Store original display text separately from normalized lookup keys."
+        }
+      ]
+    },
+    {
+      "id": "ranking",
+      "title": {
+        "vi": "8. Popularity, time decay và feedback loop",
+        "en": "8. Popularity, time decay and feedback loops"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một score cơ bản là Σ count(t) × exp(−ln(2) × age/H), với half-life H cùng đơn vị age. Sau H, đóng góp còn một nửa. Cần window/dedup policy, event-time/late-data handling và deterministic tie-breaker. All-time frequency có thể khóa chặt query cũ; decay quá mạnh làm kết quả dao động và dễ bị thao túng.",
+          "en": "A basic score is Σ count(t) × exp(−ln(2) × age/H), with half-life H in the same units as age. Contributions halve after H. Define windows/deduplication, event-time/late-data handling and deterministic tie-breaking. All-time frequency can entrench old queries, while strong decay makes results unstable and easier to manipulate."
+        },
+        {
+          "vi": "Suggestion click/acceptance tạo feedback loop: thứ được đặt đầu có nhiều exposure nên nhiều click hơn dù relevance chưa chắc tốt. Tách exposure, selection, submitted search và downstream success; đánh giá theo locale/prefix length/cohort bằng offline labeled set và online metrics phù hợp. Chặn bot/inflation theo identity/session/budget mà vẫn cân nhắc privacy, không coi request count thô là ý định người dùng.",
+          "en": "Clicks/acceptances create feedback loops: the first item gets more exposure and clicks without necessarily being more relevant. Separate exposure, selection, submitted searches and downstream success. Evaluate by locale, prefix length and cohort with labeled offline sets and suitable online metrics. Resist bot/inflation using identity/session/budget policies that consider privacy rather than treating raw request counts as intent."
+        }
+      ]
+    },
+    {
+      "id": "pipeline",
+      "title": {
+        "vi": "9. Build, publish và rollback snapshot",
+        "en": "9. Build, publish and roll back snapshots"
+      },
+      "paragraphs": [
+        {
+          "vi": "Pipeline gồm ingest → clean/privacy → aggregate/score → policy filter → build shards/top-K → validate → publish manifest → warm replicas → switch serving. Check event replay không đếm gấp đôi, schema/analyzer version, suggestion safety, recall, loaded memory và shard completeness. Snapshot immutable với checksum giúp reproducibility và rollback, nhưng rollback index không được làm sống lại term vừa bị block trong serving policy.",
+          "en": "The pipeline ingests, cleans/privacy-filters, aggregates/scores, filters policy, builds shards/top-K, validates, publishes a manifest, warms replicas and switches serving. Check replay deduplication, schema/analyzer versions, safety, recall, loaded memory and complete shards. Immutable checksummed snapshots aid reproducibility and rollback, but rolling back an index must not revive a term blocked by current serving policy."
+        },
+        {
+          "vi": "Một atomic manifest pointer không có nghĩa mọi process trên toàn cầu đổi cùng nano giây. Replica có thể load chậm, cache giữ version cũ và fanout chạm mixed shard. Nếu request cần coherent version, pin request/route tới đủ shard đã ready của version đó, giữ old version trong thời gian drain và chỉ cutover khi đủ capacity. Memory headroom phải giữ cả old/new và transient loader.",
+          "en": "An atomic manifest pointer does not make every global process switch in the same nanosecond. Replicas load slowly, caches retain older versions and fanout can mix shards. Coherent requests pin/reroute to ready shards of one version, retaining the old version during draining and cutting over with enough capacity. Memory must cover old/new versions and loading transients."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Từ query event tới index có thể phục vụ",
+          "en": "From query events to a servable index"
+        },
+        "caption": {
+          "vi": "Publish chỉ sau validation và readiness; giữ serving removal policy độc lập.",
+          "en": "Publish after validation/readiness and keep serving removals independent."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Clean và score",
+              "en": "Clean and score"
+            },
+            "detail": {
+              "vi": "Privacy, event dedup, locale, decay và bot guard.",
+              "en": "Apply privacy, event deduplication, locale, decay and bot guards."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Build và validate",
+              "en": "Build and validate"
+            },
+            "detail": {
+              "vi": "Mọi shard, candidate refs, checksum, memory và recall.",
+              "en": "Validate all shards, candidate references, checksums, memory and recall."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Warm và switch",
+              "en": "Warm and switch"
+            },
+            "detail": {
+              "vi": "Pin version, đảm bảo capacity rồi chuyển routing có rollback.",
+              "en": "Pin versions, ensure capacity and switch routing with rollback."
+            },
+            "icon": "flag"
+          }
+        ]
+      }
+    },
+    {
+      "id": "scaling",
+      "title": {
+        "vi": "10. Cache, hot prefix và sharding",
+        "en": "10. Caching, hot prefixes and sharding"
+      },
+      "paragraphs": [
+        {
+          "vi": "Client cache phải key theo normalized query + locale/context, có TTL/version và không render stale generation. Edge cache chỉ phù hợp phần global/public; private-history personalization có thể blend ở client hoặc endpoint riêng có authorization. Cache hit vẫn phải tuân urgent-removal bound; origin blocklist không sửa response đang fresh ở edge/browser.",
+          "en": "Client caches key by normalized query + locale/context, use TTLs/versions and must respect input generations. Edge caches fit global/public components; private history can blend client-side or through a separately authorized endpoint. Cache hits still obey urgent-removal bounds; origin blocklists cannot fix fresh edge/browser responses alone."
+        },
+        {
+          "vi": "First-letter sharding có thể lệch cả data và QPS; split theo prefix distribution hoặc hash prefix KV giúp từng loại khác nhau. Hash phân bố nhiều key thường đều hơn nhưng một hot prefix vẫn là một hot shard. Prefix ngắn có thể cần cache/replica riêng; khi index chia subtree, prefix ngắn hơn shard boundary có thể cần precomputed global list hoặc scatter/gather, không mặc định một shard.",
+          "en": "First-letter sharding can skew both data and QPS. Distribution-based ranges and hashed prefix KV address different aspects. Hashing many keys can distribute storage better, but one hot prefix remains a hot shard. Short prefixes may need dedicated caches/replicas; subtree-sharded indexes can need global precomputed lists or scatter/gather when prefixes are shorter than shard boundaries."
+        },
+        {
+          "vi": "Fanout top-K từ nhiều shard cần cùng ranking semantics, version và merge/dedup identity. Top-K mỗi shard đủ cho global top-K nếu score/order và eligibility nhất quán; personalization/filter sau merge có thể phá candidate recall. Bounded deadline, fallback last-known-good hoặc trả ít hơn K cần contract, không chờ mãi một shard rồi vượt latency target.",
+          "en": "Fanout across shards needs consistent ranking semantics, versions and merge/dedup identities. Per-shard top-K suffices for global top-K when scores/order and eligibility are consistent; later personalization/filtering can reduce candidate recall. Define bounded deadlines, last-known-good fallbacks or fewer-than-K responses rather than waiting indefinitely for one shard."
+        }
+      ]
+    },
+    {
+      "id": "trending",
+      "title": {
+        "vi": "11. Trending nhanh mà không rebuild mọi thứ",
+        "en": "11. Fast trending without rebuilding everything"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giữ baseline snapshot ổn định và overlay nhỏ từ stream/window. Một query tăng từ 1 lên 5 có lift lớn nhưng chưa chắc đáng đề xuất; cần min support, unique/quality signal, seasonality và anti-manipulation. Event-time window, watermark và late update policy quyết định signal thật sự mới tới đâu. Trending overlay và edge TTL phải được đo cùng nhau, nếu không event mới đã tới origin nhưng user vẫn thấy cache cũ.",
+          "en": "Use stable baseline snapshots with small stream/window overlays. A rise from one to five has high relative lift without necessarily deserving exposure; require support, unique/quality signals, seasonality and anti-manipulation. Event-time windows, watermarks and late-update policies determine actual freshness. Measure trending overlays and edge TTLs together, or new origin data remains hidden behind old cache entries."
+        },
+        {
+          "vi": "Merge baseline/trending/history bằng score calibration, identity dedup, quota và safety trước response. Không khẳng định một tỷ lệ blend đúng cho mọi locale/query. Khi overlay lỗi, degrade về baseline đã biết an toàn; urgent blocklist không được tắt theo trending. Trend freshness và suggestion relevance là hai metric khác nhau.",
+          "en": "Merge baseline/trending/history with score calibration, identity deduplication, quotas and safety. No blend ratio is universally correct across locales/queries. On overlay failure, fall back to an acceptable baseline without disabling urgent removals. Trend freshness and suggestion relevance are different metrics."
+        }
+      ]
+    },
+    {
+      "id": "privacy",
+      "title": {
+        "vi": "12. Private query, safety và removal",
+        "en": "12. Private queries, safety and removals"
+      },
+      "paragraphs": [
+        {
+          "vi": "Submitted query có thể chứa email, token, địa chỉ, thông tin y tế hoặc tên hiếm; popularity threshold đơn thuần không là bảo đảm privacy. Min support, PII/secret filtering, retention/access policy và aggregate release controls phải được thiết kế theo sản phẩm. Không đưa raw session/user ID không cần thiết vào training logs, và không copy private history vào public edge cache.",
+          "en": "Submitted queries can contain emails, tokens, addresses, health information or rare names. Popularity thresholds alone do not guarantee privacy. Design support thresholds, PII/secret filters, retention/access policies and aggregate-release controls for the product. Avoid unnecessary raw user/session IDs in training logs and never place private history in public edge caches."
+        },
+        {
+          "vi": "Filter cả build-time và serving-time cho urgent removal; bảo vệ text/highlight render khỏi injection và log payload nhạy cảm khỏi quan sát trái phép. Normalization không phải sanitation hay authorization. Anti-abuse cần rate limit, query-inflation detection và review path; term bị remove phải bị loại cả trong old snapshot rollback, cached response và overlay theo removal SLA đã chốt.",
+          "en": "Use build-time and serving-time controls for urgent removals. Render text/highlights safely and protect sensitive logs. Normalization is not sanitization or authorization. Anti-abuse needs rate limits, query-inflation detection and review paths. Removals must hold across snapshot rollbacks, cached responses and overlays within the agreed removal SLA."
+        }
+      ]
+    },
+    {
+      "id": "failure",
+      "title": {
+        "vi": "13. Đo UX và thử làm hỏng các boundary",
+        "en": "13. Measure UX and break the boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo input-to-first-useful-render, serving p99, stale response discard, empty/underfilled rate, per-locale relevance, cache hit theo context, index version skew, loaded memory và build freshness. Một API 5 ms không đảm bảo UX 100 ms nếu debounce/network/render dùng phần còn lại. Popularity pipeline backlog và urgent-removal propagation phải có alert riêng.",
+          "en": "Measure input-to-first-useful-render, serving p99, stale-response discards, empty/underfilled rates, relevance by locale, contextual cache hits, version skew, loaded memory and build freshness. A five-millisecond API cannot ensure a 100 ms UX if debounce/network/render consumes the rest. Alert separately on popularity pipeline backlog and urgent-removal propagation."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Test autocomplete",
+            "en": "Autocomplete test"
+          },
+          {
+            "vi": "Kết quả cần giữ",
+            "en": "Required outcome"
+          },
+          {
+            "vi": "Vì sao test này quan trọng",
+            "en": "Why it matters"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Response cũ về sau",
+              "en": "An old response arrives last"
+            },
+            {
+              "vi": "Không overwrite current input generation.",
+              "en": "Never overwrite the current input generation."
+            },
+            {
+              "vi": "Abort một mình không là correctness guard.",
+              "en": "Cancellation alone is not a correctness guard."
+            }
+          ],
+          [
+            {
+              "vi": "NFC composed/decomposed",
+              "en": "NFC composed/decomposed input"
+            },
+            {
+              "vi": "Cùng lookup policy cho kết quả tương đương.",
+              "en": "Equivalent results under the same lookup policy."
+            },
+            {
+              "vi": "Build/read normalize lệch làm false miss.",
+              "en": "Mismatched build/read normalization creates false misses."
+            }
+          ],
+          [
+            {
+              "vi": "Block term đứng đầu",
+              "en": "Block the top-scored term"
+            },
+            {
+              "vi": "Không lộ lại từ cache/rollback; underfill có policy.",
+              "en": "No revival via caches/rollbacks; underfilling has a policy."
+            },
+            {
+              "vi": "Top-K cache và removal không độc lập.",
+              "en": "Top-K caching and removal are not independent."
+            }
+          ],
+          [
+            {
+              "vi": "Một shard chưa load snapshot",
+              "en": "One shard has not loaded a snapshot"
+            },
+            {
+              "vi": "Không trả mixed version nếu contract yêu cầu coherence.",
+              "en": "Avoid mixed versions when coherence is required."
+            },
+            {
+              "vi": "Manifest pointer không là global process barrier.",
+              "en": "A manifest pointer is not a global process barrier."
+            }
+          ],
+          [
+            {
+              "vi": "Personalization user A/B",
+              "en": "Personalization for users A/B"
+            },
+            {
+              "vi": "Không dùng response private của A cho B.",
+              "en": "Never serve A’s private response to B."
+            },
+            {
+              "vi": "Cache key và authentication là privacy boundary.",
+              "en": "Cache keys and authentication define a privacy boundary."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi phỏng vấn kèm reasoning",
+        "en": "14. Interview questions with worked reasoning"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trình bày input contract, một serving request, một index update và một failure. Dùng mô phỏng để kiểm tra lập luận, không thay production measurement bằng tốc độ corpus nhỏ chạy trong browser.",
+          "en": "Explain the input contract, one serving request, one index update and one failure. Use the models to test reasoning rather than substituting a tiny browser corpus for production measurement."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Cached top-K rồi filter có chắc trả đủ K không?",
+            "en": "Does filtering cached top-K guarantee K results?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Loại một entry thì còn thiếu; overfetch/continuation giúp trong budget, nhưng nếu nhiều entry bị loại vẫn có thể underfill. Chốt max K, empty/fallback policy và eligibility/ranking semantics; không bỏ safety để đủ số lượng.",
+              "en": "No. Removing an entry underfills the list. Overfetch/continuation helps within a budget, but enough filtered entries can still underfill it. Define maximum K, empty/fallback behavior and eligibility/ranking semantics rather than bypass safety to fill the list."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Request ca về sau cat, abort đã gọi thì còn cần guard không?",
+            "en": "A ca response arrives after cat. Is a guard still needed after abort?"
+          },
+          "answer": [
+            {
+              "vi": "Có. Callback có thể race hoặc đã resolve; guard bằng input/context generation được tăng ngay lúc thay đổi. Chỉ apply nếu generation vẫn hiện hành, kể cả khi locale/tenant đổi trong debounce window. Abort chủ yếu giảm tài nguyên thừa.",
+              "en": "Yes. Callbacks can race or already be resolved. Increment an input/context generation immediately and apply only matching responses, including locale/tenant changes during debounce. Cancellation primarily reduces wasted resources."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Trie lookup có phải O(1) không?",
+            "en": "Is a trie lookup O(1)?"
+          },
+          "answer": [
+            {
+              "vi": "Thông thường walk O(p), trả K/bytes thêm chi phí. Không cached top-K thì còn subtree traversal; có cache thì dùng O(p+K) theo giả định child lookup và list access. Latency vẫn có network, filter/rerank và serialization.",
+              "en": "Typically the walk is O(p), with additional K/byte costs. Without cached top-K, subtree traversal adds work; cached lists enable O(p+K) under appropriate child-lookup/list-access assumptions. Networks, filtering/reranking and serialization still affect latency."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hash prefix làm mọi shard đều tải bằng nhau đúng không?",
+            "en": "Does hashing prefixes equalize every shard’s traffic?"
+          },
+          "answer": [
+            {
+              "vi": "Nó giúp phân bố nhiều key/data, không chia một hot prefix thành nhiều shard. Đo QPS skew, cache/replicate hot prefixes và route capacity phù hợp. Subtree sharding còn cần xử lý prefix ngắn hơn boundary, có thể fanout hoặc dùng global precomputed list.",
+              "en": "It helps distribute many keys/data but does not divide one hot prefix across shards. Measure QPS skew, cache/replicate hot prefixes and route capacity accordingly. Subtree sharding also needs short-prefix handling through fanout or global precomputed lists."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tin nóng cần xuất hiện trong vài phút, làm sao?",
+            "en": "How can breaking-news suggestions appear within minutes?"
+          },
+          "answer": [
+            {
+              "vi": "Thêm bounded trending overlay với window, min support, seasonality và safety, rồi merge với baseline. Đo end-to-end freshness bao gồm edge/local TTL; không chỉ đo stream job latency. Rebuild thường xuyên cũng là phương án khi index nhỏ và cost chấp nhận được, không cấm tuyệt đối.",
+              "en": "Add a bounded trending overlay with windows, support thresholds, seasonality and safety, then merge it with the baseline. Measure end-to-end freshness including edge/local TTLs, not just stream processing. Frequent rebuilds can also work for small affordable indexes; they are not categorically forbidden."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dùng NFKC rồi bỏ dấu cho mọi ngôn ngữ có được không?",
+            "en": "Can every language use NFKC followed by accent removal?"
+          },
+          "answer": [
+            {
+              "vi": "Không như một default không review. Compatibility folding và accent removal có thể mất phân biệt có nghĩa; locale/analyzer cần được test trên relevance corpus. Giữ display text, lookup policy version và build/read nhất quán; tiếng Việt đ cần rule riêng nếu muốn fold.",
+              "en": "Not as an unreviewed default. Compatibility folding and accent removal can erase meaningful distinctions. Test locale/analyzer choices on relevance data, retain display text and policy versions, and keep build/read consistent. Vietnamese đ requires a separate rule if folding is desired."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đã đổi manifest pointer atomic thì còn mixed version không?",
+            "en": "Can mixed versions remain after an atomic manifest-pointer update?"
+          },
+          "answer": [
+            {
+              "vi": "Có nếu replica/shard/cache chưa cùng ready. Atomic metadata update chỉ là một boundary. Pin request version, check shard readiness, warm capacity và route/fallback rõ; rollback index vẫn phải dùng current urgent-removal policy.",
+              "en": "Yes, if replicas/shards/caches are not ready together. The metadata update is only one boundary. Pin request versions, check shard readiness, warm capacity and define routing/fallbacks. An index rollback must still honor current urgent-removal policy."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "100 triệu query × 20 byte có đủ để nói index chỉ cần 2 GB RAM không?",
+            "en": "Do 100 million twenty-byte queries imply a two-GB RAM index?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Đó chỉ là text payload; node/edge, IDs, scores, per-prefix candidate refs, representation overhead, old/new snapshot và replica còn chưa tính. Đo distinct prefix count và loaded memory; nén/radix/FST có thể giảm nhưng không suy từ raw text một mình.",
+              "en": "No. That is text payload alone, excluding nodes/edges, IDs, scores, per-prefix candidates, representation overhead, old/new snapshots and replicas. Measure distinct prefixes and loaded memory. Compression/radix/FST choices can help, but raw text size alone is insufficient."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

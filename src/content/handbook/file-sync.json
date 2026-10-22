@@ -1,0 +1,1438 @@
+{
+  "id": "file-sync",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế File Sync: chunks, revisions và offline conflicts",
+    "en": "Designing File Sync: chunks, revisions and offline conflicts"
+  },
+  "summary": {
+    "vi": "Đi từ bytes tới authoritative metadata và crash-safe device apply; thử delta upload, CAS parent revision và keep-both để hiểu cách đồng bộ đúng qua nhiều device.",
+    "en": "Trace bytes through authoritative metadata to crash-safe device application; explore delta uploads, parent-revision CAS and keep-both to understand correct multi-device synchronization."
+  },
+  "prerequisites": [
+    "databases",
+    "consistency",
+    "messaging",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "storage-search",
+    "database",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Uploaded bytes chưa phải committed file; protect blocks khỏi GC trước khi ACK metadata tham chiếu chúng.",
+      "en": "Uploaded bytes are not committed files; protect blocks from collection before acknowledging referencing metadata."
+    },
+    {
+      "vi": "File ID sống qua rename; revision, namespace cursor và local applied state có vai trò khác nhau.",
+      "en": "File IDs survive renames; revisions, namespace cursors and locally applied state serve different roles."
+    },
+    {
+      "vi": "CAS reject stale parent; preserve local edits và resolve idempotently thay vì silent overwrite.",
+      "en": "CAS rejects stale parents; preserve local edits and resolve idempotently instead of silently overwriting."
+    },
+    {
+      "vi": "Chunking tiết kiệm tùy edit/data; CDC có thể resynchronize nhưng không bảo đảm delta luôn nhỏ.",
+      "en": "Chunking savings depend on edits/data; CDC may resynchronize without guaranteeing small deltas."
+    },
+    {
+      "vi": "Notification chỉ hint; durable replay, client correctness, GC protocol và dedup privacy đều là phần cốt lõi.",
+      "en": "Notifications are hints; durable replay, client correctness, collection protocols and deduplication privacy are central."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Nhớ vòng đời của một thay đổi file",
+      "en": "Remember the life of a file change"
+    },
+    "caption": {
+      "vi": "Đọc theo thứ tự bytes → commit → replay → recovery, rồi mới tối ưu storage và fanout.",
+      "en": "Study bytes, commits, replay and recovery before optimizing storage and fanout."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Chuẩn bị bytes",
+          "en": "Prepare bytes"
+        },
+        "detail": {
+          "vi": "Chunk, verify, upload missing blocks và protect pending data.",
+          "en": "Chunk, verify, upload missing blocks and protect pending data."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Commit revision",
+          "en": "Commit a revision"
+        },
+        "detail": {
+          "vi": "CAS parent, atomic metadata/journal và retry result.",
+          "en": "CAS the parent, atomically update metadata/journals and save retry results."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Apply trên device",
+          "en": "Apply on devices"
+        },
+        "detail": {
+          "vi": "Hint → replay → fetch → staged apply → cursor.",
+          "en": "Hint, replay, fetch, staged application and cursor checkpoint."
+        },
+        "icon": "users"
+      },
+      {
+        "title": {
+          "vi": "Giữ dữ liệu qua lỗi",
+          "en": "Preserve data across faults"
+        },
+        "detail": {
+          "vi": "Conflicts, offline retention, restore, GC và authorization.",
+          "en": "Handle conflicts, offline retention, restores, collection and authorization."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. File sync là ba bài toán gắn với cùng một invariant",
+        "en": "1. File sync joins three problems under one invariant"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đừng bắt đầu bằng “lưu file vào S3”. Bạn phải di chuyển bytes tiết kiệm, quyết định metadata/version nào được chấp nhận, và đánh thức nhiều device đang idle. Invariant trung tâm của baseline: một commit đã ACK không được trỏ tới bytes chưa durable hoặc bị GC thu hồi; một stale edit không được overwrite head mà không báo conflict. Durability luôn gắn với failure model, retention và recovery đã kiểm chứng, không phải lời hứa không bao giờ mất dữ liệu trong mọi thảm họa.",
+          "en": "Do not start with “put files in S3.” You need efficient byte transfer, authoritative metadata/version decisions and wake-ups for many idle devices. The baseline invariant is that acknowledged commits never reference non-durable or collected bytes, and stale edits never overwrite heads without a conflict signal. Durability is bounded by tested failure models, retention and recovery, not a promise against every possible disaster."
+        },
+        {
+          "vi": "Baseline hỗ trợ upload/download, nhiều device, offline edits, revision history và shared folders; file có thể hàng chục GB và sync latency mục tiêu tính bằng giây khi network cho phép. Real-time co-editing kiểu Docs và full-text search nằm ngoài scope ban đầu. Không tự merge hai opaque binary files vì cả hai có cùng extension.",
+          "en": "The baseline supports uploads/downloads, multiple devices, offline edits, revision history and shared folders. Files may be tens of GB, with a target sync latency of seconds when networks permit. Docs-style real-time co-editing and full-text search are outside the initial scope. Sharing an extension does not make two opaque binary files automatically mergeable."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Bytes",
+            "en": "Bytes"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Chia chunk, resume và verify; chỉ truyền phần thực sự còn thiếu trong scope được phép.",
+              "en": "Chunk, resume and verify; transfer only what is actually missing within the authorized scope."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Metadata",
+            "en": "Metadata"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Stable file ID, parent revision, atomic head/version/journal và retry result.",
+              "en": "Stable file IDs, parent revisions, atomic heads/versions/journals and retry results."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Devices",
+            "en": "Devices"
+          },
+          "icon": "users",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Notification là hint; local DB, cursor và replay chịu trách nhiệm hội tụ sau crash/offline.",
+              "en": "Notifications are hints; local databases, cursors and replay drive convergence after crashes/offline periods."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Logical bytes, delta bytes và idle devices là ba phép tính",
+        "en": "2. Logical bytes, delta bytes and idle devices need separate estimates"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng ví dụ 50 triệu user, trung bình lưu 10 GB/user; 10 triệu DAU và 2 edit được sync/ngày. Giả sử file được sửa trung bình 1 MB và unique delta cần upload bằng 10% file, peak bằng 3 lần trung bình. Đây là giả định để tính, không phải mức tiết kiệm chunking luôn đạt. Dùng đơn vị thập phân: GB=10^9 B, PB=10^15 B.",
+          "en": "Use 50 million users storing an average of 10 GB each, with 10 million DAU and two synchronized edits per day. Assume edited files average 1 MB, unique uploaded deltas are ten percent of the file and peak traffic is three times the average. These are sizing assumptions, not guaranteed chunking savings. Units are decimal: GB=10^9 B and PB=10^15 B."
+        },
+        {
+          "vi": "Storage 500 PB là logical live data trước dedup, version history, compression, coding, metadata và backups. Nếu workload đo được dedup factor 1,25 thì unique live bytes là 400 PB, nhưng không được dùng factor đó cho mọi cohort. Bandwidth download còn nhân theo số device nhận thay đổi và sharing fanout; upload delta 2 TB/ngày không đồng nghĩa tổng egress chỉ 2 TB.",
+          "en": "The 500 PB is logical live data before deduplication, history, compression, coding, metadata and backups. A measured deduplication factor of 1.25 would imply 400 PB of unique live bytes, but cannot be assumed for every cohort. Downloads also depend on receiving devices and sharing fanout; two TB of daily upload deltas does not imply two TB of total egress."
+        },
+        {
+          "vi": "Dù write rate chỉ vài trăm/s trong ví dụ, 10 triệu device poll mỗi 30 giây tạo khoảng 333.333 request/s, phần lớn có thể rỗng. Long poll/WebSocket giảm empty polling nhưng tạo connection state và reconnect load. Tính metadata listing, journal page, block-check batches và hot shared namespace riêng; đừng kết luận metadata nhẹ chỉ từ file-edit RPS.",
+          "en": "Even with only a few hundred writes per second here, ten million devices polling every thirty seconds create about 333,333 requests/second, potentially mostly empty. Long polling/WebSockets reduce empty polling but add connection state and reconnection load. Size listings, journal pages, block-check batches and hot shared namespaces separately; file-edit RPS alone does not establish metadata load."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng của file sync",
+            "en": "File-sync quantity"
+          },
+          {
+            "vi": "Phép tính minh họa",
+            "en": "Illustrative calculation"
+          },
+          {
+            "vi": "Kết quả có điều kiện",
+            "en": "Conditional result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Logical live data",
+              "en": "Logical live data"
+            },
+            {
+              "vi": "50M × 10 GB",
+              "en": "50M × 10 GB"
+            },
+            {
+              "vi": "500 PB",
+              "en": "500 PB"
+            }
+          ],
+          [
+            {
+              "vi": "Edits/s trung bình",
+              "en": "Average edits/s"
+            },
+            {
+              "vi": "10M × 2 / 86.400",
+              "en": "10M × 2 / 86,400"
+            },
+            {
+              "vi": "231,5/s",
+              "en": "231.5/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak edit rate",
+              "en": "Peak edit rate"
+            },
+            {
+              "vi": "231,5 × 3",
+              "en": "231.5 × 3"
+            },
+            {
+              "vi": "694,4/s",
+              "en": "694.4/s"
+            }
+          ],
+          [
+            {
+              "vi": "Delta upload/ngày",
+              "en": "Daily delta upload"
+            },
+            {
+              "vi": "20M × 1 MB × 10%",
+              "en": "20M × 1 MB × 10%"
+            },
+            {
+              "vi": "2 TB/ngày",
+              "en": "2 TB/day"
+            }
+          ],
+          [
+            {
+              "vi": "Peak delta ingress",
+              "en": "Peak delta ingress"
+            },
+            {
+              "vi": "694,4 × 0,1 MB",
+              "en": "694.4 × 0.1 MB"
+            },
+            {
+              "vi": "69,4 MB/s trước overhead",
+              "en": "69.4 MB/s before overhead"
+            }
+          ],
+          [
+            {
+              "vi": "Idle short polling",
+              "en": "Idle short polling"
+            },
+            {
+              "vi": "10M / 30 s",
+              "en": "10M / 30 s"
+            },
+            {
+              "vi": "333.333 request/s",
+              "en": "333,333 requests/s"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. API phân biệt upload bytes với commit file",
+        "en": "3. APIs separate byte upload from file commit"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mọi endpoint phải xác thực principal và namespace permission, có quota, batch/payload limit và capability hết hạn theo policy. Client-provided SHA-256 không chứng minh ownership hoặc quyền đọc; block-check chỉ trả existence trong dedup scope được phép. Upload service kiểm digest/length từ bytes thực, không tin filename hoặc hash do client khai.",
+          "en": "Every endpoint authenticates principals and namespace permissions, with quotas, batch/payload limits and policy-bound expiring capabilities. A client-provided SHA-256 does not establish ownership or read permission; block checks reveal existence only within authorized deduplication scopes. The upload service verifies digests/lengths from actual bytes rather than trusting names or claimed hashes."
+        },
+        {
+          "vi": "Ví dụ dưới dùng JSON parentRev và trả application conflict 409. Nếu contract dùng HTTP If-Match thì failed precondition thường là 412; đừng trộn hai contract khi viết client. Retry commit dùng stable operation ID và payload fingerprint, trả đúng revision/result đã lưu; tái dùng ID với payload khác phải bị từ chối.",
+          "en": "The example uses a JSON parentRev and application conflict 409. A contract using HTTP If-Match normally returns 412 for a failed precondition; clients must not mix those contracts. Commit retries use stable operation IDs and payload fingerprints to return stored revisions/results, and reject reuse with different payloads."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/namespaces/{ns}/blocks/check",
+          "description": {
+            "vi": "Check authorized scoped block IDs; không lộ global existence.",
+            "en": "Check authorized scoped block IDs without exposing global existence."
+          },
+          "request": "{ \"blocks\": [{ \"digest\": \"sha256:...\", \"bytes\": 4194304 }] }",
+          "response": "200 { missing[], uploadSession, expiresAt }"
+        },
+        {
+          "method": "PUT",
+          "path": "/v1/uploads/{session}/blocks/{digest}",
+          "description": {
+            "vi": "Upload và verify immutable bytes; trả receipt/pin có thời hạn.",
+            "en": "Upload and verify immutable bytes; return a time-bounded receipt/pin."
+          },
+          "request": "binary + declared length/checksum",
+          "response": "201 | 200 { receipt, objectVersion, protectedUntil }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/namespaces/{ns}/files/{fileId}/commit",
+          "description": {
+            "vi": "CAS parent revision và commit ordered manifest với receipts hợp lệ.",
+            "en": "CAS the parent revision and commit an ordered manifest with valid receipts."
+          },
+          "request": "{ opId, parentRev, size, blocks: [{ digest, bytes }], receipts[] }",
+          "response": "200 { revision, journalHint } | 409 { currentRevision }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/namespaces/{ns}/journal?cursor=...&limit=100",
+          "description": {
+            "vi": "Đọc committed changes theo opaque cursor đúng scope; hết retention cần resnapshot.",
+            "en": "Read committed changes using a scope-bound opaque cursor; expired retention requires resnapshotting."
+          },
+          "response": "200 { entries[], nextCursor, hasMore } | 410 { resnapshotRequired: true }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/namespaces/{ns}/notify?cursor=...",
+          "description": {
+            "vi": "Long poll có timeout; hint không chứa authoritative file data.",
+            "en": "Bounded long polling; hints do not contain authoritative file data."
+          },
+          "response": "200 { changed: boolean, hint?: string }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/namespaces/{ns}/files/{fileId}/versions/{rev}",
+          "description": {
+            "vi": "Đọc manifest và scoped download capability sau ACL check.",
+            "en": "Read a manifest and scoped download capabilities after ACL checks."
+          },
+          "response": "200 { manifest, downloadCapabilities[] }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Hai đường đi và một điểm quyết định sự thật",
+        "en": "4. Two paths and one authoritative decision"
+      },
+      "paragraphs": [
+        {
+          "vi": "Block path truyền immutable bytes qua block service/object storage. Metadata path quyết định tên, parent folder, head revision, tombstone và journal. Database giao dịch chia theo namespace là baseline thuận tiện vì có thể giữ file version, head, operation result, journal và outbox trong một transaction. Một shared folder có thể là namespace riêng được mount vào nhiều cây thư mục.",
+          "en": "The block path transfers immutable bytes through block services/object storage. The metadata path decides names, parent folders, head revisions, tombstones and journals. A transactional database sharded by namespace is a convenient baseline because versions, heads, operation results, journal entries and outboxes can share a transaction. A shared folder can be its own namespace mounted into multiple directory trees."
+        },
+        {
+          "vi": "Đường nét trong sơ đồ là logical calls, không bắt buộc mọi byte đi qua cùng API process. Upload/download có thể dùng scoped signed capability để đi trực tiếp object storage, miễn giữ authorization, verification và commit protection. Không route file GB qua metadata worker chỉ vì endpoint cùng domain.",
+          "en": "Diagram edges are logical calls, not a requirement that every byte traverse the same API process. Uploads/downloads may use scoped signed capabilities to access object storage directly while preserving authorization, verification and commit protection. A shared domain does not justify routing GB files through metadata workers."
+        }
+      ],
+      "diagram": {
+        "id": "sync-bytes-and-revisions",
+        "title": {
+          "vi": "Bytes đi trước; revision và journal được commit cùng nhau",
+          "en": "Bytes first; revisions and journal entries commit together"
+        },
+        "caption": {
+          "vi": "Bốn trace tách upload, commit, catch-up và stale edit. Metadata chỉ tham chiếu verified blocks còn được bảo vệ khỏi GC; notification chỉ là hint.",
+          "en": "Four traces separate uploading, committing, catching up and stale edits. Metadata references verified blocks protected against collection; notifications are hints."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "a",
+            "label": {
+              "vi": "Device A",
+              "en": "Device A"
+            },
+            "detail": {
+              "vi": "Giữ local DB, pending operation và bytes chưa đồng bộ. Retry dùng cùng operation ID.",
+              "en": "Keeps a local database, pending operations and unsynchronized bytes. Retries use the same operation ID."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Authenticated API",
+              "en": "Authenticated API"
+            },
+            "detail": {
+              "vi": "Kiểm principal, namespace, quota và giới hạn batch/payload. Không dùng hash như access token.",
+              "en": "Checks principals, namespaces, quotas and batch/payload limits. A hash is not an access token."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "blocks",
+            "label": {
+              "vi": "Block service",
+              "en": "Block service"
+            },
+            "detail": {
+              "vi": "Kiểm integrity và scoped existence; trả durable receipt/pin cho commit protocol.",
+              "en": "Checks integrity and scoped existence; returns a durable receipt/pin for the commit protocol."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "blobs",
+            "label": {
+              "vi": "Private block store",
+              "en": "Private block store"
+            },
+            "detail": {
+              "vi": "Immutable bytes theo dedup/encryption scope. GC phải phối hợp với pending pins và committed reachability.",
+              "en": "Immutable bytes under a deduplication/encryption scope. Collection coordinates with pending pins and committed reachability."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "meta",
+            "label": {
+              "vi": "Metadata service",
+              "en": "Metadata service"
+            },
+            "detail": {
+              "vi": "Kiểm parent revision, namespace permission và commit identity; serialize thay đổi trong namespace boundary.",
+              "en": "Checks parent revisions, namespace permissions and commit identities; serializes changes within a namespace boundary."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Metadata + journal",
+              "en": "Metadata + journal"
+            },
+            "detail": {
+              "vi": "File head, version, operation result và journal entry trong cùng transaction. Outbox/hint được tạo bền cùng commit.",
+              "en": "File heads, versions, operation results and journal entries share a transaction. Durable outbox/hints are created with the commit."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "relay",
+            "label": {
+              "vi": "Change notifier",
+              "en": "Change notifier"
+            },
+            "detail": {
+              "vi": "Coalesce namespace hints, long poll hoặc WebSocket. Không giữ file bytes hay thay journal.",
+              "en": "Coalesces namespace hints over long polling or WebSockets. It neither carries file bytes nor replaces the journal."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "b",
+            "label": {
+              "vi": "Device B",
+              "en": "Device B"
+            },
+            "detail": {
+              "vi": "Replay journal từ applied cursor, tải missing blocks, staged apply rồi mới checkpoint.",
+              "en": "Replays from an applied cursor, downloads missing blocks, stages application and then checkpoints."
+            },
+            "x": 130,
+            "y": 700,
+            "kind": "client"
+          },
+          {
+            "id": "local",
+            "label": {
+              "vi": "Local staging + DB",
+              "en": "Local staging + DB"
+            },
+            "detail": {
+              "vi": "Giữ pending edits trước resnapshot; recover apply sau crash theo filesystem semantics.",
+              "en": "Preserves pending edits before resnapshotting; recovers application after a crash under filesystem semantics."
+            },
+            "x": 740,
+            "y": 700,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "upload",
+            "label": {
+              "vi": "Upload những block còn thiếu",
+              "en": "Upload missing blocks"
+            },
+            "steps": [
+              {
+                "from": "a",
+                "to": "api",
+                "description": {
+                  "vi": "A gửi manifest candidate và hỏi missing blocks trong namespace được phép.",
+                  "en": "A submits a candidate manifest and checks missing blocks within an authorized namespace."
+                }
+              },
+              {
+                "from": "api",
+                "to": "blocks",
+                "description": {
+                  "vi": "Check không tiết lộ existence ngoài dedup scope đã chọn.",
+                  "en": "The check does not expose existence outside the chosen deduplication scope."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "a",
+                "description": {
+                  "vi": "Trả missing set và scoped upload capability; đây chưa là commit file.",
+                  "en": "Return a missing set and scoped upload capabilities; this is not a file commit."
+                }
+              },
+              {
+                "from": "a",
+                "to": "blocks",
+                "description": {
+                  "vi": "Upload unique missing blocks; server kiểm bytes, digest và length.",
+                  "en": "Upload unique missing blocks; the server checks bytes, digests and lengths."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "blobs",
+                "description": {
+                  "vi": "Lưu bền immutable objects và bảo vệ bằng pending pins.",
+                  "en": "Durably store immutable objects and protect them with pending pins."
+                }
+              },
+              {
+                "from": "blobs",
+                "to": "blocks",
+                "description": {
+                  "vi": "Storage đạt durability boundary; receipt gắn với object version/scope.",
+                  "en": "Storage reaches its durability boundary; receipts bind to object versions/scopes."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "a",
+                "description": {
+                  "vi": "A nhận receipts để commit; upload xong không tự đổi file head.",
+                  "en": "A receives commit receipts; upload completion alone does not change the file head."
+                }
+              }
+            ]
+          },
+          {
+            "id": "commit",
+            "label": {
+              "vi": "CAS head và append journal",
+              "en": "CAS the head and append to the journal"
+            },
+            "steps": [
+              {
+                "from": "a",
+                "to": "api",
+                "description": {
+                  "vi": "Commit op-42 cho file-main, parentRev=5 và ordered block list.",
+                  "en": "Commit op-42 for file-main with parentRev=5 and an ordered block list."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Chuyển command với principal; kiểm permission hiện tại, không chỉ lúc upload.",
+                  "en": "Forward the command with its principal; check current permissions, not just upload-time permissions."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "db",
+                "description": {
+                  "vi": "Transaction kiểm retry result, CAS revision và durable block protection; ghi version 6 + head + journal + outbox.",
+                  "en": "A transaction checks retry results, CAS revisions and durable block protection; it writes version 6, the head, journal and outbox."
+                }
+              },
+              {
+                "from": "db",
+                "to": "meta",
+                "description": {
+                  "vi": "Commit thành công theo durability contract; recovery protocol giữ block reachability.",
+                  "en": "Commit succeeds under its durability contract; recovery preserves block reachability."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "a",
+                "description": {
+                  "vi": "ACK cùng revision/cursor hint. Mất ACK thì retry trả cùng result, không tạo revision mới.",
+                  "en": "Acknowledge with the revision/cursor hint. If the ACK is lost, a retry returns the same result without another revision."
+                }
+              }
+            ]
+          },
+          {
+            "id": "catchup",
+            "label": {
+              "vi": "Hint, journal và crash-safe apply",
+              "en": "Hints, journal replay and crash-safe application"
+            },
+            "steps": [
+              {
+                "from": "db",
+                "to": "relay",
+                "description": {
+                  "vi": "Relay đọc outbox đã commit, có thể phát trùng.",
+                  "en": "The relay reads committed outbox entries and may duplicate delivery."
+                },
+                "async": true
+              },
+              {
+                "from": "relay",
+                "to": "b",
+                "description": {
+                  "vi": "Namespace changed. B vẫn periodic reconcile nếu hint cuối bị mất.",
+                  "en": "Namespace changed. B still periodically reconciles in case the final hint is lost."
+                },
+                "async": true
+              },
+              {
+                "from": "b",
+                "to": "meta",
+                "description": {
+                  "vi": "Đọc journal sau applied cursor, có pagination và ACL hiện tại.",
+                  "en": "Read the journal after the applied cursor with pagination and current ACL checks."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "db",
+                "description": {
+                  "vi": "Đọc committed changes hoặc trả cursor expired/resnapshot theo retention.",
+                  "en": "Read committed changes or return cursor-expired/resnapshot under retention rules."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "b",
+                "description": {
+                  "vi": "Trả ordered entries và opaque next cursor trong đúng scope.",
+                  "en": "Return ordered entries and an opaque next cursor within the correct scope."
+                }
+              },
+              {
+                "from": "b",
+                "to": "blocks",
+                "description": {
+                  "vi": "Tải những block local chưa có bằng authorization cho version tương ứng.",
+                  "en": "Download locally missing blocks with authorization for the corresponding version."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "blobs",
+                "description": {
+                  "vi": "Đọc đúng immutable block version; verify integrity khi nhận.",
+                  "en": "Read the correct immutable block version; verify received integrity."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "b",
+                "description": {
+                  "vi": "Trả bytes; timeout không được advance applied cursor.",
+                  "en": "Return bytes; a timeout must not advance the applied cursor."
+                }
+              },
+              {
+                "from": "b",
+                "to": "local",
+                "description": {
+                  "vi": "Stage file, apply idempotently, recover filesystem/local DB rồi checkpoint cursor.",
+                  "en": "Stage the file, apply idempotently, recover filesystem/local-database state, then checkpoint the cursor."
+                }
+              }
+            ]
+          },
+          {
+            "id": "conflict",
+            "label": {
+              "vi": "Offline edit không được overwrite âm thầm",
+              "en": "Offline edits must not silently overwrite"
+            },
+            "steps": [
+              {
+                "from": "b",
+                "to": "api",
+                "description": {
+                  "vi": "B cũng sửa từ parentRev=5 và commit sau A.",
+                  "en": "B also edited from parentRev=5 and commits after A."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Commit có stable ID khác; không phải retry của A.",
+                  "en": "The commit has a different stable ID; it is not A’s retry."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "db",
+                "description": {
+                  "vi": "Current head đã là 6; CAS parent 5 không còn hợp lệ.",
+                  "en": "The current head is 6; the parent-5 CAS is no longer valid."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "b",
+                "description": {
+                  "vi": "Trả conflict, không ACK thành công và không bỏ local bytes.",
+                  "en": "Return a conflict without acknowledging success or discarding local bytes."
+                }
+              },
+              {
+                "from": "b",
+                "to": "local",
+                "description": {
+                  "vi": "Giữ pending edit, hỏi user hoặc thực hiện keep-both bằng operation mới idempotent.",
+                  "en": "Preserve the pending edit and ask the user or perform keep-both using a new idempotent operation."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "chunking",
+      "title": {
+        "vi": "5. Manifest là ordered chunks; dedup không làm mất thứ tự",
+        "en": "5. A manifest orders chunks; deduplication preserves positions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một version lưu danh sách chunk IDs theo thứ tự, mỗi phần có length và có thể offset, cộng tổng size/checksum theo contract. Cùng một chunk có thể xuất hiện hai lần trong file; storage có thể giữ một bản bytes nhưng manifest vẫn giữ cả hai vị trí. Missing set chỉ upload unique blocks chưa tồn tại/được phép reuse trong scope, không xóa repeated positions của file.",
+          "en": "A version stores ordered chunk IDs with lengths and optionally offsets, plus total size/checksums under its contract. A chunk can appear twice in a file: storage may retain one byte copy, but the manifest preserves both positions. Missing sets upload unique blocks not already present/authorized for reuse; they do not remove repeated file positions."
+        },
+        {
+          "vi": "Chunk nhỏ thường giảm byte phải truyền cho edit cục bộ nhưng tăng hash/index entries, manifest size, RPC/metadata và GC work. Chunk lớn giảm bookkeeping nhưng có thể retransmit nhiều hơn. Chọn bằng workload file size/edit patterns, CPU, memory, RTT và block-storage capabilities; không có kích thước tối ưu chung. Hash cache giúp tránh đọc lại khi có bằng chứng an toàn; mtime + size đơn lẻ không đủ vì timestamp có thể coarse hoặc được giữ nguyên.",
+          "en": "Smaller chunks can reduce transfer for localized edits but increase hash/index entries, manifests, RPC/metadata and collection work. Larger chunks reduce bookkeeping but can retransmit more. Choose using file/edit workloads, CPU, memory, RTT and storage capabilities; no size is universally best. Hash caches avoid rereads when supported by safe evidence, but mtime plus size alone is insufficient because timestamps may be coarse or preserved."
+        }
+      ],
+      "experiment": "sync-chunks"
+    },
+    {
+      "id": "chunk-boundaries",
+      "title": {
+        "vi": "6. Fixed boundaries, CDC và file bị re-export",
+        "en": "6. Fixed boundaries, CDC and re-exported files"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với fixed chunks 4 MiB, một byte được thay tại chỗ trong file không đổi size thường chỉ làm đổi chunk chứa byte đó; byte gần ranh giới vẫn thuộc đúng một chunk theo offset. Chèn một byte ở đầu làm dịch boundaries phía sau và có thể đổi gần như toàn bộ chunks. Không đồng nhất hai loại edit này. Demo dùng ASCII để thấy bytes và boundaries trực tiếp.",
+          "en": "With fixed 4 MiB chunks, changing an in-place byte without changing file size normally changes only its containing chunk, including bytes next to a boundary. Inserting one byte at the start shifts subsequent boundaries and can change nearly every chunk. Do not equate these edits. The demo uses ASCII to make bytes and boundaries visible."
+        },
+        {
+          "vi": "CDC chọn cut points từ content với min/max chunk bounds; sau insertion có thể tìm lại boundaries cũ ở vùng phía sau. Không bảo đảm “chỉ chunk đầu đổi”: phụ thuộc data, rolling-window state, min/max rules và edit location. Rolling fingerprint để tìm boundary khác cryptographic digest để address/verify chunk. Đo dedup ratio cùng CPU throughput, tail chunk distribution và memory; không suy từ một ví dụ rằng CDC luôn thắng.",
+          "en": "CDC chooses content-based cut points with minimum/maximum bounds and may resynchronize with earlier boundaries downstream of an insertion. It does not guarantee “only the first chunk changes”: data, rolling-window state, bounds and edit location matter. A rolling boundary fingerprint differs from a cryptographic addressing/integrity digest. Measure deduplication with CPU throughput, tail chunk sizes and memory; one example does not prove CDC always wins."
+        },
+        {
+          "vi": "Media editor re-export, compression stream hoặc randomized encryption có thể thay gần như mọi byte dù user chỉ sửa một chi tiết. Đừng hứa upload 4 MiB cho mọi lần sửa video 2 GB. Delta benefits còn đến từ copied files và shared versions; encrypted client-side designs phải xác định chunking trước/sau encryption và privacy policy.",
+          "en": "Media re-exports, compression streams and randomized encryption can change nearly all bytes after a small visible edit. Do not promise a 4 MiB upload for every edit to a 2 GB video. Copies and shared versions can also provide delta benefits; client-encrypted designs must specify chunking/encryption order and privacy policies."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Phương pháp cắt chunk",
+            "en": "Chunk-boundary method"
+          },
+          {
+            "vi": "Ưu điểm theo điều kiện",
+            "en": "Conditional strengths"
+          },
+          {
+            "vi": "Giới hạn cần đo",
+            "en": "Limits to measure"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Fixed size",
+              "en": "Fixed size"
+            },
+            {
+              "vi": "Boundary theo offset; bookkeeping đơn giản; hợp localized overwrite.",
+              "en": "Offset-based boundaries and simple bookkeeping; fits localized overwrites."
+            },
+            {
+              "vi": "Insertion có thể làm nhiều downstream chunks đổi.",
+              "en": "Insertions can change many downstream chunks."
+            }
+          ],
+          [
+            {
+              "vi": "Content-defined",
+              "en": "Content-defined"
+            },
+            {
+              "vi": "Có thể resynchronize sau byte insertion/deletion.",
+              "en": "Can resynchronize after byte insertions/deletions."
+            },
+            {
+              "vi": "Thêm CPU/parameters; không bảo đảm mọi format có delta nhỏ.",
+              "en": "Additional CPU/parameters; small deltas are not guaranteed for every format."
+            }
+          ],
+          [
+            {
+              "vi": "Whole-file transfer",
+              "en": "Whole-file transfer"
+            },
+            {
+              "vi": "Đơn giản, có thể hợp file nhỏ hoặc data thay toàn bộ.",
+              "en": "Simple, and can suit small files or fully rewritten data."
+            },
+            {
+              "vi": "Gửi lại mọi bytes dù một vùng nhỏ đổi.",
+              "en": "Retransmits all bytes even when only a small region changes."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "publish-protocol",
+      "title": {
+        "vi": "7. Từ uploaded block tới committed file: lấp khoảng hở với GC",
+        "en": "7. From uploaded blocks to committed files: close the GC gap"
+      },
+      "paragraphs": [
+        {
+          "vi": "Kiểm “block tồn tại” rồi commit sau đó không đủ: GC có thể xóa block trong khoảng giữa hai bước. Baseline dùng durable pending pins/receipts có expiry và protocol chuyển sang committed reachability có recovery. Pin phải còn hợp lệ tại commit, và collector phải đồng bộ với barrier/epoch hoặc metadata mà commit sử dụng. Một safety delay chỉ có tác dụng nếu bạn chứng minh giới hạn upload/commit/recovery tương ứng.",
+          "en": "Checking that a block exists before a later commit is insufficient: collection can remove it between the steps. The baseline uses durable expiring pending pins/receipts and a recoverable transition to committed reachability. Pins must remain valid at commit, and collectors must coordinate with the barrier/epoch or metadata used by commits. A safety delay helps only with proven upload/commit/recovery bounds."
+        },
+        {
+          "vi": "Không có transaction SQL tự động bao trùm object store. Thiết kế một protocol: persist verified block + pin; validate protected receipts; commit metadata/head/journal và durable reachability intent; reconciler hoàn tất protection handoff, collector tôn trọng cả pending và committed intents. Nếu chưa triển khai protocol đó thì không được trình bày vài lệnh SQL như bằng chứng không thể có dangling head.",
+          "en": "A SQL transaction does not automatically include object storage. Define a protocol: persist verified blocks and pins, validate protected receipts, commit metadata/heads/journals plus durable reachability intents, then reconcile the protection handoff while collectors respect both pending and committed intents. Without that protocol, a few SQL statements do not prove dangling heads are impossible."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Thứ tự publish một file version",
+          "en": "Publication order for a file version"
+        },
+        "caption": {
+          "vi": "Mỗi bước phải có retry identity, timeout và recovery; không giữ row lock trong suốt upload dài.",
+          "en": "Each step needs retry identities, timeouts and recovery; do not hold row locks throughout long uploads."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Prepare bytes",
+              "en": "Prepare bytes"
+            },
+            "detail": {
+              "vi": "Verify digest/length và persist immutable blocks dưới pending protection.",
+              "en": "Verify digests/lengths and persist immutable blocks under pending protection."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Commit truth",
+              "en": "Commit truth"
+            },
+            "detail": {
+              "vi": "CAS parent, version/head/result/journal/outbox trong metadata transaction.",
+              "en": "CAS parents and transactionally write versions, heads, results, journals and outboxes."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Recover protection",
+              "en": "Recover protection"
+            },
+            "detail": {
+              "vi": "Chuyển reachability theo protocol; collector không được xóa bytes còn được bảo vệ.",
+              "en": "Transfer reachability under a protocol; collectors cannot delete protected bytes."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Notify và reconcile",
+              "en": "Notify and reconcile"
+            },
+            "detail": {
+              "vi": "Hint có thể trễ; journal và periodic catch-up giữ device hội tụ.",
+              "en": "Hints may lag; journals and periodic catch-up drive convergence."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "data-model",
+      "title": {
+        "vi": "8. Stable identity tách khỏi path và các loại cursor",
+        "en": "8. Stable identities differ from paths and cursors"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng file_id ổn định thay vì lấy path làm identity duy nhất; rename đổi parent/name và journal entry, không upload lại bytes. Một namespace có file tree, version history và change order riêng. Shared mount trỏ tới namespace gốc; move qua hai namespace có thể cần workflow copy/delete với semantics rõ, không giả có transaction toàn cục miễn phí.",
+          "en": "Use stable file IDs instead of paths as sole identities: renames change parents/names and journal entries without reuploading bytes. A namespace has its own tree, history and change order. Shared mounts reference their source namespace; cross-namespace moves may require explicit copy/delete workflows rather than a free global transaction."
+        },
+        {
+          "vi": "File revision trả lời “nội dung/version nào của file”; journal cursor trả lời “device đã apply change feed tới đâu trong scope”; chúng không thay thế nhau. Opaque cursor có thể bao gồm epoch, pagination/filter state; không yêu cầu client đếm số nguyên liên tiếp khi ACL/filter/compaction làm visible entries không liên tục. Nếu dùng contiguous positions, server phải định nghĩa skip/abort semantics.",
+          "en": "File revisions identify file versions; journal cursors record how far devices have applied scoped change feeds. They are not interchangeable. Opaque cursors can encode epochs, pagination and filters; clients must not demand consecutive integers when ACLs/filters/compaction hide entries. Contiguous-position designs need explicit skip/abort semantics."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Entity đồng bộ",
+            "en": "Sync entity"
+          },
+          {
+            "vi": "Key và dữ liệu chính",
+            "en": "Key and main data"
+          },
+          {
+            "vi": "Invariant cần giữ / File Sync",
+            "en": "Invariant to preserve"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Namespace",
+              "en": "Namespace"
+            },
+            {
+              "vi": "ns_id, kind, owner, membership/ACL epoch",
+              "en": "ns_id, kind, owner, membership/ACL epoch"
+            },
+            {
+              "vi": "Authorize từng operation và trang đọc.",
+              "en": "Authorize each operation and read page."
+            }
+          ],
+          [
+            {
+              "vi": "File entry",
+              "en": "File entry"
+            },
+            {
+              "vi": "(ns_id, file_id), parent_id, name, head_rev, tombstone",
+              "en": "(ns_id, file_id), parent_id, name, head_rev, tombstone"
+            },
+            {
+              "vi": "Identity sống qua rename; unique name theo policy.",
+              "en": "Identity survives renames; names are unique under policy."
+            }
+          ],
+          [
+            {
+              "vi": "File version",
+              "en": "File version"
+            },
+            {
+              "vi": "(ns_id, file_id, rev), ordered blocks, size, device, commit time",
+              "en": "(ns_id, file_id, rev), ordered blocks, size, device, commit time"
+            },
+            {
+              "vi": "Immutable manifest và protected durable blocks.",
+              "en": "Immutable manifests and protected durable blocks."
+            }
+          ],
+          [
+            {
+              "vi": "Operation result",
+              "en": "Operation result"
+            },
+            {
+              "vi": "(principal/scope, op_id), payload fingerprint, result",
+              "en": "(principal/scope, op_id), payload fingerprint, result"
+            },
+            {
+              "vi": "Retry trả cùng result theo retention contract.",
+              "en": "Retries return the same result under retention promises."
+            }
+          ],
+          [
+            {
+              "vi": "Journal + outbox",
+              "en": "Journal + outbox"
+            },
+            {
+              "vi": "(ns_id, position), operation, file_id, rev, event",
+              "en": "(ns_id, position), operation, file_id, rev, event"
+            },
+            {
+              "vi": "Atomic với metadata change; hint có thể trùng.",
+              "en": "Atomic with metadata changes; hints may duplicate."
+            }
+          ],
+          [
+            {
+              "vi": "Block protection",
+              "en": "Block protection"
+            },
+            {
+              "vi": "scope, digest, object version, pin/reachability state",
+              "en": "scope, digest, object version, pin/reachability state"
+            },
+            {
+              "vi": "Không cấp quyền đọc chỉ vì biết digest.",
+              "en": "Knowing a digest alone never grants read access."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "journal",
+      "title": {
+        "vi": "9. Journal replay cần snapshot barrier và checkpoint đúng lúc",
+        "en": "9. Journal replay needs snapshot barriers and correctly timed checkpoints"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bootstrap phải nối initial tree snapshot với một journal position nhất quán. Chọn snapshot tại barrier/cursor, rồi replay changes sau barrier; nếu snapshot dài được phân trang, giữ consistency token hoặc thuật toán reconcile chống bỏ sót rename/delete giữa các page. “List hết rồi lấy cursor hiện tại” có thể bỏ qua một change xảy ra khi đang list.",
+          "en": "Bootstrap joins an initial tree snapshot to a consistent journal position. Read a snapshot at a barrier/cursor and replay later changes; paginated snapshots need consistency tokens or reconciliation that does not miss intervening renames/deletions. “List everything, then fetch the current cursor” can skip changes made during the listing."
+        },
+        {
+          "vi": "Device replay theo order cần thiết, fetch blocks, verify, staged apply và ghi durable local state trước khi advance applied cursor. File system và local DB thường không có cùng transaction: dùng recoverable operation log, temp file và atomic replacement khi platform hỗ trợ, cùng fsync/directory persistence theo durability target. Sau crash phải quyết định an toàn apply lại hoặc hoàn tất, không chỉ ghi cursor trước để nhìn có vẻ nhanh.",
+          "en": "Devices replay in the required order, fetch blocks, verify, stage application and persist local state before advancing applied cursors. Filesystems and local databases generally lack a shared transaction: use recoverable operation logs, temporary files and platform-supported atomic replacement with appropriate file/directory persistence. After crashes, safely replay or finish operations instead of checkpointing early to appear fast."
+        },
+        {
+          "vi": "Long poll/WebSocket chỉ nói namespace changed; coalesce được nhiều event. Nếu hint cuối bị mất trong khi connection vẫn sống, chỉ chờ reconnect sẽ làm device stale mãi: cần periodic journal poll, watermark check hoặc một recovery mechanism có bound rõ. Cursor hết retention trả explicit resnapshot; bảo vệ pending local edits trước khi reconcile lại remote snapshot.",
+          "en": "Long polling/WebSockets only signal changed namespaces and can coalesce events. Losing the final hint while a connection stays alive can leave a device stale indefinitely if recovery waits only for reconnects. Use periodic journal polls, watermark checks or another bounded recovery mechanism. Expired cursors require explicit resnapshotting that preserves pending local edits first."
+        }
+      ]
+    },
+    {
+      "id": "conflicts",
+      "title": {
+        "vi": "10. Hai offline edits: reject stale parent và giữ cả hai",
+        "en": "10. Two offline edits: reject stale parents and preserve both"
+      },
+      "paragraphs": [
+        {
+          "vi": "A và B cùng đọc revision 5. A commit thành 6; B đến sau với parent 5 phải nhận conflict thay vì overwrite. “First” ở đây là commit serialization order tại authority, không phải đồng hồ device. Upload blocks của B có thể đã xong nhưng chưa thay head; client giữ pending bytes và dùng explicit resolution policy.",
+          "en": "A and B both read revision 5. A commits revision 6; B later submitting parent 5 receives a conflict rather than overwriting. “First” means authoritative commit serialization order, not device clocks. B’s blocks may already be uploaded without changing the head; the client retains pending bytes and uses an explicit resolution policy."
+        },
+        {
+          "vi": "Keep-both tạo conflict copy với file ID mới và tên không đụng nhau theo filesystem policy. Resolution operation cũng idempotent để retry không tạo mười copies. User có thể so sánh/merge bằng ứng dụng hiểu format rồi commit một version mới. Silent overwrite làm mất update ở current head; có thể vẫn còn version history, nhưng đó không phải lý do bỏ conflict signal. OT/CRDT là lựa chọn ở application model phù hợp, không tự merge mọi binary.",
+          "en": "Keep-both creates a new file ID and a conflict-copy name that respects filesystem naming policies. Resolution operations are idempotent so retries do not create ten copies. Users can compare/merge in a format-aware application and commit a new version. Silent overwrites lose updates at the current head; surviving history is not a reason to omit conflict signals. OT/CRDT applies to suitable application models, not arbitrary binary merging."
+        }
+      ],
+      "experiment": "sync-conflict"
+    },
+    {
+      "id": "client-correctness",
+      "title": {
+        "vi": "11. Client đúng phải xử lý rename, placeholder và partial write",
+        "en": "11. Correct clients handle renames, placeholders and partial writes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Filesystem watcher là hint và có thể coalesce/drop events; cần local durable index và reconciliation scan. App có thể ghi temp rồi rename, mở file khi hash đang chạy, hoặc giữ mtime/size khi bytes đổi. Kiểm file identity và stability của snapshot được hash; nếu thay trong lúc đọc thì retry theo policy. Không suy “không có watcher event = server và disk giống nhau”.",
+          "en": "Filesystem watchers are hints and can coalesce/drop events; use durable local indexes and reconciliation scans. Applications may write temporary files then rename, modify files during hashing or preserve timestamps/sizes despite changed bytes. Validate file identities and hashed-snapshot stability, retrying under policy when files change during reads. No watcher event does not prove disk and server equality."
+        },
+        {
+          "vi": "Case-insensitive volumes, Unicode name normalization, reserved names, symlink và path traversal cần rules rõ cho mỗi platform. Remote a.txt và A.txt có thể không cùng tồn tại trên một volume; tạo representable conflict name hoặc báo lỗi có thể phục hồi. Không follow symlink ra ngoài sync root một cách mù quáng. Rename dựa trên stable ID giúp tránh hiểu thành delete + upload toàn file.",
+          "en": "Case-insensitive volumes, Unicode normalization, reserved names, symlinks and path traversal need explicit platform rules. Remote a.txt and A.txt may not coexist on a volume; use representable conflict names or recoverable errors. Do not blindly follow symlinks outside the sync root. Stable-ID renames avoid treating moves as deletion plus full reupload."
+        },
+        {
+          "vi": "Selective sync và online-only placeholder không phải user delete. Tombstone từ remote khác file chưa tải; local state phải phân biệt hydrated, placeholder, excluded, pending edit và deleted. Khi nhận remote delete nhưng local có unsynced edit, bảo vệ local content rồi resolve thay vì xóa thẳng. Tombstone retention/cursor expiry phải được kiểm với device offline lâu.",
+          "en": "Selective sync and online-only placeholders are not user deletions. Remote tombstones differ from undownloaded files; local state must distinguish hydrated files, placeholders, exclusions, pending edits and deletions. Preserve unsynchronized content before resolving remote-delete/local-edit conflicts. Test tombstone retention and cursor expiry against long-offline devices."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Bytes chưa sync",
+            "en": "Unsynchronized bytes"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Không xóa khi resnapshot hoặc khi remote delete đụng local edit.",
+              "en": "Preserve them during resnapshotting and remote-delete/local-edit conflicts."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Apply có recovery",
+            "en": "Recoverable application"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Staged operations có durable identity và đường hoàn tất/replay sau crash.",
+              "en": "Staged operations have durable identities and crash completion/replay paths."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Rollout client",
+            "en": "Client rollout"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Canary, model-based tests và kill switch cho bug gây destructive reconciliation.",
+              "en": "Use canaries, model-based tests and kill switches for destructive reconciliation bugs."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "history-gc",
+      "title": {
+        "vi": "12. History, restore và GC phải cùng hiểu reachability",
+        "en": "12. History, restores and collection share reachability rules"
+      },
+      "paragraphs": [
+        {
+          "vi": "Block còn được current head, retained versions, pending uploads/commits hoặc backup policy tham chiếu thì không thể thu gom chỉ vì file path đã delete. Reference counting cần idempotent increment/decrement và recovery cho lost/duplicate events; mark-and-sweep cần consistent reachability barrier/epoch. Chọn và chứng minh một protocol thay vì chỉ ghi “GC sau 24 giờ”.",
+          "en": "Blocks referenced by current heads, retained versions, pending uploads/commits or backup policies cannot be collected merely because a path was deleted. Reference counting needs idempotent increments/decrements and recovery from lost/duplicate events; mark-and-sweep needs consistent reachability barriers/epochs. Choose and justify a protocol instead of merely saying “collect after twenty-four hours.”"
+        },
+        {
+          "vi": "Restore tạo head revision mới và journal event trỏ tới manifest cũ còn giữ bytes, không giảm revision counter hoặc rewind cursor toàn namespace. Có thể rẻ về metadata nhưng cold-tier bytes phải hydrate, authorization vẫn phải kiểm và storage reads vẫn tốn thời gian. Nếu version đã hết retention/bytes bị xóa theo policy thì không hứa restore được.",
+          "en": "Restore creates a new head revision and journal event referencing a retained manifest, rather than decrementing revision counters or rewinding namespace cursors. Metadata work can be cheap, but cold-tier bytes may need hydration, authorization still applies and reads still take time. Versions whose retained bytes have expired cannot be promised restorable."
+        },
+        {
+          "vi": "3× replication dùng ba bản bytes; coding 10 data + 4 parity có overhead nominal 1,4× trước metadata/repair/headroom. Với 500 PB unique bytes, arithmetic là 1.500 PB so với 700 PB. Không suy ra “durability tương đương” từ overhead: placement, correlated failures, repair time, corruption detection và degraded-read latency mới quyết định reliability. Tier old versions cần đo access distribution, restore SLO và cost, không gán một mốc ngày đúng cho mọi workload.",
+          "en": "Threefold replication stores three byte copies; ten data plus four parity shards have nominal 1.4-fold overhead before metadata, repair and headroom. For 500 PB of unique bytes, arithmetic yields 1,500 PB versus 700 PB. Overhead alone does not establish equivalent durability: placement, correlated failures, repair time, corruption detection and degraded-read latency determine reliability. Tiering old versions needs measured access distributions, restore SLOs and costs rather than a universal age threshold."
+        }
+      ]
+    },
+    {
+      "id": "security-scale",
+      "title": {
+        "vi": "13. Dedup privacy, shared folders và hot namespaces",
+        "en": "13. Deduplication privacy, shared folders and hot namespaces"
+      },
+      "paragraphs": [
+        {
+          "vi": "Global dedup/existence APIs có thể tạo oracle: attacker đo xem một content đã được người khác lưu chưa. Per-user/tenant scope, authorization/proof-of-possession protocols phù hợp và traffic policy có trade-off bandwidth/storage; chỉ biết hash không đủ để claim/download file. Convergent encryption còn có confirmation/dictionary risks với predictable content, không phải bản vá privacy chung. Randomized encryption, tenant keys, rotation và recovery phải được thiết kế cùng dedup policy; không tự invent crypto.",
+          "en": "Global deduplication/existence APIs can create an oracle revealing whether someone else stored content. User/tenant scopes, suitable authorization/proof-of-possession protocols and traffic policies trade bandwidth/storage against privacy; knowing a hash is insufficient to claim/download a file. Convergent encryption retains confirmation/dictionary risks for predictable content and is not a general privacy fix. Design randomized encryption, tenant keys, rotation and recovery alongside deduplication policies rather than inventing cryptography."
+        },
+        {
+          "vi": "Shared folders là authorization boundary sống: kiểm ACL khi commit, journal page và block download; revoke giữa upload và commit phải bị xử lý. Signed capability cần scope/expiry phù hợp, nhưng không thể thu hồi bytes recipient đã tải. Encryption-at-rest không đồng nghĩa E2EE; E2EE đổi sharing/key recovery, content scanning và dedup scope.",
+          "en": "Shared folders are live authorization boundaries: check ACLs on commits, journal pages and block downloads, including revocation between upload and commit. Signed capabilities need appropriate scopes/expiry but cannot recall bytes recipients already downloaded. Encryption at rest is not E2EE; E2EE changes sharing/key recovery, scanning and deduplication scopes."
+        },
+        {
+          "vi": "Shard metadata theo namespace giúp giữ transaction local nhưng một team folder rất nóng vẫn có owner/order bottleneck. Batch/coalesce notifications, bounded journal pages, admission/quota và fair scheduling giúp trước khi tách namespace. Nếu cần partition một namespace thì phải định nghĩa lại order, rename/move atomicity và cursor; consistent hashing đơn thuần không tạo cross-shard transaction. Failover home region cần fencing và durability/RPO contract, không cho hai writer tự cấp cùng head revision.",
+          "en": "Namespace sharding keeps transactions local but very hot team folders can still bottleneck ownership/order. Batch/coalesce notifications, bound journal pages and apply admission/quotas/fair scheduling before splitting namespaces. Partitioning a namespace requires new ordering, rename/move atomicity and cursor semantics; consistent hashing alone supplies no cross-shard transaction. Home-region failover needs fencing and explicit durability/RPO contracts, not two writers independently assigning the same head revision."
+        }
+      ]
+    },
+    {
+      "id": "failure-review",
+      "title": {
+        "vi": "14. Kiểm thử từ bytes được ACK tới file xuất hiện trên disk",
+        "en": "14. Test from acknowledged bytes to files appearing on disk"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo upload-to-commit, commit-to-device-applied, pending operation age, journal lag, stale-parent conflicts, integrity failures, orphan/pin age, GC backlog và restore success/time. Tách no-network, quota, disk full và denied permissions khỏi server errors; đừng coi request 200 là đã sync xong nếu filesystem apply còn thất bại. Theo dõi các metric theo client version/platform/namespace size để phát hiện rollout regression.",
+          "en": "Measure upload-to-commit, commit-to-device-applied, pending-operation ages, journal lag, stale-parent conflicts, integrity failures, orphan/pin ages, collection backlogs and restore success/time. Separate offline states, quotas, full disks and denied permissions from server errors. A 200 response does not establish synchronization if filesystem application failed. Segment by client version, platform and namespace size to detect rollout regressions."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault được inject",
+            "en": "Injected fault"
+          },
+          {
+            "vi": "Kết quả đúng cần quan sát",
+            "en": "Required observable result"
+          },
+          {
+            "vi": "Điểm khôi phục",
+            "en": "Recovery point"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Upload xong, chưa commit thì crash",
+              "en": "Crash after upload but before commit"
+            },
+            {
+              "vi": "Head không đổi; pending bytes không bị hiểu là published file.",
+              "en": "The head is unchanged; pending bytes are not treated as published files."
+            },
+            {
+              "vi": "Resume/expiry pin và orphan cleanup đúng protocol.",
+              "en": "Protocol-correct pin resume/expiry and orphan cleanup."
+            }
+          ],
+          [
+            {
+              "vi": "Commit xong, mất ACK",
+              "en": "Commit succeeds but ACK is lost"
+            },
+            {
+              "vi": "Retry cùng op ID nhận cùng revision.",
+              "en": "The same operation ID returns the same revision."
+            },
+            {
+              "vi": "Stored result atomic với head/journal.",
+              "en": "The stored result is atomic with heads/journals."
+            }
+          ],
+          [
+            {
+              "vi": "GC chạy đúng lúc commit",
+              "en": "Collection races a commit"
+            },
+            {
+              "vi": "Không có ACK head trỏ tới collected bytes.",
+              "en": "No acknowledged head points to collected bytes."
+            },
+            {
+              "vi": "Protection handoff và recovery intent được honor.",
+              "en": "Protection handoffs and recovery intents are honored."
+            }
+          ],
+          [
+            {
+              "vi": "Mất hint cuối, socket còn sống",
+              "en": "Final hint lost with a live socket"
+            },
+            {
+              "vi": "Device bắt kịp trong bound đã công bố.",
+              "en": "Devices catch up within the declared bound."
+            },
+            {
+              "vi": "Periodic reconcile/watermark, không chỉ reconnect.",
+              "en": "Periodic reconciliation/watermarks, not reconnect alone."
+            }
+          ],
+          [
+            {
+              "vi": "Disk full khi apply page",
+              "en": "Disk fills during page application"
+            },
+            {
+              "vi": "Không advance applied cursor vượt changes chưa apply.",
+              "en": "The applied cursor does not pass unapplied changes."
+            },
+            {
+              "vi": "Resume staged apply sau giải phóng disk.",
+              "en": "Resume staged application after freeing space."
+            }
+          ],
+          [
+            {
+              "vi": "ACL revoke giữa hai journal pages",
+              "en": "ACL revoked between journal pages"
+            },
+            {
+              "vi": "Không leak content/page tiếp theo ngoài quyền mới.",
+              "en": "No subsequent pages/content leak beyond current permissions."
+            },
+            {
+              "vi": "Reauthorize và xử lý local retained data theo policy.",
+              "en": "Reauthorize and handle retained local data under policy."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "15. Câu hỏi phỏng vấn và lời giải theo invariant",
+        "en": "15. Interview questions and invariant-based reasoning"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi câu trả lời nên nói rõ bytes, identity, ordering boundary và recovery. Thử thay một assumption rồi kiểm lại guarantee thay vì liệt kê object store + Redis + queue như một đáp án hoàn chỉnh.",
+          "en": "Explain bytes, identities, ordering boundaries and recovery in each answer. Change an assumption and recheck guarantees rather than treating object storage plus Redis plus a queue as a complete answer."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Sửa một byte trong file 2 GB thì upload bao nhiêu?",
+            "en": "How much is uploaded after a one-byte edit to a 2 GB file?"
+          },
+          "answer": [
+            {
+              "vi": "Nếu là overwrite tại chỗ và fixed 4 MiB chunks, thường một chunk đổi; cần upload chunk đó nếu server chưa có trong scope, rồi commit manifest. Nếu insertion ở đầu, boundaries dịch nên nhiều chunks có thể đổi. CDC có thể resynchronize nhưng không bảo đảm chỉ một chunk. Media re-export có thể rewrite toàn file.",
+              "en": "An in-place overwrite with fixed 4 MiB chunks normally changes one chunk. Upload it if absent from the authorized scope, then commit the manifest. An insertion near the start shifts boundaries and can change many chunks. CDC may resynchronize without guaranteeing a single changed chunk. Media re-exports can rewrite the entire file."
+            }
+          ],
+          "followup": {
+            "vi": "Hash cache dựa vào mtime và size có bỏ sót bytes đổi không?",
+            "en": "Can an mtime-and-size hash cache miss changed bytes?"
+          }
+        },
+        {
+          "question": {
+            "vi": "A và B cùng commit parentRev=5 thì ai thắng?",
+            "en": "Who wins when A and B both commit parentRev=5?"
+          },
+          "answer": [
+            {
+              "vi": "Authority serialize CAS: commit đầu được nhận trở thành 6, commit stale còn lại nhận conflict. Clock device không quyết định. Giữ pending local bytes; keep-both tạo file ID mới bằng operation idempotent hoặc user merge bằng ứng dụng hiểu format.",
+              "en": "The authority serializes CAS operations: the first accepted commit becomes revision 6 and the other stale commit conflicts. Device clocks do not decide. Preserve pending bytes; keep-both creates a new file ID idempotently, or a user merges with a format-aware application."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể check block rồi transaction metadata là đủ tránh missing bytes chưa?",
+            "en": "Does checking blocks before a metadata transaction prevent missing bytes?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. GC có thể xóa ở giữa. Cần protocol pending pins/protected receipts và durable reachability handoff với collector/reconciler; transaction SQL không tự bao object store. Test crash và expiry đúng điểm giữa các bước.",
+              "en": "No. Collection can delete blocks between those operations. Use pending pins/protected receipts and durable reachability handoffs with collectors/reconcilers; SQL transactions do not automatically include object stores. Test crashes and expiry at the gaps."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Notification bị mất thì journal có tự làm device bắt kịp không?",
+            "en": "Does a journal alone make devices catch up after a lost notification?"
+          },
+          "answer": [
+            {
+              "vi": "Journal giữ authority nhưng device vẫn phải đọc nó. Nếu hint cuối mất khi socket sống, cần periodic poll/watermark hoặc recovery trigger có bound. Khi đọc, fetch/verify/apply rồi checkpoint; cursor hết retention thì resnapshot và giữ local pending edits.",
+              "en": "A journal preserves authority but devices must still read it. Losing the last hint on a live socket needs periodic polling/watermarks or another bounded recovery trigger. Fetch, verify and apply before checkpointing; expired cursors require resnapshotting that preserves pending edits."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Rename file lớn có cần upload lại toàn bộ không?",
+            "en": "Does renaming a large file require a full reupload?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu identity ổn định và bytes không đổi: update parent/name và journal với concurrency rules. Path không nên là identity duy nhất. Cross-namespace move, filename collisions và filesystem case/Unicode rules có semantics riêng cần giải thích.",
+              "en": "Not with stable identities and unchanged bytes: update parent/name and journals under concurrency rules. Paths should not be sole identities. Cross-namespace moves, name collisions and filesystem case/Unicode rules need explicit semantics."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Global dedup giúp tiết kiệm thì cứ bật cho mọi tenant được không?",
+            "en": "Should global deduplication be enabled for every tenant to save space?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động. Existence/timing có thể lộ content presence; digest không chứng minh quyền đọc. Chọn scope, encryption và authorization theo privacy model. Convergent encryption không xóa confirmation/dictionary risk; cân bandwidth/storage với isolation.",
+              "en": "Not automatically. Existence/timing can reveal content presence, and digests do not establish read rights. Choose scopes, encryption and authorization under the privacy model. Convergent encryption does not remove confirmation/dictionary risks; balance bandwidth/storage with isolation."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "10+4 coding có durability giống 3 replicas không?",
+            "en": "Does 10+4 coding have the same durability as three replicas?"
+          },
+          "answer": [
+            {
+              "vi": "Không kết luận được từ số shard. 1,4× và 3× là storage arithmetic; reliability phụ thuộc placement, fault correlation, repair, scrubbing và operational errors. Test degraded reads/restore SLO cùng cost trước khi chọn.",
+              "en": "Shard counts alone cannot establish that. The 1.4-fold and threefold values are storage arithmetic; reliability depends on placement, correlated faults, repair, scrubbing and operational errors. Test degraded reads/restore SLOs alongside costs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Restore revision cũ có nên giảm head revision về số cũ không?",
+            "en": "Should restoring an old version lower the head revision?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Tạo revision mới tham chiếu manifest cũ còn retained và append journal event. Điều này giữ monotonic history/cursor semantics; check authorization và bytes availability, tính cả cold-tier restore latency.",
+              "en": "No. Create a new revision referencing a retained old manifest and append a journal event. This preserves monotonic history/cursor semantics; check authorization and byte availability, including cold-tier restore latency."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -185,7 +185,7 @@ export default function ShortLinkPlayground({ kind }: { kind: 'url-space' | 'red
               </button>
             ))}
           </div>
-          <pre>
+          <pre tabIndex={0} role="region" aria-label="HTTP redirect response">
             <code>{`HTTP/1.1 ${status} ${status === 301 ? 'Moved Permanently' : 'Found'}\nLocation: https://target.example/A\nCache-Control: ${policy === 'fresh' ? 'public, max-age=' + ttl : policy}`}</code>
           </pre>
           <ol className="redirect-replay">

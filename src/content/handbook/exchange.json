@@ -1,0 +1,1430 @@
+{
+  "id": "exchange",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Stock Exchange: matching, committed replay và risk",
+    "en": "Designing a Stock Exchange: matching, committed replay and risk"
+  },
+  "summary": {
+    "vi": "Theo dõi price-time book, stable execution identities, failover authority và shared account reservations bằng sơ đồ và ba mô phỏng có giả định rõ.",
+    "en": "Explore price-time books, stable execution identities, failover authority and shared account reservations through diagrams and three explicit models."
+  },
+  "prerequisites": [
+    "consistency",
+    "messaging",
+    "payments",
+    "databases"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "database",
+    "observability",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Accepted, committed, executed và published không phải cùng một boundary.",
+      "en": "Accepted, committed, executed and published are different boundaries."
+    },
+    {
+      "vi": "Rulebook xác định price/time, replace, cancel race và trading modes.",
+      "en": "Rulebooks define priority, replacements, cancellation races and trading modes."
+    },
+    {
+      "vi": "Replay cần full state, fixed rules và mọi input ảnh hưởng quyết định.",
+      "en": "Replay requires full state, pinned rules and every decision-relevant input."
+    },
+    {
+      "vi": "Caught-up replica vẫn cần external authority; stable fill IDs vượt qua leadership epoch.",
+      "en": "Caught-up replicas still need external authority; stable fill identities survive epochs."
+    },
+    {
+      "vi": "Shared account budgets cần atomic/conservative reservations và idempotent release.",
+      "en": "Shared budgets require atomic/conservative reservations and idempotent release."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Đi theo một command tới các consumer",
+      "en": "Trace one command through its consumers"
+    },
+    "caption": {
+      "vi": "Giữ đúng order, budget và identity tại từng boundary.",
+      "en": "Preserve ordering, budgets and identities at each boundary."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Admit / reserve",
+          "en": "Admit and reserve"
+        },
+        "detail": {
+          "vi": "Session, bounded input và account budget.",
+          "en": "Sessions, bounded inputs and account budgets."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Commit / match",
+          "en": "Commit and match"
+        },
+        "detail": {
+          "vi": "Durable order, explicit rules, quantity conservation.",
+          "en": "Durable ordering, explicit rules and conserved quantities."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Publish / project",
+          "en": "Publish and project"
+        },
+        "detail": {
+          "vi": "Private reports, feed sequence và stable output IDs.",
+          "en": "Private reports, feed sequences and stable output IDs."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Replay / fence",
+          "en": "Replay and fence"
+        },
+        "detail": {
+          "vi": "Full state, committed cut và external authority.",
+          "en": "Full state, committed cuts and external authority."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Chốt market model và những invariant phải giữ",
+        "en": "1. Define the market model and its invariants"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài này thiết kế một continuous limit-order exchange minh họa: nhận/cancel/replace lệnh, price-time priority theo symbol, private execution reports và public market data. Limit orders còn dư được rest GTC; market orders là IOC và expire phần chưa khớp. Lệnh crossing thực hiện tại resting maker price trong baseline. Đây là rulebook học tập, không khẳng định mọi venue hoặc mọi order type có cùng behavior. Auctions, hidden/reserve/pegged orders, options và margin phức tạp cần specification riêng.",
+          "en": "This educational continuous exchange accepts, cancels and replaces orders with per-symbol price-time priority, private execution reports and public market data. Residual limits rest as GTC orders; markets are IOC and expire unfilled quantities. Crossing orders execute at resting-maker prices in this baseline. These rules are not universal across venues or order types. Auctions, hidden/reserve/pegged orders, derivatives and complex margin need separate specifications."
+        },
+        {
+          "vi": "Các invariant chính: một committed command được apply theo đúng thứ tự; cùng quantity không khớp hai lần; reject không tự tạo order; mọi execution có stable identity; account reservations không vượt hard budget. Accepted không đồng nghĩa filled. Client mất connection sau submit phải coi outcome là unknown cho tới khi recovery protocol xác định, không gửi lại một business ID mới rồi vô tình tạo lệnh thứ hai.",
+          "en": "Core invariants require ordered application of committed commands, no double execution of quantities, no orders created by rejection, stable execution identities and reservations within hard account budgets. Accepted does not mean filled. Disconnections after submission leave unknown outcomes until recovery; using a fresh business ID can accidentally create a second order."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Matching correctness",
+            "en": "Matching correctness"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Price priority, FIFO và quantity conservation theo rulebook.",
+              "en": "Price priority, FIFO and quantity conservation under explicit rules."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Recovery correctness",
+            "en": "Recovery correctness"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Committed cut, full state, deterministic replay và fenced outputs.",
+              "en": "Committed cuts, full state, deterministic replay and fenced outputs."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Risk correctness",
+            "en": "Risk correctness"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Shared account budget có atomic/conservative reservation lifecycle.",
+              "en": "Shared account budgets use atomic or conservative reservation lifecycles."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Service budget không phải latency benchmark",
+        "en": "2. Service budgets are not latency benchmarks"
+      },
+      "paragraphs": [
+        {
+          "vi": "Để tách average khỏi peak, một workload giả định khác có 100 triệu commands trong phiên 23.400 giây: khoảng 4.274 commands/s trung bình và 12,8 GB input payload nếu 128 B/command. Peak 400K/s gần 94 lần average này; không nhân peak cả phiên rồi gọi đó là daily forecast. Dùng distribution và burst duration để provision queue/log/output headroom; các số sau chủ ý trình bày peak-sustained upper scenario riêng.",
+          "en": "To separate average from peak, an illustrative workload of 100 million commands over 23,400 seconds averages about 4,274 commands/s and 12.8 GB of 128-byte input payloads. A 400K/s peak is nearly 94 times that average; sustaining it throughout the session is not a daily forecast. Distributions and burst durations guide queue/log/output reserves; the following numbers intentionally show a separate peak-sustained upper scenario."
+        },
+        {
+          "vi": "Giả định peak entry 400.000 commands/s cho một capacity exercise, payload trung bình 128 B và ngày giao dịch 6,5 giờ. Payload ingress là 51,2 MB/s; nếu duy trì peak toàn phiên thì 9,36 tỷ commands và khoảng 1,198 TB payload trước indexes/replicas/framing. Đây là upper scenario theo giả định, không phải traffic thật hay log-size prediction. Cancels/replace và rejects vẫn tiêu CPU/network dù không có trades. Output fan-out thay đổi theo số fills và feed messages mỗi command.",
+          "en": "For a sizing exercise, assume 400,000 peak commands/s, 128-byte mean payloads and a 6.5-hour session. Payload ingress is 51.2 MB/s; sustaining that peak throughout the session yields 9.36 billion commands and about 1.198 TB before framing/indexes/replicas. This is a conditional scenario rather than measured traffic or a log-size prediction. Cancels, replacements and rejections consume resources without trades; output work varies with fills and feed messages."
+        },
+        {
+          "vi": "1 /400.000 = 2,5 μs là reciprocal average service-capacity budget nếu một serial owner phải gánh toàn rate, không phải end-to-end latency cam kết hoặc bằng chứng một core làm được. Nếu utilization đã gần 100%, burst và variable-cost commands tạo queueing lớn. Đo tail latency từ network boundary đã nêu, queue depth/age, persistence latency, fills per command và recovery lag. Chốt SLO riêng cho accepted/rejected reports, trade publication và failover.",
+          "en": "The reciprocal 2.5 μs is an average service-capacity budget for a serial owner handling the entire rate, not a promised end-to-end latency or proof that one core is sufficient. Near saturation, bursts and variable-cost commands cause queueing. Measure tails at defined network boundaries alongside queue depth/age, persistence, fills per command and recovery lag. Acceptance, trade publication and failover need separate objectives."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Giả định",
+            "en": "Assumption"
+          },
+          {
+            "vi": "Phép tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Kết quả có điều kiện",
+            "en": "Conditional result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Payload ingress",
+              "en": "Payload ingress"
+            },
+            {
+              "vi": "400K/s ×128B",
+              "en": "400K/s ×128B"
+            },
+            {
+              "vi": "51,2 MB/s",
+              "en": "51.2 MB/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak cả phiên",
+              "en": "Peak throughout session"
+            },
+            {
+              "vi": "400K ×23.400s",
+              "en": "400K ×23,400s"
+            },
+            {
+              "vi": "9,36B commands",
+              "en": "9.36B commands"
+            }
+          ],
+          [
+            {
+              "vi": "Input payload/session",
+              "en": "Input payload/session"
+            },
+            {
+              "vi": "9,36B ×128B",
+              "en": "9.36B ×128B"
+            },
+            {
+              "vi": "≈1,198 TB",
+              "en": "≈1.198 TB"
+            }
+          ],
+          [
+            {
+              "vi": "Serial budget",
+              "en": "Serial budget"
+            },
+            {
+              "vi": "1 /400K",
+              "en": "1 /400K"
+            },
+            {
+              "vi": "2,5 μs/command; không là latency SLO",
+              "en": "2.5 μs/command; not a latency SLO"
+            }
+          ],
+          [
+            {
+              "vi": "Giả định 4 outputs/command",
+              "en": "Assumed 4 outputs/command"
+            },
+            {
+              "vi": "400K ×4",
+              "en": "400K ×4"
+            },
+            {
+              "vi": "1,6M outputs/s trước fan-out",
+              "en": "1.6M outputs/s before fan-out"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "protocols",
+      "title": {
+        "vi": "3. Phân biệt wire session, business command và engine index",
+        "en": "3. Separate wire sessions, business commands and engine indexes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Entry có thể dùng FIX session/application messages hoặc binary order-entry protocol; REST phù hợp cho admin/query nhưng không được giả vờ là cùng hot-path wire contract. Native market-data protocol cũng khác browser WebSocket relay. Message decoding phải bounded, validate integer price ticks/lot size, principal/account quyền giao dịch và session state; malformed input không được làm book loop block vô hạn.",
+          "en": "Entry can use FIX session/application messages or binary order-entry protocols; administrative/query REST APIs are not the same hot-path wire contract. Native market data also differs from browser WebSocket relays. Bound decoding and validate integer ticks/lots, principals/accounts and session state so malformed inputs cannot stall book ownership."
+        },
+        {
+          "vi": "Session sequence phục vụ transport/session recovery; scoped client command ID phục vụ business dedup; engine index xác định total order trong một shard. Chúng không thay thế nhau. Gửi cùng command ID với payload khác phải reject conflict. Dedup phải giữ result và thời hạn/scope rõ qua reconnect/failover; một cache ngắn ở gateway không đủ nếu engine đã nhận nhưng gateway mất response. Receipt ACK, durable acceptance và execution report phải được đặt tên/định nghĩa riêng.",
+          "en": "Session sequences support session recovery, scoped client IDs support business deduplication and engine indexes order a shard. They are not interchangeable. Reusing an ID with different payloads must conflict. Results and dedup scope/retention must survive reconnects/failovers; short gateway caches are insufficient after ambiguous responses. Define receipt acknowledgements, durable acceptance and execution reports separately."
+        }
+      ],
+      "api": [
+        {
+          "method": "ENTRY",
+          "path": "NewOrder",
+          "description": {
+            "vi": "Một command business; không phải endpoint HTTP.",
+            "en": "A business command, not an HTTP endpoint."
+          },
+          "request": "{account, clientCommandId, symbol, side, type, limitTicks?, qtyLots, tif, ruleVersion}",
+          "response": "Accepted | Rejected; executions may follow; retained result recoverable"
+        },
+        {
+          "method": "ENTRY",
+          "path": "Cancel / Reduce / Replace",
+          "description": {
+            "vi": "Target identity và operation-specific priority rules.",
+            "en": "Target identities and operation-specific priority rules."
+          },
+          "request": "{clientCommandId, targetOrderId, qtyLots?, limitTicks?}",
+          "response": "Applied | NotFound | Invalid | Duplicate | IDConflict"
+        },
+        {
+          "method": "REPORT",
+          "path": "ExecutionReport",
+          "description": {
+            "vi": "Private report được authorize theo account.",
+            "en": "An account-authorized private report."
+          },
+          "response": "{outputId, commandId, orderId, execId?, lastQty?, leavesQty, status, engineIndex}"
+        },
+        {
+          "method": "FEED",
+          "path": "Sequenced delta / snapshot",
+          "description": {
+            "vi": "Channel/session sequence và snapshot barrier; public projection không chứa account secrets.",
+            "en": "Channel/session sequences and snapshot barriers protect public projections."
+          },
+          "response": "{feedSession, channel, sequence, event}; snapshot {barrier, levelsOrOrders}"
+        }
+      ]
+    },
+    {
+      "id": "state-model",
+      "title": {
+        "vi": "4. State model: identity, ownership và recovery cut",
+        "en": "4. State model: identity, ownership and recovery cuts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Không đặt một SQL transaction trên hot path cho mỗi fill chỉ để có bảng đẹp. Book state thường in-memory với authoritative log/snapshot; relational projections phục vụ query/audit theo freshness contract. Mỗi record phải nói ai được mutate, identity có reuse không và recovery cut nào bảo vệ nó. Execution side effects ở risk/post-trade cần cùng business identity nhưng không mặc định share một database transaction với matching.",
+          "en": "Do not add per-fill hot-path SQL transactions merely to fit a table design. In-memory books can use authoritative logs/snapshots with relational projections for queries/audits under freshness contracts. Records need mutation ownership, identity-reuse rules and recovery cuts. Risk/post-trade effects share business identities without implicitly sharing database transactions with matching."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "State",
+            "en": "State"
+          },
+          {
+            "vi": "Fields / identity",
+            "en": "Fields / identity"
+          },
+          {
+            "vi": "Invariant / ownership",
+            "en": "Invariant / ownership"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Resting order",
+              "en": "Resting order"
+            },
+            {
+              "vi": "orderId, account, symbol, side, ticks, leavesQty, priorityIndex",
+              "en": "orderId, account, symbol, side, ticks, leavesQty, priorityIndex"
+            },
+            {
+              "vi": "Book owner; exact FIFO và positive leaves.",
+              "en": "Book owner; exact FIFO and positive remaining quantities."
+            }
+          ],
+          [
+            {
+              "vi": "Command result",
+              "en": "Command result"
+            },
+            {
+              "vi": "scope + clientCommandId, canonical payload, retained result",
+              "en": "scope + clientCommandId, canonical payload, retained result"
+            },
+            {
+              "vi": "Same payload trả result; khác payload conflict; retention qua retries.",
+              "en": "Same payload returns results; changed payload conflicts; retention spans retries."
+            }
+          ],
+          [
+            {
+              "vi": "Execution",
+              "en": "Execution"
+            },
+            {
+              "vi": "logSession + shard + index + ordinal, maker/taker, ticks, lots",
+              "en": "logSession + shard + index + ordinal, maker/taker, ticks, lots"
+            },
+            {
+              "vi": "Immutable business identity; epoch chỉ fence publisher.",
+              "en": "Immutable business identities; epochs only fence publishers."
+            }
+          ],
+          [
+            {
+              "vi": "Reservation",
+              "en": "Reservation"
+            },
+            {
+              "vi": "reservationId, account, amount, state, consumed/released event IDs",
+              "en": "reservationId, account, amount, state, consumed/released event IDs"
+            },
+            {
+              "vi": "Risk authority; atomic reserve và idempotent lifecycle.",
+              "en": "Risk authority; atomic reservation and idempotent lifecycle."
+            }
+          ],
+          [
+            {
+              "vi": "Snapshot",
+              "en": "Snapshot"
+            },
+            {
+              "vi": "committed/applied cut, schema/rules, state, integrity, output progress",
+              "en": "committed/applied cut, schema/rules, state, integrity, output progress"
+            },
+            {
+              "vi": "Restore đúng cut rồi contiguous log suffix; validate compatibility.",
+              "en": "Restore exact cuts then contiguous suffixes with compatible rules."
+            }
+          ],
+          [
+            {
+              "vi": "Projection cursor",
+              "en": "Projection cursor"
+            },
+            {
+              "vi": "consumer identity, log/feed session, last contiguous output",
+              "en": "consumer identity, log/feed session, last contiguous output"
+            },
+            {
+              "vi": "Cursor phải commit cùng effects hoặc effects dedup được khi replay.",
+              "en": "Commit cursors with effects or make effects deduplicable on replay."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "5. Tách entry, committed state và projections",
+        "en": "5. Separate entry, committed state and projections"
+      },
+      "paragraphs": [
+        {
+          "vi": "Gateway xử lý session, authentication và admission; risk authority giữ shared budgets; sequencer/log xác lập committed order; một owner apply matching state. Outputs feed private reports, market-data projections và post-trade pipelines. Đặt database/query/cold audit ở ngoài matching loop. Điểm ACK/output phải khớp recovery guarantee: nếu đã thông báo quyết định không được mất trong failure model đã hứa, quyết định đó phải nằm trong recoverable committed state trước khi expose.",
+          "en": "Gateways own sessions/authentication/admission, risk authorities own shared budgets, logs establish committed order and a single owner applies matching state. Outputs drive private reports, market data and post-trade projections. Keep query databases/cold audits outside the matching loop. Acknowledgement/publication boundaries must match recovery guarantees: exposed decisions promised to survive a failure model must first be recoverably committed."
+        },
+        {
+          "vi": "Sơ đồ chọn risk reservation trước command commit như một orchestration baseline. Reserve thành công rồi entry crash có thể để orphan reservation; timeout reserve cũng unknown. Dùng stable reservation identity, reconciliation và release/cancel protocol; không auto-expire trong khi order vẫn có thể execute. Một thiết kế khác co-locate risk theo account hoặc escrow quota ở shards, nhưng phải chứng minh không double-spend và không release sớm, thay vì chỉ đổi vị trí hộp trên hình.",
+          "en": "The diagram uses pre-commit reservations as one orchestration baseline. Crashes can orphan reservations and reserve timeouts can be ambiguous. Stable identities, reconciliation and release/cancel protocols are required; never auto-expire funds while orders can still execute. Account-local risk or shard escrow are alternatives, but they must prove no double-spending or premature release rather than merely relocate boxes."
+        }
+      ],
+      "diagram": {
+        "id": "exchange-committed-order",
+        "title": {
+          "vi": "Một thứ tự đã commit, nhiều đầu ra có thể replay",
+          "en": "One committed order with replayable outputs"
+        },
+        "caption": {
+          "vi": "Order entry, risk reservations, log commitment và output authority là các boundary khác nhau. Book chỉ dùng committed inputs; market-data projections và post-trade consumers theo output identity riêng.",
+          "en": "Entry, risk reservation, log commitment and output authority are separate boundaries. The book consumes committed inputs; market-data and post-trade projections retain their own output identities."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "trader",
+            "label": {
+              "vi": "Trader / broker",
+              "en": "Trader / broker"
+            },
+            "detail": {
+              "vi": "Session recovery và stable business command IDs; timeout không chứng minh lệnh chưa nhận.",
+              "en": "Tracks session recovery and stable business command IDs; timeouts do not prove rejection."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Entry gateway",
+              "en": "Entry gateway"
+            },
+            "detail": {
+              "vi": "Authenticate, decode bounded binary/FIX messages, session controls và quotas; receipt ACK khác engine acceptance.",
+              "en": "Authenticates/decodes bounded entry messages with session controls and quotas; receipt differs from engine acceptance."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "risk",
+            "label": {
+              "vi": "Account risk authority",
+              "en": "Account risk authority"
+            },
+            "detail": {
+              "vi": "Serialize hoặc escrow shared account budgets; reservations/releases có identity và unknown-outcome reconciliation.",
+              "en": "Serializes or escrows account budgets with identified reservations/releases and reconciliation."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "log",
+            "label": {
+              "vi": "Sequencer / durable log",
+              "en": "Sequencer / durable log"
+            },
+            "detail": {
+              "vi": "Per-shard ordering và explicit committed cut; assigned index chưa chắc durable.",
+              "en": "Orders shard commands and exposes explicit committed cuts; assignments alone are not durable."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "queue"
+          },
+          {
+            "id": "book",
+            "label": {
+              "vi": "Deterministic book",
+              "en": "Deterministic book"
+            },
+            "detail": {
+              "vi": "Một owner cập nhật price levels/FIFO, dedup results và logged trading mode; rule/config version cố định.",
+              "en": "One owner updates levels/FIFO, dedup results and logged trading modes under pinned rules/configuration."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "standby",
+            "label": {
+              "vi": "Standby / snapshots",
+              "en": "Standby / snapshots"
+            },
+            "detail": {
+              "vi": "Restore full state và replay committed suffix; caught-up state vẫn cần external promotion authority.",
+              "en": "Restores full state and committed suffixes; catch-up still requires external promotion authority."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "authority",
+            "label": {
+              "vi": "Epoch / output fence",
+              "en": "Epoch / output fence"
+            },
+            "detail": {
+              "vi": "Authority độc lập và sinks reject old publisher; không chỉ một boolean tự đặt trong process.",
+              "en": "External authority and sinks reject old publishers rather than trusting process-local flags."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "outputs",
+            "label": {
+              "vi": "Execution outputs",
+              "en": "Execution outputs"
+            },
+            "detail": {
+              "vi": "Stable fill IDs, private reports và public projection events; output cursors có replay/dedup contract.",
+              "en": "Stable fill IDs, private reports and public projections carry replay/dedup contracts."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "queue"
+          },
+          {
+            "id": "feed",
+            "label": {
+              "vi": "Market-data publisher",
+              "en": "Market-data publisher"
+            },
+            "detail": {
+              "vi": "Sequenced projections, entitlement, bounded fanout, gap recovery và snapshot barrier.",
+              "en": "Owns sequenced projections, entitlements, bounded fanout, gap recovery and snapshot barriers."
+            },
+            "x": 130,
+            "y": 730,
+            "kind": "worker"
+          },
+          {
+            "id": "consumer",
+            "label": {
+              "vi": "Feed consumer",
+              "en": "Feed consumer"
+            },
+            "detail": {
+              "vi": "Track session/channel sequence; stale state không dùng như live book khi có gap.",
+              "en": "Tracks session/channel sequences and marks gapped books stale."
+            },
+            "x": 430,
+            "y": 730,
+            "kind": "client"
+          },
+          {
+            "id": "posttrade",
+            "label": {
+              "vi": "Post-trade / audit",
+              "en": "Post-trade / audit"
+            },
+            "detail": {
+              "vi": "Durable dedup processing, positions/clearing projections và immutable correction history.",
+              "en": "Durably deduplicates position/clearing projections and retains correction history."
+            },
+            "x": 740,
+            "y": 730,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "order",
+            "label": {
+              "vi": "Lệnh mới và executions",
+              "en": "New orders and executions"
+            },
+            "steps": [
+              {
+                "from": "trader",
+                "to": "gateway",
+                "description": {
+                  "vi": "Gửi command ID và order fields qua authenticated session.",
+                  "en": "Send command identities and order fields over authenticated sessions."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "risk",
+                "description": {
+                  "vi": "Reserve conservative account budget bằng stable reservation ID.",
+                  "en": "Reserve conservative account budgets under stable reservation IDs."
+                }
+              },
+              {
+                "from": "risk",
+                "to": "log",
+                "description": {
+                  "vi": "Log command và authoritative reservation evidence theo chosen ordering contract.",
+                  "en": "Log commands and authoritative reservation evidence under the chosen ordering contract."
+                }
+              },
+              {
+                "from": "log",
+                "to": "book",
+                "description": {
+                  "vi": "Chỉ apply committed inputs theo index.",
+                  "en": "Apply committed inputs in index order."
+                }
+              },
+              {
+                "from": "book",
+                "to": "outputs",
+                "description": {
+                  "vi": "Tạo ordered outputs với log index + ordinal và retained command result.",
+                  "en": "Produce outputs identified by log index/ordinal and retain command results."
+                }
+              },
+              {
+                "from": "outputs",
+                "to": "gateway",
+                "description": {
+                  "vi": "Private accepted/rejected/execution reports có output recovery semantics.",
+                  "en": "Return private acceptance/rejection/execution reports under recovery contracts."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "trader",
+                "description": {
+                  "vi": "Client cập nhật state, phân biệt accept với filled.",
+                  "en": "Clients distinguish accepted orders from completed executions."
+                }
+              }
+            ]
+          },
+          {
+            "id": "feed",
+            "label": {
+              "vi": "Public feed và gap",
+              "en": "Public feeds and gaps"
+            },
+            "steps": [
+              {
+                "from": "book",
+                "to": "outputs",
+                "description": {
+                  "vi": "Tạo public-book projection theo visibility rules, không phát account secrets.",
+                  "en": "Produce permitted public-book projections without account secrets."
+                }
+              },
+              {
+                "from": "outputs",
+                "to": "feed",
+                "description": {
+                  "vi": "Publisher đọc stable output stream, giữ feed/session sequencing.",
+                  "en": "Publishers consume stable outputs and maintain feed/session sequencing."
+                },
+                "async": true
+              },
+              {
+                "from": "feed",
+                "to": "consumer",
+                "description": {
+                  "vi": "Phát deltas theo channel; consumer detect missing interval.",
+                  "en": "Publish channel deltas; consumers detect missing intervals."
+                }
+              },
+              {
+                "from": "consumer",
+                "to": "feed",
+                "description": {
+                  "vi": "Retransmit hoặc xin consistent snapshot tại barrier S.",
+                  "en": "Request retransmission or a consistent snapshot at barrier S."
+                }
+              },
+              {
+                "from": "feed",
+                "to": "consumer",
+                "description": {
+                  "vi": "Snapshot S + contiguous deltas sau S; stale tới khi catch up.",
+                  "en": "Recover with snapshot S and contiguous later deltas before marking live."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recovery",
+            "label": {
+              "vi": "Crash, replay và fenced promotion",
+              "en": "Crash, replay and fenced promotion"
+            },
+            "steps": [
+              {
+                "from": "log",
+                "to": "standby",
+                "description": {
+                  "vi": "Replicate committed inputs; snapshot pin exact index/config.",
+                  "en": "Replicate committed inputs and pin snapshot indexes/configuration."
+                },
+                "async": true
+              },
+              {
+                "from": "standby",
+                "to": "log",
+                "description": {
+                  "vi": "Xác định committed cut, replay missing suffix và loại uncommitted assignments.",
+                  "en": "Establish committed cuts, replay suffixes and exclude uncommitted assignments."
+                }
+              },
+              {
+                "from": "authority",
+                "to": "outputs",
+                "description": {
+                  "vi": "Fence old epoch ở output boundary trước khi publish writer mới.",
+                  "en": "Fence old epochs at output boundaries before enabling new publishers."
+                }
+              },
+              {
+                "from": "standby",
+                "to": "book",
+                "description": {
+                  "vi": "Restore orders, dedup/control state và resume cùng rule version.",
+                  "en": "Restore orders, dedup/control state and pinned rules."
+                }
+              },
+              {
+                "from": "book",
+                "to": "outputs",
+                "description": {
+                  "vi": "Reproduce stable IDs; sinks dedup output đã nhận trước crash.",
+                  "en": "Reproduce stable identities; sinks deduplicate outputs received before crashes."
+                }
+              }
+            ]
+          },
+          {
+            "id": "release",
+            "label": {
+              "vi": "Risk reservation kết thúc",
+              "en": "Close risk reservations"
+            },
+            "steps": [
+              {
+                "from": "book",
+                "to": "outputs",
+                "description": {
+                  "vi": "Cancel/reject/fill quyết định lifecycle đã commit.",
+                  "en": "Committed cancels/rejections/fills determine lifecycle transitions."
+                }
+              },
+              {
+                "from": "outputs",
+                "to": "risk",
+                "description": {
+                  "vi": "Apply identified consume/release events; duplicates không trả credit hai lần.",
+                  "en": "Apply identified consumption/releases without double-returning credit."
+                },
+                "async": true
+              },
+              {
+                "from": "outputs",
+                "to": "posttrade",
+                "description": {
+                  "vi": "Project executions bền và reconcile accounting state.",
+                  "en": "Durably project executions and reconcile accounting state."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "halt",
+            "label": {
+              "vi": "Halt có thứ tự",
+              "en": "Ordered trading halts"
+            },
+            "steps": [
+              {
+                "from": "authority",
+                "to": "log",
+                "description": {
+                  "vi": "Authorized halt/resume/rule update được log như control input.",
+                  "en": "Log authorized halts/resumes/rule changes as control inputs."
+                }
+              },
+              {
+                "from": "log",
+                "to": "book",
+                "description": {
+                  "vi": "Đổi trading mode tại exact committed boundary.",
+                  "en": "Change trading modes at exact committed boundaries."
+                }
+              },
+              {
+                "from": "book",
+                "to": "outputs",
+                "description": {
+                  "vi": "Phát mode/output events; policy cancel khi halt được định nghĩa rõ.",
+                  "en": "Emit mode events under explicit cancel-during-halt policies."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "book",
+      "title": {
+        "vi": "6. Price levels, FIFO và partial fills",
+        "en": "6. Price levels, FIFO and partial fills"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng ordered price levels và FIFO queues trong mỗi level; orderId→node index hỗ trợ cancel nhanh. Tìm best opposing price, kiểm crossing, lấy min(incoming remaining, maker remaining), phát execution rồi update/delete maker; tiếp tục cho tới hết incoming quantity hoặc không còn eligible price. GTC rest phần dư; IOC expire phần dư. Price level tree có thể O(log P) cho thêm/xóa level, linked queue/index giúp cancel node O(1) khi đã biết node; memory reclamation và locator correctness vẫn cần thiết.",
+          "en": "Use ordered price levels and FIFO queues per level with an order-ID locator for cancellation. Select the best opposing price, test crossing, execute the minimum remaining quantity and update/remove makers until exhausted or ineligible. GTC remainders rest; IOC remainders expire. Trees can provide O(log P) level operations and indexed linked queues O(1) node cancellation, subject to correct locators and reclamation."
+        },
+        {
+          "vi": "Giá nên là bounded integer ticks và quantity là bounded integer lots; kiểm overflow khi tính notional/reservations. Một lệnh aggressive có thể sweep nhiều levels nên runtime không luôn O(1). Giữ invariant incoming qty = fills + rested + expired đối với accepted order theo semantics; tổng fills không được tăng khi business retry cùng payload. Toy model bên dưới dùng arrays và không triển khai production indexes; đó là lựa chọn học tập có chủ đích.",
+          "en": "Use bounded integer ticks/lots and guard notional/reservation overflow. Aggressive orders may sweep many levels, so work is not always O(1). Under accepted-order semantics, incoming quantity equals fills plus rested plus expired quantities; retries must not add fills. The toy model uses arrays rather than production indexes for inspectability."
+        }
+      ],
+      "experiment": "exchange-book"
+    },
+    {
+      "id": "priority",
+      "title": {
+        "vi": "7. Cancel, reduce và replace có race và policy riêng",
+        "en": "7. Cancel, reduce and replace have explicit races and policies"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cancel không quay ngược một execution đã xảy ra trước nó trong committed order. Nếu fill thắng race, cancel thấy remaining ít hơn hoặc NotFound; nếu cancel thắng, lệnh bị rút trước incoming aggressor tiếp theo. Đừng hứa cancel ngay ở gateway receipt time. Trong policy của lab, reduce quantity giữ FIFO; replace rút old order và dùng new identity/priority, kể cả cùng giá. Protocol thật có operations khác nhau; không suy mọi giảm quantity qua Replace đều giữ priority.",
+          "en": "Cancellation cannot reverse executions earlier in committed order. If fills win the race, cancellation sees less remaining quantity or absence; if cancellation wins, later aggressors cannot match the withdrawn order. Gateway receipt is not cancellation completion. This lab preserves priority for reductions but replaces orders with fresh identities/priorities even at unchanged prices. Real protocols distinguish operations; not every quantity reduction through replacement preserves priority."
+        },
+        {
+          "vi": "Cần định nghĩa self-trade prevention, minimum quantity, price bands, lot-size changes và rejected replacement có giữ old order không. Những rule này có thể làm kết quả khác toy model. Không đọc volatile config ngoài log giữa replay; pin version và chuyển rule tại logged boundary. Multi-action command phải xác định atomicity và thứ tự outputs; không coi một sequence number cho batch là tự giải mọi partial failure.",
+          "en": "Define self-trade prevention, minimum quantities, price bands, lot changes and the fate of old orders after rejected replacements. These can change outcomes relative to the toy model. Pin rule versions and log transitions instead of reading volatile configuration during replay. Multi-action commands also need atomicity and output ordering; one batch sequence number does not solve partial failures."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Race / operation",
+            "en": "Race / operation"
+          },
+          {
+            "vi": "Baseline result",
+            "en": "Baseline result"
+          },
+          {
+            "vi": "Thông tin client cần",
+            "en": "Client evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Fill trước cancel",
+              "en": "Fill before cancel"
+            },
+            {
+              "vi": "Không undo fill; cancel phần còn lại nếu có.",
+              "en": "Do not undo fills; cancel any remainder."
+            },
+            {
+              "vi": "Execution/cancel reports có ordered identities.",
+              "en": "Ordered execution/cancel reports."
+            }
+          ],
+          [
+            {
+              "vi": "Reduce 2→1",
+              "en": "Reduce 2→1"
+            },
+            {
+              "vi": "Giữ priority theo reduce policy.",
+              "en": "Keep priority under reduction rules."
+            },
+            {
+              "vi": "Operation type và leaves quantity.",
+              "en": "Operation type and remaining quantity."
+            }
+          ],
+          [
+            {
+              "vi": "Replace cùng giá",
+              "en": "Replace at same price"
+            },
+            {
+              "vi": "New priority trong lab.",
+              "en": "Fresh priority in the lab."
+            },
+            {
+              "vi": "Old/new order identities và result.",
+              "en": "Old/new identities and results."
+            }
+          ],
+          [
+            {
+              "vi": "Duplicate command",
+              "en": "Duplicate command"
+            },
+            {
+              "vi": "Return retained result, không thêm fills.",
+              "en": "Return retained results without new fills."
+            },
+            {
+              "vi": "Stable command ID, same payload.",
+              "en": "Stable command IDs and matching payloads."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "commit",
+      "title": {
+        "vi": "8. Assigned, committed, applied và published là bốn mốc",
+        "en": "8. Assigned, committed, applied and published are separate cuts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sequencer gán index giúp xác định thứ tự nhưng assigned data có thể còn ở volatile memory. Chọn durability model rõ: local durable journal chịu process crash khác với replicated committed log chịu node loss; memory map hoặc replica RAM không tự bằng power-loss durability. Baseline của bài apply và expose authoritative results từ committed prefix, chấp nhận latency cost. Nếu dùng speculative apply, phải giữ speculative state/output không bị hiểu nhầm thành kết quả không thể thu hồi.",
+          "en": "Assigned indexes order commands but may still exist only in volatile memory. Local durable journals and replicated committed logs cover different failures; memory maps or replica RAM do not imply power-loss durability. This baseline applies and exposes authoritative results from committed prefixes, accepting that latency cost. Speculative application requires strict separation of speculative state/outputs from irreversible results."
+        },
+        {
+          "vi": "Timeout sau commit nhưng trước reply là unknown outcome. Recover session/command result bằng ID đã dùng; duplicate input trong log có thể tạo DUPLICATE result nhưng không thêm trade. Output publication có crash window riêng: commit rồi chết trước send cần replay; send rồi chết trước cursor persist cần downstream dedup. “Exactly once” về business effect là protocol qua nhiều boundaries, không phải một boolean của message broker.",
+          "en": "A timeout after commitment but before a reply is ambiguous. Recover results under the original ID; duplicate log inputs can return retained results without new trades. Publication has its own windows: committed-but-unsent outputs need replay, while sent-but-uncheckpointed outputs need downstream deduplication. Exactly-once business effects require boundary-spanning protocols rather than a broker flag."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Đánh dấu từng boundary",
+          "en": "Label every boundary"
+        },
+        "caption": {
+          "vi": "Mỗi mốc trả lời một câu hỏi khác nhau.",
+          "en": "Each cut answers a different question."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Assigned",
+              "en": "Assigned"
+            },
+            "detail": {
+              "vi": "Index nào đã được cấp?",
+              "en": "Which indexes were allocated?"
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Committed",
+              "en": "Committed"
+            },
+            "detail": {
+              "vi": "Inputs nào phải phục hồi được theo failure contract?",
+              "en": "Which inputs must survive the stated failures?"
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Applied",
+              "en": "Applied"
+            },
+            "detail": {
+              "vi": "Book đã xử lý liên tục tới đâu?",
+              "en": "How far has the book applied contiguously?"
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Published",
+              "en": "Published"
+            },
+            "detail": {
+              "vi": "Consumer đã nhận/commit outputs nào?",
+              "en": "Which outputs have consumers received/committed?"
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "replay",
+      "title": {
+        "vi": "9. Deterministic replay cần nhiều hơn order book",
+        "en": "9. Deterministic replay needs more than the order book"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cùng inputs chỉ tạo cùng state nếu code, rule/config version, arithmetic, iteration order và mọi external decision đều deterministic. Timers, random choices, halt/resume, reference prices, risk decisions và admin actions tác động matching cần logged evidence hoặc một deterministic derivation đã version. Không dùng wall clock hiện tại hay một async risk query mới trong replay. Event timestamp phục vụ audit không tự là tie-breaker nếu rulebook nói sequencer order.",
+          "en": "Identical inputs imply identical states only with deterministic code, rules/configuration, arithmetic, iteration and external decisions. Timers, randomness, controls, reference prices, risk decisions and administrative actions need logged evidence or versioned deterministic derivations. Replay must not query current clocks or risk decisions. Audit timestamps are not implicit tie-breakers when the rules use sequencer order."
+        },
+        {
+          "vi": "Snapshot phải gắn exact committed/applied index, schema/config version và integrity. Capture orders/queues, order locators hoặc cách rebuild đúng FIFO, retained command results, mode/control state và output progress; phối hợp reservation/position state theo ownership boundary. Load snapshot rồi replay contiguous suffix, không skip gap. So sánh shadow replay với live state/outputs để tìm divergence; checksum chỉ phát hiện khác biệt theo coverage, không chứng minh rulebook đúng.",
+          "en": "Snapshots need exact indexes, schemas/configurations and integrity. Capture orders/queues, FIFO-preserving locator reconstruction, retained results, control state and output progress, coordinating reservations/positions across owners. Restore and replay contiguous suffixes without skipping gaps. Shadow comparisons expose divergence; checksums only detect differences in covered state, not correctness of the underlying rules."
+        }
+      ]
+    },
+    {
+      "id": "failover",
+      "title": {
+        "vi": "10. Đủ dữ liệu và có authority là hai điều kiện khác nhau",
+        "en": "10. Data readiness and authority are separate conditions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Standby replay tới committed cut chưa tự có quyền xử lý lệnh mới. Cần external ownership/epoch protocol và fencing được enforce ở entry/output hoặc sinks thích hợp; old leader network partition có thể vẫn sống. Nếu không xác định committed tail hoặc exclusive authority thì halt an toàn theo design, không để hai publishers cùng phát independent histories. Failover drill phải kiểm chứng client reports, feed sequences và post-trade effects, không chỉ process chuyển sang healthy.",
+          "en": "Catch-up does not authorize a standby to accept new work. External ownership/epochs require enforcement at suitable entry/output boundaries or sinks because partitioned old leaders may remain alive. Uncertain committed cuts or authority require the designed safe halt rather than divergent publishers. Failover drills must verify reports, feed sequences and post-trade effects, not just process health."
+        },
+        {
+          "vi": "Business execution ID phải ổn định khi replay qua epoch: ví dụ shard/session-log identity + committed index + output ordinal. Epoch mới dùng để fence writer; nếu thêm epoch vào business ID như thể đó là trade mới, downstream dedup có thể thất bại. Log/session identity vẫn phải ngăn reuse IDs qua archival/reset. Lab dùng index/ordinal vì chỉ có một cố định toy log; đây không là universal production ID format.",
+          "en": "Execution identities must survive leadership changes: for example shard/log-session identity, committed index and output ordinal. New epochs fence writers; making epochs fresh business identities can defeat deduplication. Log-session identity must also prevent reuse across resets/archives. The lab omits it only because it has one fixed toy log, not because index/ordinal is universally sufficient."
+        }
+      ],
+      "experiment": "exchange-recovery"
+    },
+    {
+      "id": "risk",
+      "title": {
+        "vi": "11. Shared account risk là bài toán phối hợp xuyên symbol",
+        "en": "11. Shared account risk crosses symbol ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một account có thể đặt lệnh trên hai symbol shards cùng lúc. Cả hai stale prechecks đều thấy đủ tiền không chứng minh tổng reservations hợp lệ. Có thể serialize qua account authority, cấp escrow quotas bảo thủ cho shards hoặc co-locate một phần state; đánh đổi là latency, utilization và coordination cost. Reservation cần stable ID, amount bounds và state machine reserve→consume/release, retries dedup và recovery sau unknown outcomes.",
+          "en": "One account can submit to two symbol shards concurrently. Two stale successful prechecks do not prove valid aggregate reservations. Account authorities, conservative shard escrow or partial colocation trade latency, utilization and coordination costs. Reservations require stable identities, bounded amounts and reserve/consume/release transitions with deduplication and ambiguous-outcome recovery."
+        },
+        {
+          "vi": "Không release reservation chỉ vì gateway timeout, client disconnect hoặc TTL hết trong khi order vẫn có thể khớp. Partial fills chuyển một phần reserved exposure thành executed exposure, cancel/reject giải phóng đúng phần theo contract; fees/price bands/market order worst-case cost cần risk rules riêng. Toy lab không có executed exposure nên conservation chỉ là available + reservations = budget. Production invariant rộng hơn; post-trade reconciliation/kill switch bổ sung chứ không thay hard pre-trade enforcement.",
+          "en": "Gateway timeouts, disconnections or TTL expiry do not justify releasing funds while orders remain executable. Partial fills convert reserved to executed exposure; cancels/rejections release the proper remainder. Fees, price bands and market-order bounds require separate risk rules. The lab has no executed exposure, so conservation is limited to available plus reserved budget; production invariants are broader. Reconciliation and kill switches complement rather than replace hard pre-trade enforcement."
+        }
+      ],
+      "experiment": "exchange-risk"
+    },
+    {
+      "id": "market-data",
+      "title": {
+        "vi": "12. Feed gaps, snapshots và fairness có contract riêng",
+        "en": "12. Feed gaps, snapshots and fairness have explicit contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Public feed có thể order-level hoặc aggregated levels; không đưa private account IDs ra public. Transport/session sequence phải đủ detect gaps/duplicates/restarts. Khi thiếu delta #N, không apply #N+1 như thể book đầy đủ: buffer có bound, retransmit missing range hoặc chuyển stale rồi lấy snapshot tại barrier S. Snapshot phải khớp projection state tại S; bỏ deltas ≤S và apply contiguous >S, mark live chỉ sau catch-up. Nếu replay retention hoặc buffer không đủ thì restart recovery, không lén bỏ missing interval.",
+          "en": "Public feeds may expose orders or aggregated levels without private account identities. Transport/session sequencing detects gaps, duplicates and restarts. Missing delta N prevents treating N+1 as complete state: use bounded buffering/retransmission or mark stale and obtain a snapshot at barrier S. Discard deltas through S and apply contiguous later events before marking live. Insufficient retention/buffers require renewed recovery rather than silently skipping missing intervals."
+        },
+        {
+          "vi": "Native feed có thể dùng binary payloads trên multicast/UDP hoặc sequenced TCP transports; browser WebSocket relay là projection khác có buffering/backpressure riêng. Sequencer xác lập một ordering policy, không loại mọi network advantage; multicast không làm mọi receivers nhận cùng instant. Thảo luận fairness bằng ingress policy, clocks/hardware timestamps, observable latency và equal-access rules đã định nghĩa, không hứa công bằng tuyệt đối chỉ vì dùng một thread.",
+          "en": "Native binary feeds can use multicast/UDP or sequenced TCP transports; browser WebSocket relays are distinct projections with their own buffers/backpressure. Sequencers establish ordering policies without removing every network advantage, and multicast does not deliver simultaneously everywhere. Discuss fairness through defined ingress policies, timestamps, observable latency and access rules rather than absolute claims based on single-threaded matching."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Consumer state",
+            "en": "Consumer state"
+          },
+          {
+            "vi": "Được làm gì",
+            "en": "Allowed behavior"
+          },
+          {
+            "vi": "Điều kiện chuyển",
+            "en": "Transition condition"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "LIVE @S",
+              "en": "LIVE @S"
+            },
+            {
+              "vi": "Apply đúng next sequence.",
+              "en": "Apply the exact next sequence."
+            },
+            {
+              "vi": "Gap → STALE/RECOVERING.",
+              "en": "Gap → STALE/RECOVERING."
+            }
+          ],
+          [
+            {
+              "vi": "RECOVERING",
+              "en": "RECOVERING"
+            },
+            {
+              "vi": "Buffer có bound; xin missing range/snapshot.",
+              "en": "Bound buffers and request recovery."
+            },
+            {
+              "vi": "Common barrier + contiguous suffix.",
+              "en": "Common barrier plus contiguous suffix."
+            }
+          ],
+          [
+            {
+              "vi": "BUFFER OVERFLOW",
+              "en": "BUFFER OVERFLOW"
+            },
+            {
+              "vi": "Không fake live state.",
+              "en": "Never fabricate live state."
+            },
+            {
+              "vi": "Restart snapshot protocol.",
+              "en": "Restart snapshot recovery."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "performance",
+      "title": {
+        "vi": "13. Tối ưu hot path sau khi giữ đúng semantics",
+        "en": "13. Optimize the hot path while preserving semantics"
+      },
+      "paragraphs": [
+        {
+          "vi": "Single owner tránh concurrent mutation trên cùng book nhưng không tự xóa allocations, GC pauses, blocking I/O hoặc cache misses. Preallocate bounded structures, tránh synchronous remote calls trong matching loop, dùng integer arithmetic, locality và explicit backpressure. Ring buffer cần publication/memory-visibility semantics, bounded capacity và policy khi consumer chậm; ghi một array rồi tăng index không tự là correct concurrent queue.",
+          "en": "A single owner avoids concurrent book mutation but does not remove allocations, GC, blocking I/O or cache misses. Use bounded preallocation, locality, integer arithmetic and explicit backpressure while keeping remote blocking calls outside matching. Ring buffers require correct publication/memory visibility, capacities and slow-consumer policies; writing arrays and incrementing indexes is not automatically a concurrent queue."
+        },
+        {
+          "vi": "Shard theo symbol độc lập để scale nhưng hot symbol vẫn là bottleneck serial. Chia một book theo price ranges không đơn giản vì incoming sweep, best-price selection và FIFO phải atomic theo rulebook. Global controls, cross-symbol risk và multi-leg orders vẫn cần coordination. Rebalance phải quiesce/fence ownership, transfer exact state/index và route new commands đúng generation; không migrate live book như stateless web request.",
+          "en": "Independent symbols can be sharded, but hot books retain serial bottlenecks. Price-range partitioning complicates atomic sweeps, best prices and FIFO. Global controls, shared risk and multi-leg orders still coordinate. Rebalancing needs fenced ownership, exact state/index transfer and generation-aware routing rather than stateless request migration."
+        }
+      ]
+    },
+    {
+      "id": "auctions-controls",
+      "title": {
+        "vi": "14. Auctions, halts và corrections không phải ngoại lệ tự phát",
+        "en": "14. Auctions, halts and corrections need first-class rules"
+      },
+      "paragraphs": [
+        {
+          "vi": "Opening/closing auctions thường chọn một clearing price theo rulebook với volume/imbalance/tie-break rules; không chỉ chạy continuous matching nhanh hơn. Volatility interruptions, market-wide controls, self-trade prevention và instrument lifecycle phải có authorized, sequenced inputs. Policy phải nói rõ lệnh nào được nhận/cancel/modify trong mỗi mode và cách chuyển sang auction/resume. Lab chỉ có CONTINUOUS/HALTED, không tính auction clearing price.",
+          "en": "Opening/closing auctions choose clearing prices under volume/imbalance/tie-breaking rules rather than simply run continuous matching faster. Interruptions, market-wide controls, self-trade prevention and instrument lifecycle need authorized sequenced inputs. Define accepted/cancelled/modified operations in each mode and transitions into auctions/resumption. The lab only models continuous/halted states, not auction clearing."
+        },
+        {
+          "vi": "Trade correction/bust không được rewrite lịch sử âm thầm hoặc reuse exec ID làm consumer hiểu sai. Dùng explicit linked correction events, authorization và reconciliation qua private reports, public feed và post-trade projections. Matching engine không tự thực hiện toàn bộ clearing/settlement; ledger/positions cũng cần durable idempotent consumers và operational evidence. Điều kiện pháp lý/venue-specific để sửa trade nằm ngoài engineering toy model.",
+          "en": "Trade corrections/busts must not silently rewrite history or reuse identities ambiguously. Use authorized linked correction events and reconcile private/public/post-trade projections. Matching is not the entirety of clearing/settlement, whose positions/ledgers require durable idempotent processing and evidence. Legal and venue-specific correction decisions are outside this engineering model."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "15. Kiểm chứng replay và failure boundaries bằng evidence",
+        "en": "15. Verify replay and failure boundaries with evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metrics gồm ingress reject reasons, sequence/commit/apply/output lag, queue age, commands/fills per second, tail latency, risk reservation age, feed gaps và replay divergence. Không để asynchronous analytics hoặc một feed consumer chậm làm engine block vô hạn; phân loại critical outputs cần durable backlog với best-effort telemetry. Overload admission phải rõ lệnh nào chưa accepted; drop một command đã ACK mà không record result là correctness failure.",
+          "en": "Measure rejection reasons, assignment/commit/application/output lag, queue ages, command/fill rates, latency tails, reservation ages, feed gaps and replay divergence. Slow analytics/feed consumers must not block matching indefinitely; distinguish durable critical backlogs from best-effort telemetry. Admission must make nonacceptance explicit: dropping acknowledged commands without retained results is a correctness failure."
+        },
+        {
+          "vi": "Property tests cần quantity conservation, FIFO/price priority, cancel ownership, duplicate/conflict handling, integer bounds và replay equality từ mọi snapshot cuts. Fault injection tại trước/sau commit, trước/sau send, old leader partition, snapshot corruption và risk release retries; compare private/public/post-trade effects theo stable identities. Benchmarks cần hardware, payload/order mix, output amplification, durability mode và percentile definition; không lấy demo animation làm throughput evidence.",
+          "en": "Properties cover quantity conservation, priority, cancellation ownership, retries/conflicts, integer bounds and replay equality at snapshot cuts. Inject commit/send crashes, leader partitions, corrupt snapshots and duplicate releases, comparing all projections under stable identities. Benchmarks must state hardware, mixes, amplification, durability and percentiles; animations are not throughput evidence."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Risk",
+            "en": "Risk"
+          },
+          {
+            "vi": "Guard / evidence",
+            "en": "Guard / evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Reply mất sau commit",
+              "en": "Reply lost after commit"
+            },
+            {
+              "vi": "Client submit duplicate order.",
+              "en": "Duplicate business submissions."
+            },
+            {
+              "vi": "Original command ID + retained result.",
+              "en": "Original IDs and retained results."
+            }
+          ],
+          [
+            {
+              "vi": "Old leader vẫn sống",
+              "en": "Old leader survives"
+            },
+            {
+              "vi": "Hai output histories.",
+              "en": "Divergent output histories."
+            },
+            {
+              "vi": "Externally enforced epoch fence.",
+              "en": "Externally enforced epoch fencing."
+            }
+          ],
+          [
+            {
+              "vi": "Snapshot thiếu dedup state",
+              "en": "Snapshot omits dedup"
+            },
+            {
+              "vi": "Retry execute thêm trade.",
+              "en": "Retries create extra trades."
+            },
+            {
+              "vi": "Full-state restore + suffix replay tests.",
+              "en": "Full-state restoration/replay tests."
+            }
+          ],
+          [
+            {
+              "vi": "Hai risk prechecks",
+              "en": "Concurrent risk prechecks"
+            },
+            {
+              "vi": "Over-reserve shared account.",
+              "en": "Over-reserve shared budgets."
+            },
+            {
+              "vi": "Atomic reserve/escrow + release identity.",
+              "en": "Atomic reservations/escrow and identified releases."
+            }
+          ],
+          [
+            {
+              "vi": "Feed mất delta",
+              "en": "Feed loses delta"
+            },
+            {
+              "vi": "Consumer book sai dù engine đúng.",
+              "en": "Consumers diverge despite correct engines."
+            },
+            {
+              "vi": "Gap state + barrier snapshot recovery.",
+              "en": "Gap states and barrier recovery."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Luyện quyết định bằng các câu hỏi có lời giải",
+        "en": "16. Practice decisions with worked questions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ một lệnh crossing có hai fills, crash sau output send và một old leader chưa bị fence. Giải thích input nào đã commit, execution nào được tính một lần, account budget nào đang reserve và consumer cần recovery gì. Thay đổi failure boundary rồi chỉ ra trade-off cụ thể.",
+          "en": "Draw a crossing order with two fills, a crash after sending outputs and an unfenced old leader. Identify committed inputs, once-counted executions, reservations and consumer recovery, then change a failure boundary and explain the trade-off."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "400K commands/s có chứng minh latency 2,5 μs không?",
+            "en": "Does 400K commands/s prove 2.5 μs latency?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Reciprocal là capacity budget trung bình cho serial owner theo giả định. Network, risk/log commitment, queueing, variable fills và output fan-out khác nhau. Cần đo tail theo boundary/hardware/mix/durability mode và headroom.",
+              "en": "No. It is a conditional average serial capacity budget. Networks, risk/commitment, queueing, variable fills and fan-out need separate measurement, boundaries, workload definitions and headroom."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Single thread có tự bảo đảm replay deterministic không?",
+            "en": "Does single-threading automatically make replay deterministic?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu đọc wall clock, random, config hoặc async decision chưa log. Pin code/rules/arithmetic/iteration và log mọi input ảnh hưởng state; replay full state gồm dedup/control/risk boundary, không chỉ price levels.",
+              "en": "No: clocks, randomness, configuration and unrecorded asynchronous decisions can diverge. Pin rules/arithmetic/iteration and record relevant inputs, including deduplication/control/risk boundaries."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Cancel receipt có bảo đảm lệnh không còn khớp được?",
+            "en": "Does cancel receipt guarantee no further fills?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cancel effect ở committed application order; fills trước nó vẫn valid theo rulebook. Đợi authoritative cancel/execution reports. Gateway receipt chỉ xác nhận một boundary transport/admission đã định nghĩa.",
+              "en": "No. Effects occur in committed application order; earlier fills remain valid. Wait for authoritative reports rather than equating gateway receipt with cancellation."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Snapshot book đủ để recover sau client retries không?",
+            "en": "Is a book snapshot enough for client retries?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu bỏ retained command IDs/results, control/rule state hoặc output progress. Retry có thể tạo executions thêm dù price levels ban đầu giống. Test restore từ mọi cut và compare whole state/outputs theo identity.",
+              "en": "Not if results/IDs, rules/control state or output progress are absent. Retries can add executions despite matching initial levels. Test complete restoration at every cut under stable identities."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Standby match state rồi có được publish ngay?",
+            "en": "Can matching standby state publish immediately?"
+          },
+          "answer": [
+            {
+              "vi": "Cần cả committed cut và authority/fencing. Old leader có thể vẫn phát outputs; epoch phải được enforce ở boundaries/sinks. Giữ exec ID qua epoch để dedup effects, không mint một trade mới vì đổi leader.",
+              "en": "Only with committed readiness and externally enforced authority/fencing. Old leaders may still publish; preserve business execution identities across epochs to deduplicate effects."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Mỗi symbol shard precheck cùng account có đủ hard limit?",
+            "en": "Do independent symbol prechecks enforce account-wide limits?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Hai checks cùng thấy 1.000 có thể nhận 700+600. Dùng atomic account reservations hoặc conservative escrow; unknown reserve/release phải reconcile và dedup. Post-trade detection không hồi tố biến nó thành hard pre-trade guarantee.",
+              "en": "No: both can observe 1,000 and accept 700+600. Atomic reservations or conservative escrow need reconciliation and deduplicated releases. Later detection does not retroactively enforce hard pre-trade limits."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Feed consumer có thể bỏ delta thiếu rồi apply tiếp không?",
+            "en": "Can consumers skip missing deltas and continue?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu muốn book chính xác. Mark stale, recover interval hoặc common snapshot barrier, rồi contiguous suffix. Nếu buffer overflow/retention thiếu thì restart recovery; không gọi state đó live chỉ vì đã thấy price mới nhất.",
+              "en": "Not for correct books. Mark stale, recover intervals or barrier snapshots, then apply contiguous suffixes. Overflow/missing retention requires recovery restarts rather than pretending the latest price repairs all state."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao replace cùng giá có thể mất FIFO?",
+            "en": "Why can same-price replacement lose FIFO?"
+          },
+          "answer": [
+            {
+              "vi": "Priority là rulebook/operation contract. Lab replace luôn new priority; reduce là operation riêng giữ priority. Đừng tổng quát “giảm qty giữ priority” cho mọi replace message. Lưu explicit operation semantics và version qua replay.",
+              "en": "Priority is operation-specific. Lab replacement always renews priority while separate reductions preserve it. Do not generalize quantity-decrease behavior across all replacement messages; version the exact semantics."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

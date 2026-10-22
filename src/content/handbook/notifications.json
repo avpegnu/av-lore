@@ -1,0 +1,1294 @@
+{
+  "id": "notifications",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Notification System: gửi đúng, retry có kiểm soát",
+    "en": "Designing a Notification System: correct sends and controlled retries"
+  },
+  "summary": {
+    "vi": "Theo dõi intent, policy, provider attempt và callback; thử crash window, dedup, preferences, caps và retry mà không nhầm provider acceptance với delivery.",
+    "en": "Follow intents, policies, provider attempts and callbacks; experiment with crash windows, deduplication, preferences, caps and retries without confusing acceptance with delivery."
+  },
+  "prerequisites": [
+    "messaging",
+    "rate-limiting",
+    "reliability",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "messaging",
+    "distributed",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "202, provider accepted, delivered evidence và read là các milestone khác nhau.",
+      "en": "202, provider acceptance, delivery evidence and reading are distinct milestones."
+    },
+    {
+      "vi": "Ingress dedup không tự giải quyết timeout unknown ở external provider.",
+      "en": "Ingress deduplication does not resolve unknown external-provider timeouts."
+    },
+    {
+      "vi": "Queue/worker riêng phải đi cùng provider quota reservation và fair scheduling.",
+      "en": "Separate queues/workers require provider quota reservation and fair scheduling."
+    },
+    {
+      "vi": "Preference/expiry phải được kiểm tại boundary đã chốt, kể cả khi retry hoặc replay DLQ.",
+      "en": "Check preferences/expiry at the agreed boundary, including retries and DLQ replays."
+    },
+    {
+      "vi": "Stable intent/delivery/attempt identity, outbox và evidence ledger giúp recovery đúng contract.",
+      "en": "Stable intent/delivery/attempt identities, outboxes and evidence ledgers support contract-correct recovery."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Bốn boundary của một notification",
+      "en": "Four notification boundaries"
+    },
+    "caption": {
+      "vi": "Một request nhỏ có thể tạo nhiều delivery và attempt; giữ identity ở từng lớp.",
+      "en": "One small request can create several deliveries and attempts; preserve identity at each layer."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Accept intent",
+          "en": "Accept the intent"
+        },
+        "detail": {
+          "vi": "Commit request/result/outbox rồi trả 202.",
+          "en": "Commit request/result/outbox before returning 202."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Chọn và schedule",
+          "en": "Choose and schedule"
+        },
+        "detail": {
+          "vi": "Preference, template, priority, quiet hours và cap.",
+          "en": "Apply preferences, templates, priority, quiet hours and caps."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Gửi có budget",
+          "en": "Send within budgets"
+        },
+        "detail": {
+          "vi": "Provider quota, deadline, retry và unknown outcome.",
+          "en": "Observe provider quotas, deadlines, retries and unknown outcomes."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Thu thập evidence",
+          "en": "Collect evidence"
+        },
+        "detail": {
+          "vi": "Verify callback, dedup, quan sát delivery và lý do suppress.",
+          "en": "Verify callbacks, deduplicate and observe delivery/suppression evidence."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Đặt tên đúng cho từng lời hứa gửi thông báo",
+        "en": "1. Name each notification guarantee precisely"
+      },
+      "paragraphs": [
+        {
+          "vi": "Notification platform nhận business intent như “order shipped”, chọn channel và quản lý policy, scheduling, template, provider, retry cùng evidence. Producer không cần tự gọi SMS/email/push trong transaction nghiệp vụ. Tách phần quyết định có nên gửi khỏi phần gọi provider giúp test policy và recovery rõ ràng.",
+          "en": "A notification platform accepts business intents such as “order shipped,” selects channels and manages policy, scheduling, templates, providers, retries and evidence. Producers should not need to call SMS/email/push providers inside business transactions. Separating the send decision from provider execution makes policy and recovery testable."
+        },
+        {
+          "vi": "Baseline gồm push, SMS và email; transactional event và campaign; preferences, quiet hours, localization và status lookup. In-app inbox/campaign editor là tính năng riêng. Đặt SLO theo milestone do mình kiểm soát: accepted-to-first-attempt hoặc accepted-to-provider-acceptance, rồi quan sát downstream delivery nếu channel có evidence. Không hứa “tới người dùng trong vài giây” mà không nói OS/carrier/mailbox có thể làm gì.",
+          "en": "The baseline includes push, SMS and email; transactional events and campaigns; preferences, quiet hours, localization and status lookup. In-app inboxes and campaign editors are separate features. Define SLOs at controlled milestones such as acceptance-to-first-attempt or acceptance-to-provider-acceptance, and observe downstream delivery when evidence exists. “Arrives in seconds” is incomplete without acknowledging OS, carrier and mailbox behavior."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Intent được nhận bền",
+            "en": "Durably accepted intent"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "202 nghĩa là platform giữ yêu cầu theo contract, không phải provider hay user đã nhận.",
+              "en": "202 means the platform retains the request under its contract, not that a provider or user received it."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Provider accepted",
+            "en": "Provider accepted"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Provider nhận xử lý; cần lưu provider ID và attempt, chưa suy ra display/open.",
+              "en": "The provider accepted processing; store its ID and attempt without inferring display/open."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Delivery evidence",
+            "en": "Delivery evidence"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Ý nghĩa khác theo channel; mailbox delivery, device delivery và read là các sự kiện khác nhau.",
+              "en": "Semantics differ by channel; mailbox delivery, device delivery and reading are different events."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Sizing theo delivery, attempt và burst",
+        "en": "2. Size deliveries, attempts and bursts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng ví dụ 50 triệu push, 2 triệu SMS và 20 triệu email mỗi ngày: đây là 72 triệu channel delivery, không nhất thiết 72 triệu API request. Một intent tới hai channel hoặc nhiều device sẽ fanout thành nhiều delivery. Một campaign 10 triệu recipient trong 10 phút yêu cầu khoảng 16.667 delivery/s trước retry, khác xa daily average.",
+          "en": "The example has 50 million pushes, two million SMS and 20 million emails daily: 72 million channel deliveries, not necessarily 72 million API requests. One intent targeting two channels or multiple devices creates several deliveries. A ten-million-recipient campaign over ten minutes needs about 16,667 deliveries/second before retries, far above daily averages."
+        },
+        {
+          "vi": "Nếu mỗi delivery trung bình 1,5 attempt, phát sinh 108 triệu attempt record/ngày. Với record minh họa 300 B và giữ 30 ngày, payload attempt log là 972 GB thập phân, trước index/replica/backup và request payload. Provider quota, destination limits, outbound connection và chi phí theo channel có thể là bottleneck trước CPU. Dùng giá/contract thực của từng khu vực để tính tiền; bài này không dùng một đơn giá SMS chung.",
+          "en": "At 1.5 attempts per delivery, the system creates 108 million attempt records/day. At an illustrative 300 B per record and 30-day retention, attempt payload alone is 972 decimal GB before indexes, replicas, backups and request payloads. Provider quotas, destination limits, outbound connections and channel costs can bottleneck before CPU. Use actual region/provider contracts for pricing rather than one universal SMS rate."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Khối lượng notification",
+            "en": "Notification quantity"
+          },
+          {
+            "vi": "Phép tính trong baseline",
+            "en": "Baseline arithmetic"
+          },
+          {
+            "vi": "Kết quả sizing",
+            "en": "Sizing result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Push trung bình",
+              "en": "Average push"
+            },
+            {
+              "vi": "50 triệu / 86.400",
+              "en": "50 million / 86,400"
+            },
+            {
+              "vi": "578,7/s",
+              "en": "578.7/s"
+            }
+          ],
+          [
+            {
+              "vi": "SMS trung bình",
+              "en": "Average SMS"
+            },
+            {
+              "vi": "2 triệu / 86.400",
+              "en": "2 million / 86,400"
+            },
+            {
+              "vi": "23,1/s",
+              "en": "23.1/s"
+            }
+          ],
+          [
+            {
+              "vi": "Email trung bình",
+              "en": "Average email"
+            },
+            {
+              "vi": "20 triệu / 86.400",
+              "en": "20 million / 86,400"
+            },
+            {
+              "vi": "231,5/s",
+              "en": "231.5/s"
+            }
+          ],
+          [
+            {
+              "vi": "Campaign burst",
+              "en": "Campaign burst"
+            },
+            {
+              "vi": "10 triệu / 600 s",
+              "en": "10 million / 600 s"
+            },
+            {
+              "vi": "16.666,7/s",
+              "en": "16,666.7/s"
+            }
+          ],
+          [
+            {
+              "vi": "Attempt/ngày",
+              "en": "Daily attempts"
+            },
+            {
+              "vi": "72 triệu × 1,5",
+              "en": "72 million × 1.5"
+            },
+            {
+              "vi": "108 triệu",
+              "en": "108 million"
+            }
+          ],
+          [
+            {
+              "vi": "Drain campaign với quota 5.000/s",
+              "en": "Campaign drain at 5,000/s quota"
+            },
+            {
+              "vi": "10 triệu / 5.000",
+              "en": "10 million / 5,000"
+            },
+            {
+              "vi": "2.000 s tối thiểu nếu không có traffic khác/retry",
+              "en": "At least 2,000 s without other traffic/retries"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. API nhận intent và trả kết quả idempotent",
+        "en": "3. Accept intents through an idempotent API"
+      },
+      "paragraphs": [
+        {
+          "vi": "Key nên phản ánh business action và scope tenant/producer, ví dụ order:123:shipped:v1. Với campaign, key thường gồm campaign version + recipient + category; retry của cùng intent không đổi key. Client không tự gán priority critical để bypass quota: category/priority phải được producer authorization và policy kiểm soát.",
+          "en": "Keys reflect business actions within tenant/producer scope, for example order:123:shipped:v1. Campaign keys often include campaign version, recipient and category; retries preserve the intent key. Clients cannot simply assign critical priority to bypass quotas: producer authorization and policy govern category/priority."
+        },
+        {
+          "vi": "Lưu idempotency result cùng durable intent/outbox. SETNX trước enqueue không đủ: crash sau key reservation nhưng trước durable job có thể làm retry bị bỏ qua vĩnh viễn trong TTL. Cùng key + cùng payload trả lại notification ID cũ; payload khác cần conflict. Dedupe retention phải bao trùm event replay window đã chốt; không chọn TTL chỉ theo dung lượng cache.",
+          "en": "Persist the idempotency result with the durable intent/outbox. SETNX before enqueue is insufficient: a crash after reserving a key but before durable job creation can suppress retries for the TTL. The same key/payload returns the original notification ID; different payloads conflict. Deduplication retention must cover the agreed event replay window rather than merely fit a cache budget."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/notifications",
+          "description": {
+            "vi": "Nhận logical intent; platform quyết định delivery plan theo policy.",
+            "en": "Accept a logical intent; the platform decides a delivery plan under policy."
+          },
+          "request": "Idempotency-Key: order:123:shipped:v1\n{ \"recipient_id\": \"u42\", \"category\": \"order-update\", \"template_version\": \"shipped:3\", \"params\": { \"order_id\": \"123\" }, \"expires_at\": \"2026-11-01T00:00:00Z\" }",
+          "response": "202 { \"notification_id\": \"n42\", \"status\": \"accepted\" }",
+          "notes": [
+            {
+              "vi": "202 chỉ sau durable acceptance; trả kết quả cũ khi retry hợp lệ. Channel override/priority cần quyền rõ.",
+              "en": "Return 202 only after durable acceptance; return the existing result on a valid retry. Channel/priority overrides require explicit permissions."
+            }
+          ]
+        },
+        {
+          "method": "PUT",
+          "path": "/users/{id}/notification-preferences",
+          "description": {
+            "vi": "Cập nhật category/channel, quiet hours và timezone có version.",
+            "en": "Versioned category/channel, quiet-hour and timezone preferences."
+          },
+          "request": "If-Match: \"prefs-v7\"\n{ \"timezone\": \"Asia/Ho_Chi_Minh\", \"marketing_email\": false, \"quiet_hours\": { \"start\": \"22:00\", \"end\": \"08:00\" } }",
+          "response": "200 { \"version\": \"prefs-v8\" } | 412 Precondition Failed"
+        },
+        {
+          "method": "POST",
+          "path": "/devices",
+          "description": {
+            "vi": "Đăng ký token của device đã được xác thực; token có thể rotate và đổi ownership.",
+            "en": "Register a token for an authenticated device; tokens can rotate or change ownership."
+          },
+          "request": "{ \"device_id\": \"phone\", \"platform\": \"ios\", \"push_token\": \"opaque-token\" }",
+          "response": "201 { \"registration_version\": \"4\" }"
+        },
+        {
+          "method": "GET",
+          "path": "/notifications/{id}",
+          "description": {
+            "vi": "Trả evidence theo delivery/channel và attempt, có authorization.",
+            "en": "Return authorized evidence per delivery/channel and attempt."
+          },
+          "response": "200 { \"intent_status\": \"accepted\", \"deliveries\": [{ \"delivery_id\": \"d1\", \"channel\": \"email\", \"provider_accepted\": true, \"delivery_evidence\": \"unknown\" }] }"
+        },
+        {
+          "method": "POST",
+          "path": "/providers/{provider}/events",
+          "description": {
+            "vi": "Nhận callback đã verify; idempotent theo provider event identity.",
+            "en": "Receive verified callbacks, idempotently by provider event identity."
+          },
+          "response": "2xx after durable event ingestion",
+          "notes": [
+            {
+              "vi": "Không trust một callback chỉ vì biết notification ID. Chống replay/giả mạo theo cơ chế authentication của provider.",
+              "en": "Knowledge of a notification ID does not authenticate a callback. Use provider-specific authentication and replay protections."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Durable intent, outbox và worker theo channel",
+        "en": "4. Durable intents, outboxes and channel workers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Producer có thể dùng transactional outbox để business commit và việc phát intent không tách rời. Notification ingress lại cần atomic intent + idempotency result + planning/outbox của chính nó. Hai outbox này ở hai boundary khác nhau; không giả định một transaction xuyên mọi microservice. Relay có thể phát trùng nên consumer phải giữ stable identity.",
+          "en": "A producer can use a transactional outbox to couple business commits with intent publication. Notification ingress separately needs atomic intent + idempotency result + its own planning/outbox. These are different boundaries, not one transaction across all microservices. Relays can duplicate events, so consumers retain stable identities."
+        },
+        {
+          "vi": "Tách logical intent, channel delivery, provider attempt và provider callback. Một worker claim bằng lease có thể hết hạn khi process pause; worker cũ vẫn có thể gọi provider. CAS/fencing bảo vệ ledger update nhưng không tự ngăn external side effect nếu provider không kiểm token/key. Thiết kế claim timeout, provider deadline và recovery phải xét failure này, không lấy local lock làm bằng chứng không duplicate send.",
+          "en": "Separate logical intents, channel deliveries, provider attempts and provider callbacks. A worker claim can expire while a process pauses; the old worker may still call a provider. CAS/fencing protects ledger updates but does not automatically prevent an external side effect unless the provider checks a token/key. Claim timeouts, provider deadlines and recovery must account for this instead of treating a local lock as proof against duplicate sends."
+        }
+      ],
+      "diagram": {
+        "id": "notification-intent-delivery",
+        "title": {
+          "vi": "Từ business intent tới provider và delivery evidence",
+          "en": "From business intent to a provider and delivery evidence"
+        },
+        "caption": {
+          "vi": "Chọn trace để phân biệt durable acceptance, preference suppression, provider timeout và callback. Trạng thái ở mỗi boundary không chứng minh được boundary kế tiếp.",
+          "en": "Choose a trace to separate durable acceptance, preference suppression, provider timeouts and callbacks. Evidence at one boundary does not prove the next boundary."
+        },
+        "width": 1180,
+        "height": 800,
+        "nodes": [
+          {
+            "id": "producer",
+            "label": {
+              "vi": "Product / campaign",
+              "en": "Product / campaign"
+            },
+            "detail": {
+              "vi": "Phát intent có business identity ổn định. Campaign mở rộng audience theo page và budget, không nạp cả triệu recipient vào RAM.",
+              "en": "Produces intents with stable business identities. Campaigns expand audiences in pages under budgets, not millions of recipients in memory."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Notification API",
+              "en": "Notification API"
+            },
+            "detail": {
+              "vi": "Authenticate producer, validate schema/category và idempotency scope; durable acceptance trước 202.",
+              "en": "Authenticates producers, validates schema/category and idempotency scope, and durably accepts before 202."
+            },
+            "x": 415,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "ledger",
+            "label": {
+              "vi": "Intent + delivery ledger",
+              "en": "Intent + delivery ledger"
+            },
+            "detail": {
+              "vi": "Authority của intent, delivery plan, attempt và outbox. Facts callback được dedup và gắn đúng provider attempt.",
+              "en": "Authoritative intents, delivery plans, attempts and outbox. Callback facts are deduplicated and linked to the correct provider attempt."
+            },
+            "x": 720,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Preferences + policy",
+              "en": "Preferences + policy"
+            },
+            "detail": {
+              "vi": "Consent/category, channel, quiet hours, timezone, suppression và cap. Re-check trước send cho policy có thể đổi.",
+              "en": "Consent/category, channels, quiet hours, timezone, suppression and caps. Rechecks changeable policies before sending."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "queues",
+            "label": {
+              "vi": "Channel × priority",
+              "en": "Channel × priority"
+            },
+            "detail": {
+              "vi": "Outbox relay đưa delivery job vào queue. Tách scheduling và quota để bulk không chiếm capacity khẩn cấp.",
+              "en": "The outbox relay publishes delivery jobs. Scheduling and quotas isolate urgent capacity from bulk work."
+            },
+            "x": 415,
+            "y": 390,
+            "kind": "queue"
+          },
+          {
+            "id": "worker",
+            "label": {
+              "vi": "Delivery worker",
+              "en": "Delivery worker"
+            },
+            "detail": {
+              "vi": "Lease/claim job, re-check policy/expiry, render template version, reserve provider budget và gửi với identity ổn định.",
+              "en": "Claims jobs, rechecks policy/expiry, renders a template version, reserves provider budget and sends with stable identity."
+            },
+            "x": 720,
+            "y": 390,
+            "kind": "worker"
+          },
+          {
+            "id": "provider",
+            "label": {
+              "vi": "External provider",
+              "en": "External provider"
+            },
+            "detail": {
+              "vi": "Có quota và contract idempotency riêng. Timeout có thể để kết quả unknown; accept không đồng nghĩa user đã đọc.",
+              "en": "Has its own quota and idempotency contract. A timeout may leave the result unknown; acceptance does not imply reading."
+            },
+            "x": 1040,
+            "y": 390,
+            "kind": "service"
+          },
+          {
+            "id": "retry",
+            "label": {
+              "vi": "Retry / DLQ",
+              "en": "Retry / DLQ"
+            },
+            "detail": {
+              "vi": "Schedule retry bounded bởi deadline/budget. DLQ cần reason, ownership và replay policy, không phải nút gửi lại mọi thứ.",
+              "en": "Schedules retries within deadlines/budgets. DLQs need reasons, ownership and replay policies, not a resend-everything button."
+            },
+            "x": 415,
+            "y": 680,
+            "kind": "queue"
+          },
+          {
+            "id": "callback",
+            "label": {
+              "vi": "Callback ingestion",
+              "en": "Callback ingestion"
+            },
+            "detail": {
+              "vi": "Verify chữ ký/authentication, dedup event, map provider ID → attempt; lưu facts dù out of order.",
+              "en": "Verifies signatures/authentication, deduplicates events, maps provider IDs to attempts and stores out-of-order facts."
+            },
+            "x": 720,
+            "y": 680,
+            "kind": "service"
+          },
+          {
+            "id": "user",
+            "label": {
+              "vi": "Recipient / mailbox",
+              "en": "Recipient / mailbox"
+            },
+            "detail": {
+              "vi": "Delivery/display/open là các milestone khác nhau; OS, carrier và mailbox có thể chặn, trì hoãn hoặc thiếu telemetry.",
+              "en": "Delivery, display and opening are distinct milestones; OSs, carriers and mailboxes can block, delay or omit telemetry."
+            },
+            "x": 1040,
+            "y": 680,
+            "kind": "client"
+          }
+        ],
+        "traces": [
+          {
+            "id": "accept",
+            "label": {
+              "vi": "Nhận intent và trả 202",
+              "en": "Accept an intent and return 202"
+            },
+            "steps": [
+              {
+                "from": "producer",
+                "to": "api",
+                "description": {
+                  "vi": "Gửi intent + idempotency key theo tenant/producer và business event.",
+                  "en": "Send an intent and an idempotency key scoped to tenant/producer and business event."
+                }
+              },
+              {
+                "from": "api",
+                "to": "ledger",
+                "description": {
+                  "vi": "Atomic insert intent/result cùng outbox; duplicate cùng payload trả lại notification ID cũ.",
+                  "en": "Atomically insert the intent/result and outbox; a same-payload duplicate returns the existing notification ID."
+                }
+              },
+              {
+                "from": "ledger",
+                "to": "api",
+                "description": {
+                  "vi": "Commit đạt durability contract. Chưa gọi provider.",
+                  "en": "Commit reaches the durability contract. No provider has been called yet."
+                }
+              },
+              {
+                "from": "api",
+                "to": "producer",
+                "description": {
+                  "vi": "Trả 202 Accepted với notification ID để tra cứu.",
+                  "en": "Return 202 Accepted with a notification ID for lookup."
+                }
+              },
+              {
+                "from": "ledger",
+                "to": "queues",
+                "description": {
+                  "vi": "Relay đọc outbox đã commit; phát delivery planning job và có thể phát trùng khi retry.",
+                  "en": "The relay reads the committed outbox and publishes a planning job; retries can duplicate it."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "send",
+            "label": {
+              "vi": "Policy cho phép và provider accept",
+              "en": "Policy permits and the provider accepts"
+            },
+            "steps": [
+              {
+                "from": "queues",
+                "to": "worker",
+                "description": {
+                  "vi": "Worker nhận/claim delivery job có stable delivery ID.",
+                  "en": "A worker receives/claims a delivery job with a stable delivery ID."
+                },
+                "async": true
+              },
+              {
+                "from": "worker",
+                "to": "policy",
+                "description": {
+                  "vi": "Kiểm preference hiện tại, category, quiet hours, cap và expiry.",
+                  "en": "Check current preferences, category, quiet hours, caps and expiry."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "worker",
+                "description": {
+                  "vi": "Được gửi; decision ghi policy version/reason và không tự miễn trừ mọi transactional intent.",
+                  "en": "Allow sending; record the policy version/reason rather than exempting every transactional intent."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "ledger",
+                "description": {
+                  "vi": "Ghi attempt/claim và render version trước external call; đây chưa phải provider success.",
+                  "en": "Record the attempt/claim and render version before the external call; this is not provider success."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "provider",
+                "description": {
+                  "vi": "Gửi sau quota reservation; giữ idempotency identity nếu provider hỗ trợ đúng semantics.",
+                  "en": "Send after quota reservation; preserve idempotency identity when the provider supports suitable semantics."
+                }
+              },
+              {
+                "from": "provider",
+                "to": "worker",
+                "description": {
+                  "vi": "Provider trả acceptance và provider message ID; chưa chứng minh mailbox/device/read.",
+                  "en": "The provider returns acceptance and a provider message ID; this does not prove mailbox/device receipt or reading."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "ledger",
+                "description": {
+                  "vi": "Record provider acceptance theo đúng attempt rồi hoàn tất job.",
+                  "en": "Record provider acceptance against the correct attempt, then complete the job."
+                }
+              }
+            ]
+          },
+          {
+            "id": "suppress",
+            "label": {
+              "vi": "Preference thay đổi khi job còn chờ",
+              "en": "Preferences change while a job is waiting"
+            },
+            "steps": [
+              {
+                "from": "queues",
+                "to": "worker",
+                "description": {
+                  "vi": "Job cũ được lấy ra sau thời gian chờ.",
+                  "en": "An older job is dequeued after a delay."
+                },
+                "async": true
+              },
+              {
+                "from": "worker",
+                "to": "policy",
+                "description": {
+                  "vi": "Re-check consent/preferences trước external send theo policy đã chốt.",
+                  "en": "Recheck consent/preferences before external send under the defined policy."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "worker",
+                "description": {
+                  "vi": "Category/channel không còn được phép hoặc đã hết deadline.",
+                  "en": "The category/channel is no longer allowed or its deadline has expired."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "ledger",
+                "description": {
+                  "vi": "Ghi suppressed/expired với reason và policy version; không gọi provider.",
+                  "en": "Record suppression/expiry with a reason and policy version; do not call the provider."
+                }
+              }
+            ]
+          },
+          {
+            "id": "unknown",
+            "label": {
+              "vi": "Provider timeout: kết quả chưa biết",
+              "en": "Provider timeout: the outcome is unknown"
+            },
+            "steps": [
+              {
+                "from": "worker",
+                "to": "provider",
+                "description": {
+                  "vi": "Worker gửi request; provider có thể đã accept trước khi connection bị mất.",
+                  "en": "The worker sends a request; the provider may accept it before the connection is lost."
+                }
+              },
+              {
+                "from": "provider",
+                "to": "worker",
+                "description": {
+                  "vi": "Timeout không chứng minh request chưa được xử lý; phản hồi trong trace này chỉ biểu diễn worker quan sát timeout.",
+                  "en": "A timeout does not prove nonprocessing; this trace represents the worker observing a timeout."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "ledger",
+                "description": {
+                  "vi": "Lưu attempt unknown, không tự gán permanent failure hay delivered.",
+                  "en": "Record an unknown attempt, not permanent failure or delivery."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "retry",
+                "description": {
+                  "vi": "Query/reconcile hoặc retry theo idempotency/deadline contract. Failover provider khác có thể nhân đôi send.",
+                  "en": "Query/reconcile or retry under the idempotency/deadline contract. Switching providers can duplicate the send."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "evidence",
+            "label": {
+              "vi": "Callback và evidence người nhận",
+              "en": "Callbacks and recipient evidence"
+            },
+            "steps": [
+              {
+                "from": "provider",
+                "to": "user",
+                "description": {
+                  "vi": "Provider/OS/mail server thực hiện bước tiếp theo ngoài quyền kiểm soát đầy đủ của platform.",
+                  "en": "The provider/OS/mail server performs the next step outside the platform’s full control."
+                },
+                "async": true
+              },
+              {
+                "from": "provider",
+                "to": "callback",
+                "description": {
+                  "vi": "Callback delivery/bounce/complaint hoặc event khác tùy channel; có thể trễ, trùng hoặc out of order.",
+                  "en": "Delivery/bounce/complaint or other channel events may be delayed, duplicated or out of order."
+                },
+                "async": true
+              },
+              {
+                "from": "callback",
+                "to": "ledger",
+                "description": {
+                  "vi": "Verify, dedup và lưu facts theo attempt; derive status không làm mất evidence cũ.",
+                  "en": "Verify, deduplicate and store attempt facts; derive status without discarding prior evidence."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "reliability",
+      "title": {
+        "vi": "5. Dedup ingress không loại bỏ provider ambiguity",
+        "en": "5. Ingress deduplication does not remove provider ambiguity"
+      },
+      "paragraphs": [
+        {
+          "vi": "At-least-once processing với idempotent local state không đồng nghĩa end-to-end exactly-once delivery. Khi provider accept rồi response mất, platform không biết có nên resend. Provider hỗ trợ idempotency đủ mạnh với cùng key/payload trong retention window có thể dedup acceptance; nếu không có, phải query/reconcile, chấp nhận duplicate risk hoặc chấp nhận risk bỏ gửi tùy category. Không gọi tất cả external exactly-once là tuyệt đối bất khả thi, cũng không hứa đạt được chỉ bằng queue.",
+          "en": "At-least-once processing with idempotent local state is not end-to-end exactly-once delivery. If a provider accepts and its response is lost, the platform cannot know whether to resend. Adequate provider idempotency using the same key/payload within its retention window can deduplicate acceptance. Otherwise choose query/reconciliation, duplicate risk or missed-send risk by category. Neither declare every external exactly-once effect impossible nor claim a queue alone provides it."
+        },
+        {
+          "vi": "Push collapse/coalescing không thay thế generic idempotency: tùy platform nó có thể thay thế message còn chờ, không thu hồi notification đã hiển thị hay chặn mọi retry trong lịch sử. Chỉ tái dùng stable identity khi provider contract xác nhận semantics; chuyển sang provider khác thường không chia sẻ dedup state.",
+          "en": "Push collapsing/coalescing is not generic idempotency: depending on the platform it may replace pending messages without recalling displayed notifications or deduplicating all historical retries. Rely on stable identities only under documented provider semantics; a different provider usually does not share deduplication state."
+        }
+      ],
+      "experiment": "notification-crash"
+    },
+    {
+      "id": "pipeline",
+      "title": {
+        "vi": "6. Theo dõi từng gate thay vì gọi mọi thứ là sent",
+        "en": "6. Inspect every gate instead of calling everything sent"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ingress dedup loại logical replay, preferences quyết định có được gửi, cap kiểm budget/admission, worker tạo attempt và provider chỉ báo acceptance. Giữ reason ở từng gate để support biết vì sao user không nhận. Suppressed không phải provider failure; DLQ không phải delivered; retry count không phải số notification mới.",
+          "en": "Ingress dedup removes logical replays, preferences decide permission to send, caps control budgets/admission, workers create attempts and providers report acceptance. Record reasons at each gate so support can explain nonreceipt. Suppression is not provider failure, a DLQ is not delivery, and retries are not new notifications."
+        },
+        {
+          "vi": "Trong mô hình dưới, mỗi cấu hình replay lại cùng stream, cap đếm admitted marketing intent theo channel và retry không tiêu lại slot. Production có thể dùng cap theo recipient/category/window khác; phải xác định lúc reserve, commit hoặc hoàn quota, tránh nhiều worker cùng vượt cap do read-then-write.",
+          "en": "The model replays the same stream under each configuration. Its cap counts admitted marketing intents per channel and retries do not spend another slot. Production may cap by recipient/category/window; define reservation, commitment or refund boundaries and prevent read-then-write races among workers."
+        }
+      ],
+      "experiment": "notification-pipeline"
+    },
+    {
+      "id": "priority",
+      "title": {
+        "vi": "7. Queue riêng chỉ là một nửa của isolation",
+        "en": "7. Separate queues are only half of isolation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một queue FIFO chứa 10 triệu email campaign rồi mới có password reset sẽ gây head-of-line blocking. Queue/worker riêng theo channel × priority giảm cạnh tranh, nhưng nếu tất cả vẫn dùng cùng provider quota đã bị bulk tiêu hết thì OTP vẫn chậm. Cần reserve throughput/admission budget ở provider hoặc account/pool phù hợp, campaign tự throttle và giới hạn expansion rate. Account/domain/IP riêng không tự tăng quota nếu provider tính quota ở cấp cao hơn.",
+          "en": "A FIFO queue containing ten million campaign emails before a password reset creates head-of-line blocking. Channel × priority queues/workers reduce contention, but OTPs still stall if bulk traffic exhausts the same provider quota. Reserve throughput/admission budgets at the appropriate provider/account/pool level, throttle campaigns and bound expansion rates. Separate accounts/domains/IPs do not create quota if the provider enforces a shared higher-level limit."
+        },
+        {
+          "vi": "Strict priority có thể làm bulk starvation khi high traffic liên tục. Dùng weighted scheduling, reserved minimum, aging hoặc deadline-aware admission theo SLO. Tính capacity dành cho retry khi outage hồi phục; không để DLQ replay lấy hết capacity của traffic mới. Isolation còn áp dụng tới template service, preference store và connection pool dùng chung, không chỉ Kafka topic.",
+          "en": "Strict priority can starve bulk work under sustained urgent load. Choose weighted scheduling, reserved minima, aging or deadline-aware admission based on SLOs. Budget recovery retries and keep DLQ replay from consuming all fresh-traffic capacity. Isolation also covers shared template services, preference stores and connection pools, not just queue topics."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Cách chia capacity",
+            "en": "Capacity strategy"
+          },
+          {
+            "vi": "Giải quyết được gì",
+            "en": "What it solves"
+          },
+          {
+            "vi": "Điểm vẫn cần xử lý",
+            "en": "Remaining work"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Một FIFO",
+              "en": "One FIFO"
+            },
+            {
+              "vi": "Đơn giản để vận hành ở quy mô nhỏ.",
+              "en": "Operational simplicity at small scale."
+            },
+            {
+              "vi": "Bulk chặn urgent, provider lỗi có thể chiếm worker.",
+              "en": "Bulk blocks urgent work; provider failures can occupy workers."
+            }
+          ],
+          [
+            {
+              "vi": "Channel riêng",
+              "en": "Separate channels"
+            },
+            {
+              "vi": "Email lỗi ít ảnh hưởng push nếu dependency được tách.",
+              "en": "Email failures affect push less when dependencies are isolated."
+            },
+            {
+              "vi": "Trong email, campaign vẫn cạnh tranh password reset.",
+              "en": "Within email, campaigns still compete with password resets."
+            }
+          ],
+          [
+            {
+              "vi": "Channel × priority",
+              "en": "Channel × priority"
+            },
+            {
+              "vi": "Tách backlog và worker scheduling.",
+              "en": "Separates backlogs and worker scheduling."
+            },
+            {
+              "vi": "Quota/provider/shared DB vẫn có thể là điểm nghẽn chung.",
+              "en": "Provider quota and shared databases can remain bottlenecks."
+            }
+          ],
+          [
+            {
+              "vi": "Quota reservation + fair scheduling",
+              "en": "Quota reservation + fair scheduling"
+            },
+            {
+              "vi": "Urgent có capacity; bulk vẫn có phần tài nguyên tối thiểu.",
+              "en": "Urgent work retains capacity while bulk gets a minimum share."
+            },
+            {
+              "vi": "Cần đo và tune theo traffic, deadline, tenant và provider.",
+              "en": "Requires measurement/tuning by traffic, deadline, tenant and provider."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "preferences",
+      "title": {
+        "vi": "8. Preferences, quiet hours, expiry và fatigue",
+        "en": "8. Preferences, quiet hours, expiry and fatigue"
+      },
+      "paragraphs": [
+        {
+          "vi": "Policy gắn category và purpose, không chỉ channel on/off. Password reset, security alert và marketing có semantics khác nhưng không được tự gọi mọi event transactional để bỏ preferences. Consent/preferences là versioned data, có audit và luồng cập nhật cache rõ. Re-check trước send giúp job chờ lâu không gửi theo opt-in cũ; vẫn cần định nghĩa race cutoff nếu preference đổi đúng lúc external call đang chạy.",
+          "en": "Policies attach to category and purpose, not just channel switches. Password resets, security alerts and marketing differ, but labelling every event transactional must not bypass preferences. Consent/preferences are versioned data with audit and cache update paths. Recheck before sending so delayed jobs do not use stale opt-ins, and define the race cutoff when a preference changes during an external call."
+        },
+        {
+          "vi": "Quiet hours dùng timezone IANA của user và lịch local; ngày đổi DST không luôn dài 24 giờ. Xác định behavior cho local time bị lặp/mất và khi user đổi timezone. Chuyển sang due_at UTC để schedule nhưng giữ timezone/policy version để giải thích; re-evaluate khi đến hạn nếu policy yêu cầu. OTP hết TTL trong quiet hours có thể cần từ chối/suppress hoặc channel/category policy khác, không gửi OTP đã hết hiệu lực vào sáng hôm sau.",
+          "en": "Quiet hours use the user’s IANA timezone and local calendar; DST days are not always 24 hours. Define repeated/missing local-time behavior and timezone changes. Schedule with UTC due_at while retaining timezone/policy versions for explanations; reevaluate at execution when required. An OTP expiring during quiet hours needs explicit suppression or category/channel policy, not delivery of an unusable code the next morning."
+        },
+        {
+          "vi": "Digest gộp nhiều social event trong một window theo recipient/category, giữ deterministic digest identity và aggregation cutoff. Không gộp những event cần nội dung/order độc lập chỉ vì cùng user. Frequency cap cần định nghĩa đếm admission, provider acceptance hay delivery; nếu đếm admission thì DLQ có thể tiêu quota, còn nếu chỉ đếm success phải giữ reservation để concurrent attempts không vượt mức.",
+          "en": "Digests aggregate social events by recipient/category/window with deterministic identity and cutoffs. Do not merge events requiring independent content/order just because they share a user. Frequency caps must define whether they count admission, provider acceptance or delivery. Admission caps can charge DLQ work, while success-only caps still need reservations to bound concurrent attempts."
+        }
+      ]
+    },
+    {
+      "id": "retry",
+      "title": {
+        "vi": "9. Retry theo lỗi, deadline và budget",
+        "en": "9. Retry by error class, deadline and budget"
+      },
+      "paragraphs": [
+        {
+          "vi": "Phân loại lỗi theo provider/channel contract: transient 5xx/throttling có thể retry; payload sai hoặc token không còn hợp lệ thường cần sửa/quarantine thay vì lặp lại cùng request. Authentication/configuration failure không phải lúc nào cũng permanent với mọi job: có thể pause provider, sửa credential rồi replay trong deadline. Respect Retry-After khi có, exponential backoff + jitter và attempt/deadline budget; không sleep giữ worker/thread hàng phút nếu có delayed queue/scheduler.",
+          "en": "Classify failures using provider/channel contracts. Transient server errors/throttling can be retryable; invalid payloads or invalidated tokens usually need repair/quarantine rather than identical retries. Authentication/configuration failures are not necessarily permanent for every job: pause the provider, repair credentials and replay within deadlines. Respect Retry-After when present, use exponential backoff with jitter and attempt/deadline budgets, and use delayed queues/schedulers rather than sleeping a worker/thread for minutes."
+        },
+        {
+          "vi": "Deadline phải kiểm trước mỗi send và trước khi chuyển sang provider dự phòng. Một intent đã expired hoặc bị revoke không được “cứ replay cho đủ” sau outage. DLQ cần reason, attempt history, payload/version, expiry và owner vận hành; replay qua cùng policy/idempotency path, không copy record thành intent mới với key mới. DLQ không phải lựa chọn duy nhất: exhausted/expired có thể là terminal status cần audit mà không được resend.",
+          "en": "Check deadlines before each send and provider failover. An expired or revoked intent must not be replayed merely to drain an outage backlog. DLQs need reasons, attempt history, payload/version, expiry and an operational owner. Replays pass through the same policy/idempotency path rather than copying records into new intents with new keys. DLQs are not the only outcome: exhausted/expired jobs may be auditable terminal states that must not be resent."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Quyết định sau một attempt thất bại",
+          "en": "Decide after a failed attempt"
+        },
+        "caption": {
+          "vi": "Unknown cần reconciliation/idempotency policy riêng; không giả định timeout là chưa send.",
+          "en": "Unknown outcomes require reconciliation/idempotency policy; a timeout is not proof of nonsending."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Phân loại outcome",
+              "en": "Classify the outcome"
+            },
+            "detail": {
+              "vi": "Accepted, retryable, invalid/revoked hoặc unknown; giữ evidence.",
+              "en": "Accepted, retryable, invalid/revoked or unknown; retain evidence."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Kiểm quyền và deadline",
+              "en": "Check policy and deadline"
+            },
+            "detail": {
+              "vi": "Preference/expiry còn cho phép? Còn retry/cost budget không?",
+              "en": "Do preferences/expiry still allow it? Is retry/cost budget available?"
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Schedule hoặc kết thúc",
+              "en": "Schedule or finish"
+            },
+            "detail": {
+              "vi": "Delay có jitter; hoặc terminal/DLQ có reason và replay guard.",
+              "en": "Schedule with jitter or terminate/dead-letter with reasons and replay guards."
+            },
+            "icon": "decision"
+          }
+        ]
+      }
+    },
+    {
+      "id": "templates",
+      "title": {
+        "vi": "10. Template version, localization và token hygiene",
+        "en": "10. Template versions, localization and token hygiene"
+      },
+      "paragraphs": [
+        {
+          "vi": "Pin template version, locale và input schema để retry không đổi nội dung ngoài ý muốn. Render có validation, escaping theo email/HTML/text và policy URL; tránh đưa secret hay PII thừa vào push lock screen. Locale fallback cần deterministic và được test. Template render failure nên được phát hiện trước hoặc lưu terminal/retry-after-fix có lý do, không gọi provider với body rỗng rồi coi sent.",
+          "en": "Pin template versions, locales and input schemas so retries do not unexpectedly change content. Validate rendering and escape for email/HTML/text with URL policies; avoid unnecessary secrets/PII on push lock screens. Locale fallback must be deterministic and tested. Detect render failures early or record explained terminal/retry-after-repair states instead of calling a provider with an empty body and marking it sent."
+        },
+        {
+          "vi": "Push token có thể rotate, app uninstall hoặc chuyển user sau logout/login. Registration phải được xác thực theo device/user/app/environment; callback invalid token chỉ vô hiệu hóa registration/version phù hợp, không xóa token mới do một callback cũ đến muộn. Token là thông tin nhạy cảm cần hạn chế log/access và storage retention; không xem token là user identity vĩnh viễn.",
+          "en": "Push tokens rotate, apps are uninstalled and user ownership changes after logout/login. Authenticate registrations by device/user/app/environment. An invalid-token callback disables only the appropriate registration/version rather than removing a new token because an old callback arrives late. Restrict token logging/access and retention; a token is not a permanent user identity."
+        }
+      ]
+    },
+    {
+      "id": "data-model",
+      "title": {
+        "vi": "11. Ledger và callback là evidence, không phải một status tuyến tính",
+        "en": "11. Ledgers and callbacks preserve evidence, not one linear status"
+      },
+      "paragraphs": [
+        {
+          "vi": "Intent chứa producer scope, business key, payload hash, category, template version, schedule/expiry và policy context. Delivery là một recipient/channel/target plan có stable delivery ID. Attempt chứa provider, attempt ID, idempotency key, started_at, timeout/deadline, response/provider ID và outcome. Không nhét vô hạn attempt array vào một row nóng; tách append-only attempt/event records với index hỗ trợ support.",
+          "en": "An intent holds producer scope, business key, payload hash, category, template version, schedule/expiry and policy context. A delivery is a recipient/channel/target plan with a stable delivery ID. Attempts hold provider, attempt ID, idempotency key, start time, timeout/deadline, response/provider ID and outcome. Do not grow an unbounded attempt array in a hot row; use append-only attempt/event records with support indexes."
+        },
+        {
+          "vi": "Callback có thể out of order hoặc trùng. Lưu provider event ID, event_time, received_at, authentication result và mapping tới attempt; derive view từ facts thay vì lấy last callback overwrite status. Complaint có thể đến sau delivery, open có thể do proxy/privacy feature, và không phải channel nào cũng có delivered/open evidence. Unknown là dữ kiện hợp lệ, không được đổi thành false success để dashboard đẹp.",
+          "en": "Callbacks can be out of order or duplicated. Store provider event IDs, event time, receipt time, authentication results and attempt mapping; derive a view from facts rather than overwriting status with the latest callback. Complaints may follow delivery, opens can come from proxies/privacy features, and not every channel exposes delivery/open evidence. Unknown is a valid state and must not become false success to improve a dashboard."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Entity notification",
+            "en": "Notification entity"
+          },
+          {
+            "vi": "Key và scope",
+            "en": "Key and scope"
+          },
+          {
+            "vi": "Điều cần bảo vệ",
+            "en": "What to protect"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Intent",
+              "en": "Intent"
+            },
+            {
+              "vi": "(tenant, producer, idempotency key)",
+              "en": "(tenant, producer, idempotency key)"
+            },
+            {
+              "vi": "Payload hash/result atomic với durable request.",
+              "en": "Payload hash/result atomic with durable request."
+            }
+          ],
+          [
+            {
+              "vi": "Delivery",
+              "en": "Delivery"
+            },
+            {
+              "vi": "(intent ID, recipient, channel, target/version)",
+              "en": "(intent ID, recipient, channel, target/version)"
+            },
+            {
+              "vi": "Identity giữ qua retry/replay đúng contract.",
+              "en": "Identity survives retries/replays under the contract."
+            }
+          ],
+          [
+            {
+              "vi": "Attempt",
+              "en": "Attempt"
+            },
+            {
+              "vi": "(delivery ID, attempt ID)",
+              "en": "(delivery ID, attempt ID)"
+            },
+            {
+              "vi": "Lease/claim, provider ID, unknown outcome và deadline.",
+              "en": "Lease/claim, provider ID, unknown outcome and deadline."
+            }
+          ],
+          [
+            {
+              "vi": "Provider event",
+              "en": "Provider event"
+            },
+            {
+              "vi": "(provider, account, event ID)",
+              "en": "(provider, account, event ID)"
+            },
+            {
+              "vi": "Verified, deduped và gắn đúng attempt; không tin client input.",
+              "en": "Verified, deduplicated and linked to the correct attempt; never trust client input."
+            }
+          ],
+          [
+            {
+              "vi": "Preference/registration",
+              "en": "Preference/registration"
+            },
+            {
+              "vi": "(user/category) hoặc (app, device, registration version)",
+              "en": "(user/category) or (app, device, registration version)"
+            },
+            {
+              "vi": "Version và revoke race policy; bảo vệ token/PII.",
+              "en": "Versioning and revocation race policy; protect tokens/PII."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "12. Failover provider, budget và vận hành an toàn",
+        "en": "12. Provider failover, budgets and safe operations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Failover dựa vào health, region, capability, deliverability và quota, không chỉ HTTP availability. Mỗi provider có circuit breaker/bulkhead và retry budget; reserve capacity ở đường fallback trước sự cố. Nếu provider A timeout unknown rồi gửi B, recipient có thể nhận cả hai; giữ cùng logical delivery ID trong ledger nhưng đừng hứa A và B tự chia sẻ dedup.",
+          "en": "Fail over based on health, region, capability, deliverability and quotas, not just HTTP availability. Use provider-level circuit breakers/bulkheads and retry budgets, and reserve fallback capacity before an incident. If A times out with an unknown outcome and B is called, the recipient can receive both. Preserve one logical delivery ID in the ledger without assuming cross-provider deduplication."
+        },
+        {
+          "vi": "Per-tenant/campaign spend budget, rate limit, review policy và kill switch giúp chặn vòng lặp SMS/email ngoài ý muốn. Kill switch phải chặn job đã queue tại execution boundary, không chỉ dừng nhận request mới. Ràng buộc consent/unsubscribe/retention được biến thành versioned policy do đội sản phẩm/pháp lý xác định theo phạm vi áp dụng; không suy một quy tắc toàn cầu cho mọi quốc gia/channel từ tên transactional.",
+          "en": "Per-tenant/campaign spend budgets, rate limits, review policies and kill switches limit runaway SMS/email loops. Kill switches stop queued jobs at execution rather than merely refusing new requests. Consent/unsubscribe/retention requirements become versioned policies defined by the responsible product/legal teams for their applicable scope, not one universal rule inferred from the transactional label."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Guardrails trước burst",
+            "en": "Guardrails before a burst"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Audience expansion theo page, quota reserve, campaign budget và pause tại worker.",
+              "en": "Paged audience expansion, reserved quotas, campaign budgets and worker-level pausing."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Recovery có kiểm soát",
+            "en": "Controlled recovery"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Rate-limited replay, policy/expiry re-check và quarantine lỗi dữ liệu.",
+              "en": "Rate-limited replay, policy/expiry rechecks and data-error quarantine."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Biết điều chưa biết",
+            "en": "Know what remains unknown"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Unknown provider result và thiếu delivery telemetry được hiển thị đúng; không hứa exactly-once end-user.",
+              "en": "Expose unknown provider outcomes and missing telemetry honestly; do not promise exactly-once end-user delivery."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "observability",
+      "title": {
+        "vi": "13. Funnel theo milestone và test crash window",
+        "en": "13. Milestone funnels and crash-window tests"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dashboard nên tách input request, unique accepted intent, planned delivery, preference suppressed, cap blocked, expired, attempt, provider accepted, delivered evidence, complaint và open/click evidence. Mỗi mẫu số khác nhau: attempt count có thể lớn hơn delivery count, còn event duplicate không là user mới. Dùng provider/region/category/template/tenant làm dimension có kiểm soát cardinality; trace ID không để lộ payload nhạy cảm.",
+          "en": "Dashboards separate input requests, unique accepted intents, planned deliveries, preference suppression, caps, expiry, attempts, provider acceptance, delivery evidence, complaints and open/click evidence. Denominators differ: attempts can exceed deliveries, and duplicate events are not new users. Use provider/region/category/template/tenant dimensions with bounded cardinality; trace IDs must not expose sensitive payloads."
+        },
+        {
+          "vi": "Alert theo queue age/deadline cho urgent, acceptance latency, retry amplification, unknown outcome age, DLQ reason/rate, invalid-token trend và budget burn. Test crash sau idempotency reservation nhưng trước durable job, sau provider acceptance trước ledger update, stale worker sau lease expiry, opt-out khi job đang chờ, callback out of order và replay sau expiry. Kiểm invariant/no silent loss ở durable boundary cùng reason của các intentional suppression, không chỉ đếm sent.",
+          "en": "Alert on urgent queue age/deadlines, acceptance latency, retry amplification, unknown-outcome age, DLQ reasons/rates, invalid-token trends and budget burn. Test crashes after key reservation before durable jobs, after provider acceptance before ledger updates, stale workers after lease expiry, opt-outs while queued, out-of-order callbacks and replays after expiry. Verify invariants/no silent loss at durable boundaries and reasons for intentional suppression rather than merely counting sent events."
+        }
+      ]
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi tình huống và lời giải có điều kiện",
+        "en": "14. Scenario questions with conditional answers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một đáp án tốt chỉ ra boundary và failure mode trước khi đề xuất retry hoặc thêm queue. Dùng những tình huống này để tự giải thích trade-off với deadline, duplicate risk, user preference và budget.",
+          "en": "A strong answer names boundaries and failure modes before adding retries or queues. Use these scenarios to explain deadline, duplication, preference and budget trade-offs."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "SETNX dedup đã thành công nhưng process chết trước enqueue: có an toàn không?",
+            "en": "SETNX dedup succeeds, then the process dies before enqueue. Is that safe?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Retry có thể bị dedup bỏ qua trong khi chưa có durable job. Atomic intent/result + outbox hoặc state machine có recovery mới liên kết reservation và công việc thực. Một key TTL riêng chỉ giới hạn thời gian lỗi, không chứng minh không mất intent.",
+              "en": "No. Retries can be suppressed even though no durable job exists. Atomic intent/result plus an outbox, or a recoverable state machine, links reservation to actual work. A separate key TTL only bounds the failure interval; it does not prove the intent cannot be lost."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Provider timeout sau accept thì có thể bảo đảm không duplicate bằng local ledger không?",
+            "en": "Can a local ledger guarantee no duplicates after a provider timeout following acceptance?"
+          },
+          "answer": [
+            {
+              "vi": "Không chỉ bằng local check. Outcome ở provider chưa được biết; retry có thể tạo acceptance thứ hai. Provider idempotency đúng contract hoặc status query/reconciliation có thể giúp; nếu không, chọn trade-off theo category. Collapse key không mặc định là exactly-once key, và failover provider khác có thể làm mất dedup protection.",
+              "en": "Not by local checks alone. The provider outcome is unknown and a retry can create another acceptance. Contract-appropriate provider idempotency or status reconciliation can help; otherwise choose a category-specific trade-off. A collapse key is not automatically an exactly-once key, and switching providers can remove deduplication protection."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đã chia queue priority mà OTP vẫn chậm khi campaign chạy, kiểm tra đâu?",
+            "en": "OTP is slow during campaigns despite priority queues. What should you inspect?"
+          },
+          "answer": [
+            {
+              "vi": "Kiểm quota provider/account, connection pool, preference/template DB và campaign expansion dùng chung. Queue riêng không tạo throughput provider mới. Reserve urgent capacity ở đúng quota boundary, throttle bulk, dùng fair scheduling và đo queue age/acceptance latency của transactional riêng.",
+              "en": "Inspect shared provider/account quotas, connection pools, preference/template stores and campaign expansion. Separate queues do not create new provider throughput. Reserve urgent capacity at the actual quota boundary, throttle bulk, schedule fairly and measure urgent queue age/acceptance latency separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "User opt-out sau khi job đã queue thì có gửi không?",
+            "en": "A user opts out after a job is queued. Should it still send?"
+          },
+          "answer": [
+            {
+              "vi": "Theo policy của category, re-check tại execution và ghi suppression reason/version. Nếu external call đã bắt đầu thì cần race cutoff rõ; không thể thu hồi một email/SMS đã gửi chỉ bằng xóa queue. Kill switch/cancel cũng phải chặn queued execution, không chỉ ingress.",
+              "en": "Recheck at execution under category policy and record suppression reason/version. If the external call has begun, define the race cutoff; deleting a queue entry cannot recall an email/SMS already sent. Kill switches/cancellations must guard execution as well as ingress."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có nên replay toàn bộ DLQ sau outage?",
+            "en": "Should every DLQ item be replayed after an outage?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Lọc expired, revoked, invalid payload/token và intent đã có kết quả; giữ stable identity và re-check policy. Replay có quota riêng để không làm fresh traffic nghẽn lại. Credential/config errors có thể sửa rồi replay, còn terminal expired cần audit chứ không resend.",
+              "en": "No. Filter expired/revoked work, invalid payloads/tokens and already-resolved intents; preserve stable identities and recheck policy. Replay needs its own quota so it cannot overload fresh traffic. Configuration errors may be repaired and replayed, whereas expired terminal work needs audit rather than resending."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Callback delivered có chứng minh người dùng đọc email không?",
+            "en": "Does a delivered callback prove a user read an email?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Delivery semantics thường là một downstream milestone, khác open/read; open cũng có thể bị proxy/privacy feature ảnh hưởng. Giữ evidence đúng tên, cho phép unknown và không dùng một status SENT để diễn giải mọi channel. Callback cần verify và dedup, kể cả khi đến sau event khác.",
+              "en": "No. Delivery is a downstream milestone rather than reading, and opens can be affected by proxies/privacy features. Name evidence precisely, allow unknown states and avoid one SENT status for all channels. Verify and deduplicate callbacks, including late ones."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao một template retry lại gửi nội dung khác lần đầu?",
+            "en": "Why might a template retry send different content than its first attempt?"
+          },
+          "answer": [
+            {
+              "vi": "Nếu render theo template latest và dữ liệu mutable thì retry có thể đổi body. Pin template version, locale và input snapshot hoặc định nghĩa rõ dynamic fields nào được re-evaluate. Đổi payload với cùng provider idempotency key có thể conflict nên content identity và retry contract phải phối hợp.",
+              "en": "Rendering the latest template from mutable data can change a retry’s body. Pin the template version, locale and input snapshot, or explicitly define fields that are reevaluated. Changing payloads under the same provider idempotency key can conflict, so content identity and retry contracts must align."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao cap chỉ đếm success vẫn cần reservation?",
+            "en": "Why do success-only caps still need reservations?"
+          },
+          "answer": [
+            {
+              "vi": "Nếu nhiều worker đều thấy success count dưới cap rồi cùng gửi, tổng có thể vượt cap trước khi callback về. Reserve allowance atomic trước call, commit/release theo outcome và xử lý unknown riêng; hoặc chọn admission cap đơn giản hơn và công bố semantics. Retry của một delivery không được tiêu lại quota tùy ý.",
+              "en": "Concurrent workers can all observe a count below the cap and send before callbacks arrive, exceeding it. Atomically reserve allowance before calls, commit/release by outcome and handle unknowns separately, or choose simpler documented admission-cap semantics. A delivery retry must not arbitrarily spend the cap again."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

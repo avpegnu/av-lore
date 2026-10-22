@@ -1,0 +1,1150 @@
+{
+  "id": "leaderboard",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Leaderboard: score replay, ties và global rank",
+    "en": "Designing a Leaderboard: score replay, ties and global ranks"
+  },
+  "summary": {
+    "vi": "Thử versioned score projection và sharded top-K/rank; phân tích tie policy, precision, season rollover và rebuild để bảng xếp hạng phản ánh đúng outcomes.",
+    "en": "Explore versioned score projections and sharded top-K/ranks; examine ties, precision, season rollovers and rebuilds so rankings reflect authoritative outcomes."
+  },
+  "prerequisites": [
+    "caching",
+    "messaging",
+    "databases",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "cache",
+    "database",
+    "messaging"
+  ],
+  "takeaways": [
+    {
+      "vi": "Rank definition và tie rule là product contract; ordinal khác competition/dense rank.",
+      "en": "Rank definitions/ties are product contracts; ordinal differs from competition/dense ranks."
+    },
+    {
+      "vi": "Durable outcomes/aggregates trước serving; projection replay cần atomic identity/version protocol.",
+      "en": "Durable outcomes/aggregates precede serving; projection replays need atomic identity/version protocols."
+    },
+    {
+      "vi": "Range output O(log N+M); single ZSET không tự sharded qua Redis Cluster.",
+      "en": "Range outputs cost O(log N+M); single ZSETs do not automatically span Redis Cluster."
+    },
+    {
+      "vi": "Exact sharded rank cần tie-aware counts và coherent view; missing shard có partial semantics.",
+      "en": "Exact sharded ranks need tie-aware counts/coherent views; missing shards require partial semantics."
+    },
+    {
+      "vi": "Season cutoff, correction/ban và snapshot+tail rebuild phải giữ cùng scoring rules.",
+      "en": "Season cutoffs, corrections/bans and snapshot/tail rebuilds preserve scoring rules."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ match outcome tới một rank có nghĩa",
+      "en": "From match outcomes to meaningful ranks"
+    },
+    "caption": {
+      "vi": "Đọc sorted order rồi kiểm replay, sharding và recovery theo cùng semantics.",
+      "en": "Study sorted orders, then validate replay, sharding and recovery under matching semantics."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Trust outcome",
+          "en": "Trust outcomes"
+        },
+        "detail": {
+          "vi": "Authoritative rules, durable identity và aggregates.",
+          "en": "Validate authoritative rules, durable identities and aggregates."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Project score",
+          "en": "Project scores"
+        },
+        "detail": {
+          "vi": "Atomic versioned absolute updates hoặc dedup deltas.",
+          "en": "Apply atomic versioned totals or deduplicated deltas."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Read rank",
+          "en": "Read ranks"
+        },
+        "detail": {
+          "vi": "Ties, around window, top-K và coherent view.",
+          "en": "Define ties, neighborhoods, top-K and coherent views."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Scale và recover",
+          "en": "Scale and recover"
+        },
+        "detail": {
+          "vi": "Shard semantics, season/freeze, rebuild và moderation.",
+          "en": "Manage shards, seasons/freezes, rebuilds and moderation."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Chốt rank definition, freshness và season",
+        "en": "1. Define ranks, freshness and seasons"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline gồm global top-K, own rank, around-me và monthly season; score chỉ từ authoritative game outcomes. Ví dụ visibility target dưới 1 giây sau durable match result khi hệ thống khỏe, với explicit stale/partial policy khi overload. Matchmaking và complex social feeds ngoài baseline. Hỏi exact ordinal rank hay competition/dense rank; “đồng điểm đều hạng 2” khác một unique position trong sorted set.",
+          "en": "The baseline covers global top-K, own ranks, neighborhoods and monthly seasons, with authoritative game outcomes. An example visibility target is below one second after durable results under healthy conditions, with explicit stale/partial policies under overload. Matchmaking and complex social feeds are outside scope. Exact ordinal positions differ from competition/dense ranks where ties can share rank two."
+        },
+        {
+          "vi": "Tie policy có thể score rồi member ID, earliest achievement hoặc domain rule. Season có timezone/cutoff, trusted event time, late-result grace và freeze/correction policy. Nếu rank dùng trao giải thì không tự đổi requirement thành percentile vì implementation rẻ hơn; approximate ranking là product decision được chốt rõ.",
+          "en": "Ties can use member IDs, earliest achievement or domain rules. Seasons need timezones/cutoffs, trusted event times and late-result/freeze/correction policies. Award-bearing exact ranks must not silently become percentiles because implementation is cheaper; approximation is an explicit product decision."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Ordering",
+            "en": "Ordering"
+          },
+          "icon": "chart",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Ordinal, competition và dense rank có kết quả khác nhau khi ties.",
+              "en": "Ordinal, competition and dense ranks differ under ties."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Freshness",
+            "en": "Freshness"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Score accepted, projection visible và season finalized là các boundary khác.",
+              "en": "Accepted scores, visible projections and finalized seasons are different boundaries."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Trust",
+            "en": "Trust"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Authoritative server giảm score forgery, không làm anti-cheat tuyệt đối.",
+              "en": "Authoritative servers reduce score forgery rather than making anti-cheat absolute."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Đếm player outcomes, queries và peak memory",
+        "en": "2. Count player outcomes, queries and peak memory"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả sử 25 triệu monthly players, 5 triệu DAU và 10 scored player outcomes/DAU/ngày. Đây là participation/outcome count, không unique matches khi một match có nhiều người. 50 triệu updates/ngày ≈578,7/s, peak ×5 ≈2.894/s. Rank read QPS phải tính riêng theo active sessions/UI refresh; không suy từ write rate.",
+          "en": "Assume twenty-five million monthly players, five million DAU and ten scored player outcomes per DAU/day. This counts participation/outcomes, not unique multiplayer matches. Fifty million daily updates average 578.7/second, with an assumed fivefold peak of 2,894/second. Rank reads depend separately on sessions/UI refreshes rather than write rates."
+        },
+        {
+          "vi": "25M×100 B =2,5 GB chỉ là illustrative resident-entry assumption. Đo actual Redis encoding/member bytes/allocator, version maps, dedup state, replicas, AOF rewrite/fork copy-on-write và simultaneous old/new rebuild generations. Một board vừa một primary có thể là baseline đơn giản nếu benchmark dưới query/update/failure workload; không khẳng định node nào cũng giữ memory đó hoặc đạt tens-of-thousands ops/s.",
+          "en": "Twenty-five million times one hundred B gives 2.5 GB under an illustrative per-entry assumption. Measure actual encodings/member bytes/allocators, version maps, deduplication state, replicas, AOF rewrite/copy-on-write and overlapping rebuild generations. One primary per board is a simple baseline when benchmarks support the workload/failures, not a universal memory or throughput claim."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng leaderboard",
+            "en": "Leaderboard quantity"
+          },
+          {
+            "vi": "Assumption workload",
+            "en": "Workload assumption"
+          },
+          {
+            "vi": "Giá trị minh họa",
+            "en": "Illustrative result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Daily player updates",
+              "en": "Daily player updates"
+            },
+            {
+              "vi": "5M ×10",
+              "en": "5M ×10"
+            },
+            {
+              "vi": "50M/ngày",
+              "en": "50M/day"
+            }
+          ],
+          [
+            {
+              "vi": "Average updates/s",
+              "en": "Average updates/s"
+            },
+            {
+              "vi": "50M /86.400",
+              "en": "50M /86,400"
+            },
+            {
+              "vi": "578,7/s",
+              "en": "578.7/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak updates/s",
+              "en": "Peak updates/s"
+            },
+            {
+              "vi": "Average ×5",
+              "en": "Average ×5"
+            },
+            {
+              "vi": "2.894/s",
+              "en": "2,894/s"
+            }
+          ],
+          [
+            {
+              "vi": "Entry budget",
+              "en": "Entry budget"
+            },
+            {
+              "vi": "25M ×100 B",
+              "en": "25M ×100 B"
+            },
+            {
+              "vi": "2,5 GB; đo actual + reserve riêng",
+              "en": "2.5 GB; separately measure actual use/reserve"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Public read khác trusted score ingestion",
+        "en": "3. Public reads differ from trusted score ingestion"
+      },
+      "paragraphs": [
+        {
+          "vi": "Internal outcome API xác thực game service, event signature/identity và rule/season; browser không tự gửi điểm được tin cậy. Dedup identity thường gồm match/outcome + player + scoring/correction version, không chỉ match ID vì một match có nhiều players. Public API limit K/around/page, enforce profile visibility và trả rank definition/freshness.",
+          "en": "Authenticate game services, identities/signatures and rules/seasons at internal outcome ingestion; browsers do not submit trusted points. Deduplication identities usually include outcomes/matches, players and scoring/correction versions, not match IDs alone. Public APIs bound K/neighborhoods/pages, enforce profile visibility and report rank definitions/freshness."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/v1/score-outcomes",
+          "description": {
+            "vi": "Trusted game result; source persist trước serving projection.",
+            "en": "Trusted game results persist before serving projections."
+          },
+          "request": "{ outcomeId, matchId, playerId, seasonId, ruleVersion, resultVersion, points }",
+          "response": "202 { acceptedOutcomeId, sourceVersion }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/boards/{board}/seasons/{season}/top?limit=10",
+          "description": {
+            "vi": "Bounded top-K, query-bound generation cursor nếu cần paging.",
+            "en": "Bounded top-K with generation-bound query cursors when paging is needed."
+          },
+          "response": "200 { entries[], rankPolicy, generation, asOf, partial, nextCursor? }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/boards/{board}/seasons/{season}/players/{id}?around=2",
+          "description": {
+            "vi": "Own/authorized player rank và neighbors theo cùng view.",
+            "en": "Authorized player ranks and neighbors under a coherent view."
+          },
+          "response": "200 { player, rank, rankPolicy, around[], generation, asOf } | 404"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Durable source → projection, không phải hai writes độc lập",
+        "en": "4. Durable sources precede projections instead of independent dual writes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline transaction ghi unique outcome, aggregate total/version của player/season và outbox trong cùng source DB. Relay phát absolute aggregate event; rank worker apply monotonic version. Nếu history consumer và Redis consumer chạy độc lập trên ephemeral event, Redis có thể hiển thị score chưa durable trong history; phải có authoritative durable log hoặc transaction/outbox giữ source guarantee.",
+          "en": "A baseline transaction records unique outcomes, per-player/season aggregate totals/versions and outboxes. Relays publish absolute aggregate events; workers apply monotonic versions. Independent history/Redis consumers on ephemeral events can expose scores absent from durable history, requiring authoritative durable logs or transactional sources/outboxes."
+        },
+        {
+          "vi": "Read path lấy rank/score rồi batch hydrate profiles. Redis index là serving projection có durability/failover policy, không là nguồn duy nhất nếu bạn hứa rebuild. History retention, rule versions, corrections và moderation state phải đủ để reconstruct đúng board population/score, không chỉ SUM mọi positive points từng thấy.",
+          "en": "Reads retrieve ranks/scores then batch-hydrate profiles. Redis is a serving projection under durability/failover policies, not the sole source when rebuilds are promised. Retained history, rules, corrections and moderation must reconstruct populations/scores correctly rather than sum every observed positive event."
+        }
+      ],
+      "diagram": {
+        "id": "board-durable-source-and-projection",
+        "title": {
+          "vi": "Score source bền vững trước, rank projection sau",
+          "en": "Durable score sources precede rank projections"
+        },
+        "caption": {
+          "vi": "History, authoritative aggregate và outbox cùng transaction trong baseline. Redis phục vụ query và có thể rebuild theo season/rule generation; không hứa linearizable cross-shard snapshot từ các reads độc lập.",
+          "en": "History, authoritative aggregates and outboxes share a baseline transaction. Redis serves queries and can rebuild by season/rule generations; independent reads do not create linearizable cross-shard snapshots."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Player client",
+              "en": "Player client"
+            },
+            "detail": {
+              "vi": "Chỉ query rank/profile theo quyền; không tự gửi trusted score delta.",
+              "en": "Queries authorized ranks/profiles without submitting trusted score deltas."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Leaderboard API",
+              "en": "Leaderboard API"
+            },
+            "detail": {
+              "vi": "Validate season, K, around window và ranking policy; query generation/freshness metadata.",
+              "en": "Validates seasons, K, around-windows and ranking policies; reports generations/freshness."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "rank",
+            "label": {
+              "vi": "Rank serving index",
+              "en": "Rank serving index"
+            },
+            "detail": {
+              "vi": "ZSET + source-version map theo board/season; atomic monotonic projection và coherent rank/around read.",
+              "en": "Board/season ZSETs and source-version maps support atomic monotonic projections and coherent rank/around reads."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "profiles",
+            "label": {
+              "vi": "Profile cache",
+              "en": "Profile cache"
+            },
+            "detail": {
+              "vi": "Batch hydrate permitted display fields; profile miss không tự đổi score population.",
+              "en": "Batch-hydrates authorized display fields; profile misses do not inherently change score populations."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "game",
+            "label": {
+              "vi": "Authoritative game",
+              "en": "Authoritative game"
+            },
+            "detail": {
+              "vi": "Validate match outcome/service identity/rules; anti-cheat vẫn cần review và correction evidence.",
+              "en": "Validates match outcomes, service identities and rules; anti-cheat still needs reviews/correction evidence."
+            },
+            "x": 130,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "source",
+            "label": {
+              "vi": "History + aggregates",
+              "en": "History + aggregates"
+            },
+            "detail": {
+              "vi": "Unique outcome/player identity, scoring rule, corrected totals, monotonic player/season version và transactional outbox.",
+              "en": "Unique outcome/player identities, scoring rules, corrected totals, monotonic player/season versions and transactional outboxes."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Score event stream",
+              "en": "Score event stream"
+            },
+            "detail": {
+              "vi": "At-least-once delivery có duplicates/out-of-order; retention và replay watermark có contract.",
+              "en": "At-least-once delivery permits duplicates/reordering under explicit retention/replay-watermark contracts."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "queue"
+          },
+          {
+            "id": "project",
+            "label": {
+              "vi": "Projection worker",
+              "en": "Projection worker"
+            },
+            "detail": {
+              "vi": "Apply absolute total khi source version mới; key space/epoch giữ rebuild không trộn generation.",
+              "en": "Applies newer-version absolute totals while key spaces/epochs isolate rebuild generations."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "rebuild",
+            "label": {
+              "vi": "Rebuild / publisher",
+              "en": "Rebuild / publisher"
+            },
+            "detail": {
+              "vi": "Snapshot consistent watermark, replay tail, validate và publish generation; old key được retain cho query/session khi cần.",
+              "en": "Snapshots consistent watermarks, replays tails, validates and publishes generations; retains old keys as query/session policies require."
+            },
+            "x": 740,
+            "y": 710,
+            "kind": "worker"
+          },
+          {
+            "id": "archive",
+            "label": {
+              "vi": "Season archive",
+              "en": "Season archive"
+            },
+            "detail": {
+              "vi": "Finalized board cùng cutoff/rules/correction policy để audit, awards và retention.",
+              "en": "Finalized boards preserve cutoffs/rules/correction policies for audits, awards and retention."
+            },
+            "x": 430,
+            "y": 710,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "score",
+            "label": {
+              "vi": "Durable outcome tới rank",
+              "en": "Durable outcome to rank"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "game",
+                "description": {
+                  "vi": "Game interaction đi qua authoritative validation; client không tự đặt points.",
+                  "en": "Game interactions pass authoritative validation rather than clients setting points."
+                }
+              },
+              {
+                "from": "game",
+                "to": "source",
+                "description": {
+                  "vi": "Commit unique player outcome + aggregate total/version + outbox.",
+                  "en": "Commit unique player outcomes, aggregate totals/versions and outboxes."
+                }
+              },
+              {
+                "from": "source",
+                "to": "events",
+                "description": {
+                  "vi": "Relay committed aggregate event; consumer ACK crash có thể redeliver.",
+                  "en": "Relay committed aggregate events; consumer ACK crashes can redeliver."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "project",
+                "description": {
+                  "vi": "Nhận (board,season,player,total,version,rule).",
+                  "en": "Receive board/season/player/total/version/rule records."
+                },
+                "async": true
+              },
+              {
+                "from": "project",
+                "to": "rank",
+                "description": {
+                  "vi": "Atomic check source version rồi update score/version trong cùng serving shard.",
+                  "en": "Atomically check versions and update scores/version markers in one serving shard."
+                }
+              }
+            ]
+          },
+          {
+            "id": "query",
+            "label": {
+              "vi": "Top-K và quanh player",
+              "en": "Top-K and neighboring players"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Query season/board, K hoặc around player theo quyền.",
+                  "en": "Query authorized seasons/boards and K or player neighborhoods."
+                }
+              },
+              {
+                "from": "api",
+                "to": "rank",
+                "description": {
+                  "vi": "Read top-K hoặc atomic rank+range theo ranking/generation contract.",
+                  "en": "Read top-K or coherent rank/range results under ranking/generation contracts."
+                }
+              },
+              {
+                "from": "rank",
+                "to": "api",
+                "description": {
+                  "vi": "Trả member/score/position và projection watermark/freshness.",
+                  "en": "Return members, scores, positions and projection watermarks/freshness."
+                }
+              },
+              {
+                "from": "api",
+                "to": "profiles",
+                "description": {
+                  "vi": "Batch hydrate tên/avatar được phép, không đọc profile từng request nối tiếp.",
+                  "en": "Batch-hydrate authorized names/avatars rather than sequential per-player calls."
+                }
+              },
+              {
+                "from": "profiles",
+                "to": "api",
+                "description": {
+                  "vi": "Missing profile có fallback; không âm thầm re-rank population.",
+                  "en": "Missing profiles have fallbacks rather than silently reranking populations."
+                }
+              },
+              {
+                "from": "api",
+                "to": "client",
+                "description": {
+                  "vi": "Response nêu rank definition, season và staleness/partial khi có.",
+                  "en": "Responses identify rank definitions, seasons and any staleness/partial state."
+                }
+              }
+            ]
+          },
+          {
+            "id": "rebuild",
+            "label": {
+              "vi": "Rebuild không làm mất live tail",
+              "en": "Rebuild without losing the live tail"
+            },
+            "steps": [
+              {
+                "from": "source",
+                "to": "rebuild",
+                "description": {
+                  "vi": "Consistent snapshot tổng score tại watermark theo source partition vector khi cần.",
+                  "en": "Snapshot consistent score totals at watermarks, using partition vectors when required."
+                }
+              },
+              {
+                "from": "events",
+                "to": "rebuild",
+                "description": {
+                  "vi": "Replay retained tail sau snapshot; version guards bỏ duplicate/stale events.",
+                  "en": "Replay retained post-snapshot tails; version guards reject duplicate/stale events."
+                },
+                "async": true
+              },
+              {
+                "from": "rebuild",
+                "to": "rank",
+                "description": {
+                  "vi": "Build fresh generation, validate count/sums/sample ranks và catch-up trước pointer swap.",
+                  "en": "Build fresh generations and validate counts/sums/sample ranks plus catch-up before switching pointers."
+                }
+              },
+              {
+                "from": "rank",
+                "to": "api",
+                "description": {
+                  "vi": "Query pin generation hoặc expire cursor; không đổi global fleet đồng thời bằng một assumption.",
+                  "en": "Queries pin generations or expire cursors rather than assuming instantaneous fleet-wide switches."
+                }
+              }
+            ]
+          },
+          {
+            "id": "season",
+            "label": {
+              "vi": "Season rollover và correction",
+              "en": "Season rollover and corrections"
+            },
+            "steps": [
+              {
+                "from": "game",
+                "to": "source",
+                "description": {
+                  "vi": "Assign trusted season/cutoff; late result đi theo grace/freeze policy.",
+                  "en": "Assign trusted seasons/cutoffs; late results follow grace/freeze policies."
+                }
+              },
+              {
+                "from": "source",
+                "to": "archive",
+                "description": {
+                  "vi": "Finalize snapshot kèm rule version; correction sau awards có audit/version riêng.",
+                  "en": "Finalize snapshots with rule versions; post-award corrections have their own audits/versions."
+                },
+                "async": true
+              },
+              {
+                "from": "source",
+                "to": "events",
+                "description": {
+                  "vi": "Correction tạo absolute total mới và version cao hơn, kể cả khi score giảm.",
+                  "en": "Corrections generate newer absolute totals/versions even when scores decrease."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "project",
+                "description": {
+                  "vi": "Project correction theo season/generation và moderation eligibility.",
+                  "en": "Project corrections by season/generation and moderation eligibility."
+                },
+                "async": true
+              },
+              {
+                "from": "project",
+                "to": "rank",
+                "description": {
+                  "vi": "Không dùng score-only GT guard để chặn mọi correction giảm điểm.",
+                  "en": "Do not use score-only GT guards that reject all downward corrections."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "sorted-set",
+      "title": {
+        "vi": "5. Sorted set trả position nhanh; product rank có thể khác",
+        "en": "5. Sorted sets return positions efficiently, but product ranks can differ"
+      },
+      "paragraphs": [
+        {
+          "vi": "Redis sorted sets hỗ trợ update/rank O(log N); range trả M members thường O(log N+M), không O(log N) bất kể output size. Skiplist spans hỗ trợ order statistics ở large encoding; engine có compact encoding cho set nhỏ. SQL index score hỗ trợ top-K tốt, nhưng generic B-tree không tự có stored subtree counts cho arbitrary exact ordinal rank; count higher entries có thể scan nhiều index entries tùy plan/selectivity. SQL vẫn hợp workload nhỏ hoặc snapshot/offline ranks.",
+          "en": "Redis sorted sets support logarithmic updates/ranks, while ranges returning M members typically cost O(log N+M), not logarithmic regardless of output. Skiplist spans support large-set order statistics, with compact encodings for small sets. SQL score indexes handle top-K well, but generic B-trees do not inherently store arbitrary ordinal-rank subtree counts; counting preceding entries can scan many entries depending on plans/selectivity. SQL remains valid for small workloads or offline/snapshot ranks."
+        },
+        {
+          "vi": "Redis ascending order dùng score rồi byte-lexicographic member; REV đảo cả score và tie direction. ZREVRANK là zero-based ordinal position; UI thường cộng 1. Competition rank =1+count(score greater), dense rank =1+count(distinct greater scores), không phải lúc nào ZREVRANK cũng là rank product muốn. Demo dùng ASCII IDs để byte order dễ kiểm.",
+          "en": "Ascending Redis order uses score then member byte lexicographic order; REV reverses both scores and ties. ZREVRANK returns zero-based ordinal positions, commonly displayed plus one. Competition ranks count higher-scoring players, while dense ranks count distinct higher scores, so ZREVRANK does not implement every product rank. The demo uses ASCII IDs for transparent byte ordering."
+        }
+      ],
+      "experiment": "board-replay"
+    },
+    {
+      "id": "precision",
+      "title": {
+        "vi": "6. Tie-breaking không được làm score mất precision",
+        "en": "6. Tie-breaking must not destroy score precision"
+      },
+      "paragraphs": [
+        {
+          "vi": "Redis score là double; integers trong supported exact range có thể biểu diễn chính xác nhưng arbitrary decimal/composite values có thể collide do rounding. Ví dụ pack points×2^32+tieBits chỉ exact nếu bounds/tie domain chứng minh tổng nằm trong safe integer budget; không nhét Unix milliseconds tùy ý vào 32 bits. Trong JavaScript dùng conservative Number.isSafeInteger hoặc integer representation/validation phù hợp trước gửi.",
+          "en": "Redis scores are doubles: supported integers are exact, but arbitrary decimals/composites can collide through rounding. Packing points×2^32+tieBits needs proven bounds and safe integer totals; arbitrary Unix milliseconds do not fit thirty-two bits. Use conservative JavaScript safe-integer checks or suitable integer representations/validation before submission."
+        },
+        {
+          "vi": "Earliest-to-reach cần định nghĩa timestamp source, precision, season epoch và behavior sau penalty/correction. Nếu pack composite score thì ZINCRBY raw points không còn update đúng tuple; cần atomic compute/set cùng dedup/version guard hoặc ordered index hỗ trợ comparator thật. Equal packed tie vẫn cần deterministic final tie-breaker. Không claim Redis native member comparator tùy ý đổi được bằng một config.",
+          "en": "Earliest-achievement ties need timestamp sources, precision, season epochs and penalty/correction rules. Composite packing invalidates raw-point ZINCRBY updates; use atomic compute/set with dedup/version guards or indexes supporting actual tuple comparators. Equal packed ties still need deterministic final ordering. Redis member comparisons are not arbitrary configurable comparators."
+        }
+      ],
+      "code": {
+        "language": "bash",
+        "content": "# One board/season key; bounds are inclusive, positions are zero-based.\nZRANGE lb:{2026-10}:scores 0 9 REV WITHSCORES\nZREVRANK lb:{2026-10}:scores player:42\n# Rank + around range need one coherent read protocol when live updates race.\n# Raw ZINCRBY is NOT replay-safe without an atomic deduplication protocol.",
+        "caption": {
+          "vi": "Read commands minh họa; scoring/projection protocol ở phần tiếp theo, không chạy Redis thật trong bài.",
+          "en": "Illustrative reads; the following projection protocol handles scoring, and this lesson runs no real Redis."
+        }
+      }
+    },
+    {
+      "id": "projection",
+      "title": {
+        "vi": "7. Duplicate và out-of-order events cần xử lý tại projection boundary",
+        "en": "7. Handle duplicate/reordered events at the projection boundary"
+      },
+      "paragraphs": [
+        {
+          "vi": "ZINCRBY cộng hai lần nếu worker update Redis rồi crash trước commit offset. Dedup ở source DB chỉ bảo vệ source, không tự bảo vệ side effect Redis. Có thể dùng atomic dedup marker+delta update trong cùng serving shard với retention compatible replay, hoặc absolute aggregate total + monotonic per-player/season version trong một atomic apply. Demo dùng phương án absolute; source phải aggregate outcomes đúng và tăng version cả khi correction giảm score.",
+          "en": "ZINCRBY double-counts when workers update Redis then crash before offset commits. Source deduplication protects the source, not Redis side effects. Options include atomic marker-plus-delta updates with replay-compatible retention or atomic absolute totals plus monotonic player/season versions. The demo uses absolute totals, relying on correct source aggregation and newer versions even for downward corrections."
+        },
+        {
+          "vi": "Version map và score key cần chung atomicity/Redis Cluster slot nếu dùng script. Lua execution atomic với commands khác nhưng runtime error không rollback writes đã xảy ra; validate types/limits/key state trước mutation và có rebuild/reconcile path. Stale worker không được trộn active generation; an toàn của projection còn phụ thuộc persistence/failover và source watermark recovery.",
+          "en": "Version maps and score keys need shared atomicity/Cluster slots for scripts. Lua execution is atomic relative to other commands, but runtime errors do not roll back prior writes: validate types/limits/key states first and provide rebuild/reconciliation. Stale workers must not mix generations, and projection safety also depends on persistence/failover and source-watermark recovery."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Apply một absolute score event",
+          "en": "Apply an absolute score event"
+        },
+        "caption": {
+          "vi": "Identity/version được scope theo board/season/player; score thấp hơn vẫn có thể là correction mới hợp lệ.",
+          "en": "Scope identities/versions by board/season/player; lower scores can still be valid newer corrections."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Validate",
+              "en": "Validate"
+            },
+            "detail": {
+              "vi": "Trusted source, rule/season/epoch và numeric bounds.",
+              "en": "Validate trusted sources, rules/seasons/epochs and numeric bounds."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Compare version",
+              "en": "Compare versions"
+            },
+            "detail": {
+              "vi": "Old/duplicate version không đổi score.",
+              "en": "Old/duplicate versions leave scores unchanged."
+            },
+            "icon": "compare"
+          },
+          {
+            "title": {
+              "vi": "Atomic apply",
+              "en": "Apply atomically"
+            },
+            "detail": {
+              "vi": "Set absolute score và source version cùng boundary.",
+              "en": "Set absolute scores and source versions within one boundary."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Checkpoint",
+              "en": "Checkpoint"
+            },
+            "detail": {
+              "vi": "Ack event sau apply; retry vẫn idempotent.",
+              "en": "Acknowledge after application; retries remain idempotent."
+            },
+            "icon": "flag"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sharding",
+      "title": {
+        "vi": "8. Một ZSET key không tự trải qua cả Redis Cluster",
+        "en": "8. One ZSET key does not automatically span Redis Cluster"
+      },
+      "paragraphs": [
+        {
+          "vi": "Scale nhiều boards/seasons qua keys khác, read replicas/caches theo freshness policy trước khi split một board. Redis Cluster đặt một key ở một slot; thêm nodes không tự chia giant sorted set. Nếu hash-shard users, global top-K có thể merge local top-K từ mọi shard khi cùng order/filter/snapshot: một global top-K member không thể nằm sau K member trong chính shard của nó.",
+          "en": "Distribute boards/seasons across keys and add freshness-aware read replicas/caches before splitting one board. Redis Cluster places one key in one slot; adding nodes does not split giant sorted sets. User-hash sharding can merge local top-K from all shards under common orders/filters/snapshots: global top-K members cannot follow K members within their own shard."
+        },
+        {
+          "vi": "Exact ordinal rank phải đếm tuple đứng trước target trên mọi shard: greater score cộng equal-score member đứng trước theo tie rule. Chỉ sum ZCOUNT(score greater) trả competition rank, không ordinal. Independent shard reads ở các thời điểm khác không chứng minh một instant global snapshot; missing shard phải partial/fail theo contract. Demo giữ dataset frozen để kiểm arithmetic.",
+          "en": "Exact ordinal ranks count tuples preceding targets on every shard: greater scores plus preceding equal-score members under the tie rule. Summing only greater-score counts gives competition rather than ordinal rank. Independent shard reads at different times do not establish a global snapshot; missing shards require partial/failure behavior. The demo freezes data to isolate arithmetic."
+        }
+      ],
+      "experiment": "board-shards"
+    },
+    {
+      "id": "range-approximation",
+      "title": {
+        "vi": "9. Range sharding và histogram đổi chi phí query",
+        "en": "9. Range sharding and histograms change query costs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Score-range sharding giữ higher-range counts cộng local rank nhưng players migrate khi score/correction qua boundary. Cần consistent ownership/count updates và split hot ranges; top-K có thể đọc nhiều ranges nếu highest range ít players. Hash sharding cân key count chứ không bảo đảm QPS uniform; merge candidates có network/CPU cost theo shards×K và tail latency theo slow shard.",
+          "en": "Score-range sharding combines higher-range counts with local ranks but migrates players across score/correction boundaries. Ownership/count updates must remain consistent, with hot-range splitting; sparse highest ranges can make top-K span several ranges. Hashing balances key counts rather than necessarily QPS. Candidate merging costs network/CPU proportional to shards times K and waits for slow shards."
+        },
+        {
+          "vi": "Exact top-K cộng approximate percentile/histogram là lựa chọn product hợp lệ nếu users/awards chấp nhận. Histogram update phải decrement old bucket và increment new bucket, xử lý duplicates/corrections/population change; counts incoherent làm interval sai. Nêu percentile/tie definition, bucket resolution/error bound và as-of timestamp. Demo interval từ cùng frozen histogram không là proof pipeline live histogram tự exact.",
+          "en": "Exact top-K plus approximate percentiles/histograms is valid when product/awards permit. Histograms must decrement old buckets and increment new ones while handling duplicates, corrections and population changes; incoherent counts invalidate intervals. Specify percentile/tie definitions, resolution/error bounds and as-of times. Frozen-demo intervals do not prove live histogram pipelines exact."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Cách chia board",
+            "en": "Board partitioning"
+          },
+          {
+            "vi": "Điểm thuận lợi",
+            "en": "Strength"
+          },
+          {
+            "vi": "Điểm phải trả giá",
+            "en": "Cost"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Single board key",
+              "en": "Single board key"
+            },
+            {
+              "vi": "Coherent rank/range protocol trên một serving owner.",
+              "en": "Coherent rank/range protocols within one serving owner."
+            },
+            {
+              "vi": "Memory/update throughput và failover của owner.",
+              "en": "Owner memory/throughput and failover limits."
+            }
+          ],
+          [
+            {
+              "vi": "Hash by member",
+              "en": "Hash by member"
+            },
+            {
+              "vi": "Member distribution và local sorted sets.",
+              "en": "Distributed members with local sorted sets."
+            },
+            {
+              "vi": "Top-K/rank fanout, ties và consistent cut.",
+              "en": "Top-K/rank fanout, ties and consistent cuts."
+            }
+          ],
+          [
+            {
+              "vi": "Score range",
+              "en": "Score range"
+            },
+            {
+              "vi": "Rank từ higher-range counts + local index.",
+              "en": "Ranks from higher-range counts plus local indexes."
+            },
+            {
+              "vi": "Migrations, count consistency, skew và hot range.",
+              "en": "Migrations, consistent counts, skew and hot ranges."
+            }
+          ],
+          [
+            {
+              "vi": "Approximate distribution",
+              "en": "Approximate distribution"
+            },
+            {
+              "vi": "Giảm exact-query work khi product cho phép.",
+              "en": "Less exact-query work when product permits."
+            },
+            {
+              "vi": "Error/definition, coherent histogram và award policy.",
+              "en": "Error definitions, coherent histograms and award policies."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "read-pagination",
+      "title": {
+        "vi": "10. Rank và around-me phải dùng cùng view",
+        "en": "10. Ranks and neighborhoods need a coherent view"
+      },
+      "paragraphs": [
+        {
+          "vi": "ZREVRANK rồi ZRANGE ở hai network calls có thể race với score update: around window không còn quanh user. Dùng atomic read script/protocol trên cùng key hoặc snapshot/generation view phù hợp; profile hydrate sau không tự phá score view, nhưng ban/eligibility đổi phải có semantics riêng. Nếu live best-effort là acceptable thì nói rõ response không là fixed snapshot.",
+          "en": "Separate ZREVRANK/ZRANGE calls can race updates and yield neighborhoods no longer surrounding users. Use atomic reads on the same key or suitable snapshot/generation views. Profile hydration need not alter score views, while eligibility/bans need explicit semantics. Clearly label acceptable live best-effort responses instead of claiming fixed snapshots."
+        },
+        {
+          "vi": "Offset pagination trên live ranking có thể duplicate/skip khi players di chuyển. Query-bound cursor cần season/rank policy/generation và last tuple, nhưng tuple cursor cũng không tạo snapshot nếu data vẫn đổi. Snapshot leaderboard hoặc frozen tournament results cho stable pages; retention/cursor expiry phải tương thích. Missing profile không nên xóa row rồi reassign rank nếu product rank population vẫn gồm player đó.",
+          "en": "Offset paging over live ranks can duplicate/skip moving players. Cursors bind seasons/rank policies/generations and last tuples, but tuple cursors alone do not freeze changing data. Snapshot/finalized boards provide stable pages with compatible retention/expiry. Missing profiles should not silently remove players and reassign ranks while the population still includes them."
+        }
+      ]
+    },
+    {
+      "id": "season-rebuild",
+      "title": {
+        "vi": "11. Rollover, late results và rebuild cần watermarks",
+        "en": "11. Rollovers, late results and rebuilds need watermarks"
+      },
+      "paragraphs": [
+        {
+          "vi": "New season dùng key/generation mới thay vì mass reset một hot key. Trusted season assignment xác định theo finalized match time hoặc ingestion time đã chọn, timezone và grace; late event sau freeze được reject/archive/correct theo policy. Awards cần finalization watermark và replay/audit, không chỉ EXPIREAT theo clock. Old board retention phục vụ history/appeals khác cache TTL.",
+          "en": "New seasons use new keys/generations rather than mass resets. Trusted season assignment follows chosen finalized-match or ingestion times, timezones and grace policies; post-freeze events are rejected, archived or corrected explicitly. Awards need finalization watermarks/replays/audits rather than expiry clocks alone. Old-board history/appeal retention differs from cache TTL."
+        },
+        {
+          "vi": "Rebuild source snapshot tại consistent watermark, project full totals/rules/eligibility vào fresh generation rồi replay tail sau watermark. Validate member counts, score sums và sampled ranks trước publish; giữ stream retention đủ thời gian rebuild và partition-offset vector khi không có single global cursor. Không snapshot rồi lấy newest offset để bỏ qua tail. Current projection AOF/replicas có RPO/RTO riêng; repair/rebuild là plan được đo, không hứa “Redis mất thì rebuild tức thì”.",
+          "en": "Rebuild consistent source snapshots at watermarks into fresh generations with totals/rules/eligibility, then replay subsequent tails. Validate counts, score sums and sampled ranks, retain streams long enough and use partition-offset vectors when no global cursor exists. Taking newest offsets after snapshots can skip tails. AOF/replicas have specific RPO/RTO; measure recovery rather than promising instant rebuilds."
+        }
+      ]
+    },
+    {
+      "id": "social-security",
+      "title": {
+        "vi": "12. Friends, moderation và profile privacy",
+        "en": "12. Friends, moderation and profile privacy"
+      },
+      "paragraphs": [
+        {
+          "vi": "Friends board nhỏ có thể batch read F member scores và sort O(F log F), lấy top-K hoặc quanh user; fetching O(F) không làm sort miễn phí. Kiểm friendship/visibility, blocklist và cross-region restrictions trước hydrate; global rank không tự là friends rank. Nhiều social boards lớn có thể cần materialized audience projections với update fanout và policy lifecycle.",
+          "en": "Small friends boards can batch-read F scores and sort in O(F log F) for top-K/neighborhoods; linear fetching does not make sorting free. Check friendships, visibility, blocks and regional policies before hydration; global ranks are not friends ranks. Large social audiences can need materialized projections with fanout and policy lifecycles."
+        },
+        {
+          "vi": "Authenticate game service, verify replay/rule bounds và giữ outcome evidence cho anti-cheat review. Ban/remove/correction phải durable tại source và propagate index/cache/archive theo policy; ZREM tạm rồi rebuild từ unfiltered history sẽ hồi sinh người bị loại. Scoring-rule changes cần versioned recomputation, không tùy tiện cộng penalty event nhiều lần khi retry.",
+          "en": "Authenticate game services, verify replay/rule bounds and retain outcome evidence for anti-cheat review. Persist bans/removals/corrections at sources and propagate under policy: temporary ZREM plus unfiltered rebuilds can resurrect excluded players. Scoring-rule changes need versioned recomputation rather than repeatedly adding retried penalties."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "13. Đo score-to-visible và rebuild trong failure drills",
+        "en": "13. Measure score visibility and rebuilds during failure drills"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metric gồm durable outcome→projection-visible latency theo season/region, stale-version rejection, score mismatches với source, index member count, hot key CPU, replication/AOF lag, query partial rate, profile hydration latency và rebuild ETA. Theo dõi scoring corrections/bans và awards-finalization errors riêng. Failover test phải kiểm score/version marker khớp, không chỉ Redis ping thành công.",
+          "en": "Measure durable-outcome-to-visible latency by season/region, stale-version rejections, source/projection mismatches, membership, hot-key CPU, replication/AOF lag, partial queries, hydration latency and rebuild ETAs. Track corrections/bans and award-finalization errors separately. Failovers must preserve score/version consistency, not merely restore Redis pings."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault leaderboard",
+            "en": "Leaderboard fault"
+          },
+          {
+            "vi": "Invariant cần quan sát",
+            "en": "Observed invariant"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Update rồi crash trước offset ACK",
+              "en": "Update then crash before offset acknowledgement"
+            },
+            {
+              "vi": "Replay không tăng score thêm.",
+              "en": "Replay does not add scores again."
+            }
+          ],
+          [
+            {
+              "vi": "Version 2 tới trước version 1",
+              "en": "Version two arrives before version one"
+            },
+            {
+              "vi": "Absolute score không downgrade bởi stale retry.",
+              "en": "Stale retries do not downgrade absolute scores."
+            }
+          ],
+          [
+            {
+              "vi": "Correction giảm score",
+              "en": "A correction lowers scores"
+            },
+            {
+              "vi": "Version cao hơn được apply dù score thấp hơn.",
+              "en": "Newer versions apply even when scores decrease."
+            }
+          ],
+          [
+            {
+              "vi": "Shard timeout",
+              "en": "A shard times out"
+            },
+            {
+              "vi": "Không gọi partial result là exact complete rank.",
+              "en": "Partial results are not labeled exact complete ranks."
+            }
+          ],
+          [
+            {
+              "vi": "Live update giữa rank/range",
+              "en": "Live update between rank/range reads"
+            },
+            {
+              "vi": "Coherent view hoặc declared best-effort semantics.",
+              "en": "Coherent views or declared best-effort semantics."
+            }
+          ],
+          [
+            {
+              "vi": "Rebuild trong lúc ban/correct",
+              "en": "Rebuild during bans/corrections"
+            },
+            {
+              "vi": "Không revive excluded player hoặc skip tail.",
+              "en": "Excluded players are not revived and tails are not skipped."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi phỏng vấn về rank, replay và distributed view",
+        "en": "14. Interview questions on ranks, replay and distributed views"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trả lời bằng sorted tuple, event identity, projection boundary và snapshot semantics. Test brute-force sorted fixture với sharded merge trước khi dùng complexity để biện hộ architecture.",
+          "en": "Explain sorted tuples, event identities, projection boundaries and snapshot semantics. Validate sharded merges against brute-force fixtures before using complexity to justify architecture."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "ZREVRANK có luôn là rank người chơi muốn không?",
+            "en": "Does ZREVRANK always give the desired player rank?"
+          },
+          "answer": [
+            {
+              "vi": "Nó là zero-based ordinal position theo score/member ordering. Competition/dense rank có tie semantics khác. REV đảo lexical tie direction; earliest achievement cần ordered model/encoding có bounds rõ.",
+              "en": "It is a zero-based ordinal position under score/member ordering. Competition/dense ranks differ on ties. REV reverses lexical ties; earliest-achievement rules need explicit ordering/encoding bounds."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dedup matchId ở source đã đủ chống ZINCRBY lặp chưa?",
+            "en": "Does source match-ID deduplication prevent repeated ZINCRBY effects?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Redis update rồi crash trước offset ACK vẫn replay. Atomic dedup+delta hoặc absolute aggregate+version tại projection boundary; identity gồm player/correction vì match có nhiều outcomes.",
+              "en": "No. Redis updates followed by pre-ACK crashes can replay. Use atomic deduplication/deltas or absolute aggregates/versions at the projection boundary, with player/correction-aware identities."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hash-shard global rank chỉ cần sum higher scores?",
+            "en": "Does hash-sharded global rank only sum higher scores?"
+          },
+          "answer": [
+            {
+              "vi": "Đó là competition rank. Ordinal còn equal-score member đứng trước theo tie order. Cần target tuple đúng version và consistent shard view nếu claim exact global snapshot.",
+              "en": "That gives competition rank. Ordinal ranks also count preceding equal-score members, using correct target versions and coherent shard views when claiming exact snapshots."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một shard timeout có trả những top-K còn lại như complete được không?",
+            "en": "Can available-shard top-K be returned as complete after one timeout?"
+          },
+          "answer": [
+            {
+              "vi": "Không bảo đảm missing shard không chứa top players. Mark partial hoặc fail theo contract; local top-K union proof cần mọi shard và cùng ordering/filter/view.",
+              "en": "Missing shards may contain leading players. Mark partial or fail under the contract; the union proof requires all shards and common orders/filters/views."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao không cộng timestamp nhỏ vào score float để tie-break?",
+            "en": "Why not add a small timestamp fraction to scores for ties?"
+          },
+          "answer": [
+            {
+              "vi": "Double precision và score magnitude có thể làm fraction biến mất hoặc reorder sai. Chứng minh domain/safe integer packing hoặc dùng ordered index comparator phù hợp; packed score update không là raw ZINCRBY points.",
+              "en": "Floating precision/magnitudes can erase fractions or reorder ties. Prove bounded safe packing or use appropriate tuple indexes; packed updates are not raw-point increments."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Redis Cluster tự chia giant ZSET khi thêm node?",
+            "en": "Does adding Redis Cluster nodes split a giant ZSET?"
+          },
+          "answer": [
+            {
+              "vi": "Không, một key thuộc một slot. Split board phải đổi data model/query fanout/count consistency hoặc chọn approximate policy được product chấp nhận.",
+              "en": "No: one key occupies one slot. Splitting boards changes models, fanout/count consistency or explicitly accepted approximation policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Rebuild bằng SUM(points) có luôn khôi phục đúng không?",
+            "en": "Does rebuilding with SUM(points) always restore the board?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ nếu source/rules/retention bao phủ dedup, corrections, eligibility và season. Cần snapshot watermark + tail replay + generation publish; bỏ ban/correction hoặc lấy offset sai sẽ restore wrong score.",
+              "en": "Only with sufficient sources/rules/retention covering deduplication, corrections, eligibility and seasons. Use snapshot watermarks, tail replay and generation publication; missing policies/incorrect offsets restore wrong scores."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể đổi mọi rank thấp thành percentile để scale không?",
+            "en": "Can all lower ranks be replaced with percentiles for scale?"
+          },
+          "answer": [
+            {
+              "vi": "Là product trade-off, không tự đổi khi exact ranks/awards đã được yêu cầu. Nếu chấp nhận approximation, công bố definition, bucket resolution/error/as-of và giữ histogram updates coherent.",
+              "en": "That is a product trade-off, not an automatic replacement for requested exact ranks/awards. Accepted approximations need explicit definitions, resolutions/errors/as-of times and coherent histogram updates."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

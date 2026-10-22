@@ -1,0 +1,1200 @@
+{
+  "id": "reservations",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Reservation System: inventory, holds và late payment",
+    "en": "Designing a Reservation System: inventory, holds and late payments"
+  },
+  "summary": {
+    "vi": "Thử whole-stay race và expired-hold revival; nối conditional inventory transactions với payment recovery, waiting-room admission và channel capacity boundaries.",
+    "en": "Explore whole-stay races and expired-hold revival; connect inventory transactions with payment recovery, waiting-room admission and channel capacity boundaries."
+  },
+  "prerequisites": [
+    "databases",
+    "consistency",
+    "payments",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "database",
+    "backend",
+    "distributed"
+  ],
+  "takeaways": [
+    {
+      "vi": "Whole-stay inventory và reservation/result/outbox phải cùng atomic boundary.",
+      "en": "Whole-stay inventory, reservations/results and outboxes share atomic boundaries."
+    },
+    {
+      "vi": "HELD state cần expiry/version semantics; timeout payment không chứng minh chưa charge.",
+      "en": "Hold states need expiry/version semantics; payment timeouts do not prove no charge."
+    },
+    {
+      "vi": "Late capture không tự revive released entitlement; recovery/refund có identity riêng.",
+      "en": "Late captures cannot revive released entitlements; recoveries/refunds have separate identities."
+    },
+    {
+      "vi": "Conditional updates vẫn có abort/deadlock/unknown commit; retries phải bounded/idempotent.",
+      "en": "Conditional updates still abort/deadlock/have ambiguous commits; retries are bounded/idempotent."
+    },
+    {
+      "vi": "Waiting room/Redis TTL/async channel events không tự tạo durable global no-oversell guarantee.",
+      "en": "Waiting rooms, TTLs and asynchronous channel events do not inherently provide durable global capacity guarantees."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ availability hint tới confirmed entitlement",
+      "en": "From availability hints to confirmed entitlements"
+    },
+    "caption": {
+      "vi": "Quyền dùng inventory và trạng thái tiền là hai workflow liên kết, không một transaction xuyên network.",
+      "en": "Inventory entitlements and payment states are linked workflows, not one network-spanning transaction."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Browse",
+          "en": "Browse"
+        },
+        "detail": {
+          "vi": "Cached hints và trusted quote/date policy.",
+          "en": "Read cached hints and trusted quotes/dates."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Acquire",
+          "en": "Acquire"
+        },
+        "detail": {
+          "vi": "Atomic all-night capacity, hold ID và expiry.",
+          "en": "Acquire whole-stay capacity, hold identities and deadlines."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Confirm/release",
+          "en": "Confirm or release"
+        },
+        "detail": {
+          "vi": "Verified payment, version/deadline guard và counters.",
+          "en": "Apply verified payment/deadline/version checks and counters."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Recover/scale",
+          "en": "Recover and scale"
+        },
+        "detail": {
+          "vi": "Late payments, admission, shards và channels.",
+          "en": "Recover late payments and manage admission/shards/channels."
+        },
+        "icon": "route"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Bán room type, specific seat hay interval?",
+        "en": "1. Are you selling room types, seats or intervals?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline hotel bán quantity theo (hotel, room type, local date), stay [checkIn,checkOut), search/quote, hold, payment confirmation, cancellation và admin inventory. Assume rooms cùng type fungible; specific room, maintenance/adjacent seats hoặc yêu cầu cùng physical unit toàn stay có thể cần interval/assignment model khác. Không khẳng định mọi booking product nên bỏ room identity.",
+          "en": "The baseline sells quantities by hotel, room type and local date for half-open stays, with search/quotes, holds, payments, cancellations and administration. Rooms within types are assumed fungible; specific units, maintenance, adjacent seats or same-unit stays can require interval/assignment models. Room identity is not universally unnecessary."
+        },
+        {
+          "vi": "Invariant: active holds + confirmed commitments không vượt integer sellable limit trên bất kỳ night/resource nào trong authority boundary. Baseline overbooking bằng0; nếu product chủ động cho overbooking thì limit/rounding/guest-remediation là explicit business policy. Availability search có thể stale, nhưng cache true không cấp entitlement. Booking p99<1s không gồm external payment là example target cần benchmark.",
+          "en": "Active holds plus confirmed commitments must not exceed integer sellable limits on any night/resource within the authority boundary. Baseline overbooking is zero; deliberate overbooking requires explicit limits/rounding/remediation policies. Stale search hints grant no entitlements. Sub-second booking p99 excluding payments is an illustrative benchmark target."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Inventory unit",
+            "en": "Inventory unit"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Date ở hotel timezone là calendar date, không luôn là 24 giờ tính bằng seconds.",
+              "en": "Hotel-local dates are calendar dates rather than always twenty-four-hour durations."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "All-or-nothing stay",
+            "en": "All-or-nothing stays"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Thiếu một đêm phải rollback cả stay, không giữ những đêm đã trừ.",
+              "en": "One missing night rolls back the whole stay rather than leaking partial allocations."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Money khác entitlement",
+            "en": "Money differs from entitlement"
+          },
+          "icon": "compare",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Payment success đến muộn không tự hồi sinh hold đã cấp cho người khác.",
+              "en": "Late payment success cannot revive entitlements already reassigned."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Average booking rate thấp không loại bỏ contention",
+        "en": "2. Low average booking rates do not eliminate contention"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ 1 triệu rooms, occupancy70% cho700.000 occupied room-nights/ngày. Nếu steady state và average stay3nights, daily arrivals xấp xỉ233.333; coi daily bookings tương đương còn là assumption về steady flow, không suy trực tiếp mọi ngày thực tế. Average khoảng2,70 bookings/s; view:booking100:1 cho270views/s, peak×10 cho2.700views/s.",
+          "en": "One million rooms at seventy-percent occupancy imply 700,000 occupied room-nights/day. Three-night steady-state stays suggest roughly 233,333 daily arrivals; equating bookings with arrivals adds a steady-flow assumption. That gives 2.70 average bookings/second, 270 views/second at an assumed hundredfold ratio and 2,700 at tenfold peaks."
+        },
+        {
+          "vi": "5.000hotels×20types×365days×2years tạo73M nightly rows trước reservations/lines/index/outbox. Một last-room row trong sale vẫn serialize nhiều requests dù toàn cluster average nhỏ. Mỗi stay chạm nhiều nightly rows và payment/retry/expiry/cancel thêm traffic; benchmark lock wait, transaction abort, durable commit và failure capacity riêng.",
+          "en": "Five thousand hotels times twenty types times 365 days times two years yield seventy-three million nightly rows before reservations/lines/indexes/outboxes. Last-room sales can serialize requests despite low cluster averages. Multi-night stays, payments, retries, expiry and cancellation add traffic; benchmark lock waits, aborts, durability and failure capacity separately."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng reservation",
+            "en": "Reservation quantity"
+          },
+          {
+            "vi": "Assumption",
+            "en": "Assumption"
+          },
+          {
+            "vi": "Kết quả minh họa",
+            "en": "Illustrative result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Occupied room-nights/day",
+              "en": "Occupied room-nights/day"
+            },
+            {
+              "vi": "1M ×70%",
+              "en": "1M ×70%"
+            },
+            {
+              "vi": "700K",
+              "en": "700K"
+            }
+          ],
+          [
+            {
+              "vi": "Daily reservations/arrivals",
+              "en": "Daily reservations/arrivals"
+            },
+            {
+              "vi": "700K /3 nights; steady state",
+              "en": "700K /3 nights; steady state"
+            },
+            {
+              "vi": "233.333/ngày",
+              "en": "233,333/day"
+            }
+          ],
+          [
+            {
+              "vi": "Average booking TPS",
+              "en": "Average booking TPS"
+            },
+            {
+              "vi": "233.333 /86.400",
+              "en": "233,333 /86,400"
+            },
+            {
+              "vi": "2,70/s",
+              "en": "2.70/s"
+            }
+          ],
+          [
+            {
+              "vi": "Availability views",
+              "en": "Availability views"
+            },
+            {
+              "vi": "100× bookings; peak×10",
+              "en": "100× bookings; peak×10"
+            },
+            {
+              "vi": "270–2.700/s theo assumptions",
+              "en": "270–2,700/s under assumptions"
+            }
+          ],
+          [
+            {
+              "vi": "Two-year nightly inventory",
+              "en": "Two-year nightly inventory"
+            },
+            {
+              "vi": "5K ×20 ×365 ×2",
+              "en": "5K ×20 ×365 ×2"
+            },
+            {
+              "vi": "73M rows",
+              "en": "73M rows"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Hold API có stable result và trusted quote",
+        "en": "3. Hold APIs use stable results and trusted quotes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Validate positive quantity, hotel-local dates, maximum stay, guest/tenant permission và quote price/currency/version/expiry từ trusted source. Browser không tự gửi paymentSucceeded=true để confirm. Idempotency key scope guest/merchant+operation, fingerprint gồm dates/type/quantity/quote; retry commit ambiguity phải trả reservation/result cũ, không decrement lại inventory.",
+          "en": "Validate quantities, hotel-local dates, stay bounds, permissions and trusted quote prices/currencies/versions/expiries. Browsers cannot confirm by claiming payment success. Scope idempotency by guest/merchant/operation with dates/type/quantity/quote fingerprints; ambiguous commits replay existing reservation results rather than decrement inventory again."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/v1/hotels/{hotel}/availability?type=...&checkIn=...&checkOut=...",
+          "description": {
+            "vi": "Stale-tolerant hints và quote metadata, không guarantee hold.",
+            "en": "Stale-tolerant hints and quotes do not guarantee holds."
+          },
+          "response": "200 { availabilityHint, nightlyRates[], quoteId, expiresAt, asOf }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/reservations",
+          "description": {
+            "vi": "Atomic all-night HELD reservation với stable operation key.",
+            "en": "Atomically acquire whole-stay holds under stable operation keys."
+          },
+          "request": "Idempotency-Key: ...\n{ hotelId, roomTypeId, checkIn, checkOut, quantity, quoteId }",
+          "response": "201 { reservationId, version, status: \"HELD\", holdExpiresAt } | 409 { reason }"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/v1/reservations/{id}/payment-evidence",
+          "description": {
+            "vi": "Authenticated verified evidence gắn payment operation và hold version.",
+            "en": "Authenticated verified evidence binds payment operations and hold versions."
+          },
+          "request": "{ paymentOperationId, providerReference, verifiedOutcome, holdVersion }",
+          "response": "200 { bookingDecision, paymentRecoveryState }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/reservations/{id}/cancellations",
+          "description": {
+            "vi": "Idempotent cancellation/release và riêng refund lifecycle.",
+            "en": "Idempotent cancellations/releases with separate refund lifecycles."
+          },
+          "request": "Idempotency-Key: ...\n{ expectedVersion, reason }",
+          "response": "202 { reservationStatus, refundOperationId?, refundStatus? }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Browse path rẻ, booking path có authority",
+        "en": "4. Cheap browsing and authoritative booking paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Search/cache đọc availability/rates projection theo TTL/events; cached stale true dẫn tới sold-out response lúc hold là behavior hợp lệ nếu UI contract nói rõ. Booking service kiểm source rows trong transaction. Baseline giữ inventory/reservation/idempotency/outbox cùng shard theo hotel; payment network call chỉ bắt đầu sau commit, không giữ SQL locks trong lúc user xác thực/pay.",
+          "en": "Search caches project availability/rates through TTLs/events. Stale-positive hints can legitimately lead to sold-out hold responses under clear contracts. Booking transactions inspect authoritative rows. Hotel shards hold inventory/reservations/idempotency/outboxes together, while external payment starts after commit without locks during user authentication/payment."
+        },
+        {
+          "vi": "Replica/cache không tự đủ cho last-room decision nếu lag. Source failover/split-brain cũng phải giữ một writable authority và durable acknowledged commitments theo failure model; row-level algorithm trên hai independent writable primaries không còn cùng invariant. CDN hợp static photos; nó không thay booking correctness boundary.",
+          "en": "Lagging replicas/caches cannot establish last-room decisions. Failovers/split-brain handling must preserve authoritative writes and acknowledged durability; row algorithms across independent primaries do not share the invariant. CDNs serve static photos rather than replace booking correctness boundaries."
+        }
+      ],
+      "diagram": {
+        "id": "reservation-entitlement-and-payment",
+        "title": {
+          "vi": "Browse có thể stale; entitlement phải do inventory authority cấp",
+          "en": "Browsing may be stale; inventory authorities grant entitlements"
+        },
+        "caption": {
+          "vi": "Baseline giữ inventory, reservation, idempotency và outbox trong một hotel shard transaction. Payment nằm ngoài; deadline/release/confirm phải cùng hiểu active hold.",
+          "en": "Inventory, reservations, idempotency and outboxes share a hotel-shard transaction. Payments remain external; deadlines/releases/confirmations share active-hold semantics."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "guest",
+            "label": {
+              "vi": "Guest / client",
+              "en": "Guest / client"
+            },
+            "detail": {
+              "vi": "Query dates/quote, giữ stable request key và không tự chứng minh payment success.",
+              "en": "Queries dates/quotes, retains request keys and does not establish payment success itself."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Authenticated API",
+              "en": "Authenticated API"
+            },
+            "detail": {
+              "vi": "Validate guest/tenant, dates/quantity, quote version và signed admission khi có.",
+              "en": "Validates guests/tenants, dates/quantities, quotes and any signed admission."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "search",
+            "label": {
+              "vi": "Search / rates",
+              "en": "Search / rates"
+            },
+            "detail": {
+              "vi": "Read-heavy availability/price hints; response có as-of và quote expiry.",
+              "en": "Read-heavy availability/price hints carry as-of times and quote expiries."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "cache",
+            "label": {
+              "vi": "Availability projection",
+              "en": "Availability projection"
+            },
+            "detail": {
+              "vi": "CDC/outbox refresh có lag; cache true không bảo đảm hold sẽ thắng.",
+              "en": "CDC/outbox refreshes can lag; cached availability does not guarantee successful holds."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "wait",
+            "label": {
+              "vi": "Admission / waiting room",
+              "en": "Admission / waiting room"
+            },
+            "detail": {
+              "vi": "Optional flash-sale layer giới hạn concurrency; fairness/admission không là inventory ownership.",
+              "en": "Optional flash-sale admission bounds concurrency but does not establish inventory ownership."
+            },
+            "x": 130,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "book",
+            "label": {
+              "vi": "Reservation service",
+              "en": "Reservation service"
+            },
+            "detail": {
+              "vi": "Short transactions cho all-night hold, guarded confirm/release; payment/recovery operations có identity riêng.",
+              "en": "Uses short transactions for whole-stay holds and guarded confirmations/releases with separate payment/recovery identities."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Inventory + reservations",
+              "en": "Inventory + reservations"
+            },
+            "detail": {
+              "vi": "Preprovisioned per-night rows, integer sellable limits, hold lines, state/version/expiry, idempotency và transactional outbox.",
+              "en": "Stores preprovisioned nightly rows, integer limits, hold lines, state/version/expiry, idempotency and outboxes."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "pay",
+            "label": {
+              "vi": "Payment / recovery",
+              "en": "Payment / recovery"
+            },
+            "detail": {
+              "vi": "Verified capture/auth facts, unknown outcomes, same-operation retries và compensation/refund workflow.",
+              "en": "Provides verified capture/auth facts, unknown-outcome handling, same-operation retries and compensation/refund workflows."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "sweep",
+            "label": {
+              "vi": "Expiry sweeper",
+              "en": "Expiry sweeper"
+            },
+            "detail": {
+              "vi": "Claim expired holds, conditionally release đúng một lần và audit; TTL notifications chỉ là hint.",
+              "en": "Claims expired holds and conditionally releases once with audits; TTL notifications are hints."
+            },
+            "x": 430,
+            "y": 710,
+            "kind": "worker"
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Reservation events",
+              "en": "Reservation events"
+            },
+            "detail": {
+              "vi": "Committed outbox → cache/email/audit consumers; duplicate events không release inventory lại.",
+              "en": "Committed outboxes feed cache/email/audit consumers; duplicate events do not release inventory again."
+            },
+            "x": 740,
+            "y": 710,
+            "kind": "queue"
+          }
+        ],
+        "traces": [
+          {
+            "id": "browse",
+            "label": {
+              "vi": "Browse và quote",
+              "en": "Browse and quote"
+            },
+            "steps": [
+              {
+                "from": "guest",
+                "to": "api",
+                "description": {
+                  "vi": "Search local calendar dates, room type và quantity.",
+                  "en": "Search local calendar dates, room types and quantities."
+                }
+              },
+              {
+                "from": "api",
+                "to": "search",
+                "description": {
+                  "vi": "Query availability/rates theo policy.",
+                  "en": "Query availability/rates under policy."
+                }
+              },
+              {
+                "from": "search",
+                "to": "cache",
+                "description": {
+                  "vi": "Read projection có version/as-of; có thể stale.",
+                  "en": "Read potentially stale versioned/as-of projections."
+                }
+              },
+              {
+                "from": "search",
+                "to": "guest",
+                "description": {
+                  "vi": "Trả quote/hints; phải revalidate lúc tạo hold.",
+                  "en": "Return quotes/hints to revalidate at hold creation."
+                }
+              }
+            ]
+          },
+          {
+            "id": "hold",
+            "label": {
+              "vi": "Acquire all-night hold",
+              "en": "Acquire a whole-stay hold"
+            },
+            "steps": [
+              {
+                "from": "guest",
+                "to": "api",
+                "description": {
+                  "vi": "POST hold cùng key scoped guest/operation và quote identity.",
+                  "en": "Post holds with guest/operation-scoped keys and quote identities."
+                }
+              },
+              {
+                "from": "api",
+                "to": "book",
+                "description": {
+                  "vi": "Validate authorized quantity/dates và trusted price.",
+                  "en": "Validate authorized quantities/dates and trusted prices."
+                }
+              },
+              {
+                "from": "book",
+                "to": "db",
+                "description": {
+                  "vi": "Một transaction: dedup, lock expected nightly rows, check capacity, update held, insert hold/lines/result/outbox.",
+                  "en": "One transaction deduplicates, locks expected nightly rows, checks capacity and records held units, hold lines, results and outboxes."
+                }
+              },
+              {
+                "from": "db",
+                "to": "book",
+                "description": {
+                  "vi": "Commit đạt booking durability boundary; nếu thiếu một đêm rollback toàn bộ.",
+                  "en": "Commit under booking durability; missing one night rolls the whole stay back."
+                }
+              },
+              {
+                "from": "book",
+                "to": "guest",
+                "description": {
+                  "vi": "Trả stable reservation ID/expiry; retry không tạo hold mới.",
+                  "en": "Return stable reservation identities/expiries without duplicate holds on retry."
+                }
+              },
+              {
+                "from": "book",
+                "to": "pay",
+                "description": {
+                  "vi": "Bắt đầu external payment sau commit, không giữ inventory row locks.",
+                  "en": "Start external payments after commit without retaining inventory-row locks."
+                }
+              }
+            ]
+          },
+          {
+            "id": "confirm",
+            "label": {
+              "vi": "Verified payment và entitlement check",
+              "en": "Verified payments and entitlement checks"
+            },
+            "steps": [
+              {
+                "from": "pay",
+                "to": "book",
+                "description": {
+                  "vi": "Verified outcome gắn đúng reservation/payment operation; có thể callback muộn.",
+                  "en": "Verified outcomes bind correct reservation/payment operations and can arrive late."
+                },
+                "async": true
+              },
+              {
+                "from": "book",
+                "to": "db",
+                "description": {
+                  "vi": "Lock/validate active hold, version, decision deadline và all inventory lines; atomically HELD→CONFIRMED nếu hợp lệ.",
+                  "en": "Validate locked active holds, versions, deadlines and lines; atomically confirm valid entitlements."
+                }
+              },
+              {
+                "from": "db",
+                "to": "book",
+                "description": {
+                  "vi": "Nếu hold đã release/reallocate, reject stale confirm và giữ payment recovery evidence.",
+                  "en": "Reject stale confirmations of released/reallocated holds while preserving payment recovery evidence."
+                }
+              },
+              {
+                "from": "book",
+                "to": "pay",
+                "description": {
+                  "vi": "Khi cần: explicit valid rehold hoặc idempotent compensation/refund workflow, không force-confirm.",
+                  "en": "When needed, acquire new valid holds or use idempotent compensation/refund workflows rather than force-confirming."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "expiry",
+            "label": {
+              "vi": "Sweep/release và cache refresh",
+              "en": "Sweep/release and refresh projections"
+            },
+            "steps": [
+              {
+                "from": "sweep",
+                "to": "db",
+                "description": {
+                  "vi": "Claim due holds; conditional status/version/expiry check và release all lines cùng transaction.",
+                  "en": "Claim due holds and conditionally release all lines under status/version/expiry checks in one transaction."
+                }
+              },
+              {
+                "from": "db",
+                "to": "events",
+                "description": {
+                  "vi": "Committed expiry/cancel event đi qua durable outbox relay.",
+                  "en": "Committed expiry/cancellation events pass through durable outboxes."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "cache",
+                "description": {
+                  "vi": "Idempotent/versioned availability projection update; booking truth không chờ cache.",
+                  "en": "Update projections idempotently/by version; booking truth does not wait for caches."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "flash",
+            "label": {
+              "vi": "Flash-sale admission trước inventory",
+              "en": "Flash-sale admission before inventory"
+            },
+            "steps": [
+              {
+                "from": "guest",
+                "to": "wait",
+                "description": {
+                  "vi": "Queue/lottery theo fairness policy, authentication và bot controls.",
+                  "en": "Use authenticated queue/lottery admission and bot controls under fairness policies."
+                }
+              },
+              {
+                "from": "wait",
+                "to": "api",
+                "description": {
+                  "vi": "Admit bounded concurrency với scoped short-lived token chống replay.",
+                  "en": "Admit bounded concurrency with scoped short-lived replay-resistant tokens."
+                }
+              },
+              {
+                "from": "api",
+                "to": "book",
+                "description": {
+                  "vi": "Admission chỉ cấp quyền thử book; inventory vẫn quyết định.",
+                  "en": "Admission grants permission to attempt booking; inventory still decides."
+                }
+              },
+              {
+                "from": "book",
+                "to": "db",
+                "description": {
+                  "vi": "Same durable ownership/conditional acquisition boundary; không bypass vì request đã qua queue.",
+                  "en": "Keep durable conditional ownership/acquisition even after queue admission."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "concurrency",
+      "title": {
+        "vi": "5. Check và reserve cả stay trong một short transaction",
+        "en": "5. Check and reserve whole stays in short transactions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Read available rồi UPDATE sau tạo race: A/B cùng thấy1, cả hai có thể book. Conditional UPDATE, explicit row locks hoặc optimistic version với correct retry đều có thể là thành phần; quan trọng là capacity check/mutation, reservation/hold lines, idempotency result và outbox cùng transaction. Database CHECK là backstop, không tự kết nối một nửa stay đã commit với nửa còn lại.",
+          "en": "Reading availability before later writes creates races where both guests see one unit. Conditional updates, explicit locks or optimistic versions with correct retries can help, but capacity checks/mutations, hold lines, idempotency results and outboxes need one transaction. Checks constrain rows without joining separately committed stay fragments."
+        },
+        {
+          "vi": "Preprovision expected nightly rows hoặc use safe creation/locking protocol. Verify đúng calendar date set và số nights; missing row không được hiểu như free room. Lock nhiều rows theo consistent order across create/confirm/cancel/admin flows hoặc handle deadlocks với bounded jittered idempotent retry. Range UPDATE không tự bảo đảm lock order theo date; atomic conditional update vẫn có lock timeout/deadlock/serialization abort/unknown commit, không “no retries ever”.",
+          "en": "Preprovision expected nightly rows or safely create/lock them. Validate exact calendar dates and night counts; missing rows are not free rooms. Use consistent lock ordering across creation/confirmation/cancellation/admin or handle deadlocks through bounded idempotent retries. Range updates do not promise date-order locks; conditional statements can still time out, deadlock, abort or have ambiguous commits."
+        }
+      ],
+      "experiment": "booking-nights"
+    },
+    {
+      "id": "transaction",
+      "title": {
+        "vi": "6. Ví dụ transaction: validate đủ rows trước mutate",
+        "en": "6. Example transactions validate all expected rows before mutations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ dùng pessimistic row lock cho một hotel/type. Application phải assert dates/capacity sau SELECT và ROLLBACK nếu sai; comment trong code không tự enforce business logic. Quyết định hạn hold dùng trusted authority time theo contract sau relevant locks, không lấy clock từ browser. Transaction-start timestamp có thể cũ nếu wait lâu; chọn time semantics có chủ đích.",
+          "en": "The example pessimistically locks one hotel/type. Applications must validate dates/capacity and roll back on failure; comments do not enforce logic. Hold deadlines use contract-defined trusted decision times after relevant locks rather than browser clocks. Transaction-start timestamps can age during waits, so choose time semantics deliberately."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "BEGIN;\nSELECT day, sellable_limit, held, confirmed\nFROM room_inventory\nWHERE hotel_id = :hotel AND room_type_id = :type\n  AND day >= :check_in AND day < :check_out\nORDER BY day\nFOR UPDATE;\n-- Application: require the exact expected calendar-date set.\n-- Require held + confirmed + :qty <= sellable_limit on EVERY row.\n-- Otherwise ROLLBACK; do not continue.\nUPDATE room_inventory SET held = held + :qty\nWHERE hotel_id = :hotel AND room_type_id = :type\n  AND day >= :check_in AND day < :check_out;\n-- In this SAME transaction: reservation + hold_lines + idempotency result + outbox.\n-- All statements/constraints must succeed before COMMIT.\nCOMMIT;",
+        "caption": {
+          "vi": "SQL sketch cần application checks/transaction handling và schema constraints; không là endpoint production copy-paste.",
+          "en": "The SQL sketch requires checks, transaction handling and constraints; it is not a complete production endpoint."
+        }
+      }
+    },
+    {
+      "id": "holds",
+      "title": {
+        "vi": "7. Hold expiry là entitlement policy, không hủy payment",
+        "en": "7. Hold expiry is an entitlement policy, not payment cancellation"
+      },
+      "paragraphs": [
+        {
+          "vi": "HELD reserve inventory trong một deadline; confirm cần verified payment evidence, matching operation/hold version, active status và expiry eligibility theo authority decision time. Status=HELD một mình không đủ nếu deadline đã qua mà sweeper chưa chạy. Có thể product cho extension trong conditions riêng, nhưng phải acquire/update dưới authority, không client tự kéo TTL.",
+          "en": "Holds reserve inventory until deadlines. Confirmation requires verified payment evidence, matching identities/versions, active status and deadline eligibility under authority time. HELD alone is insufficient when expired-but-unswept. Products may allow controlled extensions, but clients cannot unilaterally extend TTLs."
+        },
+        {
+          "vi": "Sweeper claim expired rows rồi guarded status/version/deadline transition, release all hold lines và write outbox atomically. Confirm và release serialize cùng state/inventory boundary; chỉ flow thắng mới đổi counters. Redis TTL/keyspace notification có thể là hint, không là exactly-once release protocol. Deadline không cancel external PSP call đã chạy.",
+          "en": "Sweepers claim due rows and atomically transition statuses/versions, release lines and write outboxes. Confirmation/release serialize at shared state/inventory boundaries so only the winner changes counters. Redis expiry notifications can hint rather than provide exactly-once releases, and deadlines do not cancel external PSP calls."
+        }
+      ],
+      "experiment": "booking-expiry"
+    },
+    {
+      "id": "late-payment",
+      "title": {
+        "vi": "8. UNKNOWN và late capture cần payment recovery riêng",
+        "en": "8. Unknown outcomes and late captures need payment recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Payment timeout không đồng nghĩa failed. Policy có thể giữ hold thêm trong bound hoặc expire rồi xử lý late paid qua recovery; phải chốt trade-off inventory utilization và customer experience. Khi hold đã release và B book, callback A tới không được force CONFIRMED chỉ vì provider success. Reacquire capacity/new hold nếu còn hợp lệ, hoặc idempotent refund/compensation workflow với known references và owned unresolved queue.",
+          "en": "Timeouts are not failures. Policies may extend holds within bounds or expire them with late-payment recovery, trading utilization and experience. Provider success cannot force confirmation after release/reallocation. Reacquire valid capacity/new holds or use idempotent referenced refund/compensation workflows with owned unresolved queues."
+        },
+        {
+          "vi": "Authorization-then-capture có thể giảm một số mismatches nhưng provider windows, capture failures và unknown outcomes vẫn tồn tại. Một distributed saga không làm refunds luôn thành công hoặc hoàn tất tức thì; confirmed booking, payment facts và recovery state cần liên kết/audit, không nhét mọi thứ vào một scalar PAID status.",
+          "en": "Authorization-before-capture can reduce some mismatches while retaining provider windows, failures and ambiguous outcomes. Sagas do not make refunds instantaneous/infallible. Link and audit booking entitlements, payment facts and recovery states rather than collapsing them into PAID."
+        }
+      ]
+    },
+    {
+      "id": "cancellation",
+      "title": {
+        "vi": "9. Cancel/release một lần; refund có lifecycle riêng",
+        "en": "9. Cancel/release once while refunds have their own lifecycle"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cancellation kiểm user/policy và reservation version. Transaction transition từ eligible HELD/CONFIRMED sang cancelled/released, chuyển held/confirmed counts đúng loại và tạo refund intent/outbox nếu cần. Duplicate request nhận result cũ; duplicate event không chạy inventory++ lần nữa. Cancellation already-expired không release lại.",
+          "en": "Cancellations verify permissions/policies/versions. Transactions transition eligible holds/confirmations, adjust the correct counters and create refund intents/outboxes as needed. Duplicate requests replay results and duplicate events do not release inventory again. Already-expired reservations release nothing again."
+        },
+        {
+          "vi": "Reservation cancelled có thể vẫn refund processing/unknown; UI không hứa money returned chỉ vì inventory đã free. Payment recovery operation có identity và evidence riêng. Nếu amend dates/type/quantity, phải acquire new resource set và release old theo một atomic transition hoặc explicit saga compensation; không delete old booking trước rồi mới thử lấy stay mới mà vẫn hứa atomic amend.",
+          "en": "Cancelled reservations can still have processing/unknown refunds; freed inventory does not establish returned money. Recovery operations have separate identities/evidence. Amendments need atomic new-resource acquisition/old-resource release or explicit sagas; deleting old bookings before acquiring replacements does not provide atomic amendments."
+        }
+      ]
+    },
+    {
+      "id": "data-limits",
+      "title": {
+        "vi": "10. Inventory schema lưu explicit integer limits",
+        "en": "10. Inventory schemas store explicit integer limits"
+      },
+      "paragraphs": [
+        {
+          "vi": "Inventory row có hotel/type/day, integer sellable_limit, held, confirmed và version khi cần. Backstop held≥0, confirmed≥0, held+confirmed≤sellable_limit. Reservation/hold lines lưu quantity theo từng date cùng quote/rate snapshot, state/version/expiry và guest/tenant. Scoped idempotency record và payment link cần retention phù hợp retries/recovery.",
+          "en": "Nightly rows store hotel/type/day, integer sellable limits, held/confirmed counts and optional versions, constrained nonnegative and within limits. Reservation lines preserve quantities/dates, quote snapshots, state/version/expiry and guests/tenants. Scoped identities/payment links need retry/recovery-compatible retention."
+        },
+        {
+          "vi": "Nếu cho overbooking10%, đừng dùng reserved < total×1,10 rồi increment integer: total1 tạo threshold1,1 và có thể bán2. Materialize integer sellable_limit theo explicit rounding/policy. Admin giảm limit dưới active commitments cần conflict/relocation/remediation workflow, không bypass CHECK. Physical room assignment/maintenance có thể thêm constraints ngoài room-type fungibility.",
+          "en": "A condition reserved < total×1.10 can allow two integer sales against total one and threshold 1.1. Materialize explicit integer limits under rounding policies. Reducing limits below commitments needs conflict/relocation/remediation workflows rather than bypassing constraints. Physical assignments/maintenance add constraints beyond fungibility."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Entity reservation",
+            "en": "Reservation entity"
+          },
+          {
+            "vi": "Identity / state",
+            "en": "Identity / state"
+          },
+          {
+            "vi": "Boundary cần giữ",
+            "en": "Required boundary"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Night inventory",
+              "en": "Night inventory"
+            },
+            {
+              "vi": "(hotel,type,local_date), integer limit, held, confirmed",
+              "en": "(hotel,type,local_date), integer limit, held, confirmed"
+            },
+            {
+              "vi": "All nights một hotel-shard transaction.",
+              "en": "All stay nights share a hotel-shard transaction."
+            }
+          ],
+          [
+            {
+              "vi": "Reservation + lines",
+              "en": "Reservation and lines"
+            },
+            {
+              "vi": "reservation_id, dates/qty, version/status/expiry",
+              "en": "reservation_id, dates/qty, version/status/expiry"
+            },
+            {
+              "vi": "State và all line counters đổi atomically.",
+              "en": "States and all line counters change atomically."
+            }
+          ],
+          [
+            {
+              "vi": "Request identity",
+              "en": "Request identity"
+            },
+            {
+              "vi": "guest/operation/key + fingerprint/result",
+              "en": "guest/operation/key + fingerprint/result"
+            },
+            {
+              "vi": "Không tạo hold mới khi replay committed request.",
+              "en": "Replayed committed requests create no new holds."
+            }
+          ],
+          [
+            {
+              "vi": "Payment/recovery",
+              "en": "Payment/recovery"
+            },
+            {
+              "vi": "attempt/capture/refund IDs và evidence",
+              "en": "attempt/capture/refund IDs and evidence"
+            },
+            {
+              "vi": "External side effect có unknown/reconciliation.",
+              "en": "External effects require ambiguity/reconciliation handling."
+            }
+          ],
+          [
+            {
+              "vi": "Outbox / projections",
+              "en": "Outbox and projections"
+            },
+            {
+              "vi": "reservation version + event type",
+              "en": "reservation version and event type"
+            },
+            {
+              "vi": "Projection lag không cấp quyền oversell.",
+              "en": "Projection lag never grants oversell permissions."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "flash-sales",
+      "title": {
+        "vi": "11. Flash sales: admission không thay durable ownership",
+        "en": "11. Flash-sale admission does not replace durable ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Waiting room/lottery giảm requests tới booking tier, ký scoped admission token, kiểm expiry/replay/guest limits và bot controls. Admit theo measured lock/checkout capacity, không theo arbitrary N/s. Fair FIFO, lottery hoặc priority là product policy; queue position cũng cần recovery/reentry policy. Admission token chỉ cho thử book, không chứng minh đã sở hữu seat.",
+          "en": "Waiting rooms/lotteries bound booking requests using scoped expiring replay-resistant tokens, guest limits and bot controls. Admit according to measured locking/checkout capacity rather than arbitrary rates. FIFO, lotteries/priorities and reentry policies are product decisions. Admission grants attempts rather than seat ownership."
+        },
+        {
+          "vi": "In-memory counters/SET NX TTL rồi async SQL không tự chống oversell khi failover mất holds hoặc stale owner còn chạy. Strict guarantee cần durable authority/fencing, hoặc escrow/allotments với tổng allocated capacity được chứng minh và transfer/recovery protocol. Có thể trả provisional hold trước durable commit nếu contract nói rõ; đừng gọi nó confirmed. Reconciliation phát hiện oversell sau sự cố không chứng minh invariant chưa từng bị phá.",
+          "en": "In-memory counters/TTL holds followed by asynchronous SQL do not inherently prevent failover/stale-owner oversell. Strict guarantees need durable authorities/fencing or proven escrow allocations/transfer protocols. Explicitly provisional holds can precede durable commits but are not confirmations. Discovering oversell afterward does not prove it never happened."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Các lớp bảo vệ một ticket drop",
+          "en": "Layers protecting ticket drops"
+        },
+        "caption": {
+          "vi": "Outer layers giảm demand; ownership layer vẫn phải đúng dưới failure.",
+          "en": "Outer layers reduce demand while ownership remains correct under failure."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Admit",
+              "en": "Admit"
+            },
+            "detail": {
+              "vi": "Queue/lottery, auth, bot policy và signed tokens.",
+              "en": "Apply queue/lottery policies, authentication and signed tokens."
+            },
+            "icon": "users"
+          },
+          {
+            "title": {
+              "vi": "Bound concurrency",
+              "en": "Bound concurrency"
+            },
+            "detail": {
+              "vi": "Limit lock/worker demand theo measured capacity.",
+              "en": "Bound locking/worker demand under measured capacity."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Acquire ownership",
+              "en": "Acquire ownership"
+            },
+            "detail": {
+              "vi": "Durable conditional hold hoặc proven escrow authority.",
+              "en": "Acquire durable conditional holds or proven escrow ownership."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Confirm/recover",
+              "en": "Confirm and recover"
+            },
+            "detail": {
+              "vi": "Payment/expiry/version protocol và owned compensation.",
+              "en": "Handle payments/expiry/versions and owned compensation."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "shards-channels",
+      "title": {
+        "vi": "12. Shard theo transaction; các channels phải chia cùng capacity",
+        "en": "12. Shard by transactions while channels share capacity coherently"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hotel_id giữ baseline stay một hotel trên một shard. Multi-hotel cart, cross-property package hoặc room assignment giữa pools không tự là single-shard transaction: cần distributed protocol hoặc explicit partial/cancel semantics. Regional read/cache replicas phục vụ browse; one writable owner/epoch cho inventory theo failure model.",
+          "en": "Hotel sharding keeps single-hotel stays local. Multi-hotel carts, cross-property packages and cross-pool assignments require distributed protocols or explicit partial/cancellation semantics. Regional replicas serve browsing while inventory retains appropriate writable ownership/epochs."
+        },
+        {
+          "vi": "Direct site và external channels cùng bán một pool phải dùng authoritative reservation endpoint hoặc bounded allotments/quota transfer. Eventual availability sync một mình có thể oversell giữa hai channel nhìn stale capacity. Ingest external booking IDs idempotently, define channel latency/conflict policy và reconcile imported reservations; không dùng async event delivery làm global capacity proof.",
+          "en": "Sites/external channels sharing pools need authoritative reservations or bounded allocations/transfers. Eventual availability synchronization alone can oversell across stale channel views. Import bookings idempotently, define latency/conflict policies and reconcile, rather than treating asynchronous events as global capacity proofs."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "13. Đo lock waits, hold age và paid-but-unconfirmed",
+        "en": "13. Measure lock waits, hold ages and paid-unconfirmed cases"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metric theo hotel/type/date hot range: booking success/sold-out/conflict, lock wait/deadlock/abort, unknown commit retries, hold age/expiry backlog, search-to-hold staleness và payment unknown/late-success/refund age. Correlate reservation/hold version/payment operation; không log guest/payment secrets. Paid-but-unconfirmed cần owner/escalation, không chỉ một warning log.",
+          "en": "Measure hot hotel/type/date success/sold-out/conflicts, lock waits/deadlocks/aborts, ambiguous commits, hold/expiry ages, browse staleness and unknown/late-payment/refund ages. Correlate reservation/hold/payment identities without exposing secrets. Paid-unconfirmed cases require ownership/escalation rather than warning logs alone."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault reservation",
+            "en": "Reservation fault"
+          },
+          {
+            "vi": "Invariant/recovery",
+            "en": "Invariant/recovery"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "A/B đọc last room đồng thời",
+              "en": "Concurrent last-room reads"
+            },
+            {
+              "vi": "Chỉ đủ capacity được commit; losing request sold-out/retry theo contract.",
+              "en": "Commit within capacity and return contract-defined sold-out/retry outcomes."
+            }
+          ],
+          [
+            {
+              "vi": "Night2 full sau Night1 update",
+              "en": "Second night full after first-night changes"
+            },
+            {
+              "vi": "Rollback all stay; không leak partial nights.",
+              "en": "Roll back whole stays without leaked nights."
+            }
+          ],
+          [
+            {
+              "vi": "Commit succeeded, response lost",
+              "en": "Commit succeeds but response is lost"
+            },
+            {
+              "vi": "Same operation key trả same hold, không reserve lại.",
+              "en": "Same operation keys replay holds without reacquisition."
+            }
+          ],
+          [
+            {
+              "vi": "Confirm race sweep",
+              "en": "Confirmation races expiry"
+            },
+            {
+              "vi": "Một guarded state transition và consistent inventory counters.",
+              "en": "One guarded transition preserves inventory counters."
+            }
+          ],
+          [
+            {
+              "vi": "Late paid sau reallocation",
+              "en": "Late payment after reallocation"
+            },
+            {
+              "vi": "Không revive old hold; owned valid rehold/refund recovery.",
+              "en": "Do not revive holds; use owned reacquisition/refund recovery."
+            }
+          ],
+          [
+            {
+              "vi": "Redis loss trong flash sale",
+              "en": "Redis loss during ticket sales"
+            },
+            {
+              "vi": "Durable authority/escrow không cấp trùng ownership.",
+              "en": "Durable authorities/escrow prevent duplicated ownership."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi phỏng vấn về inventory và expiry",
+        "en": "14. Interview questions on inventory and expiry"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ một row cho mỗi night, ghi held/confirmed/limit rồi thêm request identity và payment attempt. Kiểm trạng thái sau từng transaction/crash; đừng dừng ở “dùng lock” mà chưa nói lock cái gì và tới khi nào.",
+          "en": "Draw nightly rows with held/confirmed/limit values, request identities and payment attempts. Check each transaction/crash state rather than merely proposing locks without resources or lifetimes."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Hai khách cùng đặt last room thì sao?",
+            "en": "What happens when two guests book the last room?"
+          },
+          "answer": [
+            {
+              "vi": "Capacity check và mutation trong cùng short transaction với hold/result/outbox. Serialize cùng inventory rows; loser không commit vượt limit. Có constraints/idempotency và bounded retry cho abort/unknown commit.",
+              "en": "Atomically check/mutate capacity with holds/results/outboxes in short transactions. Serialize common rows, constrain commits within limits and handle abort/ambiguous retries idempotently."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Stay3nights, night2 full thì có giữ night1 không?",
+            "en": "Does a three-night stay retain night one when night two is full?"
+          },
+          "answer": [
+            {
+              "vi": "Không trong all-or-nothing contract. Verify expected calendar rows và rollback mọi nightly mutation nếu thiếu capacity hoặc row. Nếu product muốn split stay phải là explicit offer, không partial allocation leak.",
+              "en": "Not under whole-stay semantics. Validate calendar rows and roll back every mutation on missing capacity/rows. Split stays require explicit offers, not leaked allocations."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "WHERE status=HELD đã đủ cho confirm trước expiry chưa?",
+            "en": "Does status=HELD suffice for deadline-safe confirmation?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa nếu row hết deadline nhưng sweeper chưa chạy. Kiểm hold/version/decision-time eligibility và verified payment operation cùng authority boundary; extension phải explicit.",
+              "en": "Not for expired-unswept rows. Validate hold/version/deadline eligibility and payment identities within the authority boundary, with explicit extension policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Payment thành công sau hold release và B book thì làm gì?",
+            "en": "What if payment succeeds after release and another guest books?"
+          },
+          "answer": [
+            {
+              "vi": "Không force-confirm A. Reacquire valid availability nếu còn hoặc compensation/refund riêng có identity/recovery. UNKNOWN không là failed; expiry không cancel external call.",
+              "en": "Do not force confirmation. Reacquire valid capacity or use identified recoverable compensation/refunds. Unknown outcomes are not failures and expiry does not cancel external calls."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Conditional UPDATE có phải không cần retry bao giờ?",
+            "en": "Do conditional updates eliminate every retry?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Có lock timeout/deadlock/serialization abort hoặc commit response ambiguity. Retry bounded với same operation identity, consistent multi-row locking và response replay khi đã commit.",
+              "en": "No: timeouts, deadlocks, serialization aborts and ambiguous commits remain. Use bounded retries, stable identities, consistent locking and committed-result replay."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Redis TTL hold rồi async persist có guarantee no oversell?",
+            "en": "Do Redis TTL holds plus asynchronous persistence guarantee no oversell?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự có. Failover/stale owners/lost accepted holds cần durable authority/fencing hoặc escrow protocol. Admission giảm load, reconciliation phát hiện lỗi sau đó không thay safety proof.",
+              "en": "Not inherently. Failover, stale owners and lost holds need durable authorities/fencing or escrow protocols. Admission reduces load, and post-failure reconciliation does not replace safety."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "reserved < total×1,1 có đúng overbooking10% không?",
+            "en": "Does reserved < total×1.1 implement ten-percent overbooking correctly?"
+          },
+          "answer": [
+            {
+              "vi": "Không cho mọi integer capacity; total1 cho threshold1,1 có thể admit unit thứ2. Dùng integer sellable limit với rounding policy explicit, enforce held+confirmed≤limit và admin conflict handling.",
+              "en": "Not for all integer capacities: a threshold of 1.1 can admit a second unit. Use explicitly rounded integer limits, commitment constraints and administrative conflict handling."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Availability sync giữa hai channels có ngăn mọi double booking không?",
+            "en": "Does channel availability synchronization prevent every double booking?"
+          },
+          "answer": [
+            {
+              "vi": "Async stale sync không đủ. Cần central authority hoặc bounded channel allotments/quota transfer; external IDs idempotent, conflict/latency/reconciliation policy rõ.",
+              "en": "Asynchronous stale synchronization is insufficient. Use central authorities or bounded channel allocations/transfers with idempotent identities and explicit conflict/latency/reconciliation policies."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

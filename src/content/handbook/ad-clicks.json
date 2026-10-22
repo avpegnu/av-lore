@@ -1,0 +1,1134 @@
+{
+  "id": "ad-clicks",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Ad Click Aggregation: event time, replay và finalized counts",
+    "en": "Designing Ad Click Aggregation: event time, replay and finalized counts"
+  },
+  "summary": {
+    "vi": "Theo click đến trễ qua window và sink revisions; phân tích dedup/checkpoint, hot ads, backfill và publication authority để tách preliminary analytics khỏi finalized reporting.",
+    "en": "Trace late clicks through windows and sink revisions; examine deduplication/checkpoints, hot ads, backfills and publication authority to separate preliminary analytics from finalized reporting."
+  },
+  "prerequisites": [
+    "messaging",
+    "databases",
+    "reliability",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "messaging",
+    "storage-search",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Event time, watermark, allowed lateness và finalization cutoff có roles khác nhau.",
+      "en": "Event time, watermarks, allowed lateness and finalization cutoffs have different roles."
+    },
+    {
+      "vi": "Stable click identity và dedup horizon khác source replay/checkpoint guarantee.",
+      "en": "Stable click identities/deduplication horizons differ from replay/checkpoint guarantees."
+    },
+    {
+      "vi": "Absolute upsert cần version/authority fencing; old replay không được overwrite newer count.",
+      "en": "Absolute upserts need version/authority fences so old replays cannot overwrite newer counts."
+    },
+    {
+      "vi": "Stable hot-key salt và per-ad sum phải đúng trước global top-N.",
+      "en": "Stable hot-key salting and complete per-ad sums precede global top-N."
+    },
+    {
+      "vi": "Recount chỉ biết retained evidence theo rules/cutoff; finalized publication và adjustments có audit.",
+      "en": "Recounts know retained evidence under rules/cutoffs; finalized publications and adjustments need audits."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Đếm click từ evidence tới publication",
+      "en": "Count clicks from evidence to publication"
+    },
+    "caption": {
+      "vi": "Mỗi boundary có identity/time/version contract; đừng cộng những records có provenance khác nhau tùy tiện.",
+      "en": "Each boundary has identity/time/version contracts; do not arbitrarily add incompatible-provenance records."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Accept evidence",
+          "en": "Accept evidence"
+        },
+        "detail": {
+          "vi": "Durable log, stable ID và trusted time/context.",
+          "en": "Use durable logs, stable identities and trusted time/context."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Window và revise",
+          "en": "Window and revise"
+        },
+        "detail": {
+          "vi": "Watermark/lateness, dedup và checkpoint state.",
+          "en": "Handle watermarks/lateness, deduplication and checkpoints."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Materialize",
+          "en": "Materialize"
+        },
+        "detail": {
+          "vi": "Absolute count với validated generation/revision.",
+          "en": "Materialize absolute counts with validated generations/revisions."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Recount và finalize",
+          "en": "Recount and finalize"
+        },
+        "detail": {
+          "vi": "Coverage/rules/cutoff, isolated publication và owned adjustments.",
+          "en": "Validate coverage/rules/cutoffs, isolated publications and owned adjustments."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Định nghĩa counted click và finalized total",
+        "en": "1. Define counted clicks and finalized totals"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline đếm unique eligible click theo ad/minute và dimensions, top-N trên time window, dashboard freshness khoảng một phút và daily reporting dùng finalized publication. Auction/ad serving và fraud ML nằm ngoài baseline nhưng eligibility hook/rule version nằm trong count contract. “Đúng” nghĩa dedup và rule/cutoff nhất quán trên retained evidence, không chứng minh mọi click của con người đều tới hệ thống.",
+          "en": "The baseline counts unique eligible ad/minute clicks and dimensions, supports time-window top-N, targets roughly minute-fresh dashboards and uses finalized daily publications. Auctions/ad serving and fraud ML are outside scope, but eligibility hooks/rule versions are part of counting. Correctness means consistent deduplication/rules/cutoffs over retained evidence, not proof that every human click arrived."
+        },
+        {
+          "vi": "Streaming có thể exact trên arrived eligible events nhưng incomplete vì late data; đừng gọi mọi preliminary count là thống kê approximate ±x% khi chưa đo error model. Finalization cũng có cutoff/revision policy; một click hợp lệ tới sau cutoff có thể cần adjustment, không thể nói nightly batch chứa mọi late click tương lai. Hỏi dashboard và billing có cần cùng version tại cùng thời điểm không.",
+          "en": "Streaming may be exact for arrived eligible events but incomplete under lateness; preliminary counts do not imply quantified statistical approximation. Finalization has cutoffs/revisions too: valid post-cutoff arrivals may require adjustments, and nightly batches cannot include future arrivals. Ask whether dashboards and billing need the same version at the same moment."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Event identity",
+            "en": "Event identity"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Retry cùng logical event dùng stable ID; repeat genuine click và fraud eligibility có policy riêng.",
+              "en": "Retries retain stable logical identities; genuine repeated clicks and fraud eligibility have separate policies."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Time contract",
+            "en": "Time contract"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Event time, watermark progress, allowed lateness và billing cutoff không thay thế nhau.",
+              "en": "Event times, watermarks, allowed lateness and billing cutoffs are not interchangeable."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Publication",
+            "en": "Publication"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Finalized revision có authority; old streaming writer không được hồi sinh preliminary count.",
+              "en": "Finalized revisions have authority; old streaming writers cannot revive preliminary counts."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Sizing theo events, state và dimension cardinality",
+        "en": "2. Size events, state and dimension cardinality"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ 1 tỷ raw arrivals/ngày và 100 B/arrival tạo 100 GB/ngày trước protocol/schema overhead, compression, replica và archive copies. Average ≈11.574/s, peak ×5 ≈57.870/s. Partition/worker count phải dựa benchmark payload, skew, dedup state, checkpoint và sink capacity, không chỉ “vài chục partitions đủ”.",
+          "en": "One billion daily raw arrivals at one hundred B each give one hundred GB/day before protocol/schema overhead, compression, replicas and archives. Average ingestion is 11,574/second and an assumed fivefold peak is 57,870/second. Partition/worker counts require payload/skew/state/checkpoint/sink benchmarks rather than assumptions that a few dozen partitions suffice."
+        },
+        {
+          "vi": "Hai triệu active ads ×1.440 minutes là dense grid 2,88 tỷ possible keys/ngày. Nếu một accepted unique click chỉ góp một base ad-minute row, nonempty rows còn ≤accepted unique clicks; actual bound là min(dense grid, unique events). Country/device/grouping rollups và multiple grains làm rows/updates tăng; count sparse rows thay vì preallocate full Cartesian product.",
+          "en": "Two million ads times 1,440 minutes gives a dense grid of 2.88 billion possible daily keys. With one base ad-minute contribution per accepted unique event, nonempty rows are also bounded by unique events, giving the minimum of both bounds. Dimensions, rollups and grains increase rows/updates; count sparse rows rather than preallocate Cartesian products."
+        },
+        {
+          "vi": "Dedup state xấp xỉ unique arrival rate ×retained horizon ×bytes/key trước engine overhead. 1B/ngày giữ một ngày identity ở budget32 B là32 GB raw, chưa metadata/replication/checkpoint. Horizon không chỉ watermark lag: retry/replay/backfill và billing rules quyết định. Tumbling key có thể nhiều open windows khi out-of-order/allowed lateness, không luôn một window/key.",
+          "en": "Deduplication state roughly multiplies unique rates, retained horizons and bytes/key before overhead. Retaining one billion daily identities at a thirty-two-B budget needs thirty-two GB raw before metadata, replication and checkpoints. Retry/replay/backfill and billing rules set horizons, not watermark lag alone. Out-of-order/lateness can keep several tumbling windows open per key."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng click pipeline",
+            "en": "Click-pipeline quantity"
+          },
+          {
+            "vi": "Giả định số học",
+            "en": "Arithmetic assumption"
+          },
+          {
+            "vi": "Kết quả có giới hạn",
+            "en": "Bounded result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Average raw rate",
+              "en": "Average raw rate"
+            },
+            {
+              "vi": "1B /86.400",
+              "en": "1B /86,400"
+            },
+            {
+              "vi": "11.574/s",
+              "en": "11,574/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak raw rate",
+              "en": "Peak raw rate"
+            },
+            {
+              "vi": "Average ×5",
+              "en": "Average ×5"
+            },
+            {
+              "vi": "57.870/s",
+              "en": "57,870/s"
+            }
+          ],
+          [
+            {
+              "vi": "Raw daily bytes",
+              "en": "Raw daily bytes"
+            },
+            {
+              "vi": "1B ×100 B",
+              "en": "1B ×100 B"
+            },
+            {
+              "vi": "100 GB trước overhead",
+              "en": "100 GB before overhead"
+            }
+          ],
+          [
+            {
+              "vi": "Dense ad-minute keys",
+              "en": "Dense ad-minute keys"
+            },
+            {
+              "vi": "2M ×1.440",
+              "en": "2M ×1,440"
+            },
+            {
+              "vi": "2,88B possible, không là số rows bắt buộc",
+              "en": "2.88B possible, not required stored rows"
+            }
+          ],
+          [
+            {
+              "vi": "One-day dedup key budget",
+              "en": "One-day dedup key budget"
+            },
+            {
+              "vi": "1B ×32 B",
+              "en": "1B ×32 B"
+            },
+            {
+              "vi": "32 GB raw trước engine overhead",
+              "en": "32 GB raw before engine overhead"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api-ingest",
+      "title": {
+        "vi": "3. Durable ingest và redirect có failure policy rõ",
+        "en": "3. Durable ingestion and redirects need explicit failure policies"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tracking service validate signed impression/click context, tenant/ad, destination và payload limits; timestamps browser không mặc định trusted. Gán stable logical click ID theo contract để retry không tạo UUID mới mỗi lần. Log-before-redirect có thể giảm mất counted events nhưng khi broker unavailable phải chọn fail-closed, fail-open có loss accounting hoặc durable bounded local buffer/recovery. Không hứa đồng thời redirect luôn available và lossless ingest mà không có protocol/failure assumptions.",
+          "en": "Tracking validates signed contexts, tenants/ads, destinations and payload bounds rather than trusting browser timestamps. Stable logical click identities prevent retries creating new UUIDs. Logging before redirect can reduce lost counted events, but outages require fail-closed behavior, accounted fail-open losses or durable bounded buffering/recovery. Always-available redirects and lossless ingestion do not coexist by assertion alone."
+        },
+        {
+          "vi": "Read APIs limit range/granularity/dimensions/top-K và enforce advertiser ownership. Response cần publication generation, rule, source offsets/cutoff/as-of và preliminary/finalized/partial state. Không chỉ trả một integer rồi để downstream đoán có thể bill hay chưa.",
+          "en": "Read APIs bound ranges, grains, dimensions and K and enforce advertiser ownership. Responses expose generations, rules, offsets/cutoffs/as-of times and preliminary/finalized/partial states rather than leaving downstream consumers to infer billability from integers."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/v1/click-events",
+          "description": {
+            "vi": "Trusted/bounded ingestion; giữ stable event identity qua retries.",
+            "en": "Trusted bounded ingestion preserves identities across retries."
+          },
+          "request": "{ clickId, adId, eventTime, receivedAt, dimensions, schemaVersion, trackingProof }",
+          "response": "202 { ingestReceipt, durabilityPolicy } | retryable failure"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/ads/{adId}/clicks?from=...&to=...&grain=1m",
+          "description": {
+            "vi": "Half-open time range và canonical dimension scope.",
+            "en": "Half-open ranges and canonical dimension scopes."
+          },
+          "response": "200 { points[], generation, ruleVersion, asOf, sourceCutoff, publicationState }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/ads/top?from=...&to=...&limit=100",
+          "description": {
+            "vi": "Top-N sau aggregate cùng ad trên toàn requested scope.",
+            "en": "Top-N follows full per-ad aggregation across the requested scope."
+          },
+          "response": "200 { ads[], generation, asOf, partial, publicationState }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Một raw evidence path và các versioned views",
+        "en": "4. One evidence path and versioned views"
+      },
+      "paragraphs": [
+        {
+          "vi": "Raw log là source replay trong retained horizon; archive giữ durable manifests/offset ranges/schema để recount lâu hơn. Fast path dedup/window/aggregate và materialize absolute counts, slow path recount cùng eligibility/dedup rules tại cutoff đã chọn. Không bắt buộc hai engines/codebases: có thể replay cùng stream job vào generation mới nếu retention/state/migration cho phép.",
+          "en": "Raw logs support replays within retention; archives preserve manifests/offset ranges/schemas for longer recounts. Fast paths deduplicate/window/materialize absolute counts, while recounts use compatible eligibility/deduplication rules at chosen cutoffs. Separate codebases/engines are optional: retained logs and suitable state/migration can replay the same job into new generations."
+        },
+        {
+          "vi": "Archive consumer không được commit offset rồi bỏ qua file chưa durable. Manifest publish sau verified object upload và includes source range; duplicate batches cần deterministic identity/dedup. Query chọn một active publication thay vì cộng stream row và batch row cho cùng key. Recount không cứu được raw events đã lost trước durable acceptance hoặc hết retention.",
+          "en": "Archive consumers must not checkpoint past undurable files. Publish manifests after verified uploads with source ranges and deterministic batch identities. Queries select active publications rather than add stream and batch rows for the same key. Recounts cannot recover raw events lost before acceptance or beyond retention."
+        }
+      ],
+      "diagram": {
+        "id": "click-time-and-authority",
+        "title": {
+          "vi": "Một raw log; window revisions và publication authority rõ ràng",
+          "en": "One raw log with explicit window revisions and publication authority"
+        },
+        "caption": {
+          "vi": "Streaming và recount cùng dùng retained evidence nhưng có freshness/cutoff khác. Backfill publish generation mới; old writer không được đè generation đang phục vụ.",
+          "en": "Streaming and recounts share retained evidence with different freshness/cutoff contracts. Backfills publish new generations; old writers cannot overwrite active generations."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "click",
+            "label": {
+              "vi": "Tracking / redirect",
+              "en": "Tracking / redirect"
+            },
+            "detail": {
+              "vi": "Validate signed tracking context, destination và event identity; durable acceptance trước counted-redirect contract.",
+              "en": "Validates signed tracking contexts, destinations and identities; durable acceptance precedes counted-redirect contracts."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "raw",
+            "label": {
+              "vi": "Durable raw log",
+              "en": "Durable raw log"
+            },
+            "detail": {
+              "vi": "Retained raw evidence cùng trusted timestamps, IDs, schema và source offsets; partition policy bảo vệ dedup scope.",
+              "en": "Retains evidence, trusted timestamps, identities, schemas and source offsets with dedup-compatible partitioning."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "queue"
+          },
+          {
+            "id": "stream",
+            "label": {
+              "vi": "Window aggregator",
+              "en": "Window aggregator"
+            },
+            "detail": {
+              "vi": "Exact dedup trong horizon, event-time windows, watermarks/lateness, checkpointed state và versioned outputs.",
+              "en": "Performs horizon-bounded exact deduplication, event-time windows, lateness/checkpoints and versioned outputs."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "worker"
+          },
+          {
+            "id": "updates",
+            "label": {
+              "vi": "Aggregate changelog",
+              "en": "Aggregate changelog"
+            },
+            "detail": {
+              "vi": "Absolute count + key/dimensions/rule + generation/revision; replay không được tự cộng lại.",
+              "en": "Carries absolute counts, keys/dimensions/rules and generations/revisions; replays must not increment again."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "queue"
+          },
+          {
+            "id": "serving",
+            "label": {
+              "vi": "Serving materialization",
+              "en": "Serving materialization"
+            },
+            "detail": {
+              "vi": "Engine-specific upsert/query semantics; version checks hoặc isolated generation + active pointer.",
+              "en": "Uses engine-specific upsert/query semantics and version checks or isolated generations with active pointers."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "query",
+            "label": {
+              "vi": "Analytics API",
+              "en": "Analytics API"
+            },
+            "detail": {
+              "vi": "Authorized ad/range/dimension queries, completeness/provenance metadata và bounded top-N.",
+              "en": "Serves authorized ad/range/dimension queries with completeness/provenance metadata and bounded top-N."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "dash",
+            "label": {
+              "vi": "Dashboard / reporting",
+              "en": "Dashboard / reporting"
+            },
+            "detail": {
+              "vi": "Hiển thị preliminary/as-of; billing chỉ dùng publication đã chốt theo contract.",
+              "en": "Displays preliminary/as-of states; billing uses contractually finalized publications."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "client"
+          },
+          {
+            "id": "lake",
+            "label": {
+              "vi": "Raw archive",
+              "en": "Raw archive"
+            },
+            "detail": {
+              "vi": "Manifest/checksum/schema và complete offset ranges, privacy/retention policy áp dụng cho replay.",
+              "en": "Keeps manifests/checksums/schemas and complete offset ranges with privacy/retention-aware replays."
+            },
+            "x": 130,
+            "y": 710,
+            "kind": "store"
+          },
+          {
+            "id": "recount",
+            "label": {
+              "vi": "Recount / backfill",
+              "en": "Recount / backfill"
+            },
+            "detail": {
+              "vi": "Recompute theo dedup/eligibility/rules/cutoff cố định; không biết mọi click chưa từng ingest.",
+              "en": "Recomputes under fixed deduplication, eligibility, rules and cutoffs; cannot know never-ingested clicks."
+            },
+            "x": 430,
+            "y": 710,
+            "kind": "worker"
+          },
+          {
+            "id": "publish",
+            "label": {
+              "vi": "Generation publisher",
+              "en": "Generation publisher"
+            },
+            "detail": {
+              "vi": "Validate, reconcile, authorize and fence publication; bill revision/adjustment có audit.",
+              "en": "Validates, reconciles, authorizes and fences publications with audited billing revisions/adjustments."
+            },
+            "x": 740,
+            "y": 710,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "ingest",
+            "label": {
+              "vi": "Durable ingest trước khi ghi nhận click",
+              "en": "Durable ingestion before counting clicks"
+            },
+            "steps": [
+              {
+                "from": "click",
+                "to": "raw",
+                "description": {
+                  "vi": "Persist stable event ID/ad/context/trusted time và await configured durability.",
+                  "en": "Persist stable identities, ads, contexts and trusted times under configured durability."
+                }
+              },
+              {
+                "from": "raw",
+                "to": "click",
+                "description": {
+                  "vi": "ACK theo failure boundary; redirect response timeout/retry giữ cùng logical event identity.",
+                  "en": "Acknowledge under the failure boundary; redirect-response retries preserve logical event identities."
+                }
+              },
+              {
+                "from": "raw",
+                "to": "stream",
+                "description": {
+                  "vi": "Consume replayable raw positions; duplicated business events còn cần dedup riêng.",
+                  "en": "Consume replayable positions; duplicate business events still need separate deduplication."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "stream",
+            "label": {
+              "vi": "Event-time window tới dashboard",
+              "en": "Event-time windows to dashboards"
+            },
+            "steps": [
+              {
+                "from": "raw",
+                "to": "stream",
+                "description": {
+                  "vi": "Dedup trước window assignment/rollups theo stable identity và partition policy.",
+                  "en": "Deduplicate before windows/rollups under stable identities and partition policies."
+                },
+                "async": true
+              },
+              {
+                "from": "stream",
+                "to": "updates",
+                "description": {
+                  "vi": "Emit absolute window count/revision; late accepted event có thể phát revision mới.",
+                  "en": "Emit absolute counts/revisions; accepted late events can create new revisions."
+                },
+                "async": true
+              },
+              {
+                "from": "updates",
+                "to": "serving",
+                "description": {
+                  "vi": "Materialize theo valid generation và comparison policy; không blind additive.",
+                  "en": "Materialize under valid generations/comparison policies rather than blind addition."
+                },
+                "async": true
+              },
+              {
+                "from": "dash",
+                "to": "query",
+                "description": {
+                  "vi": "Request phạm vi và dimensions; không dùng preliminary như billable mặc định.",
+                  "en": "Request ranges/dimensions without treating preliminary results as billable by default."
+                }
+              },
+              {
+                "from": "query",
+                "to": "serving",
+                "description": {
+                  "vi": "Read active generation nhất quán cho requested range hoặc trả mixed/provisional metadata rõ.",
+                  "en": "Read coherent active generations for ranges or explicitly report mixed/provisional states."
+                }
+              },
+              {
+                "from": "query",
+                "to": "dash",
+                "description": {
+                  "vi": "Return counts cùng as-of/source/rule/cutoff và freshness state.",
+                  "en": "Return counts with as-of/source/rule/cutoff and freshness state."
+                }
+              }
+            ]
+          },
+          {
+            "id": "late",
+            "label": {
+              "vi": "Late click và evidence giữ lại",
+              "en": "Late clicks and retained evidence"
+            },
+            "steps": [
+              {
+                "from": "raw",
+                "to": "stream",
+                "description": {
+                  "vi": "Late arrival nằm sau window cleanup đi side output, không âm thầm biến mất khỏi evidence.",
+                  "en": "Arrivals after cleanup go to side outputs without silently disappearing from evidence."
+                },
+                "async": true
+              },
+              {
+                "from": "raw",
+                "to": "lake",
+                "description": {
+                  "vi": "Archive raw log theo manifest/offset checkpoint; verify coverage.",
+                  "en": "Archive logs under manifests/offset checkpoints and verify coverage."
+                },
+                "async": true
+              },
+              {
+                "from": "lake",
+                "to": "recount",
+                "description": {
+                  "vi": "Recount retained unique eligible events theo declared cutoff và rule version.",
+                  "en": "Recount retained unique eligible events under declared cutoffs/rule versions."
+                }
+              }
+            ]
+          },
+          {
+            "id": "publish",
+            "label": {
+              "vi": "Backfill không đua overwrite với old stream",
+              "en": "Backfills avoid racing old-stream overwrites"
+            },
+            "steps": [
+              {
+                "from": "lake",
+                "to": "recount",
+                "description": {
+                  "vi": "Read deterministic manifest snapshot và raw range.",
+                  "en": "Read deterministic manifest snapshots/raw ranges."
+                }
+              },
+              {
+                "from": "recount",
+                "to": "publish",
+                "description": {
+                  "vi": "Submit candidate totals, validation statistics, source offsets và rule generation.",
+                  "en": "Submit candidate totals, validation statistics, offsets and rule generations."
+                }
+              },
+              {
+                "from": "publish",
+                "to": "serving",
+                "description": {
+                  "vi": "Write isolated generation; validate rồi atomically switch query pointer/cutover phù hợp.",
+                  "en": "Write isolated generations, validate and switch query pointers under suitable cutover protocols."
+                }
+              },
+              {
+                "from": "publish",
+                "to": "query",
+                "description": {
+                  "vi": "Expose finalized publication/revision; revoke old-writer authority cho active namespace.",
+                  "en": "Expose finalized publications/revisions and fence old writers from active namespaces."
+                }
+              },
+              {
+                "from": "query",
+                "to": "dash",
+                "description": {
+                  "vi": "Show corrected/finalized numbers; invoice adjustments dùng published revision ID.",
+                  "en": "Show corrected/finalized counts; invoice adjustments reference published revision IDs."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "time-windows",
+      "title": {
+        "vi": "5. Event time quyết định window; arrival quyết định khi ta biết",
+        "en": "5. Event time assigns windows; arrival determines knowledge timing"
+      },
+      "paragraphs": [
+        {
+          "vi": "Click event time 10:00:59 tới processor 10:01:07 vẫn thuộc tumbling minute [10:00,10:01). Processing-time grouping chuyển window theo network delay và replay schedule, có thể đúng cho operational metric nhưng khác business click-time reporting. Validate trusted server time/skew và quarantine future timestamps để một producer sai clock không đẩy progress qua hàng loạt windows.",
+          "en": "A 10:00:59 click arriving at 10:01:07 belongs to the event-time minute [10:00,10:01). Processing-time groups depend on network/replay schedules, which can suit operational metrics but differ from business click-time reports. Validate trusted timestamps/skew and quarantine future times so broken clocks do not advance progress across many windows."
+        },
+        {
+          "vi": "Tumbling windows không overlap; hopping size5m/slide1m có thể gán một event vào năm windows; session windows có gap-based merging và active session kéo dài nếu không giới hạn. State cost còn phụ thuộc active keys, out-of-order horizon, allowed lateness, trigger và retained data/aggregates, không chỉ loại window. Demo dùng tumbling60s và một input để thấy semantics trước.",
+          "en": "Tumbling windows do not overlap; five-minute/one-minute hopping windows can assign events five times. Sessions merge by inactivity gaps and may extend without policy limits. State depends on active keys, disorder horizons, allowed lateness, triggers and retained data/aggregates, not window type alone. The demo starts with sixty-second tumbling windows and one input."
+        }
+      ],
+      "experiment": "click-windows"
+    },
+    {
+      "id": "watermarks",
+      "title": {
+        "vi": "6. Watermark là progress assumption, không chứng chỉ completeness",
+        "en": "6. Watermarks are progress assumptions, not completeness certificates"
+      },
+      "paragraphs": [
+        {
+          "vi": "Watermark thường được sinh từ observed timestamps và source strategy; downstream multi-input operator lấy minimum progress của active inputs. Một partition im lặng có thể giữ watermark đứng lại; idleness timeout loại nó khỏi minimum giúp latency nhưng khi data cũ trở lại nó có thể late. Watermark alignment/backpressure và source timestamp validation cần theo engine, không ép mỗi worker dùng max event time toàn bộ rồi kết luận đủ data.",
+          "en": "Watermarks follow source timestamp/progress strategies, and downstream multi-input progress uses active-input minima. Silent partitions can stall progress; idleness policies improve latency but returning data can be late. Alignment, backpressure and timestamp validation are engine-specific rather than global maximum-time shortcuts."
+        },
+        {
+          "vi": "Watermark lag quyết định progress conservatism; allowed lateness quyết định giữ window state bao lâu sau main trigger; raw retention quyết định có replay/recount được tới đâu. Chúng là ba parameter khác. Late accepted events có thể emit revised count, quá cleanup thì side output/quarantine theo policy. Không dùng side output như thùng rác: retained evidence vẫn cần reconciliation/finalization.",
+          "en": "Watermark lag governs progress conservatism, allowed lateness governs post-trigger state retention and raw retention governs replay/recount horizons. These are distinct. Accepted late events can emit revisions, while post-cleanup events enter side outputs/quarantine under policy. Side outputs remain evidence requiring reconciliation/finalization rather than discarded garbage."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Vòng đời một minute window",
+          "en": "A minute-window lifecycle"
+        },
+        "caption": {
+          "vi": "Progress closure là quyết định xử lý state, không phải lời hứa không có future late events.",
+          "en": "Progress closure manages state rather than promising no future late events."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Accumulate",
+              "en": "Accumulate"
+            },
+            "detail": {
+              "vi": "Dedup valid events vào event-time window.",
+              "en": "Deduplicate valid events into event-time windows."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Main trigger",
+              "en": "Main trigger"
+            },
+            "detail": {
+              "vi": "Watermark qua window end thì emit absolute revision.",
+              "en": "Emit absolute revisions after progress passes window ends."
+            },
+            "icon": "flag"
+          },
+          {
+            "title": {
+              "vi": "Late revisions",
+              "en": "Late revisions"
+            },
+            "detail": {
+              "vi": "Trong allowed retention còn update và emit version mới.",
+              "en": "Retained windows can update and emit newer versions."
+            },
+            "icon": "compare"
+          },
+          {
+            "title": {
+              "vi": "Retire / side output",
+              "en": "Retire and side-output"
+            },
+            "detail": {
+              "vi": "Sau cleanup chuyển late evidence sang recount/adjustment policy.",
+              "en": "After cleanup route late evidence into recount/adjustment policies."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dedup",
+      "title": {
+        "vi": "7. Business duplicates khác crash replay",
+        "en": "7. Business duplicates differ from crash replay"
+      },
+      "paragraphs": [
+        {
+          "vi": "Producer retry cùng event ID và raw log chứa hai copies là business duplicate; source/processor replay cùng log position sau crash là processing replay. Checkpoint consistent offsets+state giải phần replay nội bộ khi source/state backend support; không tự biết hai click IDs khác nhau là cùng hành vi. Stable identity/scope, payload conflict handling và fraud repeat policy phải có trước “dedup by ID”.",
+          "en": "Producer retries creating duplicate log records differ from processors replaying positions after crashes. Consistent offset/state checkpoints address internal replay under supported sources/backends, not whether different click IDs represent one action. Define stable scopes/identities, payload-conflict handling and fraud/repeat policies before deduplicating IDs."
+        },
+        {
+          "vi": "TTL cần bao phủ agreed duplicate/retry horizon hoặc có durable dedup/recount strategy cho replay dài hơn. Chọn TTL dài hơn watermark lag vài giây không bảo đảm billing dedup ngày/tuần. Partitioning cần đưa cùng identity tới cùng dedup authority; nếu ad/dimensions của cùng event bị sửa thì phải detect, không để hai keys mỗi nơi count một lần. Bloom false positive có thể bỏ unique billable event, nên không dùng positive=drop làm exact billing proof.",
+          "en": "TTL must cover agreed duplicate/retry horizons or be paired with durable deduplication/recount strategies for longer replays. Slightly exceeding watermark lag does not establish daily/weekly billing deduplication. Partition duplicate identities to shared authorities and detect changed ads/dimensions. Bloom false positives can discard unique billable events, so positive-means-drop cannot prove exact counting."
+        }
+      ]
+    },
+    {
+      "id": "checkpoint-sink",
+      "title": {
+        "vi": "8. Exactly-once effect có boundary tới sink",
+        "en": "8. Exactly-once effects have sink boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Checkpoint state và input positions tương thích giúp restore không nhân internal counts khi replay; checkpoints phải durable/completed và source replay còn available. External writes đã thoát ra sau checkpoint cũ có thể được phát lại. Transactional sink commit với checkpoint hoặc idempotent/versioned materialization cần connector/engine support; chỉ bật checkpoint không biến mọi HTTP/OLAP write thành exactly-once.",
+          "en": "Compatible state/input checkpoints avoid internal replay multiplication when durable checkpoints and replayable sources survive. External writes since earlier checkpoints can be emitted again. Checkpoint-transactional sinks or idempotent/versioned materializations need connector/engine support; checkpointing alone does not make arbitrary HTTP/OLAP writes exactly once."
+        },
+        {
+          "vi": "Absolute upsert cùng key/value idempotent nhưng stale revision vẫn có thể overwrite mới. Backfill/live writers cũng race nếu chỉ dùng key(ad,minute,dims). Cần monotonic version trong cùng authority generation hoặc isolated generation + controlled query cutover. Equal version/different payload là conflict cần quarantine/audit, không để arrival order chọn billing count.",
+          "en": "Absolute upserts are idempotent for identical records but stale revisions can overwrite newer ones. Backfills/live writers race on unversioned ad/minute/dimension keys. Use monotonic revisions within authority generations or isolated generations with controlled cutovers. Equal versions with different payloads require quarantine/audits rather than arrival-order billing decisions."
+        }
+      ],
+      "experiment": "click-sink"
+    },
+    {
+      "id": "materialization",
+      "title": {
+        "vi": "9. OLAP write semantics phải theo đúng engine",
+        "en": "9. OLAP write semantics are engine-specific"
+      },
+      "paragraphs": [
+        {
+          "vi": "Aggregate key gồm tenant/ad, event-time window/grain, canonical dimensions hoặc dimension-key đã kiểm, rule version và generation scope. Count dùng integer đủ lớn; record có revision, source coverage/as-of và publication state. Không hash dimension string tùy tiện rồi quên collision/normalization, hoặc mix total(*) với country/device rows rồi SUM double count.",
+          "en": "Aggregate keys include tenants/ads, event-time windows/grains, canonical dimensions or validated dimension keys, rules and generation scopes. Use sufficiently wide integers, revisions, source coverage/as-of metadata and publication states. Avoid unvalidated dimension hashing/normalization and summing total rows together with dimensional rollups."
+        },
+        {
+          "vi": "Ví dụ Pinot full upsert cần primary-key partitioning và comparison semantics phù hợp; equal comparison values không tạo deterministic conflict resolution tự động. Có thể isolate publication generation theo table/key namespace, dùng một revision comparison field trong active generation và source-side conflict validation. Engine merge/routing/query visibility phải kiểm, không mang SQL PRIMARY KEY overwrite assumptions sang mọi column store.",
+          "en": "For example, Pinot full upserts need primary-key partitioning and appropriate comparison semantics; equal comparison values do not automatically provide deterministic conflict handling. Isolate publication generations by tables/key namespaces, compare revisions within generations and validate source conflicts. Verify engine merges/routing/query visibility rather than assuming universal SQL-primary-key overwrites."
+        }
+      ],
+      "code": {
+        "language": "json",
+        "content": "{\n  \"tenantId\": \"t1\", \"adId\": \"ad42\",\n  \"windowStart\": \"2026-10-22T10:00:00Z\", \"grain\": \"1m\",\n  \"dimensions\": { \"country\": \"VN\", \"device\": \"mobile\" },\n  \"ruleVersion\": \"click-rules-v3\",\n  \"generation\": 2, \"revision\": 17, \"count\": 412,\n  \"publicationState\": \"preliminary\",\n  \"sourceCutoff\": \"2026-10-22T10:02:00Z\"\n}",
+        "caption": {
+          "vi": "Record schema minh họa, không phải universal Pinot/ClickHouse connector config.",
+          "en": "Illustrative record schema, not universal Pinot/ClickHouse connector configuration."
+        }
+      }
+    },
+    {
+      "id": "hot-topn",
+      "title": {
+        "vi": "10. Hot ads cần stable partitioning; top-N cần sum đúng trước",
+        "en": "10. Hot ads need stable partitioning; top-N needs correct aggregation first"
+      },
+      "paragraphs": [
+        {
+          "vi": "Key by ad_ID giữ cùng ad trên một partition/task, tạo hotspot khi ad cực phổ biến. Có thể dedup trước theo click ID rồi repartition, hoặc stable salt hash(clickID)%B dưới ad để retries cùng identity tới cùng bucket. Salt random mới mỗi retry có thể đưa duplicate sang workers khác và double count. Stage2 sum partials theo ad/window; checkpoint/version semantics áp dụng cho cả hai stages.",
+          "en": "Ad-key partitioning can hotspot popular ads. Deduplicate by click identity before repartitioning, or use stable click-ID-derived salts so retries share buckets. Independent random retry salts can duplicate counts across workers. Second stages sum per-ad/window partials, preserving checkpoint/version semantics throughout."
+        },
+        {
+          "vi": "Đừng lấy local top-N ở salted raw partitions rồi merge như leaderboard hash-members mà chưa sum cùng ad. Một ad hạng2 trong nhiều shards có tổng cao nhất nhưng bị mọi local top1 loại. Aggregate per-ad partials hoàn chỉnh trước global top-N, hoặc dùng candidate algorithm có proof/error bound. Filters/rollups/range phải cùng scope; missing partition/time window có partial/completeness metadata.",
+          "en": "Unlike disjoint leaderboard members, salted partitions may share ads: local top-N before summing can omit an ad ranked second everywhere but first globally. Complete per-ad partial aggregation before global top-N, or use proven/bounded candidate methods. Match filters/rollups/ranges and expose missing-partition/window completeness."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Tình huống aggregation",
+            "en": "Aggregation situation"
+          },
+          {
+            "vi": "Cách đúng cần điều kiện",
+            "en": "Conditioned correct approach"
+          },
+          {
+            "vi": "Lỗi thường gặp",
+            "en": "Common error"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Hot ad duplicate retry",
+              "en": "Hot-ad retry duplicates"
+            },
+            {
+              "vi": "Stable identity/dedup authority trước hoặc cùng salting.",
+              "en": "Keep stable identity/deduplication authority before or within salting."
+            },
+            {
+              "vi": "Random retry salt làm cùng ID tới hai workers.",
+              "en": "Random retry salts split identical IDs between workers."
+            }
+          ],
+          [
+            {
+              "vi": "Global top-N across ad partials",
+              "en": "Global top-N across ad partials"
+            },
+            {
+              "vi": "Sum same ad trước final ranking.",
+              "en": "Sum each ad before final ranking."
+            },
+            {
+              "vi": "Local top-N loại ad có total global cao.",
+              "en": "Local top-N can omit globally leading totals."
+            }
+          ],
+          [
+            {
+              "vi": "Multiple rollup levels",
+              "en": "Multiple rollup levels"
+            },
+            {
+              "vi": "Query chọn grain/grouping set không overlap contributions.",
+              "en": "Select grains/grouping sets without overlapping contributions."
+            },
+            {
+              "vi": "SUM cả total và country/device rows.",
+              "en": "Sum totals together with dimensional rows."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "backfill-finalize",
+      "title": {
+        "vi": "11. Recount và replay publish thế hệ mới, không overwrite mù",
+        "en": "11. Recounts/replays publish generations instead of blind overwrites"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lambda giữ stream và batch logic khác nhau nên cần shared rule definitions/tests/reconciliation để tránh drift. Kappa replay cùng pipeline giúp giảm duplication nhưng cần retained input, compatible state/schema, source cutoff và capacity để chạy backfill cùng live traffic. Không kiến trúc nào tự “exact”: missing raw evidence, rule bug hoặc dedup sai đều đi vào cả output nếu không kiểm.",
+          "en": "Lambda separates streaming/batch logic and needs shared rules/tests/reconciliation against drift. Kappa reuses pipelines but requires retained input, compatible state/schemas, source cutoffs and capacity alongside live traffic. Neither is automatically exact: missing evidence, rule bugs and bad deduplication can affect both."
+        },
+        {
+          "vi": "Build isolated output generation theo raw manifest/offset snapshot và rule version. Validate coverage/count invariants, compare eligible unique counts, inspect divergence và authorize cutover; query pins generation hoặc reports mixed revision explicitly. Fence old writers khỏi active publication. Final invoice cần published revision ID và adjustments sau cutoff, không edit historical bills chỉ vì streaming row tới muộn.",
+          "en": "Build isolated generations from raw manifests/offset snapshots and rules. Validate coverage/invariants, compare eligible unique counts, investigate divergence and authorize cutovers; queries pin generations or explicitly expose mixed revisions. Fence old writers from active publications. Final invoices reference published revisions and post-cutoff adjustments rather than mutable late-stream rows."
+        }
+      ]
+    },
+    {
+      "id": "privacy-operations",
+      "title": {
+        "vi": "12. Retention và observability đi cùng replay",
+        "en": "12. Retention and observability accompany replay"
+      },
+      "paragraphs": [
+        {
+          "vi": "Raw clicks có thể chứa identifiers/location/device context; collect minimum fields cần, pseudonymization/access controls, retention và deletion/suppression propagation phải bao gồm log, archive, OLAP, exports và backfills. Replay phải honor policy state hiện hành phù hợp contract, không hồi sinh dữ liệu đã bị suppress chỉ vì đọc archive cũ. Không log full tracking secrets/tokens trong traces.",
+          "en": "Raw clicks can contain identifiers/location/device context. Minimize collection and apply pseudonymization, access controls, retention and suppression/deletion policies across logs, archives, OLAP, exports and backfills. Replays honor appropriate policy state instead of reviving suppressed data from old archives. Keep tracking secrets/tokens out of traces."
+        },
+        {
+          "vi": "Metric gồm ingest durable ACK latency/loss accounting, per-partition lag/watermark skew, idleness transitions, duplicate/conflict rate, accepted-late/too-late rate, checkpoint duration/failures, sink stale revision rejects, archive coverage và stream/recount divergence theo same rule/cutoff. Alert không dùng raw IDs làm unbounded labels. Đo backfill RTO và competing live freshness, không chỉ average event throughput.",
+          "en": "Measure durable-ingest latency/loss accounting, partition lag/watermark skew, idleness, duplicate/conflict rates, late/too-late rates, checkpoints, stale-sink rejections, archive coverage and same-rule/cutoff recount divergence. Avoid unbounded raw-ID metric labels. Measure backfill RTO and live freshness competition rather than average throughput alone."
+        }
+      ]
+    },
+    {
+      "id": "failure-review",
+      "title": {
+        "vi": "13. Thử crash, late input và old writer sau cutover",
+        "en": "13. Test crashes, late inputs and old writers after cutovers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixture kiểm theo logical click IDs và expected event-time windows, không chỉ tổng response 200. Một overcount duplicate và một lost late click có thể bù nhau trong daily total, nên kiểm từng class/window/ID. Finalized count cần traceable source manifest/rule/cutoff để giải thích billing discrepancy.",
+          "en": "Validate logical identities and event-time windows rather than successful responses alone. A duplicate overcount and a lost late click can cancel in daily totals, requiring class/window/identity checks. Final counts need traceable manifests/rules/cutoffs for discrepancies."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault ad-click",
+            "en": "Ad-click fault"
+          },
+          {
+            "vi": "Kết quả cần chứng minh",
+            "en": "Required result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Producer retry cùng click ID",
+              "en": "Producer retries the same click ID"
+            },
+            {
+              "vi": "Một eligible contribution trong agreed dedup scope/horizon.",
+              "en": "One eligible contribution within the agreed deduplication scope/horizon."
+            }
+          ],
+          [
+            {
+              "vi": "Processor crash sau external write",
+              "en": "Processor crashes after external writes"
+            },
+            {
+              "vi": "Restore/replay không nhân external effect.",
+              "en": "Restore/replay does not multiply external effects."
+            }
+          ],
+          [
+            {
+              "vi": "Watermark tiến rồi partition quay lại",
+              "en": "A partition returns after progress advanced"
+            },
+            {
+              "vi": "Late policy + retained evidence, không giả complete.",
+              "en": "Apply late policies and retain evidence without pretending completeness."
+            }
+          ],
+          [
+            {
+              "vi": "Old revision sau new revision",
+              "en": "Old revisions arrive after newer ones"
+            },
+            {
+              "vi": "Count không regress hoặc double-add.",
+              "en": "Counts neither regress nor double-add."
+            }
+          ],
+          [
+            {
+              "vi": "Old stream writer sau recount publish",
+              "en": "Old stream writers run after recount publication"
+            },
+            {
+              "vi": "Old authority không overwrite active finalized generation.",
+              "en": "Old authority cannot overwrite active finalized generations."
+            }
+          ],
+          [
+            {
+              "vi": "Future timestamp lỗi",
+              "en": "A malformed future timestamp"
+            },
+            {
+              "vi": "Quarantine/bound clock skew trước progress poisoning.",
+              "en": "Quarantine/bound skew before it poisons progress."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi phỏng vấn về time và publication correctness",
+        "en": "14. Interview questions on time and publication correctness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ input ID, event/arrival time, watermark trước event, window cleanup và sink version. Giải thích một failure xuyên cả chuỗi thay vì dừng ở “Flink có exactly-once”.",
+          "en": "Track identities, event/arrival times, prior watermarks, cleanup and sink versions. Explain end-to-end failures rather than stopping at Flink exactly-once terminology."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Watermark qua minute end có chứng minh không còn late click?",
+            "en": "Does a watermark past minute end prove no late clicks remain?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nó là source progress assumption; idle partition/clock skew/network outage vẫn tạo late arrivals. Allowed lateness, side output, retained evidence và finalized cutoff/revisions quyết định xử lý tiếp.",
+              "en": "No. Source progress assumptions coexist with lateness from idle inputs, skew or outages. Allowed lateness, side outputs, retained evidence and finalized cutoffs/revisions determine recovery."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dedup TTL dài hơn watermark lag đã đủ billing chưa?",
+            "en": "Is a deduplication TTL exceeding watermark lag enough for billing?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự đủ. Duplicate retry/replay/backfill horizon có thể dài hơn; cần exact identity scope và durable/recount policy. Same ID phải tới cùng dedup authority, khác IDs không tự là khác genuine clicks.",
+              "en": "Not automatically: retry/replay/backfill horizons can be longer. Define exact identity scopes and durable/recount policies, route identical IDs consistently and distinguish identities from genuine behavior."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Checkpoint bật rồi sink COUNT += output có bị đếm đôi?",
+            "en": "Can additive sinks double-count with checkpointing enabled?"
+          },
+          "answer": [
+            {
+              "vi": "Có nếu output sau checkpoint cũ được replay. Transactional connector hoặc absolute versioned materialization cần bảo vệ external boundary. Upsert cùng key cũng cần stale revision/authority guard.",
+              "en": "Yes when post-checkpoint outputs replay. Transactional connectors or absolute versioned materializations must protect external boundaries, including stale-revision/authority guards."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Batch overwrite yesterday rồi old stream ghi tiếp thì sao?",
+            "en": "What if old streaming writes continue after yesterday is recounted?"
+          },
+          "answer": [
+            {
+              "vi": "Có thể regress finalized count. Publish isolated generation có source/rule/cutoff và fence old writers; query active pointer/version, không chọn whichever row arrived last.",
+              "en": "Final counts can regress. Publish isolated generations with sources/rules/cutoffs and fence old writers; query active pointers/versions instead of last-arrival rows."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Salt random mỗi click retry có đúng không?",
+            "en": "Is a new random salt on every click retry safe?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu dedup keyed theo salted destination: duplicate đi hai workers. Dedup-first rồi repartition hoặc stable salt từ identity, sau đó sum partials với đúng checkpoint/version semantics.",
+              "en": "Not when deduplication depends on salted destinations. Deduplicate before repartitioning or derive stable identity salts, then sum partials under compatible checkpoint/version semantics."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Local top-N trên các ad partials có luôn ra global top-N?",
+            "en": "Do local top-N ad partials always yield global top-N?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cùng ad có thể đứng sau cutoff mỗi shard nhưng sum lớn nhất. Aggregate same-ad contributions đầy đủ trước final ranking hoặc dùng candidate algorithm có proof/error contract.",
+              "en": "No: one ad can fall below every local cutoff yet have the largest sum. Complete per-ad aggregation before ranking or use a candidate algorithm with proven/bounded guarantees."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Nightly recount có tính được mọi click đã xảy ra không?",
+            "en": "Can nightly recounts include every click that occurred?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ retained ingested evidence theo cutoff/eligibility/dedup rules. Lost-before-log hoặc future late events không tự có. Cần loss accounting và adjustment/finalization policy, không claim universal exact truth.",
+              "en": "Only retained ingested evidence under cutoffs/eligibility/deduplication rules is available. Pre-log losses or future arrivals do not appear automatically; define loss accounting and adjustment/finalization policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Stream và batch total bằng nhau đã chứng minh pipeline đúng?",
+            "en": "Do equal streaming and batch totals prove correctness?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Shared rule bug hoặc over/undercount bù nhau có thể giấu lỗi. So ID/window/dimension classes, source coverage, independent fixtures và publication metadata, rồi điều tra divergence có owner.",
+              "en": "No. Shared rule bugs or offsetting overcounts/undercounts can hide errors. Compare identities/windows/dimensions, coverage, independent fixtures and publication metadata with owned investigations."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

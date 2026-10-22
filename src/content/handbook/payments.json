@@ -1,0 +1,1169 @@
+{
+  "id": "payments",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Payment System: idempotency, ledger và reconciliation",
+    "en": "Designing a Payment System: idempotency, ledgers and reconciliation"
+  },
+  "summary": {
+    "vi": "Theo dõi intent, provider effects và accounting facts qua timeout/retry; thử duplicate captures và balanced-but-wrong ledger để hiểu identity, atomic boundaries và recovery.",
+    "en": "Track intents, provider effects and accounting facts through timeouts/retries; explore duplicate captures and balanced-but-wrong ledgers to understand identities, atomic boundaries and recovery."
+  },
+  "prerequisites": [
+    "databases",
+    "consistency",
+    "messaging",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "backend",
+    "database",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Timeout là thiếu evidence, không là proof chưa charge; giữ stable attempt/provider identity.",
+      "en": "Timeouts mean missing evidence, not proof of no charge; preserve stable attempt/provider identities."
+    },
+    {
+      "vi": "Idempotency có scope/payload/retention; same key không dedup xuyên provider.",
+      "en": "Idempotency has scopes/payloads/retention; the same key does not deduplicate across providers."
+    },
+    {
+      "vi": "Event dedup khác unique financial posting; balanced duplicate vẫn sai tiền.",
+      "en": "Event deduplication differs from financial-posting uniqueness; balanced duplicates still misstate money."
+    },
+    {
+      "vi": "Payment facts, ledger và outbox cần explicit atomic boundary; external PSP calls không tự thuộc transaction.",
+      "en": "Payment facts, ledgers and outboxes need explicit atomic boundaries; PSP calls are not automatically transactional."
+    },
+    {
+      "vi": "Refund/payout reservations, reconciliation và owned recovery là phần thiết kế chính.",
+      "en": "Refund/payout reservations, reconciliation and owned recovery are central design elements."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Theo dấu một money operation",
+      "en": "Trace one money operation"
+    },
+    "caption": {
+      "vi": "Tách logical identity, external evidence và accounting trước khi tối ưu throughput.",
+      "en": "Separate logical identities, external evidence and accounting before optimizing throughput."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Record intent",
+          "en": "Record intent"
+        },
+        "detail": {
+          "vi": "Trusted amount/currency, stable identity và durable dispatch.",
+          "en": "Validate amounts/currencies, stable identities and durable dispatch."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Execute và recover",
+          "en": "Execute and recover"
+        },
+        "detail": {
+          "vi": "Provider contract, timeout, webhook và reference lookup.",
+          "en": "Use provider contracts, timeouts, webhooks and reference lookups."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Post atomically",
+          "en": "Post atomically"
+        },
+        "detail": {
+          "vi": "Unique financial operation, balanced postings và outbox.",
+          "en": "Enforce unique financial operations, balanced postings and outboxes."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Reconcile",
+          "en": "Reconcile"
+        },
+        "detail": {
+          "vi": "External reports, reservations và owned breaks.",
+          "en": "Reconcile external reports, reservations and owned breaks."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Money flow trước, provider integration sau",
+        "en": "1. Define money flows before provider integration"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hỏi merchant hay marketplace, pay-in, seller payout, partial refunds, disputes và settlement qua provider nào. Baseline dùng PSP tokenization và provider rails; không tự xây card network hoặc FX treasury. Reliability target là không tạo duplicate financial effect cho cùng logical operation trong contract đã xác định, ghi nhận evidence bền và có recovery cho unknown outcomes. Không có magic guarantee “không bao giờ mất tiền trong mọi failure”.",
+          "en": "Ask whether this is a merchant or marketplace, which pay-ins, seller payouts, partial refunds, disputes and settlements are needed, and through which providers. The baseline uses PSP tokenization/rails rather than building card networks or FX treasury. Reliability means preventing duplicate financial effects for the same logical operation under defined contracts, durably recording evidence and recovering ambiguous outcomes, not magical protection against every failure."
+        },
+        {
+          "vi": "Customer order, payment intent, provider attempt và từng capture/refund/payout là identity khác. User bấm retry không phải tự tạo intent mới; một intent cũng có thể có attempt bị từ chối rồi attempt khác thành công. Fulfillment dùng business policy và confirmed payment evidence phù hợp, không chỉ browser redirect hoặc một status tùy tiện.",
+          "en": "Orders, payment intents, provider attempts and individual captures/refunds/payouts have different identities. Clicking retry should not automatically create a new intent, while one intent can have declined and successful attempts. Fulfillment depends on business policies and appropriate confirmed evidence rather than redirects or arbitrary statuses."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Intent và attempt",
+            "en": "Intents and attempts"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Intent là ý định trả cho order; attempt là một lần thực hiện qua provider, có reference riêng.",
+              "en": "An intent is an order payment intention; attempts execute through providers with their own references."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Financial operation",
+            "en": "Financial operations"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Capture, refund, payout và adjustment có ID, amount/currency và lifecycle riêng.",
+              "en": "Captures, refunds, payouts and adjustments have identities, amounts/currencies and lifecycles."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Knowledge và truth",
+            "en": "Knowledge and truth"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "UNKNOWN là local thiếu evidence, không chứng minh provider chưa tạo effect.",
+              "en": "UNKNOWN means missing local evidence, not proof that providers created no effect."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. TPS chỉ là một phần; ledger rows và external limits cũng quan trọng",
+        "en": "2. TPS is only part of sizing; ledger rows and external limits matter"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả sử 10 triệu payment intents/ngày: trung bình 115,7/s, peak ×10 khoảng 1.157/s. Mỗi successful capture tạo journal transaction ba posting rows trong ví dụ seller/fee split, mỗi row 200 B thì 30 triệu rows/ngày, 6 GB/ngày và 2,19 TB/năm raw. Refunds, fees, settlements, payouts, indexes, replicas, audit/inbox/outbox và retention chưa tính. Ba posting rows không phải luật chung của mọi payment.",
+          "en": "Ten million intents/day imply an average 115.7/second and an assumed tenfold peak of 1,157/second. Three 200 B posting rows per successful capture in the example seller/fee split produce thirty million rows/day, six GB/day and 2.19 TB/year raw. Refunds, fees, settlements, payouts, indexes, replicas, audit/inboxes/outboxes and retention are excluded. Three postings are not universal for every payment."
+        },
+        {
+          "vi": "Một DB transactional có thể là baseline tốt nhưng phải đo locking/hot accounts, durable commit, posting validation, reserve calculations và failover capacity. PSP rate limits, retry waves, webhook bursts và sweeper recovery có thể chi phối traffic. Không kết luận “throughput luôn dễ” từ average TPS; correctness và capacity phải kiểm cùng nhau dưới failure.",
+          "en": "A transactional database can be a good baseline, but measure locking/hot accounts, durable commits, posting validation, reservations and failover capacity. PSP limits, retries, webhook bursts and recovery sweeps can dominate traffic. Average TPS does not prove throughput is always easy: validate correctness and capacity together under failure."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng payment",
+            "en": "Payment quantity"
+          },
+          {
+            "vi": "Assumption minh họa",
+            "en": "Illustrative assumption"
+          },
+          {
+            "vi": "Kết quả raw",
+            "en": "Raw result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Average intents/s",
+              "en": "Average intents/s"
+            },
+            {
+              "vi": "10M / 86.400",
+              "en": "10M / 86,400"
+            },
+            {
+              "vi": "115,7/s",
+              "en": "115.7/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak intents/s",
+              "en": "Peak intents/s"
+            },
+            {
+              "vi": "Average ×10",
+              "en": "Average ×10"
+            },
+            {
+              "vi": "1.157/s",
+              "en": "1,157/s"
+            }
+          ],
+          [
+            {
+              "vi": "Capture posting rows/ngày",
+              "en": "Daily capture posting rows"
+            },
+            {
+              "vi": "10M ×3 nếu tất cả capture",
+              "en": "10M ×3 if all are captured"
+            },
+            {
+              "vi": "30M rows",
+              "en": "30M rows"
+            }
+          ],
+          [
+            {
+              "vi": "Raw yearly postings",
+              "en": "Raw yearly postings"
+            },
+            {
+              "vi": "30M ×200 B ×365",
+              "en": "30M ×200 B ×365"
+            },
+            {
+              "vi": "2,19 TB trước overhead",
+              "en": "2.19 TB before overhead"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "money-api",
+      "title": {
+        "vi": "3. Amount do server quyết định; mọi money operation có identity",
+        "en": "3. Servers decide amounts; every money operation has an identity"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng integer minor units trong range an toàn hoặc fixed-precision decimal theo currency contract, không binary floating point cho tiền. Không mặc định mọi currency có hai decimals; fee/tax split có rounding/residual policy bảo toàn gross. Browser gửi order ID/token, server kiểm trusted price, inventory/reservation, currency, merchant/account và authorization. Một request USD 10000 không được reuse key đã gắn với USD 5000.",
+          "en": "Use safely ranged integer minor units or currency-contract fixed-precision decimals rather than binary floating point. Currencies do not universally have two decimals; fee/tax splits need explicit rounding/residual policies that conserve gross amounts. Browsers submit orders/tokens; servers verify trusted prices, reservations, currencies, merchant/accounts and permissions. A USD 10000 request must not reuse a key bound to USD 5000."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/payments",
+          "description": {
+            "vi": "Tạo logical payment từ trusted order; key scoped principal/merchant/operation.",
+            "en": "Create logical payments from trusted orders with principal/merchant/operation-scoped keys."
+          },
+          "request": "Idempotency-Key: ...\n{ orderId, paymentMethodToken, expectedOrderVersion }",
+          "response": "201 { paymentId, attemptId, status, nextAction? } | 202 { status: \"processing\" }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/payments/{id}",
+          "description": {
+            "vi": "Authorized status/facts; pending/unknown không giả thành failed.",
+            "en": "Authorized statuses/facts without treating pending/unknown as failures."
+          },
+          "response": "200 { paymentId, attempts[], capturedMinor, refundedMinor, processingOperations[] }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/payments/{id}/refunds",
+          "description": {
+            "vi": "Refund ID/key riêng với atomic refundable reservation.",
+            "en": "Separate refund identities/keys with atomic refundable reservations."
+          },
+          "request": "Idempotency-Key: ...\n{ amountMinor, reason, expectedVersion }",
+          "response": "202 { refundId, status } | 409 { reason }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/provider-events/{provider}",
+          "description": {
+            "vi": "Provider signed event ingestion; durable inbox trước success ACK.",
+            "en": "Ingest provider-signed events into durable inboxes before successful acknowledgement."
+          },
+          "request": "raw signed provider body",
+          "response": "2xx after durable acceptance | retryable failure"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Atomic local facts không bao trùm provider side effect",
+        "en": "4. Atomic local facts do not include provider side effects"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline giữ payment/attempt, reservations, verified inbox, financial posting identities, ledger và outbox trong một transactional DB. Nó giúp atomically apply confirmed event và emit durable event intent. PSP HTTP call vẫn ở ngoài: không giữ DB row lock trong lúc chờ network rồi coi đó là distributed transaction. Worker dispatch phải durable ngay từ create, không commit payment rồi phụ thuộc một in-memory enqueue có thể mất.",
+          "en": "The baseline keeps payments/attempts, reservations, verified inboxes, posting identities, ledgers and outboxes in one transactional database, enabling atomic confirmed-event application and durable event intents. PSP HTTP calls remain external: holding row locks through network calls does not create distributed transactions. Dispatch must be durable at creation rather than depend on losable in-memory enqueues."
+        },
+        {
+          "vi": "Nếu ledger là service riêng, consumer phải atomically enforce operation identity với toàn bộ balanced posting transaction, track lag và reconcile payment facts với ledger. Không claim event đã publish sẽ chắc chắn tới đúng một lần; relay liveness, retry retention và poison-event handling đều có điều kiện. Financial correctness boundary phải rõ trước khi tách service vì organizational preference.",
+          "en": "Separate ledger services must atomically enforce operation identities with entire balanced posting transactions, track lag and reconcile payment facts with ledgers. Published events do not inherently arrive exactly once: relay liveness, retry retention and poison-event handling are conditional. Establish financial correctness boundaries before splitting services for organizational reasons."
+        }
+      ],
+      "diagram": {
+        "id": "payment-facts-and-ledger",
+        "title": {
+          "vi": "Durable intent, provider effect và ledger là ba boundary",
+          "en": "Durable intent, provider effects and ledgers are three boundaries"
+        },
+        "caption": {
+          "vi": "Baseline đặt payment facts, inbox, ledger và outbox trong cùng transactional DB; PSP nằm ngoài transaction. Job/event delivery có thể trùng, money operation phải có identity riêng.",
+          "en": "The baseline keeps payment facts, inboxes, ledgers and outboxes in one transactional database; the PSP is outside that transaction. Jobs/events may duplicate, while money operations need their own identities."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "checkout",
+            "label": {
+              "vi": "Checkout",
+              "en": "Checkout"
+            },
+            "detail": {
+              "vi": "Dùng tokenized payment method, stable logical attempt và trạng thái processing khi outcome chưa rõ.",
+              "en": "Uses tokenized methods, stable logical attempts and processing states for ambiguous outcomes."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Payment API",
+              "en": "Payment API"
+            },
+            "detail": {
+              "vi": "Auth, server-side order amount/currency và operation fingerprint; không tin số tiền từ browser.",
+              "en": "Checks authorization, server-side order amounts/currencies and operation fingerprints; does not trust browser amounts."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Payment + ledger DB",
+              "en": "Payment + ledger DB"
+            },
+            "detail": {
+              "vi": "Baseline cùng DB: operation identity, attempts, verified inbox, ledger transactions, reservations và outbox. PSP call không nằm trong SQL transaction.",
+              "en": "One baseline database holds operation identities, attempts, verified inboxes, ledger transactions, reservations and outboxes. PSP calls are outside SQL transactions."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "exec",
+            "label": {
+              "vi": "Provider executor",
+              "en": "Provider executor"
+            },
+            "detail": {
+              "vi": "Lease/attempt fencing cho local work, stable provider key/scope, retries có budget và unknown-outcome recovery.",
+              "en": "Uses local work leases/attempt fencing, stable provider keys/scopes, retry budgets and ambiguous-outcome recovery."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "worker"
+          },
+          {
+            "id": "psp",
+            "label": {
+              "vi": "Payment provider",
+              "en": "Payment provider"
+            },
+            "detail": {
+              "vi": "External payment protocol, tokenization, authentication, authorize/capture/refund; idempotency contract theo API.",
+              "en": "External tokenization, authentication, authorization/capture/refunds and API-specific idempotency contracts."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "hook",
+            "label": {
+              "vi": "Webhook ingress",
+              "en": "Webhook ingress"
+            },
+            "detail": {
+              "vi": "Verify raw payload/signature/account context; persist inbox trước ACK. Không tin client redirect thành công.",
+              "en": "Verifies raw payloads/signatures/account context and persists inboxes before acknowledging. Does not trust success redirects."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "edge"
+          },
+          {
+            "id": "apply",
+            "label": {
+              "vi": "Event processor",
+              "en": "Event processor"
+            },
+            "detail": {
+              "vi": "Map provider facts vào đúng attempt/operation; atomic state + financial posting identity + balanced entries + outbox.",
+              "en": "Maps provider facts to correct attempts/operations; atomically applies states, financial posting identities, balanced entries and outboxes."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Outbox relay / bus",
+              "en": "Outbox relay / bus"
+            },
+            "detail": {
+              "vi": "At-least-once publish; subscriber có inbox/dedup riêng. Theo dõi backlog và poison event.",
+              "en": "At-least-once publication; subscribers maintain inboxes/deduplication. Monitor backlogs and poison events."
+            },
+            "x": 130,
+            "y": 400,
+            "kind": "queue"
+          },
+          {
+            "id": "orders",
+            "label": {
+              "vi": "Order / fulfillment",
+              "en": "Order / fulfillment"
+            },
+            "detail": {
+              "vi": "Business policy quyết định khi nào fulfill; idempotent theo order/operation, không chạy lại vì duplicate event.",
+              "en": "Business policies decide fulfillment timing; order/operation idempotency prevents duplicated fulfillment."
+            },
+            "x": 130,
+            "y": 710,
+            "kind": "service"
+          },
+          {
+            "id": "recon",
+            "label": {
+              "vi": "Reconciliation",
+              "en": "Reconciliation"
+            },
+            "detail": {
+              "vi": "Match provider/bank evidence theo operation/currency/gross/net/timing; mở owned break, correction có authorization.",
+              "en": "Matches provider/bank evidence by operations/currencies/gross/net/timing; assigns owned breaks and authorized corrections."
+            },
+            "x": 740,
+            "y": 710,
+            "kind": "worker"
+          },
+          {
+            "id": "reports",
+            "label": {
+              "vi": "Provider / bank reports",
+              "en": "Provider / bank reports"
+            },
+            "detail": {
+              "vi": "Settlement reports có phiên bản, cutoff/timezone và fee/adjustment semantics riêng.",
+              "en": "Versioned settlement reports have cutoff/timezone and fee/adjustment semantics."
+            },
+            "x": 1040,
+            "y": 710,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "intent",
+            "label": {
+              "vi": "Tạo intent và thực hiện provider operation",
+              "en": "Create an intent and execute a provider operation"
+            },
+            "steps": [
+              {
+                "from": "checkout",
+                "to": "api",
+                "description": {
+                  "vi": "Submit order ID, token và operation key; amount được tính lại từ trusted order.",
+                  "en": "Submit order IDs, tokens and operation keys; derive amounts from trusted orders."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Unique scoped key + payload fingerprint, payment attempt và durable execution job trong một transaction.",
+                  "en": "Atomically create scoped key/fingerprint records, payment attempts and durable execution jobs."
+                }
+              },
+              {
+                "from": "db",
+                "to": "exec",
+                "description": {
+                  "vi": "Worker nhận committed job; replay giữ provider/key/payload scope.",
+                  "en": "Workers receive committed jobs; replays retain provider/key/payload scopes."
+                },
+                "async": true
+              },
+              {
+                "from": "exec",
+                "to": "psp",
+                "description": {
+                  "vi": "Call tokenized provider API theo documented contract; không giữ DB lock trong suốt network call.",
+                  "en": "Call tokenized provider APIs under documented contracts without holding database locks throughout network calls."
+                }
+              },
+              {
+                "from": "psp",
+                "to": "exec",
+                "description": {
+                  "vi": "Response có thể thành công, failure chắc chắn, requires action hoặc unknown timeout.",
+                  "en": "Responses can indicate success, definite failure, required action or ambiguous timeout."
+                }
+              },
+              {
+                "from": "exec",
+                "to": "db",
+                "description": {
+                  "vi": "Lưu provider reference/facts bằng guarded update; không overwrite confirmed fact bằng timeout đến muộn.",
+                  "en": "Guardedly persist references/facts without overwriting confirmed facts with late timeouts."
+                }
+              }
+            ]
+          },
+          {
+            "id": "confirmation",
+            "label": {
+              "vi": "Webhook tới ledger và fulfillment",
+              "en": "Webhook to ledger and fulfillment"
+            },
+            "steps": [
+              {
+                "from": "psp",
+                "to": "hook",
+                "description": {
+                  "vi": "Signed provider event có thể duplicate hoặc out of order.",
+                  "en": "Signed provider events may be duplicated or reordered."
+                },
+                "async": true
+              },
+              {
+                "from": "hook",
+                "to": "db",
+                "description": {
+                  "vi": "Persist verified raw event/inbox identity và account/resource context.",
+                  "en": "Persist verified raw events/inbox identities and account/resource context."
+                }
+              },
+              {
+                "from": "hook",
+                "to": "psp",
+                "description": {
+                  "vi": "ACK sau durable acceptance; khi DB không accept thì không giả 2xx đã giữ event.",
+                  "en": "Acknowledge after durable acceptance; do not pretend acceptance with a 2xx when persistence failed."
+                }
+              },
+              {
+                "from": "db",
+                "to": "apply",
+                "description": {
+                  "vi": "Process committed inbox, lookup current provider resource nếu event không đủ/không hợp thứ tự.",
+                  "en": "Process committed inboxes and retrieve current provider resources when events are incomplete/reordered."
+                },
+                "async": true
+              },
+              {
+                "from": "apply",
+                "to": "db",
+                "description": {
+                  "vi": "Một transaction: validate operation, update facts, unique financial posting, balanced entries, outbox và processed marker.",
+                  "en": "In one transaction validate operations, update facts, enforce unique financial postings, write balanced entries/outboxes and mark processing."
+                }
+              },
+              {
+                "from": "db",
+                "to": "events",
+                "description": {
+                  "vi": "Relay committed event; publish/ACK crash có thể gây redelivery.",
+                  "en": "Relay committed events; publish/ACK crashes can redeliver."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "orders",
+                "description": {
+                  "vi": "Subscriber apply idempotently và kiểm fulfillment eligibility; processing không tự là paid.",
+                  "en": "Subscribers apply idempotently and check fulfillment eligibility; processing does not mean paid."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "unknown",
+            "label": {
+              "vi": "Outcome chưa rõ không phải thất bại",
+              "en": "Unknown outcomes are not failures"
+            },
+            "steps": [
+              {
+                "from": "exec",
+                "to": "psp",
+                "description": {
+                  "vi": "Provider có thể đã nhận/capture khi local deadline hết.",
+                  "en": "The provider may have accepted/captured when the local deadline expires."
+                }
+              },
+              {
+                "from": "exec",
+                "to": "db",
+                "description": {
+                  "vi": "Record unknown attempt và recovery schedule nếu chưa có confirmed facts.",
+                  "en": "Record an unknown attempt and recovery schedule unless facts are already confirmed."
+                }
+              },
+              {
+                "from": "db",
+                "to": "exec",
+                "description": {
+                  "vi": "Sweeper claim recovery job bằng bounded lease và stable identity.",
+                  "en": "Sweepers claim recovery jobs using bounded leases and stable identities."
+                },
+                "async": true
+              },
+              {
+                "from": "exec",
+                "to": "psp",
+                "description": {
+                  "vi": "Query documented resource/reference hoặc safely replay cùng operation nếu scope/window còn hợp lệ.",
+                  "en": "Query documented resources/references or safely replay the same operation while its scope/window remain valid."
+                }
+              },
+              {
+                "from": "exec",
+                "to": "db",
+                "description": {
+                  "vi": "Apply evidence; không có lookup/reference thì giữ unresolved và mở reconciliation case.",
+                  "en": "Apply evidence; without usable references/lookups, remain unresolved and open reconciliation cases."
+                }
+              }
+            ]
+          },
+          {
+            "id": "refund",
+            "label": {
+              "vi": "Partial refund có reservation và operation riêng",
+              "en": "Partial refunds have reservations and their own identities"
+            },
+            "steps": [
+              {
+                "from": "checkout",
+                "to": "api",
+                "description": {
+                  "vi": "Authorized refund request cho amount/currency/payment hợp lệ.",
+                  "en": "An authorized refund requests valid amounts/currencies/payments."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Atomic check captured−confirmed refunds−in-flight reservations; tạo refund ID và outbox.",
+                  "en": "Atomically check captured amounts minus confirmed refunds and in-flight reservations, then create refund IDs/outboxes."
+                }
+              },
+              {
+                "from": "db",
+                "to": "exec",
+                "description": {
+                  "vi": "Execute đúng refund ID/key; timeout không tự release reservation rồi tạo refund mới.",
+                  "en": "Execute the same refund ID/key; timeouts do not automatically release reservations and create new refunds."
+                },
+                "async": true
+              },
+              {
+                "from": "exec",
+                "to": "psp",
+                "description": {
+                  "vi": "Submit refund tới đúng provider/capture reference.",
+                  "en": "Submit refunds against the correct provider/capture references."
+                }
+              },
+              {
+                "from": "psp",
+                "to": "hook",
+                "description": {
+                  "vi": "Refund outcome qua verified callback hoặc reconciliation; not all refunds tức thì.",
+                  "en": "Refund outcomes arrive through verified callbacks/reconciliation; not all refunds are immediate."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "reconciliation",
+            "label": {
+              "vi": "So khớp external evidence",
+              "en": "Match external evidence"
+            },
+            "steps": [
+              {
+                "from": "reports",
+                "to": "recon",
+                "description": {
+                  "vi": "Ingest versioned reports, preserve original và parse schema/currency/cutoff.",
+                  "en": "Ingest versioned reports, preserve originals and parse schemas/currencies/cutoffs."
+                },
+                "async": true
+              },
+              {
+                "from": "recon",
+                "to": "db",
+                "description": {
+                  "vi": "Match capture/refund/payout references cùng gross/fee/net/time; expected timing difference khác missing operation.",
+                  "en": "Match capture/refund/payout references with gross/fees/net/time, distinguishing timing differences from missing operations."
+                }
+              },
+              {
+                "from": "recon",
+                "to": "db",
+                "description": {
+                  "vi": "Persist owned break hoặc authorized corrective transaction ID; không edit old ledger rows để che mismatch.",
+                  "en": "Persist owned breaks or authorized corrective transaction IDs without editing old postings to conceal mismatches."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "idempotency",
+      "title": {
+        "vi": "5. Idempotency là protocol có scope và retention",
+        "en": "5. Idempotency is a scoped, retained protocol"
+      },
+      "paragraphs": [
+        {
+          "vi": "Local key gắn tenant/merchant + operation type + logical attempt, payload fingerprint và durable result/workflow state. Unique insert xử lý concurrent creates, nhưng processing row bị kẹt sau crash vẫn cần ownership lease/recovery; lease hết hạn không hủy external call đang chạy. Persist provider account, operation key và resource/reference sớm theo protocol để retry không trôi sang provider/key khác.",
+          "en": "Local keys bind tenants/merchants, operation types, logical attempts, fingerprints and durable results/workflow states. Unique inserts handle concurrent creation, but crashed processing rows still need ownership/recovery; lease expiry does not cancel external calls. Persist provider accounts, operation keys and references early under the protocol so retries do not drift between providers/keys."
+        },
+        {
+          "vi": "Provider dedup còn phụ thuộc API/version, account/endpoint, payload và retention. Ví dụ Stripe API v1 có thể replay cached result kể cả server error, còn API v2 có completion/retry semantics khác; đọc đúng contract thay vì gắn “same key luôn safe” lên mọi PSP. Sau expiry hoặc đổi provider, key string giống nhau không chứng minh cùng effect. Permanent business operation identity có thể cần tồn tại lâu hơn provider retry cache.",
+          "en": "Provider deduplication depends on API/version, accounts/endpoints, payloads and retention. For example, Stripe API v1 may replay cached results including errors while v2 can have different completion/retry semantics; use the actual contract instead of assuming same-key safety for every PSP. Expired windows/provider changes invalidate key-string equivalence. Durable business-operation identities can outlive provider retry caches."
+        }
+      ]
+    },
+    {
+      "id": "unknown",
+      "title": {
+        "vi": "6. Timeout: khôi phục evidence, không tạo charge mới vô thức",
+        "en": "6. Timeouts require evidence recovery rather than blind new charges"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một local timeout không nói provider chưa charge. Ghi attempt outcome unknown, giữ liên kết với intent và không cho checkout tạo logical attempt khác chỉ vì spinner chậm. Resolve bằng documented provider resource/reference lookup, verified webhook hoặc reconciliation; nếu same-operation retry còn được provider dedup bảo vệ thì replay đúng scope/payload/window. Idempotency key không mặc định là searchable resource ID.",
+          "en": "Local timeouts do not establish that providers did not charge. Record unknown attempts, preserve intent links and do not create new logical attempts merely because spinners are slow. Resolve through documented resource/reference lookups, verified webhooks or reconciliation; replay only within valid same-operation deduplication scopes/windows. Idempotency keys are not inherently searchable resource IDs."
+        },
+        {
+          "vi": "Nếu không có reference/lookup và evidence chưa tới, giữ unresolved với age/deadline/escalation thay vì invent failed. Không failover một unknown capture sang PSP B chỉ với cùng key: A và B không chia global idempotency store. Không giải unknown bằng refund đoán mò; refund là money operation riêng cũng có thể pending/fail và cần reference/authorization.",
+          "en": "Without usable references/lookups/evidence, retain unresolved states with ages/deadlines/escalation rather than inventing failure. Do not fail over ambiguous captures to PSP B with the same key: providers do not share global idempotency stores. Speculative refunds do not resolve ambiguity; refunds are separate fallible operations needing references/authorization."
+        }
+      ],
+      "experiment": "payment-retry"
+    },
+    {
+      "id": "state-facts",
+      "title": {
+        "vi": "7. Authorization, capture, refund, dispute và settlement tách nhau",
+        "en": "7. Separate authorizations, captures, refunds, disputes and settlements"
+      },
+      "paragraphs": [
+        {
+          "vi": "Authorization giữ khả năng capture theo provider/payment-method window, không đồng nghĩa funds đã settled vào bank. Capture có thể async, partial/multiple theo product/provider capabilities. Refund amount/timing có lifecycle riêng; dispute có evidence/review/outcome, có thể phát sinh sau refund tùy network/process. Một status ladder SUCCEEDED→REFUNDED→DISPUTED đơn giản không biểu diễn đủ mọi money fact.",
+          "en": "Authorizations reserve capture capability within provider/method windows rather than establish bank-settled funds. Captures can be asynchronous, partial or multiple where supported. Refund amounts/timing have their own lifecycles; disputes have evidence/review/outcomes and can interact with prior refunds. A simple succeeded-to-refunded-to-disputed ladder cannot represent all money facts."
+        },
+        {
+          "vi": "Dùng guarded version/state transition cho từng object và retain provider facts/events. Một late failure của attempt cũ không được downgrade intent đã có successful capture; cũng không được bỏ mọi failure callback sau success nếu nó nói về refund/payout khác. Match account/resource/attempt, validate event semantics và fetch current resource khi cần. Internal UNKNOWN là knowledge dimension, không phải bank state.",
+          "en": "Use guarded transitions for individual objects while retaining provider facts/events. Old-attempt failures must not downgrade successfully captured intents, but failures for separate refunds/payouts cannot all be discarded after success. Match accounts/resources/attempts, validate semantics and retrieve current resources when needed. Internal UNKNOWN describes knowledge, not bank state."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Funds lifecycle",
+            "en": "Funds lifecycle"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Authorized/captured/settled có amount và timing khác nhau.",
+              "en": "Authorized/captured/settled amounts and times differ."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Adjustments",
+            "en": "Adjustments"
+          },
+          "icon": "compare",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Refund, fee, dispute và payout là các linked operations, không overwrite capture history.",
+              "en": "Refunds, fees, disputes and payouts are linked operations, not overwrites of capture history."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Knowledge",
+            "en": "Knowledge"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "UNKNOWN, retry scheduled và evidence received là workflow facts riêng.",
+              "en": "Unknown outcomes, scheduled retries and received evidence are separate workflow facts."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "webhook",
+      "title": {
+        "vi": "8. Webhook ingestion phải durable và operation-aware",
+        "en": "8. Webhook ingestion must be durable and operation-aware"
+      },
+      "paragraphs": [
+        {
+          "vi": "Verify raw body/signature theo provider SDK/contract, account/tenant context, replay/time policy và bounded payload trước business processing. Parse lại body rồi verify trên bytes khác có thể làm signature sai. Persist accepted event/inbox trước 2xx, sau đó process async; nếu durable acceptance thất bại thì để provider retry theo contract. Token/secret không vào logs; rotate secrets theo documented overlap.",
+          "en": "Verify raw bodies/signatures under provider SDK/contracts, account/tenant context, replay/time policies and payload bounds before business processing. Verifying reserialized rather than original bytes can fail. Persist accepted events/inboxes before 2xx responses and process asynchronously; failed durable acceptance should allow provider retries. Keep tokens/secrets out of logs and rotate under supported overlap policies."
+        },
+        {
+          "vi": "Event-ID dedup xử lý cùng delivery lặp; hai event IDs khác có thể mô tả cùng capture. Financial posting identity phải dựa operation/business semantics, không chỉ message ID. Consumer atomically ghi processed marker, state changes, posting result và outbox trong boundary đã chọn. Invalid/out-of-order fact không được im lặng drop rồi mất audit; lưu lý do, retry lookup hoặc owned review.",
+          "en": "Event-ID deduplication handles repeated deliveries, but distinct event IDs can describe the same capture. Financial posting identities derive from operation semantics rather than message IDs alone. Atomically record processing markers, states, postings and outboxes within the chosen boundary. Preserve reasons/audits for invalid/reordered facts and retry lookups or assign review rather than silently dropping them."
+        }
+      ]
+    },
+    {
+      "id": "ledger",
+      "title": {
+        "vi": "9. Double-entry kiểm conservation, không chứng minh đúng business event",
+        "en": "9. Double entry checks conservation, not business-event correctness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi journal transaction trong cùng currency có tổng debit bằng credit và toàn bộ postings commit atomically. Account types quyết định debit/credit tăng hay giảm; không diễn giải debit luôn là tiền ra. Capture mẫu 10000: Dr PSP receivable asset 10000, Cr seller payable liability 9500, Cr platform fee revenue 500. Đây là illustrative marketplace policy trước settlement, chưa tính provider fee/tax/FX.",
+          "en": "Each same-currency journal transaction has equal total debits/credits and commits all postings atomically. Account types determine debit/credit effects; debits are not universally money leaving. An example capture posts Dr PSP receivable asset 10000, Cr seller payable liability 9500 and Cr platform fee revenue 500. This illustrative pre-settlement marketplace policy excludes provider fees/taxes/FX."
+        },
+        {
+          "vi": "Refund mẫu trước payout, hoàn fee theo tỷ lệ: Dr seller payable 95%, Dr fee revenue 5%, Cr PSP receivable 100%. Correction append reversing/adjustment transaction gắn original, không edit old posted amounts. Balance caches/materialized balances phải reconcile với journal và vẫn có concurrency control cho available funds. Một balanced duplicate vẫn cân và sai tiền; cần unique operation posting và correct amount/accounts/currency.",
+          "en": "An example pre-payout proportional-fee refund debits seller payable by ninety-five percent, debits fee revenue by five percent and credits PSP receivable by the full amount. Corrections append linked reversing/adjustment transactions rather than edit posted amounts. Cached/materialized balances reconcile with journals and still need concurrency controls for available funds. Balanced duplicates remain balanced while misstating money, requiring unique operation postings and correct amounts/accounts/currencies."
+        }
+      ],
+      "experiment": "payment-ledger"
+    },
+    {
+      "id": "refunds-payouts",
+      "title": {
+        "vi": "10. Partial refunds và payouts cần reserve dưới concurrency",
+        "en": "10. Partial refunds and payouts need concurrent reservations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hai refund request cùng đọc captured=10000/refunded=0 có thể mỗi request đòi 7000. Check rồi call PSP riêng rẽ không giữ invariant. Atomic reservation tính captured amount trừ confirmed refunds và active reserved refunds theo operation; provider outcome unknown giữ reservation cho tới evidence/policy resolution, không release sớm rồi gửi lại với key mới. Validate cumulative amount theo provider capture/method rules.",
+          "en": "Two refund requests reading captured=10000/refunded=0 can each request 7000. Separate checks/provider calls do not preserve the invariant. Atomically reserve captured amounts minus confirmed and active reserved refunds by operation. Unknown outcomes retain reservations until evidence/policy resolution rather than releasing early and retrying with new keys. Validate cumulative amounts under capture/method rules."
+        },
+        {
+          "vi": "Payout chỉ dùng eligible available funds theo settlement, reserve, fees, chargeback và risk policy; ledger credit balance không tự đồng nghĩa có thể withdraw ngay. Concurrent payouts cần atomic spending/reservation và business operation identity. Compensation refund/transfer reversal là hành động mới có thể thất bại hoặc khác phí/timing, không phải rollback cross-system đã hoàn tất.",
+          "en": "Payouts use eligible available funds under settlement, reserve, fee, chargeback and risk policies; credit balances do not automatically imply withdrawability. Concurrent payouts need atomic reservations/spending and operation identities. Compensating refunds/transfer reversals are new fallible actions with potentially different fees/timing, not completed cross-system rollbacks."
+        }
+      ]
+    },
+    {
+      "id": "reconciliation",
+      "title": {
+        "vi": "11. Reconciliation là evidence workflow với người chịu trách nhiệm",
+        "en": "11. Reconciliation is an owned evidence workflow"
+      },
+      "paragraphs": [
+        {
+          "vi": "Match internal operations/ledger với provider reports và bank evidence theo provider account/reference, currency, gross, fee, net, batch và cutoff/timezone. Một provider capture success chưa bank settle cùng ngày có thể là timing difference hợp lệ; settlement net thiếu so gross có thể là phí. Preserve originals/schema version và ingest report idempotently để rerun không tạo posting trùng.",
+          "en": "Match internal operations/ledgers against provider reports/bank evidence by accounts/references, currencies, gross/fees/net, batches and cutoff/timezones. Successful captures can settle later, while differences between settlement net and gross can be fees. Preserve original/versioned reports and ingest idempotently to prevent rerun duplicates."
+        },
+        {
+          "vi": "Classify missing-internal, missing-external, amount/currency mismatch, duplicate và timing/unresolved; mỗi break có owner, age, evidence và resolution. Authorized correction có new operation ID và audit, không UPDATE ledger để làm dashboard xanh. Reconciliation không phát hiện mọi bug nếu hai bên cùng mô tả một wrong intent hoặc evidence thiếu; cần domain validation, invariants và independent controls.",
+          "en": "Classify missing internal/external records, amount/currency mismatches, duplicates and timing/unresolved cases with owners, ages, evidence and resolutions. Authorized corrections use new operation IDs/audits rather than editing ledgers to make dashboards green. Reconciliation cannot detect every bug when both sides represent the same wrong intent or evidence is missing; domain validation, invariants and independent controls remain necessary."
+        }
+      ]
+    },
+    {
+      "id": "security-data",
+      "title": {
+        "vi": "12. Data model và security phục vụ audit/recovery",
+        "en": "12. Data models and security support audits/recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tối thiểu có payment/order link, provider attempts, scoped idempotency workflow, financial operations/reservations, verified inbox, journal transaction/postings và outbox. Refund/capture có thể nhiều lần nên unique(payment_id, entry_type) thường quá thô; dùng actual operation ID + posting schema/version phù hợp. Constraints per-row không tự enforce tổng debit=credit của cả transaction: cần transactional posting routine/validation và reconciliation.",
+          "en": "At minimum store payment/order links, provider attempts, scoped idempotency workflows, financial operations/reservations, verified inboxes, journal transactions/postings and outboxes. Multiple captures/refunds make payment_id plus entry_type overly coarse; use actual operation IDs and suitable posting schemas/versions. Row constraints alone do not enforce whole-transaction debit/credit totals: use transactional posting validation and reconciliation."
+        },
+        {
+          "vi": "PSP-hosted/tokenized collection giảm exposure của card data; tokenization không tự loại bỏ mọi security/compliance obligation. Không lưu raw card details, CVV hoặc secrets trong examples/logs. Auth mọi status/refund/admin path, tenant isolation, least privilege, secret rotation và audit cho corrective entries. Data retention/deletion phải theo policy phù hợp audit và privacy; không ghi một số năm chung cho mọi jurisdiction/product.",
+          "en": "PSP-hosted/tokenized collection reduces card-data exposure without eliminating all security/compliance obligations. Avoid raw card details, CVVs and secrets in examples/logs. Authenticate status/refund/admin paths and apply tenant isolation, least privilege, rotation and corrective-entry audits. Retention/deletion follow appropriate audit/privacy policies rather than a universal period for every jurisdiction/product."
+        }
+      ]
+    },
+    {
+      "id": "failure-review",
+      "title": {
+        "vi": "13. Kiểm thử khi process crash đúng giữa hai side effects",
+        "en": "13. Test crashes between side effects"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo unknown/pending age, webhook durable-accept/process lag, duplicate operation attempts, dedup conflicts, provider error/throttle, posting imbalance, ledger-to-source breaks và payout/refund reservations. Correlate order/payment/attempt/provider-reference/operation mà không lộ payment tokens. Đặt owners/escalation cho aged unknown và reconciliation queue.",
+          "en": "Measure unknown/pending ages, webhook acceptance/processing lag, duplicate attempts, dedup conflicts, provider throttles/errors, posting imbalances, ledger/source breaks and reservations. Correlate orders, payments, attempts, references and operations without exposing tokens. Assign escalation owners to aged unknowns and reconciliation queues."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault payment",
+            "en": "Payment fault"
+          },
+          {
+            "vi": "State đúng cần giữ",
+            "en": "Required preserved state"
+          },
+          {
+            "vi": "Recovery cần thử",
+            "en": "Recovery to test"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Create commit xong, worker chưa chạy",
+              "en": "Creation commits before worker execution"
+            },
+            {
+              "vi": "Durable execution job tồn tại.",
+              "en": "A durable execution job exists."
+            },
+            {
+              "vi": "Worker resume không tạo payment mới.",
+              "en": "Workers resume without creating new payments."
+            }
+          ],
+          [
+            {
+              "vi": "PSP capture, response mất",
+              "en": "Provider captures but response is lost"
+            },
+            {
+              "vi": "UNKNOWN không bị coi là failed/uncharged.",
+              "en": "UNKNOWN is not treated as failed/uncharged."
+            },
+            {
+              "vi": "Reference lookup/verified event/safe same-op replay.",
+              "en": "Reference lookup, verified events or safe same-operation replay."
+            }
+          ],
+          [
+            {
+              "vi": "Webhook persist xong, process crash",
+              "en": "Webhook persists before processing crash"
+            },
+            {
+              "vi": "Inbox có thể replay.",
+              "en": "The inbox is replayable."
+            },
+            {
+              "vi": "State+ledger+marker atomic; không duplicate posting.",
+              "en": "Atomic states/ledger/markers prevent duplicate postings."
+            }
+          ],
+          [
+            {
+              "vi": "Distinct events cùng capture",
+              "en": "Distinct events describe one capture"
+            },
+            {
+              "vi": "Một financial posting cho capture.",
+              "en": "One financial posting represents the capture."
+            },
+            {
+              "vi": "Operation unique khác event-ID dedup.",
+              "en": "Operation uniqueness differs from event-ID deduplication."
+            }
+          ],
+          [
+            {
+              "vi": "Hai refunds đồng thời",
+              "en": "Two concurrent refunds"
+            },
+            {
+              "vi": "Confirmed + reserved không vượt allowed amount.",
+              "en": "Confirmed plus reserved refunds stay within allowed amounts."
+            },
+            {
+              "vi": "Atomic reservation và unknown lifecycle.",
+              "en": "Atomic reservations and unknown-outcome lifecycles."
+            }
+          ],
+          [
+            {
+              "vi": "Provider A unknown, B available",
+              "en": "Provider A is unknown while B is available"
+            },
+            {
+              "vi": "Không duplicate charge qua routing mới.",
+              "en": "Routing changes do not create duplicate charges."
+            },
+            {
+              "vi": "Resolve A trước hoặc explicit business recovery protocol.",
+              "en": "Resolve A or use an explicit business recovery protocol."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi phỏng vấn về identity, evidence và money invariant",
+        "en": "14. Interview questions on identities, evidence and money invariants"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi trả lời, ghi ID của order, attempt và operation; đánh dấu local commit và provider effect riêng. Vẽ một crash rồi nói evidence nào cho phép tiếp tục. Không thay proof bằng “dùng Kafka exactly-once”.",
+          "en": "Identify orders, attempts and operations while marking local commits separately from provider effects. Add a crash and identify the evidence permitting recovery rather than replacing a proof with Kafka exactly-once terminology."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "PSP timeout: customer bị charge chưa?",
+            "en": "Did a PSP timeout charge the customer?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa biết từ timeout. Record unknown, giữ logical attempt/key/provider scope, resolve từ resource/reference API, verified event hoặc reconciliation. Same-key replay chỉ an toàn theo documented scope/payload/window; không tự giả key là searchable ID.",
+              "en": "Timeouts alone do not answer. Record unknown states, preserve attempt/key/provider scopes and resolve from documented references/APIs, verified events or reconciliation. Same-key replay depends on scopes/payloads/windows; keys are not automatically searchable IDs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Cùng key gửi PSP B có chống double charge không?",
+            "en": "Does sending the same key to PSP B prevent double charges?"
+          },
+          "answer": [
+            {
+              "vi": "Không; dedup store/scope không chia qua hai provider. A có thể đã capture trong khi local unknown. Resolve hoặc dùng explicit recovery protocol với confirmed facts, không blind failover.",
+              "en": "No: providers do not share deduplication scopes/stores. A may have captured despite local ambiguity. Resolve using confirmed evidence or explicit recovery protocols rather than blind failover."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Debit bằng credit có chứng minh ledger đúng không?",
+            "en": "Do equal debits and credits prove the ledger correct?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Balanced duplicate hoặc wrong account/currency/amount vẫn balance. Enforce atomic balanced transaction, unique financial operation identity, validated mapping và reconciliation với independent evidence.",
+              "en": "No. Balanced duplicates or incorrect accounts/currencies/amounts can still balance. Enforce atomic balanced transactions, unique financial-operation identities, validated mappings and independent-evidence reconciliation."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Webhook event ID dedup có đủ chống duplicate ledger posting?",
+            "en": "Is webhook event-ID deduplication sufficient for ledger posting?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu hai event IDs cùng mô tả capture/refund đó. Dedup delivery và financial operation riêng, persist uniqueness cùng toàn bộ posting transaction. Multiple refunds cần refund IDs khác chứ không cấm mọi entry_type trùng trong payment.",
+              "en": "Not when distinct event IDs describe the same capture/refund. Separately deduplicate deliveries and financial operations atomically with postings. Multiple refunds need distinct identities rather than prohibiting repeated entry types for a payment."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Late failed callback sau succeeded nên bỏ hết được không?",
+            "en": "Can every failed callback arriving after success be discarded?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Có thể là old attempt, refund khác hoặc payout khác. Match resource/attempt/operation và provider semantics; guarded transition trên một scalar status không đủ. Retain audit/evidence và fetch current resource khi cần.",
+              "en": "No: it could describe an old attempt, another refund or a payout. Match resources/attempts/operations and provider semantics. Guarding one scalar status is insufficient; retain evidence/audits and retrieve current resources when needed."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hai partial refunds cùng lúc làm sao không vượt capture?",
+            "en": "How do concurrent partial refunds avoid exceeding captures?"
+          },
+          "answer": [
+            {
+              "vi": "Atomic refundable reservations tính cả in-flight operations. Timeout không tự release rồi tạo refund key mới. Confirm/fail reservation theo evidence; correction/compensation là operation riêng có thể thất bại.",
+              "en": "Atomically reserve refundable amounts including in-flight operations. Timeouts do not automatically release reservations and justify new keys. Resolve reservations using evidence; corrections/compensations are separately fallible operations."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Payment row processing sau crash thì unique key đã đủ chưa?",
+            "en": "Does a unique key resolve a processing payment row after a crash?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Unique key chặn creation trùng nhưng không hoàn tất workflow hoặc biết PSP effect. Cần durable dispatch/recovery, provider reference/key contract, lease/fencing cho local work và reconciliation.",
+              "en": "No. Uniqueness prevents duplicate creation but neither finishes workflows nor establishes provider effects. Use durable dispatch/recovery, provider reference/key contracts, local work leases/fencing and reconciliation."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Refund có phải rollback payment không?",
+            "en": "Is a refund a payment rollback?"
+          },
+          "answer": [
+            {
+              "vi": "Không theo cross-system transaction semantics. Nó là new money operation có provider reference, lifecycle, fee/timing và failure riêng; ledger append reversal/adjustment, không xóa payment history.",
+              "en": "Not as a cross-system transaction rollback. Refunds are new operations with references, lifecycles, fees/timing and failure possibilities; ledgers append linked reversals/adjustments instead of deleting history."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

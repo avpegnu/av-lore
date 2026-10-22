@@ -1,0 +1,1331 @@
+{
+  "id": "object-storage",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Object Storage: publication, erasure coding và GC",
+    "en": "Designing Object Storage: publication, erasure coding and GC"
+  },
+  "summary": {
+    "vi": "Thử correlated fragment failures, multipart conflicts và reader pins; nối byte durability, metadata consistency và lifecycle thành protocol rõ ràng.",
+    "en": "Explore correlated fragment failures, multipart conflicts and reader pins across byte durability, metadata consistency and lifecycle protocols."
+  },
+  "prerequisites": [
+    "key-value-store",
+    "databases",
+    "file-sync",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "database",
+    "security",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Immutable bytes cần durable preparation và GC fencing trước metadata publication.",
+      "en": "Immutable bytes require durable preparation and GC fencing before publication."
+    },
+    {
+      "vi": "MDS tolerance đếm fragments; correlated domains và repair window quyết định risk.",
+      "en": "MDS tolerance counts fragments; correlated domains and repair windows shape risks."
+    },
+    {
+      "vi": "ETags, expected checksums và conditional completion giải các lỗi khác nhau.",
+      "en": "ETags, expected checksums and conditional completion address different failures."
+    },
+    {
+      "vi": "Strong GET không tự cho global snapshot LIST hoặc atomic multi-key writes.",
+      "en": "Strong GETs do not imply snapshot listings or atomic multi-key writes."
+    },
+    {
+      "vi": "GC phải giữ reader/upload/version/migration references, không chỉ current head.",
+      "en": "GC protects reader/upload/version/migration references, not only current heads."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Tồn tại, đọc đúng và thu hồi an toàn",
+      "en": "Existence, correct reads and safe reclamation"
+    },
+    "caption": {
+      "vi": "Ba quyết định phải khớp trong cùng lifecycle protocol.",
+      "en": "These decisions need one coherent lifecycle protocol."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Prepare bytes",
+          "en": "Prepare bytes"
+        },
+        "detail": {
+          "vi": "Placement epochs, durable fragments và final integrity.",
+          "en": "Placement epochs, durable fragments and final integrity."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Publish metadata",
+          "en": "Publish metadata"
+        },
+        "detail": {
+          "vi": "Conditional head/index commit và result reconciliation.",
+          "en": "Conditional head/index commits and reconciliation."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Read immutable",
+          "en": "Read immutable"
+        },
+        "detail": {
+          "vi": "Pin generation, verify sufficient fragments.",
+          "en": "Pin generations and verify sufficient fragments."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Repair/reclaim",
+          "en": "Repair and reclaim"
+        },
+        "detail": {
+          "vi": "Rebuild, migrate và GC với reference/fencing rules.",
+          "en": "Rebuild, migrate and reclaim under reference/fencing rules."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Object semantics trước disk layout",
+        "en": "1. Define object semantics before disk layouts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline có bucket/key, PUT/GET/HEAD/DELETE, range reads, prefix LIST và multipart. Object data là immutable generation; overwrite tạo bytes mới rồi đổi head. Đây không phải POSIX filesystem có append/rename/locking tự động hay transaction across arbitrary keys. Chốt max object/part size, metadata limit, request throughput, consistency, retention và restore latency theo backend đã chọn. Bài này là platform minh họa, không tuyên bố triển khai private của một cloud service.",
+          "en": "The baseline includes buckets/keys, PUT/GET/HEAD/DELETE, ranges, prefix listing and multipart uploads. Immutable generations make overwrites new bytes followed by head changes. This is not a POSIX filesystem with implicit append/rename/locking or arbitrary cross-key transactions. Define object/part sizes, metadata limits, throughput, consistency, retention and restore latency for the chosen backend. This is an educational platform rather than a private cloud implementation."
+        },
+        {
+          "vi": "Durability, availability và consistency là ba mục tiêu khác nhau. Một object còn recoverable trên disk chưa có nghĩa API đang reachable; strong metadata cũng không cứu bytes đã mất. Không suy “11 nines” từ số replicas, AFR hoặc một coding formula. Product cần mô hình failure correlation, repair windows, software bugs/deletion và evidence vận hành; các phép tính dưới chỉ là sizing/availability theo giả định.",
+          "en": "Durability, availability and consistency are distinct. Recoverable bytes do not imply reachable APIs, and strong metadata cannot restore lost data. Replica counts, AFRs or coding formulas do not prove durability targets. Models need correlated failures, repair windows, software/deletion risks and operational evidence; the calculations below are conditional sizing/availability arithmetic."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Metadata plane",
+            "en": "Metadata plane"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Key/version/head/index, permissions và publication state.",
+              "en": "Keys, versions, heads, indexes, permissions and publication state."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Data plane",
+            "en": "Data plane"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Immutable fragments, verified writes, reads và repair.",
+              "en": "Immutable fragments, verified writes, reads and repair."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Lifecycle",
+            "en": "Lifecycle"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Reader/upload pins, retention, migration và fenced GC.",
+              "en": "Reader/upload pins, retention, migration and fenced GC."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Object count và bytes tạo hai bài toán capacity",
+        "en": "2. Object counts and bytes create separate capacity problems"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 100 PB logical data, average object 1 MB và metadata 1 KB theo đơn vị thập phân. Object count là 100 tỷ; metadata payload khoảng 100 TB trước indexes, replicas và history. Triple replication cần 300 PB raw payload; MDS 8+4 cần 150 PB. Nếu disk 20 TB và bỏ mọi reserve/overhead, tương ứng 15.000 và 7.500 disks. Với 7.500 disks và AFR giả định 2%, kỳ vọng trung bình khoảng 0,41 disk failure/ngày; đó không phải xác suất mất object hoặc guarantee failure độc lập.",
+          "en": "Assume decimal 100 PB logical data, one-MB average objects and one-KB metadata. This gives a hundred billion objects and roughly a hundred TB of metadata before indexes, replicas and history. Triple replication needs 300 PB payload; MDS 8+4 needs 150 PB. Ignoring reserves/overhead, twenty-TB disks imply fifteen thousand versus 7,500 disks. At an assumed two-percent AFR, 7,500 disks average about 0.41 failures/day, not an object-loss probability or independence guarantee."
+        },
+        {
+          "vi": "Cần thêm free-space headroom cho repair/compaction, skew, placement constraints, rebuild backlog, staging uploads và temporary tier copies. Nhiều tiny objects gây request/index/metadata pressure khác với một vài huge objects gây bandwidth pressure. Average size không đủ mô tả tail; đo size distribution, access distribution, GET/PUT/LIST mix, range sizes và hot keys. EC tiết kiệm capacity nhưng thêm encode/decode/repair cost.",
+          "en": "Add free-space reserves for repairs/compaction, skew, placement, rebuild backlogs, uploads and temporary tier copies. Tiny objects stress requests/indexes/metadata differently from large bandwidth-heavy objects. Averages miss tails: measure sizes, accesses, operation mixes, ranges and hot keys. EC saves capacity while adding encoding, decoding and repair work."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sizing giả định",
+            "en": "Assumed sizing"
+          },
+          {
+            "vi": "Phép tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Payload result",
+            "en": "Payload result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Object count",
+              "en": "Object count"
+            },
+            {
+              "vi": "100PB /1MB",
+              "en": "100PB /1MB"
+            },
+            {
+              "vi": "100B",
+              "en": "100B"
+            }
+          ],
+          [
+            {
+              "vi": "Metadata",
+              "en": "Metadata"
+            },
+            {
+              "vi": "100B ×1KB",
+              "en": "100B ×1KB"
+            },
+            {
+              "vi": "100TB",
+              "en": "100TB"
+            }
+          ],
+          [
+            {
+              "vi": "Replication 3×",
+              "en": "Replication 3×"
+            },
+            {
+              "vi": "100PB ×3",
+              "en": "100PB ×3"
+            },
+            {
+              "vi": "300PB",
+              "en": "300PB"
+            }
+          ],
+          [
+            {
+              "vi": "MDS 8+4",
+              "en": "MDS 8+4"
+            },
+            {
+              "vi": "100PB ×12/8",
+              "en": "100PB ×12/8"
+            },
+            {
+              "vi": "150PB",
+              "en": "150PB"
+            }
+          ],
+          [
+            {
+              "vi": "EC disks chưa reserve",
+              "en": "EC disks before reserves"
+            },
+            {
+              "vi": "150PB /20TB",
+              "en": "150PB /20TB"
+            },
+            {
+              "vi": "7.500",
+              "en": "7,500"
+            }
+          ],
+          [
+            {
+              "vi": "Mean disk failures/day",
+              "en": "Mean disk failures/day"
+            },
+            {
+              "vi": "7.500 ×0,02 /365",
+              "en": "7,500 ×0.02 /365"
+            },
+            {
+              "vi": "≈0,41",
+              "en": "≈0.41"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "3. APIs có checksum, preconditions và outcome rõ",
+        "en": "3. APIs expose checksums, preconditions and outcomes"
+      },
+      "paragraphs": [
+        {
+          "vi": "API minh họa dưới đây dùng namespace riêng; real S3-compatible implementation phải theo wire/auth/encoding/limits của protocol cụ thể. Signed request hoặc presigned grant có expiry và scope chặt nhưng vẫn là một authorization capability; không để URL logs lộ grant. Conditional writes ngăn silent lost update khi key đã đổi. ETag là validator theo contract, không mặc định full-object MD5 hoặc content identity dùng chung mọi upload mode.",
+          "en": "The teaching API uses its own namespace; actual S3-compatible implementations must follow protocol-specific wire/auth/encoding/limits. Signed requests or presigned grants are scoped, expiring capabilities whose URLs need protected logs. Conditional writes prevent silent lost updates. ETags are contract-specific validators rather than universal whole-object MD5s or identities across upload modes."
+        }
+      ],
+      "api": [
+        {
+          "method": "PUT",
+          "path": "/objects/{bucket}/{key}",
+          "description": {
+            "vi": "Stream object mới; conditional create/overwrite và explicit checksum algorithm/type.",
+            "en": "Stream objects with conditional creation/overwrite and explicit checksum algorithms/types."
+          },
+          "request": "bytes + If-Match / If-None-Match + checksum metadata",
+          "response": "200 { versionId, etag, checksum, committedAt }",
+          "notes": [
+            {
+              "vi": "Giữ request identity khi retry unknown outcome nếu platform có contract đó; không giả retry luôn tạo cùng version.",
+              "en": "Preserve identities under an explicit platform retry contract; retries do not inherently create the same version."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/objects/{bucket}/{key}",
+          "description": {
+            "vi": "Resolve immutable generation; optional Range có byte offsets/validation rõ.",
+            "en": "Resolve immutable generations with explicit optional range offsets/validation."
+          },
+          "response": "200 bytes | 206 range + versionId + validator | 404"
+        },
+        {
+          "method": "DELETE",
+          "path": "/objects/{bucket}/{key}",
+          "description": {
+            "vi": "Đổi visibility/version marker theo versioning policy; chưa hứa physical erasure tức thì.",
+            "en": "Change visibility/delete markers under version policies rather than promise immediate physical erasure."
+          },
+          "response": "204"
+        },
+        {
+          "method": "GET",
+          "path": "/objects/{bucket}?prefix={prefix}&cursor={cursor}",
+          "description": {
+            "vi": "Prefix listing có contract freshness/pagination riêng.",
+            "en": "Prefix listings with separate freshness/pagination contracts."
+          },
+          "response": "200 { keys, nextCursor, listingMode, generatedAt }"
+        },
+        {
+          "method": "POST",
+          "path": "/uploads/{bucket}/{key}",
+          "description": {
+            "vi": "Initiate multipart session, bind intent/policy/reservation.",
+            "en": "Initiate sessions bound to intent/policy/reservations."
+          },
+          "response": "201 { uploadId, acceptedChecksumType, limits, expectedValidator }"
+        },
+        {
+          "method": "POST",
+          "path": "/uploads/{uploadId}/complete",
+          "description": {
+            "vi": "Validate explicit ordered parts manifest và publish theo head precondition.",
+            "en": "Validate explicit ordered manifests and publish under head preconditions."
+          },
+          "request": "{ parts:[{number,etag}], expectedChecksum, expectedValidator }",
+          "response": "200 { versionId, checksum } | conflict / invalid-part / checksum-error"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Publish và recover đi xuyên cả hai planes",
+        "en": "4. Publication and recovery span both planes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metadata trả lời object nào tồn tại; data nodes trả verified immutable fragments. Placement map có epochs và failure domains, không chỉ một danh sách hosts đang ping được. Upload sessions, reader pins và migration state cũng tham gia lifecycle. Stateless API instances scale được, nhưng state cần authority và recovery ở các services phía sau. Trace dưới đây chọn một logical protocol, không giấu atomicity vào một mũi tên “write metadata”.",
+          "en": "Metadata determines existence; data nodes provide verified immutable fragments. Placement maps carry epochs and failure domains rather than merely reachable hosts. Uploads, readers and migrations participate in lifecycle. Stateless API instances can scale, but underlying state needs authority and recovery. The traces describe a logical protocol rather than hiding atomicity inside a metadata-write arrow."
+        }
+      ],
+      "diagram": {
+        "id": "object-publication-and-repair",
+        "title": {
+          "vi": "Bytes chuẩn bị trước, metadata publish sau",
+          "en": "Prepare bytes before publishing metadata"
+        },
+        "caption": {
+          "vi": "Prepared fragments được pin khỏi GC; metadata commit chọn immutable version. Repair và migration cũng publish generation mới thay vì sửa một pointer không có fencing.",
+          "en": "Preparation pins fragments against GC; metadata commits choose immutable versions. Repairs and migrations also publish fenced generations."
+        },
+        "width": 1180,
+        "height": 830,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client / SDK",
+              "en": "Client / SDK"
+            },
+            "detail": {
+              "vi": "Stable request/upload identity, expected checksum và conditional-write intent; timeout có thể là unknown outcome.",
+              "en": "Retains request/upload identities, expected checksums and conditional intent; timeouts may have unknown outcomes."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Object API",
+              "en": "Object API"
+            },
+            "detail": {
+              "vi": "Auth, quota, stream body/checksum và resolve metadata; gateway stateless không có nghĩa uploads không cần state.",
+              "en": "Authenticates, limits work, streams/checks bodies and resolves metadata; stateless gateways still coordinate stateful uploads."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "meta",
+            "label": {
+              "vi": "Metadata authority",
+              "en": "Metadata authority"
+            },
+            "detail": {
+              "vi": "Linearizable head CAS, versions, key index và upload completion records theo contract.",
+              "en": "Owns linearizable head CAS, versions, key indexes and completion records under explicit contracts."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Metadata shards",
+              "en": "Metadata shards"
+            },
+            "detail": {
+              "vi": "Shard directory + durable committed rows/indexes; LIST consistency và pagination được định nghĩa riêng.",
+              "en": "Maintains shard directories and committed rows/indexes; listing/pagination guarantees are explicit."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "iam",
+            "label": {
+              "vi": "IAM / key services",
+              "en": "IAM / key services"
+            },
+            "detail": {
+              "vi": "Tenant/bucket/object policies, short-lived grants và encryption-key authorization; deny uncertainty theo policy.",
+              "en": "Owns tenant/bucket/object policies, short-lived grants and encryption-key authorization."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "placement",
+            "label": {
+              "vi": "Placement / epochs",
+              "en": "Placement / epochs"
+            },
+            "detail": {
+              "vi": "Map fragment→disk/rack/zone, health và allocation epoch; repair không tự ý giành ownership.",
+              "en": "Maps fragments to disks/racks/zones with health/allocation epochs; repairs cannot silently seize ownership."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "data",
+            "label": {
+              "vi": "Immutable fragments",
+              "en": "Immutable fragments"
+            },
+            "detail": {
+              "vi": "Durable prepared fragments, per-fragment integrity, sealed manifests và bounded upload reservations.",
+              "en": "Stores durable prepared fragments, integrity data, sealed manifests and bounded upload reservations."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "upload",
+            "label": {
+              "vi": "Multipart sessions",
+              "en": "Multipart sessions"
+            },
+            "detail": {
+              "vi": "Parts, tags, expected intent, abort/completion state và reservation pins; not public objects before commit.",
+              "en": "Tracks parts/tags, expected intent, abort/completion state and pins; sessions are not public objects before commit."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "repair",
+            "label": {
+              "vi": "Scrub / repair",
+              "en": "Scrub / repair"
+            },
+            "detail": {
+              "vi": "Detect known corruption, reconstruct từ đủ survivors, verify và publish replacement placement generation.",
+              "en": "Detects corruption, reconstructs from sufficient survivors, verifies and publishes replacement placement generations."
+            },
+            "x": 430,
+            "y": 730,
+            "kind": "worker"
+          },
+          {
+            "id": "gc",
+            "label": {
+              "vi": "GC / compaction",
+              "en": "GC / compaction"
+            },
+            "detail": {
+              "vi": "Reachability gồm versions, uploads, reader pins và migration; fence trước reclaim.",
+              "en": "Tracks versions, uploads, readers and migrations with fencing before reclamation."
+            },
+            "x": 740,
+            "y": 730,
+            "kind": "worker"
+          },
+          {
+            "id": "cold",
+            "label": {
+              "vi": "Tier / replica targets",
+              "en": "Tier / replica targets"
+            },
+            "detail": {
+              "vi": "Async migration/replication có status, lag, verify-before-switch và retention rules.",
+              "en": "Asynchronous migration/replication exposes status/lag and verifies before switching under retention rules."
+            },
+            "x": 1040,
+            "y": 730,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "put",
+            "label": {
+              "vi": "PUT và metadata commit",
+              "en": "PUT and metadata commit"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Gửi bytes, checksum và expected ETag/generation theo chosen API.",
+                  "en": "Send bytes, checksums and expected ETags/generations under the chosen API."
+                }
+              },
+              {
+                "from": "api",
+                "to": "iam",
+                "description": {
+                  "vi": "Authorize tenant/bucket/key và encryption use.",
+                  "en": "Authorize tenant/bucket/key and encryption use."
+                }
+              },
+              {
+                "from": "api",
+                "to": "placement",
+                "description": {
+                  "vi": "Cấp immutable object ID và allocation/reservation epoch.",
+                  "en": "Allocate an immutable object ID and reservation epoch."
+                }
+              },
+              {
+                "from": "api",
+                "to": "data",
+                "description": {
+                  "vi": "Stream/encode, kiểm checksum hoàn tất và đạt durable placement threshold.",
+                  "en": "Stream/encode, complete checksum validation and reach durable placement thresholds."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Publish sealed manifest bằng conditional metadata transaction; reservation còn valid.",
+                  "en": "Conditionally publish a sealed manifest while its reservation remains valid."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "db",
+                "description": {
+                  "vi": "Commit head/version và authoritative key index trong contract.",
+                  "en": "Commit head/version and authoritative key indexes under the contract."
+                }
+              },
+              {
+                "from": "api",
+                "to": "client",
+                "description": {
+                  "vi": "Trả parsed final success sau commit; mất response cần reconcile.",
+                  "en": "Return final success after commit; lost responses require reconciliation."
+                }
+              }
+            ]
+          },
+          {
+            "id": "get",
+            "label": {
+              "vi": "GET pin immutable generation",
+              "en": "GET pins an immutable generation"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "GET/Range và auth context tới gateway.",
+                  "en": "Send GET/range requests with authorization context."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Resolve current immutable object version; không dùng stale cache phá consistency.",
+                  "en": "Resolve immutable versions without violating consistency through stale caches."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "data",
+                "description": {
+                  "vi": "Reader lease/pin hoặc epoch protection giữ đúng version trong thời gian đọc.",
+                  "en": "Reader pins/leases or epochs protect the resolved version."
+                }
+              },
+              {
+                "from": "data",
+                "to": "api",
+                "description": {
+                  "vi": "Đọc sufficient verified fragments; systematic range reads có thể tối ưu theo scheme.",
+                  "en": "Read sufficient verified fragments with scheme-dependent range optimizations."
+                }
+              },
+              {
+                "from": "api",
+                "to": "client",
+                "description": {
+                  "vi": "Trả đúng một generation và validate checksum theo range/full-object semantics.",
+                  "en": "Return one generation and validate range/full-object checksum semantics."
+                }
+              }
+            ]
+          },
+          {
+            "id": "multipart",
+            "label": {
+              "vi": "Multipart completion",
+              "en": "Complete multipart publication"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Upload parts bằng session/part identity; retry một part không restart toàn object.",
+                  "en": "Upload independently identified parts without restarting whole objects on retries."
+                }
+              },
+              {
+                "from": "api",
+                "to": "upload",
+                "description": {
+                  "vi": "Track accepted tags/checksums và session state, giữ upload pin.",
+                  "en": "Track tags/checksums and sessions while retaining pins."
+                }
+              },
+              {
+                "from": "api",
+                "to": "data",
+                "description": {
+                  "vi": "Chuẩn bị part fragments theo durability contract.",
+                  "en": "Prepare part fragments under durability contracts."
+                }
+              },
+              {
+                "from": "upload",
+                "to": "meta",
+                "description": {
+                  "vi": "Validate ordered manifest/current tags/expected checksum và head precondition trước publish.",
+                  "en": "Validate ordered manifests/tags/checksums/head preconditions before publication."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "db",
+                "description": {
+                  "vi": "Commit object generation và retained completion result trong platform model.",
+                  "en": "Commit the object and retained completion result in this platform model."
+                }
+              }
+            ]
+          },
+          {
+            "id": "repair",
+            "label": {
+              "vi": "Repair không đổi logical object",
+              "en": "Repair without changing the logical object"
+            },
+            "steps": [
+              {
+                "from": "repair",
+                "to": "data",
+                "description": {
+                  "vi": "Scrub phát hiện missing/corrupt fragment đã biết; chọn đủ valid survivors.",
+                  "en": "Scrubbing detects known missing/corrupt fragments and selects enough valid survivors."
+                }
+              },
+              {
+                "from": "repair",
+                "to": "placement",
+                "description": {
+                  "vi": "Allocate replacement target dưới placement epoch hiện tại.",
+                  "en": "Allocate replacement targets under the current placement epoch."
+                }
+              },
+              {
+                "from": "repair",
+                "to": "data",
+                "description": {
+                  "vi": "Reconstruct, verify và ghi bền replacement fragment.",
+                  "en": "Reconstruct, verify and durably write replacements."
+                }
+              },
+              {
+                "from": "repair",
+                "to": "meta",
+                "description": {
+                  "vi": "CAS placement manifest/generation; loser không ghi đè repair mới hơn.",
+                  "en": "CAS placement generations without overwriting newer repairs."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "gc",
+                "description": {
+                  "vi": "Old fragments chỉ reclaim sau reachability/reader/migration checks.",
+                  "en": "Reclaim old fragments only after reachability/reader/migration checks."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "lifecycle",
+            "label": {
+              "vi": "Migration và cleanup",
+              "en": "Migrate and clean up"
+            },
+            "steps": [
+              {
+                "from": "data",
+                "to": "cold",
+                "description": {
+                  "vi": "Copy hoặc re-encode theo tier, giữ nguồn trong lúc verify.",
+                  "en": "Copy or re-encode under tier rules, retaining verified sources."
+                },
+                "async": true
+              },
+              {
+                "from": "cold",
+                "to": "meta",
+                "description": {
+                  "vi": "Publish verified target manifest/status; expose replication/restore lag.",
+                  "en": "Publish verified targets/status with visible replication/restore lag."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "gc",
+                "description": {
+                  "vi": "Fence reference changes trước sweep và tuân retention/version locks.",
+                  "en": "Fence reference changes before sweeping under retention/version locks."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "publication",
+      "title": {
+        "vi": "5. Commit pointer chỉ an toàn khi bytes và GC cùng contract",
+        "en": "5. Pointer commits need byte durability and GC contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline tạo immutable object ID, reserve placement, stream/encode và chờ tất cả n fragments được chuẩn bị bền trên failure-domain layout đã chọn. Kiểm whole-object checksum sau khi body hoàn tất rồi publish sealed manifest bằng metadata CAS. Chọn all n là contract của ví dụ, không yêu cầu mọi storage system giống nhau: ACK khi chỉ đủ k fragments có thể đọc được ngay nhưng chưa có đủ redundancy mong muốn. Khi thiếu node, có thể chọn replacement target hoặc fail write theo availability policy.",
+          "en": "The baseline allocates immutable IDs/reservations, streams/encodes and durably prepares all n fragments under its placement layout. Validate whole-object integrity after body completion, then publish sealed manifests using metadata CAS. All n is this example’s contract rather than a universal rule: k fragments allow reconstruction but lack the desired spare redundancy. Missing targets require replacement placement or write failure under the availability policy."
+        },
+        {
+          "vi": "Nếu API crash trước commit, prepared bytes có thể thành orphan nhưng không xuất hiện như object nửa chừng. Tuy nhiên, reservation/pin phải giữ chúng khỏi GC trong khi commit còn có thể thành công; GC cần fence expired reservations trước khi delete và metadata commit phải reject reservation đã fenced. Sau commit, lost response là unknown outcome: lookup retained request/completion record hoặc reconcile theo API contract. Atomic head CAS không tự tạo transaction across mọi keys hay mọi external system.",
+          "en": "Crashes before commit may leave invisible orphan bytes rather than partial objects. Reservations/pins must protect bytes while commits remain possible; GC fences expired reservations before deletion, and commits reject fenced allocations. Lost post-commit responses have unknown outcomes requiring retained records or contract-specific reconciliation. Atomic head CAS does not create transactions across arbitrary keys or external systems."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một write có boundary rõ",
+          "en": "A write with explicit boundaries"
+        },
+        "caption": {
+          "vi": "Integrity failure có thể để lại staged bytes; chỉ final validated metadata publication làm object visible.",
+          "en": "Integrity failures may leave staged bytes; only validated metadata publication exposes objects."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Prepare",
+              "en": "Prepare"
+            },
+            "detail": {
+              "vi": "Immutable ID, allocation epoch và durable fragments.",
+              "en": "Immutable IDs, allocation epochs and durable fragments."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Validate",
+              "en": "Validate"
+            },
+            "detail": {
+              "vi": "Final checksum và manifest completeness/placement.",
+              "en": "Final integrity, manifest completeness and placement."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Commit",
+              "en": "Commit"
+            },
+            "detail": {
+              "vi": "Conditional head/index publication với reservation fencing.",
+              "en": "Conditional head/index publication with reservation fencing."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Reclaim",
+              "en": "Reclaim"
+            },
+            "detail": {
+              "vi": "Orphans/old generations qua reachability và reader protection.",
+              "en": "Reclaim orphans/old generations with reader protection."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
+    },
+    {
+      "id": "erasure",
+      "title": {
+        "vi": "6. Erasure tolerance phụ thuộc placement",
+        "en": "6. Erasure tolerance depends on placement"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với systematic MDS (k data, m parity), bất kỳ k valid fragments có thể reconstruct. “Chịu m failures” ở đây là m fragments unavailable hoặc known-bad đã được loại, không phải tùy ý m zones hoặc m silent unknown errors. Nếu nhiều fragments cùng một rack/zone, một correlated fault làm mất nhiều fragments. Ví dụ 8+4 phân bố bốn fragments mỗi zone qua ba zones chịu mất một zone; mất thêm một fragment khi chưa repair sẽ vượt tolerance.",
+          "en": "For a systematic MDS code with k data and m parity fragments, any k valid fragments reconstruct data. Tolerance of m failures means unavailable or identified-bad fragments, not arbitrary m zones or unknown silent errors. Shared racks/zones correlate losses. An 8+4 layout with four fragments in each of three zones survives one zone loss, but another unavailable fragment before repair exceeds tolerance."
+        },
+        {
+          "vi": "Overhead 12/8 = 1,5 so với replication ba bản là 3,0 trong hai schemes cụ thể. Không suy mọi EC đều “nửa chi phí” mọi replication scheme, hoặc k+m fragments cần k+m availability zones. Chọn code theo placement, read pattern, repair bandwidth, encode CPU và capacity reserve. Lab mô phỏng MDS availability arithmetic, không tạo parity thật; có thể đổi layout để thấy same code nhưng khác correlated-failure behavior.",
+          "en": "The compared schemes have overheads 12/8 = 1.5 and three respectively. This does not make all EC half as costly as every replica scheme or require one availability zone per fragment. Codes depend on placements, reads, repair bandwidth, CPU and reserves. The lab models MDS availability arithmetic without encoding parity; changing placement exposes different correlated-failure behavior under the same code."
+        }
+      ],
+      "experiment": "object-erasure"
+    },
+    {
+      "id": "repair",
+      "title": {
+        "vi": "7. Repair nhanh vừa đủ để khép vulnerability window",
+        "en": "7. Repair closes vulnerability windows under resource limits"
+      },
+      "paragraphs": [
+        {
+          "vi": "Missing fragment và checksum-detected corruption trở thành repair candidates; trước reconstruct phải có đủ valid survivors đúng object/stripe generation. Basic full-stripe repair của một fragment có thể đọc k fragments rồi ghi một replacement. Systematic range reads, batching, regenerating/LRC designs có cost khác. Repair target phải respect placement và epoch, verify output rồi CAS replacement manifest; một repair worker cũ không được ghi đè placement mới.",
+          "en": "Missing or checksum-invalid fragments become repair candidates requiring enough valid survivors from the correct object/stripe generation. Basic repair may read k full fragments and write one replacement; systematic ranges, batching and specialized codes change costs. Targets respect placement/epochs, output is verified and replacement manifests CAS-published so stale workers cannot overwrite newer placements."
+        },
+        {
+          "vi": "Throttle repair để không làm foreground traffic sụp, nhưng không kéo dài exposure tùy ý. Ưu tiên objects gần hết redundancy, account cho rebuild queues, cross-zone bandwidth và spare disk capacity. Scrubbing phát hiện latent errors ở cold data trước khi một disk failure khác xảy ra. Đặt guardrails cho firmware/deploy/deletion blast radius; mathematical parity không cứu correlated software xóa tất cả fragments hoặc encryption keys.",
+          "en": "Throttle repairs without making exposure arbitrarily long. Prioritize low-redundancy objects and account for queues, inter-zone bandwidth and spare capacity. Scrubbing discovers latent cold-data errors before additional failures. Limit firmware/deployment/deletion blast radii: parity cannot repair software deleting every fragment or encryption key."
+        }
+      ]
+    },
+    {
+      "id": "layout-integrity",
+      "title": {
+        "vi": "8. Packing, streaming checksum và physical layout",
+        "en": "8. Packing, streaming integrity and physical layout"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tiny objects có thể được pack vào large sealed files để giảm filesystem metadata và seeks; index giữ object/fragment ID → file, offset, length và checksum. Delete logical reference không lập tức giải phóng giữa packed file; compaction copy live records, verify và publish mapping generation mới trước reclaim file cũ. Không overwrite offsets ngay khi reader cũ còn dùng mapping cũ. Packing cũng tạo read amplification/compaction trade-offs, không tối ưu miễn phí mọi size.",
+          "en": "Packing tiny objects into large sealed files can reduce filesystem metadata and seeks. Indexes map object/fragment IDs to files, offsets, lengths and checksums. Logical deletions do not immediately free packed interiors; compaction copies live records, verifies and publishes new mappings before reclaiming old files. Old-reader mappings need protection. Packing trades read/compaction amplification rather than universally optimizing every size."
+        },
+        {
+          "vi": "Whole-object checksum chỉ được validate đầy đủ sau khi đọc hết request body, trừ khi buffer toàn body trước. Có thể stream vào staging và tính checksum đồng thời; mismatch ngăn publication rồi cleanup bytes tạm. Per-fragment checksums phát hiện lỗi đọc/scrub; full-object/range validation có semantics riêng. CRC phục vụ integrity detection, không thay authentication/cryptographic tamper protection. ETag và explicit checksum algorithm/type phải được xử lý theo API contract.",
+          "en": "Whole-object validation completes only after consuming the body unless it was fully buffered. Stream into staging while calculating integrity, reject publication on mismatch and clean temporary bytes. Fragment checksums support reads/scrubbing; ranges and whole objects have distinct validation semantics. CRCs detect corruption rather than replace authentication or cryptographic tamper protection. Handle ETags and explicit checksum algorithms/types according to API contracts."
+        }
+      ]
+    },
+    {
+      "id": "multipart",
+      "title": {
+        "vi": "9. Multipart manifest phải giữ đúng intent",
+        "en": "9. Multipart manifests must preserve intent"
+      },
+      "paragraphs": [
+        {
+          "vi": "Multipart tách transfer thành independent parts và complete bằng explicit ordered manifest. Part number và tag/checksum phải khớp data đã accept; một writer hoặc retry khác thay cùng part number có thể làm manifest cũ invalid. Nhưng chỉ đọc lại tags rồi complete chưa chứng minh assembled bytes đúng nội dung client định gửi. Giữ expected application checksum/size và verify theo checksum type mà protocol hỗ trợ. Không giả thiếu một part number ở giữa luôn bị backend reject: một số protocols complete chính danh sách parts caller cung cấp, nên completeness của intent cần kiểm riêng.",
+          "en": "Multipart transfers independent parts and completes an explicit ordered manifest. Part numbers/tags/checksums must match accepted data; replacing a part can invalidate old manifests. Refreshing tags alone does not prove assembled content matches the client’s intent. Preserve expected checksums/sizes and validate supported types. Missing intermediate part numbers are not universally rejected: protocols may assemble exactly the supplied list, so intended completeness needs separate validation."
+        },
+        {
+          "vi": "Concurrent overwrite của public key cần conditional completion, không chỉ uploadId. Sau conflict, re-read state và quyết định intent; không tự bỏ precondition để retry thành công. Nếu completion response mất, object có thể đã commit. Với real S3 CompleteMultipartUpload, initial HTTP 200 còn có thể chứa final error trong body, nên dùng SDK phù hợp hoặc parse final result; status header không đủ chứng minh success. Lab là platform contract đơn giản với retained completion record và exact-payload checksum model, không mô phỏng hết S3.",
+          "en": "Concurrent public-key overwrites need conditional completion rather than upload IDs alone. Re-read and reconsider intent after conflicts instead of dropping preconditions. Lost responses may follow successful commits. Actual S3 completion can emit initial HTTP 200 followed by an embedded error, requiring suitable SDK handling or final-body parsing. The lab simplifies this into retained completion records and exact-payload checks rather than a full S3 simulator."
+        },
+        {
+          "vi": "Abort/lifecycle giúp reclaim unfinished parts, nhưng requests đang in-flight có thể race cleanup. Cần session fencing, bounded retry và recheck theo backend contract. Completed object có lifecycle khác với unfinished upload: abort không được dùng như DELETE của object đã publish. Retention/locks/quota và upload owner cần áp dụng cho cả staged bytes để tránh uploads bỏ dở chiếm disk mãi.",
+          "en": "Aborts and lifecycle rules reclaim unfinished parts, but in-flight requests can race cleanup. Use session fencing, bounded retries and backend-specific rechecks. Completed objects and unfinished uploads have different lifecycles: aborting is not deletion of published objects. Ownership, quotas and lifecycle controls must also govern staged bytes."
+        }
+      ],
+      "experiment": "object-multipart"
+    },
+    {
+      "id": "metadata-list",
+      "title": {
+        "vi": "10. Strong GET không tự thành snapshot LIST",
+        "en": "10. Strong GET does not automatically create snapshot listings"
+      },
+      "paragraphs": [
+        {
+          "vi": "GET resolve key head qua linearizable metadata authority để đáp ứng read-after-write trong baseline. Gateway/CDN cache head cũ có thể phá contract dù bytes immutable, nên cần validation/lease/freshness rule tương thích hoặc đọc authority. Head và authoritative key index phải commit trong protocol đã chọn; asynchronous secondary index có thể làm PUT thành công nhưng LIST chưa thấy key. Scale metadata theo object count, versions, key length, indexes và hot namespaces, không chỉ byte payload của data plane.",
+          "en": "Baseline GETs resolve heads through linearizable metadata authorities for read-after-write behavior. Stale gateway/CDN heads can violate this despite immutable bytes, requiring compatible validation/leases or authority reads. Heads and authoritative key indexes need coordinated publication; lagging secondary indexes can omit successfully written keys. Metadata scales with objects, versions, key lengths, indexes and hotspots rather than only payload bytes."
+        },
+        {
+          "vi": "Hash full key phân bố point operations tốt nhưng prefix LIST cần scatter/merge hoặc directory index. Range partition theo (bucket,key) thuận tiện prefix scans nhưng dễ hot range và cần split/relocation protocol. Hash một prefix cố định không giải mọi arbitrary-prefix query miễn phí. Shard directory/version phải giúp cursor đi qua split đúng, tránh skip/duplicate ngoài contract; tenant quota cũng phải giới hạn broad LIST work.",
+          "en": "Full-key hashing distributes point operations but makes prefix listing scatter/merge or use directories. Ranges over bucket/key favor scans while requiring hotspot splitting and relocation. Hashing fixed prefixes does not solve arbitrary prefixes for free. Versioned directories/cursors handle splits under explicit duplicate/skip rules, and tenant quotas bound broad listing work."
+        },
+        {
+          "vi": "Baseline chọn LIST đọc authoritative committed indexes, có read-after-write freshness cho writes hoàn tất trước request; không hứa mọi pages cùng một point-in-time snapshot khi concurrent writes xảy ra. Cursor giữ query scope, shard-directory state cần thiết và last key theo contract. Nếu cần snapshot toàn listing, thêm MVCC/read timestamp hoặc coordinated snapshot được giữ qua cursor TTL; per-key Raft một mình chưa đủ. Real backend có loại bucket và ordering rules riêng, không áp mọi semantics của general-purpose listing lên directory bucket.",
+          "en": "The baseline reads authoritative committed indexes with read-after-write freshness for completed prior writes, without promising one snapshot across pages under concurrent mutation. Cursors bind query scopes, required directory state and last keys. Full-list snapshots need retained MVCC timestamps or coordinated snapshots across cursor lifetimes; per-key Raft alone is insufficient. Backend bucket types can also have different ordering semantics."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Operation",
+            "en": "Operation"
+          },
+          {
+            "vi": "Contract baseline",
+            "en": "Baseline contract"
+          },
+          {
+            "vi": "Cần thêm nếu muốn mạnh hơn",
+            "en": "Additional stronger mechanism"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "GET một key",
+              "en": "Single-key GET"
+            },
+            {
+              "vi": "Resolve latest completed head theo authority.",
+              "en": "Resolve completed heads through authority."
+            },
+            {
+              "vi": "Cache validation/lease đúng contract.",
+              "en": "Compatible cache validation/leases."
+            }
+          ],
+          [
+            {
+              "vi": "LIST một request",
+              "en": "One listing request"
+            },
+            {
+              "vi": "Committed index freshness; concurrency semantics rõ.",
+              "en": "Fresh committed indexes with explicit concurrent behavior."
+            },
+            {
+              "vi": "Common snapshot nếu cần linearizable range view.",
+              "en": "Common snapshots for linearizable range views."
+            }
+          ],
+          [
+            {
+              "vi": "LIST nhiều pages",
+              "en": "Multi-page listing"
+            },
+            {
+              "vi": "Cursor không hứa global frozen set.",
+              "en": "Cursors do not imply frozen global sets."
+            },
+            {
+              "vi": "MVCC snapshot + TTL/split-aware cursors.",
+              "en": "MVCC snapshots with lifetimes and split-aware cursors."
+            }
+          ],
+          [
+            {
+              "vi": "Update hai keys",
+              "en": "Update two keys"
+            },
+            {
+              "vi": "Không atomic trong baseline.",
+              "en": "Not atomic in the baseline."
+            },
+            {
+              "vi": "Application manifest hoặc transaction protocol riêng.",
+              "en": "Application manifests or separate transaction protocols."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "reader-gc",
+      "title": {
+        "vi": "11. Reader pin và GC fencing bảo vệ immutable generations",
+        "en": "11. Reader pins and GC fencing protect generations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một reader đã resolve v1 phải đọc đúng v1 tới hết dù head đang là v2. Chỉ dùng head lookup lại cho từng chunk có thể trộn generations; chỉ kiểm v1 không còn head rồi delete có thể làm reader fail. Có thể giữ reader pins/leases, epoch-based protection hoặc bound lifetime/grace được chứng minh. Lease expiry cần xử lý network pause/crash, renewal và fencing; “chờ vài phút” không đủ khi reader/upload có thể kéo dài hơn.",
+          "en": "A reader resolving v1 must read v1 throughout even if the head becomes v2. Re-resolving heads per chunk can mix generations, while deleting any non-head version can break readers. Use pins/leases, epoch protection or proven lifetime/grace bounds. Leases need pause/crash, renewal and fencing behavior; arbitrary waits do not protect longer readers/uploads."
+        },
+        {
+          "vi": "Reachability còn gồm retained versions, legal/retention locks, multipart sessions, snapshots, repairs và tier migrations. Mark/sweep cần consistent cut hoặc allocation-age/fencing protocol để object được publish đúng lúc sweep không bị xóa. Cleanup phải idempotent và có audit/canary/dry-run safeguards phù hợp vì GC bug có thể phá tất cả copies cùng lúc. Lab chỉ minh họa một tracked reader và một overwrite; không triển khai distributed reference counting.",
+          "en": "Reachability also includes retained versions/locks, uploads, snapshots, repairs and migrations. Mark/sweep needs consistent cuts or allocation-age/fencing protocols to avoid deleting concurrently published objects. Idempotent cleanup and suitable audits/canaries/dry runs matter because GC bugs can delete all copies together. The lab models one tracked reader and overwrite rather than distributed reference counting."
+        }
+      ],
+      "experiment": "object-reader"
+    },
+    {
+      "id": "versions-delete",
+      "title": {
+        "vi": "12. Delete marker khác physical erasure",
+        "en": "12. Delete markers differ from physical erasure"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với versioning, DELETE có thể tạo delete marker để latest lookup không thấy object, trong khi previous versions vẫn retained và có thể đọc nếu có quyền. Xóa specific version, lifecycle expiration và overwrite không mặc định giống nhau. Bucket policy, retention locks và legal holds là controls riêng; crypto-key deletion cũng có blast radius và không được dùng thay thế một deletion policy chưa rõ.",
+          "en": "With versioning, deletion can create a marker hiding latest lookups while older versions remain accessible under permissions. Specific-version deletion, expiration and overwriting differ. Policies, retention locks and holds are separate controls; encryption-key deletion has its own blast radius and cannot substitute for unclear deletion semantics."
+        },
+        {
+          "vi": "Không suy logical 404 có nghĩa physical bytes đã biến mất khỏi replicas, packs, backups hoặc logs. Công bố retention/deletion timelines và trạng thái lifecycle phù hợp, kiểm các version/reference còn sống trước reclaim. Read authorization phải áp dụng cho versioned URLs và cached/private assets, không chỉ latest key. Repeated delete/retry cần idempotent semantics, nhất là khi event notifications có thể duplicate hoặc đến trễ.",
+          "en": "A logical 404 does not establish removal from replicas, packs, backups or logs. Define retention/deletion timelines and inspect live references before reclamation. Authorization covers versions and cached/private assets rather than only latest keys. Deletion/retries need idempotent behavior when notifications duplicate or arrive late."
+        }
+      ]
+    },
+    {
+      "id": "tiering",
+      "title": {
+        "vi": "13. Migration verify-before-switch và restore contracts",
+        "en": "13. Verify-before-switch migrations and restore contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tier transition có thể copy, re-encode hoặc chuyển media, tùy thiết kế; không phải mọi tiering luôn re-encode. Giữ nguồn trong khi chuẩn bị target, verify checksums/durability và publish compatible placement generation trước reclaim. Background IO cần quota và priority để migration không làm tăng read timeout hoặc kéo dài repair window. Rollback cũng cần giữ generation nguồn tới khi đủ điều kiện cleanup.",
+          "en": "Tier transitions can copy, re-encode or change media depending on design. Retain sources while preparing targets, verify integrity/durability and publish compatible placement generations before cleanup. Background quotas/priorities prevent migrations from harming reads or repairs. Rollback also needs retained source generations until safe cleanup."
+        },
+        {
+          "vi": "Cold/archive classes có thể có restore delay, retrieval fees hoặc minimum-retention behavior riêng; không coi “cheaper per GB” là rẻ hơn mọi workload. API cần phân biệt object tồn tại nhưng cần restore với not found. Cache restored copies theo TTL/authorization và theo dõi restore jobs idempotently. Cost model gồm requests, stored/staged bytes, cross-zone repair, egress và restore—not chỉ disk price.",
+          "en": "Cold/archive designs can have distinct restore delays, retrieval costs or retention behavior; lower storage prices do not make every workload cheaper. Distinguish objects needing restoration from absence. Restored copies need expiry/authorization and idempotent job tracking. Cost includes requests, staged/storage bytes, repairs, egress and restoration rather than disk prices alone."
+        }
+      ]
+    },
+    {
+      "id": "security-regions",
+      "title": {
+        "vi": "14. Security, cells và cross-region recovery",
+        "en": "14. Security, cells and cross-region recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách tenant/bucket/object authorization, signed-request validation, quotas và encryption-key permissions. At-rest encryption không thay access control; mất hoặc revoke KMS key cũng có thể làm bytes còn nguyên mà không đọc được. Presigned grants phải hạn chế method/key/expiry và tránh log secrets; data-node URLs không được bỏ qua checks của object API. Audit metadata và billing cần nhất quán đủ mục đích nhưng không nên biến thành leakage của sensitive object names.",
+          "en": "Separate tenant/bucket/object authorization, signature validation, quotas and key permissions. Encryption does not replace access controls; key loss/revocation can make intact bytes unreadable. Presigned grants constrain methods/keys/expiry and protected logs. Data-node access must not bypass object policies. Metadata/billing audits should serve their purposes without leaking sensitive names."
+        },
+        {
+          "vi": "Cell-based deployment giới hạn một số operational blast radii nếu data/metadata/control dependencies thật sự tách đúng. Async cross-region replication có lag và RPO lớn hơn zero theo contract; promote replica cần generation/fencing, delete ordering và conflict policy. Synchronous cross-region commit có latency/availability trade-off khác. Một healthy replica region không tự chứng minh metadata, object bytes và encryption keys đều đủ để restore; phải drill restore bằng evidence.",
+          "en": "Cells limit some operational blast radii only when data/metadata/control dependencies are actually isolated. Asynchronous regional replication has contract-specific lag/RPO; promotion needs generations/fencing, deletion order and conflict policies. Synchronous commits have different latency/availability trade-offs. Healthy replica regions do not prove recoverable metadata, bytes and keys without restoration drills."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "15. Failure matrix quan trọng hơn tên storage engine",
+        "en": "15. Failure matrices matter more than engine names"
+      },
+      "paragraphs": [
+        {
+          "vi": "Theo dõi object count/size tail, metadata p99, fragment write/read/checksum errors, repair backlog/age, bytes under-redundant, GC lag, staged uploads và LIST fan-out. Capacity alert cần include reserve và cross-zone throughput; disk còn trống không có nghĩa repair đủ nhanh. Chạy crash drills ở từng publication boundary và kiểm client-visible behavior thay vì chỉ process alive.",
+          "en": "Track size/count tails, metadata p99, fragment/integrity failures, repair backlog/age, under-redundant bytes, GC lag, staged uploads and listing fan-out. Capacity alerts include reserves and cross-zone throughput: free disks do not prove adequate repair speed. Drill publication-boundary crashes and verify client behavior rather than process liveness."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault point",
+            "en": "Fault point"
+          },
+          {
+            "vi": "Expected visibility",
+            "en": "Expected visibility"
+          },
+          {
+            "vi": "Recovery/guard",
+            "en": "Recovery/guard"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Crash trước metadata commit",
+              "en": "Crash before metadata commit"
+            },
+            {
+              "vi": "Old head hoặc absent, không object một phần.",
+              "en": "Old head or absence, never partial objects."
+            },
+            {
+              "vi": "Reservation fencing và orphan cleanup an toàn.",
+              "en": "Reservation fencing and safe orphan cleanup."
+            }
+          ],
+          [
+            {
+              "vi": "Commit rồi mất reply",
+              "en": "Commit then lose response"
+            },
+            {
+              "vi": "New generation có thể đã public.",
+              "en": "New generations may already be public."
+            },
+            {
+              "vi": "Reconcile request/upload result theo contract.",
+              "en": "Reconcile retained results under contract."
+            }
+          ],
+          [
+            {
+              "vi": "Một zone mất",
+              "en": "Zone loss"
+            },
+            {
+              "vi": "Recoverable chỉ nếu còn đủ valid fragments.",
+              "en": "Recoverable only with enough valid fragments."
+            },
+            {
+              "vi": "Placement-aware repair + reserve/bandwidth.",
+              "en": "Placement-aware repair and reserves/bandwidth."
+            }
+          ],
+          [
+            {
+              "vi": "Checksum mismatch",
+              "en": "Integrity mismatch"
+            },
+            {
+              "vi": "Không publish hoặc không serve corrupt data.",
+              "en": "Reject publication or corrupt reads."
+            },
+            {
+              "vi": "Retry source/repair từ valid survivors.",
+              "en": "Retry sources or repair from valid survivors."
+            }
+          ],
+          [
+            {
+              "vi": "GC gặp active reader",
+              "en": "GC encounters readers"
+            },
+            {
+              "vi": "Reader vẫn đọc immutable generation đã pin.",
+              "en": "Readers retain their pinned generations."
+            },
+            {
+              "vi": "Pin/lease/epoch và publication fencing.",
+              "en": "Pins/leases/epochs and publication fencing."
+            }
+          ],
+          [
+            {
+              "vi": "LIST split/migration",
+              "en": "Listing across shard splits"
+            },
+            {
+              "vi": "Không ngầm hứa snapshot nếu cursor không giữ được.",
+              "en": "Do not imply unsupported snapshot guarantees."
+            },
+            {
+              "vi": "Versioned routing/cursor contract hoặc retained snapshot.",
+              "en": "Versioned routing/cursors or retained snapshots."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Câu hỏi về publication, durability và lifecycle",
+        "en": "16. Questions about publication, durability and lifecycle"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ một overwrite có reader đang đọc v1, một part bị replace và một metadata commit mất response. Mỗi thao tác phải chỉ rõ object nào visible, bytes nào còn được bảo vệ và client biết gì sau timeout.",
+          "en": "Draw an overwrite with an active v1 reader, a replaced upload part and a lost commit response. Identify visible objects, protected bytes and client knowledge after each timeout."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Metadata commit có tự giải distributed atomicity không?",
+            "en": "Does metadata publication automatically solve distributed atomicity?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Chuẩn bị bytes đủ bền, validate manifest/checksum, giữ reservation khỏi GC và fence commit/reclaim races trước. Metadata CAS là visibility point trong protocol đó; nó không tạo transaction across mọi hệ thống.",
+              "en": "No. Prepare durable bytes, validate manifests/integrity, protect reservations and fence commit/reclamation races. CAS is a visibility point within that protocol rather than a universal distributed transaction."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "8+4 có chịu bốn zone failures không?",
+            "en": "Does 8+4 tolerate four zone failures?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ bảo đảm theo MDS assumption với tối đa bốn unavailable fragments. Một zone có thể chứa nhiều fragments. Tính loss theo placement/correlation, không đếm zone như một shard đơn lẻ; silent unknown corruption cũng cần integrity/error model riêng.",
+              "en": "The MDS assumption tolerates four unavailable fragments, not arbitrary zones. Placement determines fragments lost per zone, while unknown corruption needs separate integrity/error models."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "ETag match có chứng minh uploaded object đúng expected bytes?",
+            "en": "Do matching ETags prove intended object bytes?"
+          },
+          "answer": [
+            {
+              "vi": "Không chung cho mọi protocol. Tags có thể chỉ là validators; multipart tags không luôn full MD5. Manifest tag match xác nhận accepted parts phù hợp references, còn intended length/checksum/content cần validation riêng theo algorithm/type.",
+              "en": "Not universally. Tags may be validators and multipart tags are not always whole-object MD5s. Matching references still require separate intended-length/checksum/content validation."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Complete multipart HTTP 200 là chắc chắn success?",
+            "en": "Does HTTP 200 always prove multipart completion?"
+          },
+          "answer": [
+            {
+              "vi": "Không với protocol có final embedded error như S3 completion. Parse final body/SDK result và xử lý lost reply như unknown outcome. Reconcile theo contract, không blind retry tạo version khác rồi tưởng đó là cùng action.",
+              "en": "Not when final errors can be embedded as in S3 completion. Parse final results and treat lost replies as unknown outcomes requiring reconciliation rather than blind duplicate actions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Linearizable GET từng key có đủ cho LIST nhiều pages snapshot?",
+            "en": "Do linearizable point reads create snapshot pagination?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cần authoritative index freshness, shard routing/split contract và nếu hứa frozen set thì retained common snapshot/MVCC cursor. Concurrent inserts/deletes giữa pages không tự được “đóng băng” bởi per-key consensus.",
+              "en": "No. Listing needs authoritative indexes, split-aware routing and retained common snapshots/MVCC when promising frozen sets. Per-key consensus does not freeze concurrent pagination."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Old version không là head thì có GC được ngay?",
+            "en": "Can non-head versions be reclaimed immediately?"
+          },
+          "answer": [
+            {
+              "vi": "Không khi reader, retained version, upload, snapshot hoặc migration còn reference. Dùng pins/epochs/leases với fencing; grace period chỉ đúng nếu có lifetime bounds chứng minh. Lab cho thấy GET metadata đúng vẫn fail nếu bytes bị xóa sớm.",
+              "en": "Not while readers, retained versions, uploads, snapshots or migrations reference them. Use fenced pins/epochs/leases or proven lifetime bounds; correct initial metadata reads do not prevent premature deletion failures."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "AFR và parity có đủ tính 11 nines?",
+            "en": "Can AFRs and parity counts establish extreme durability targets?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cần correlated failures, repair exposure, latent integrity errors, software/deletion/key-loss risks và validation evidence. Disk failure rate không bằng object loss rate, storage overhead cũng không là xác suất.",
+              "en": "No. Include correlated failures, repair exposure, latent corruption, software/deletion/key risks and validation. Disk failure rates and storage ratios are not object-loss probabilities."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Abort upload có xóa object đã publish không?",
+            "en": "Does aborting an upload delete published objects?"
+          },
+          "answer": [
+            {
+              "vi": "Không trong contract này: unfinished upload cleanup khác object DELETE/version lifecycle. In-flight parts cần fencing/recheck; completed generation có references/retention riêng. Không dùng abort như shortcut bypass policy của public object.",
+              "en": "No. Unfinished cleanup differs from object deletion/version lifecycle. Fence/recheck in-flight parts and respect completed-generation references/retention rather than bypass object policies with aborts."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

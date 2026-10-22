@@ -1,0 +1,1106 @@
+{
+  "id": "key-value-store",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Distributed Key–Value Store: quorum, versions và repair",
+    "en": "Designing a Distributed Key–Value Store: quorums, versions and repair"
+  },
+  "summary": {
+    "vi": "Đi từ key placement tới durability, conflict và repair; thử ring, fixed-set quorum và Merkle traversal để phân biệt overlap, availability và consistency guarantees.",
+    "en": "Trace placement through durability, conflicts and repair; explore rings, fixed-set quorums and Merkle traversal to distinguish overlaps, availability and consistency guarantees."
+  },
+  "prerequisites": [
+    "load-balancing",
+    "databases",
+    "consistency",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "distributed",
+    "database",
+    "architecture"
+  ],
+  "takeaways": [
+    {
+      "vi": "Coordinator là request role; N copies phải ở distinct physical failure domains.",
+      "en": "Coordinators are request roles; N copies require distinct physical failure domains."
+    },
+    {
+      "vi": "R+W>N là fixed-set overlap; không tự tạo linearizable CAS hoặc rollback timeout.",
+      "en": "R+W>N establishes fixed-set overlap, not linearizable CAS or timeout rollbacks."
+    },
+    {
+      "vi": "Hints/read repair không thay anti-entropy cho cold ranges; tombstone GC cần safety protocol.",
+      "en": "Hints/read repair do not replace cold-range anti-entropy; tombstone collection needs safety protocols."
+    },
+    {
+      "vi": "LWW, causal siblings và CRDT có semantics/limits khác; convergence không thay business invariant.",
+      "en": "LWW, causal siblings and CRDTs have different semantics/limits; convergence does not replace business invariants."
+    },
+    {
+      "vi": "Sizing phải tính replica fanout, stable IO, compaction, repair và failure headroom.",
+      "en": "Sizing accounts for replica fanout, stable IO, compaction, repair and failure headroom."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ key tới guarantee có thể kiểm chứng",
+      "en": "From keys to testable guarantees"
+    },
+    "caption": {
+      "vi": "Giải thích ownership, ACK và recovery trước khi chọn node count.",
+      "en": "Explain ownership, acknowledgements and recovery before choosing node counts."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Place",
+          "en": "Place"
+        },
+        "detail": {
+          "vi": "Hash, vnodes và distinct topology-aware replicas.",
+          "en": "Hash, virtual nodes and distinct topology-aware replicas."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Acknowledge",
+          "en": "Acknowledge"
+        },
+        "detail": {
+          "vi": "W/R, stable durability boundary và unknown outcomes.",
+          "en": "Define W/R, stable durability boundaries and unknown outcomes."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Reconcile",
+          "en": "Reconcile"
+        },
+        "detail": {
+          "vi": "Causal versions, siblings và tombstones.",
+          "en": "Handle causal versions, siblings and tombstones."
+        },
+        "icon": "compare"
+      },
+      {
+        "title": {
+          "vi": "Repair và operate",
+          "en": "Repair and operate"
+        },
+        "detail": {
+          "vi": "Hints, trees, rebalance, hot keys và bounded recovery.",
+          "en": "Manage hints, trees, rebalancing, hot keys and bounded recovery."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Chọn guarantee trước khi chọn ring",
+        "en": "1. Choose guarantees before choosing a ring"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline là get/put/delete cho opaque keys, values nhỏ dưới 10 KB theo policy, partitioned/replicated qua nhiều node. Range scans, secondary indexes và multi-key transactions ngoài baseline. Mục tiêu illustrative là 1 triệu ops/s peak và single-region p99 vài milliseconds khi đủ capacity; phải benchmark workload, value size, persistence và failure condition thay vì hứa latency từ tên công nghệ.",
+          "en": "The baseline offers get/put/delete for opaque keys with policy-bounded small values below ten KB, partitioned/replicated across nodes. Range scans, secondary indexes and multi-key transactions are outside the baseline. Illustrative targets are one million peak operations/second and single-region p99 of a few milliseconds with adequate capacity; benchmark workload, values, persistence and failures instead of inferring latency from technology names."
+        },
+        {
+          "vi": "Dynamo-style leaderless store có thể ưu tiên chấp nhận writes trong nhiều failure scenarios và reconcile sau. Nó không “always writable” nếu không còn admitted durable target, hết disk/quota hoặc request cần W lớn. Nếu product cần linearizable compare-and-set, inventory invariant hay fencing token, chọn consensus-backed per-range protocol và API phù hợp; không thêm một Redis lock bên ngoài rồi tuyên bố store đã có strong consistency.",
+          "en": "A Dynamo-style leaderless store can prioritize accepting writes through many failures and reconcile later. It is not always writable without reachable admitted durable targets, disk/quota capacity or sufficient W responses. Products requiring linearizable compare-and-set, inventory invariants or fencing tokens need suitable consensus-backed per-range protocols/APIs; an external Redis lock alone does not make the store strongly consistent."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Leaderless baseline",
+            "en": "Leaderless baseline"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Versioned writes, tunable R/W và explicit conflicts; availability phụ thuộc reachable quorum/policy.",
+              "en": "Versioned writes, tunable R/W and explicit conflicts; availability depends on reachable quorums/policies."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Consensus alternative",
+            "en": "Consensus alternative"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Majority commit và linearizable read protocol khi cần; minority có thể từ chối.",
+              "en": "Use majority commits and linearizable-read protocols when needed; minority partitions may refuse operations."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Không có free guarantee",
+            "en": "No free guarantee"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Timeout không chứng minh rollback; quorum overlap không chứng minh linearizability.",
+              "en": "Timeouts do not prove rollbacks, and quorum overlaps do not prove linearizability."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Tính replica operations, không chỉ client QPS",
+        "en": "2. Count replica operations, not just client QPS"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả sử 10 tỷ keys × 1 KB value = 10 TB raw values, N=3 tạo 30 TB values. Key bytes, version metadata, tombstones, indexes, WAL, compaction overlap và backups chưa được tính. Nếu node có 2 TB usable cho budget này và multiplier headroom 1,5 thì ceil(30/2×1,5)=23 nodes về storage; đây chưa là topology-safe deployment plan.",
+          "en": "Ten billion keys times one KB/value gives ten TB of raw values and thirty TB at N=3. This excludes keys, version metadata, tombstones, indexes, WALs, compaction overlap and backups. With two usable TB/node for this budget and a 1.5 headroom multiplier, storage sizing gives ceil(30/2×1.5)=23 nodes; that is not yet a topology-safe deployment plan."
+        },
+        {
+          "vi": "Peak 1M ops/s, 80% read và 20% write. Nếu mỗi read thật sự chỉ phát tới R=2 và mỗi write phát tới N=3, replica operations = 1M×(0,8×2+0,2×3)=2,2M/s. Giả sử benchmark đúng workload đạt 50K replica ops/s/node: cần 44 nodes trước reserve, 66 nếu nhân 1,5. Nếu read cũng fanout N=3 hoặc hedges tăng, con số khác; repair/rebalance/compaction cạnh tranh cùng tài nguyên.",
+          "en": "At one million peak operations/second, eighty percent reads and twenty percent writes, exactly two read replicas and three write replicas imply 1M×(0.8×2+0.2×3)=2.2M replica operations/second. A workload-specific benchmark of fifty thousand replica operations/second/node gives forty-four nodes before reserve or sixty-six with a 1.5 multiplier. Reading all three replicas or hedging changes this; repairs, rebalancing and compaction compete for resources."
+        },
+        {
+          "vi": "50K ops/s/node là input có điều kiện, không capability mặc định. Test skew, SSD latency/fsync, network bytes, value sizes, hot partitions và một AZ down. Replica placement phải giữ đủ quorum sau failure domain loss; tổng CPU headroom một mình không chứng minh điều đó.",
+          "en": "Fifty thousand operations/second/node is a conditional input, not a default capability. Test skew, SSD latency/fsync, network bytes, values, hot partitions and AZ loss. Replica placement must preserve required quorums after failure-domain loss; aggregate CPU headroom alone does not prove this."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sizing KV",
+            "en": "KV sizing"
+          },
+          {
+            "vi": "Công thức theo baseline",
+            "en": "Baseline calculation"
+          },
+          {
+            "vi": "Kết quả cần điều kiện",
+            "en": "Conditional result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Raw values",
+              "en": "Raw values"
+            },
+            {
+              "vi": "10B × 1 KB",
+              "en": "10B × 1 KB"
+            },
+            {
+              "vi": "10 TB",
+              "en": "10 TB"
+            }
+          ],
+          [
+            {
+              "vi": "Replicated values",
+              "en": "Replicated values"
+            },
+            {
+              "vi": "10 TB × N=3",
+              "en": "10 TB × N=3"
+            },
+            {
+              "vi": "30 TB trước overhead",
+              "en": "30 TB before overhead"
+            }
+          ],
+          [
+            {
+              "vi": "Storage nodes",
+              "en": "Storage nodes"
+            },
+            {
+              "vi": "ceil(30 / 2 × 1,5)",
+              "en": "ceil(30 / 2 × 1.5)"
+            },
+            {
+              "vi": "23 theo budget giả định",
+              "en": "23 under the assumed budget"
+            }
+          ],
+          [
+            {
+              "vi": "Replica operations/s",
+              "en": "Replica operations/s"
+            },
+            {
+              "vi": "1M × (0,8×R2 + 0,2×N3)",
+              "en": "1M × (0.8×R2 + 0.2×N3)"
+            },
+            {
+              "vi": "2,2M/s",
+              "en": "2.2M/s"
+            }
+          ],
+          [
+            {
+              "vi": "Throughput nodes",
+              "en": "Throughput nodes"
+            },
+            {
+              "vi": "2,2M / 50K × 1,5",
+              "en": "2.2M / 50K × 1.5"
+            },
+            {
+              "vi": "66 trước topology/IO review",
+              "en": "66 before topology/IO review"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Get có thể trả siblings; timeout có thể là unknown outcome",
+        "en": "3. Gets can return siblings; timeouts can mean unknown outcomes"
+      },
+      "paragraphs": [
+        {
+          "vi": "API phải ghi rõ key encoding/limit, value limit, namespace/tenant auth, TTL và consistency allowlist. Causal context là opaque metadata từ read trước, giúp nhận biết overwrite theo quan hệ nhân quả; context không là lease hoặc proof rằng chỉ một writer tồn tại. API có thể expose R/W hoặc named consistency levels nhưng không cho client phá durability/security policy bằng tham số tùy ý.",
+          "en": "Specify key encodings/limits, value limits, tenant authentication, TTLs and allowed consistency policies. Causal contexts are opaque metadata from prior reads that help identify causally related overwrites; they are not leases or proof of a sole writer. APIs may expose R/W or named levels without letting clients bypass durability/security policies."
+        },
+        {
+          "vi": "Operation ID chỉ dedup nếu store persist identity/result atomically với mutation theo contract và retention tương thích retry; không tự có vì header tên Idempotency-Key. Unknown timeout phải được resolve bằng retry identity hoặc read/reconciliation có semantics rõ, không rollback giả. DELETE ghi versioned tombstone để stale value không tự quay lại trong repair.",
+          "en": "Operation IDs deduplicate only when identities/results persist with mutations under a defined atomicity/retention contract; naming a header Idempotency-Key does not supply that. Resolve ambiguous timeouts through retry identities or explicit reads/reconciliation, not pretend rollbacks. DELETE writes versioned tombstones so repair does not simply revive stale values."
+        }
+      ],
+      "api": [
+        {
+          "method": "PUT",
+          "path": "/v1/kv/{encodedKey}",
+          "description": {
+            "vi": "Versioned write với context và allowlisted consistency policy.",
+            "en": "Versioned writes with contexts and allowed consistency policies."
+          },
+          "request": "{ value, context?, operationId?, consistency: \"home-quorum\" }",
+          "response": "200 { context, durabilityPolicy } | 409 { siblings } | 503 { outcome: \"unknown\" }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/kv/{encodedKey}",
+          "description": {
+            "vi": "Trả reconciled value hoặc siblings theo data model.",
+            "en": "Return reconciled values or siblings under the data model."
+          },
+          "response": "200 { values[], context } | 404 { context? } | 503"
+        },
+        {
+          "method": "DELETE",
+          "path": "/v1/kv/{encodedKey}",
+          "description": {
+            "vi": "Ghi tombstone cùng version/context, có retry semantics như write.",
+            "en": "Write tombstones with versions/contexts and write-like retry semantics."
+          },
+          "request": "{ context?, operationId?, consistency }",
+          "response": "200 { context } | 503 { outcome: \"unknown\" }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Coordinator là request role, không phải global leader",
+        "en": "4. A coordinator is a request role, not a global leader"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thin client có thể gửi tới bất kỳ ingress coordinator; smart client dùng topology metadata route thẳng tới owner rồi xử lý stale-map redirects. Coordinator hash key, tìm preference list N distinct physical nodes theo topology epoch và fanout. Nó không nhất thiết là first clockwise owner. Placement cần rack/AZ awareness; N vnode cùng một máy không phải N durable copies.",
+          "en": "Thin clients can contact arbitrary coordinators; smart clients route using topology metadata and handle stale-map redirects. Coordinators hash keys, find N distinct physical replicas under a topology epoch and fan out. Coordinators need not be the first clockwise owner. Placement needs rack/AZ awareness: N virtual nodes on one machine are not N durable copies."
+        },
+        {
+          "vi": "Storage engine ở mỗi replica xử lý log/memtable/SSTables, version reconciliation và tombstone semantics. Membership/topology control, failure suspicion, data placement và background repair là các subsystem liên quan nhưng không được nhập thành một “gossip làm hết”. Logical arrows minh họa fanout không có nghĩa coordinator gửi tuần tự từng replica.",
+          "en": "Replica engines handle logs/memtables/SSTables, reconciliation and tombstones. Membership/topology control, failure suspicion, placement and repair are related but distinct subsystems rather than gossip doing everything. Logical diagram arrows do not imply sequential replica fanout."
+        }
+      ],
+      "diagram": {
+        "id": "kv-home-and-repair",
+        "title": {
+          "vi": "Coordinator, home replicas và repair là các vai trò khác nhau",
+          "en": "Coordinators, home replicas and repair have different roles"
+        },
+        "caption": {
+          "vi": "Baseline leaderless minh họa N=3. ACK phụ thuộc W và durability contract; fallback hints được tách khỏi home quorum, không tuyên bố linearizability.",
+          "en": "The leaderless baseline illustrates N=3. Acknowledgement depends on W and the durability contract; fallback hints are separate from home quorums and do not establish linearizability."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client",
+              "en": "Client"
+            },
+            "detail": {
+              "vi": "Giữ request identity/context khi retry, deadline và policy xử lý siblings/timeout.",
+              "en": "Preserves request identities/contexts on retries, deadlines and sibling/timeout policies."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "coord",
+            "label": {
+              "vi": "Request coordinator",
+              "en": "Request coordinator"
+            },
+            "detail": {
+              "vi": "Nhận request rồi route bằng topology epoch và preference list; không nhất thiết là first owner.",
+              "en": "Routes requests using topology epochs and preference lists; need not be the first owner."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "r1",
+            "label": {
+              "vi": "Home A / AZ1",
+              "en": "Home A / AZ1"
+            },
+            "detail": {
+              "vi": "WAL theo durability boundary, versions và tombstones cho key range.",
+              "en": "Stores WAL entries under a durability boundary, versions and tombstones for the range."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "r2",
+            "label": {
+              "vi": "Home B / AZ2",
+              "en": "Home B / AZ2"
+            },
+            "detail": {
+              "vi": "Replica độc lập failure domain; read có thể trả stale hoặc sibling.",
+              "en": "An independent failure-domain replica; reads may return stale values or siblings."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "r3",
+            "label": {
+              "vi": "Home C / AZ3",
+              "en": "Home C / AZ3"
+            },
+            "detail": {
+              "vi": "Có thể tạm unreachable; gossip suspicion không đồng nghĩa xóa membership.",
+              "en": "May be temporarily unreachable; gossip suspicion does not remove membership."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "fallback",
+            "label": {
+              "vi": "Fallback D / hints",
+              "en": "Fallback D / hints"
+            },
+            "detail": {
+              "vi": "Chỉ dùng khi sloppy policy cho phép; durable hint vẫn có expiry/capacity và failure risk.",
+              "en": "Used only under sloppy policies; durable hints still have expiry/capacity and failure risks."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "topology",
+            "label": {
+              "vi": "Topology / epochs",
+              "en": "Topology / epochs"
+            },
+            "detail": {
+              "vi": "Placement, distinct owners và migration epoch có coordination riêng; không lấy heartbeat làm ownership commit.",
+              "en": "Coordinates placement, distinct owners and migration epochs separately from heartbeats."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "repair",
+            "label": {
+              "vi": "Range repair",
+              "en": "Range repair"
+            },
+            "detail": {
+              "vi": "So canonical range trees, stream differences và reconcile versions; throttle disk/network.",
+              "en": "Compares canonical range trees, streams differences and reconciles versions with disk/network throttling."
+            },
+            "x": 740,
+            "y": 710,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "write",
+            "label": {
+              "vi": "Home write với W=2",
+              "en": "Home write with W=2"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "coord",
+                "description": {
+                  "vi": "PUT k,v với context và stable operation identity nếu API hỗ trợ dedup.",
+                  "en": "PUT k,v with context and a stable operation identity when the API supports deduplication."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "topology",
+                "description": {
+                  "vi": "Lookup N distinct home nodes theo active placement epoch.",
+                  "en": "Look up N distinct home nodes under the active placement epoch."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "r1",
+                "description": {
+                  "vi": "Gửi mutation với version/causal metadata và durability yêu cầu.",
+                  "en": "Send the mutation with version/causal metadata and required durability."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "r2",
+                "description": {
+                  "vi": "Fanout tới B, không chờ A mới bắt đầu.",
+                  "en": "Fan out to B without waiting for A first."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "r3",
+                "description": {
+                  "vi": "C cũng nhận mutation hoặc trở nên lag nếu network chậm.",
+                  "en": "C also receives the mutation or lags when the network is slow."
+                }
+              },
+              {
+                "from": "r1",
+                "to": "coord",
+                "description": {
+                  "vi": "ACK sau stable boundary của A; append memory-only không đủ nếu contract cần crash durability.",
+                  "en": "A acknowledges after its stable boundary; memory-only appends do not satisfy crash-durable contracts."
+                }
+              },
+              {
+                "from": "r2",
+                "to": "coord",
+                "description": {
+                  "vi": "ACK thứ hai hoàn tất W=2; C chưa nhất thiết đã xong.",
+                  "en": "The second ACK satisfies W=2; C need not have finished."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "client",
+                "description": {
+                  "vi": "Trả success cùng context/version; durability chỉ trong failure model đã chọn.",
+                  "en": "Return success with context/version under the chosen failure model."
+                }
+              }
+            ]
+          },
+          {
+            "id": "read",
+            "label": {
+              "vi": "Read và reconcile",
+              "en": "Read and reconcile"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "coord",
+                "description": {
+                  "vi": "GET với R và session context nếu cần.",
+                  "en": "GET with R and any required session context."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "r2",
+                "description": {
+                  "vi": "Đọc version, value và tombstone metadata.",
+                  "en": "Read versions, values and tombstone metadata."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "r3",
+                "description": {
+                  "vi": "Đọc replica thứ hai theo read policy.",
+                  "en": "Read another replica under the read policy."
+                }
+              },
+              {
+                "from": "r2",
+                "to": "coord",
+                "description": {
+                  "vi": "B trả version mới; read result chưa chỉ là scalar timestamp.",
+                  "en": "B returns a newer version; read results contain more than scalar timestamps."
+                }
+              },
+              {
+                "from": "r3",
+                "to": "coord",
+                "description": {
+                  "vi": "C có thể stale hoặc concurrent sibling; reconcile theo declared policy.",
+                  "en": "C may be stale or contain concurrent siblings; reconcile under the declared policy."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "client",
+                "description": {
+                  "vi": "Trả reconciled result/context hoặc siblings. Không âm thầm merge application semantics tùy tiện.",
+                  "en": "Return reconciled results/contexts or siblings without arbitrary application-level merges."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "r3",
+                "description": {
+                  "vi": "Read repair nếu policy bật; không thay thế background repair cho cold keys.",
+                  "en": "Perform read repair when enabled; this does not replace cold-key background repair."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "hint",
+            "label": {
+              "vi": "Fallback và hinted handoff",
+              "en": "Fallback and hinted handoff"
+            },
+            "steps": [
+              {
+                "from": "coord",
+                "to": "r3",
+                "description": {
+                  "vi": "C timeout/unreachable; chưa chứng minh C chết hoặc mutation chưa tới C.",
+                  "en": "C times out/is unreachable, proving neither death nor that the mutation never arrived."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "fallback",
+                "description": {
+                  "vi": "Nếu cho phép sloppy writes, ghi value + intended home C + version/hint.",
+                  "en": "When sloppy writes are allowed, store the value, intended home C and version/hint."
+                }
+              },
+              {
+                "from": "fallback",
+                "to": "coord",
+                "description": {
+                  "vi": "ACK fallback chỉ được đếm theo contract sloppy; fixed-home proof không còn áp dụng nguyên trạng.",
+                  "en": "Count the fallback ACK only under the sloppy contract; fixed-home overlap proofs no longer apply unchanged."
+                }
+              },
+              {
+                "from": "fallback",
+                "to": "r3",
+                "description": {
+                  "vi": "Khi C recover, replay bounded hints idempotently; hint expiry/loss còn cần anti-entropy.",
+                  "en": "When C recovers, replay bounded hints idempotently; expired/lost hints still require anti-entropy."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "repair",
+            "label": {
+              "vi": "Cold range anti-entropy",
+              "en": "Cold-range anti-entropy"
+            },
+            "steps": [
+              {
+                "from": "repair",
+                "to": "r1",
+                "description": {
+                  "vi": "Yêu cầu tree cho cùng range, encoding và repair snapshot/version semantics.",
+                  "en": "Request a tree for matching ranges, encodings and repair snapshot/version semantics."
+                }
+              },
+              {
+                "from": "repair",
+                "to": "r3",
+                "description": {
+                  "vi": "So root/children; matching subtree không cần stream mọi record.",
+                  "en": "Compare roots/children; matching subtrees need no full-record stream."
+                }
+              },
+              {
+                "from": "r1",
+                "to": "repair",
+                "description": {
+                  "vi": "Trả các divergent records cùng causal/delete metadata.",
+                  "en": "Return divergent records with causal/deletion metadata."
+                }
+              },
+              {
+                "from": "repair",
+                "to": "r3",
+                "description": {
+                  "vi": "Reconcile và stream missing state, không copy A blindly đè concurrent value.",
+                  "en": "Reconcile and stream missing state without blindly overwriting concurrent values from A."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "partitioning",
+      "title": {
+        "vi": "5. Ring và vnodes giảm movement nhưng không xóa hot keys",
+        "en": "5. Rings and virtual nodes reduce movement without eliminating hot keys"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hash key vào token space; preference list chọn owners distinct và topology-aware. Vnodes chia data thành nhiều ranges để cân assignment và recovery work; bigger node có thể nhận weight lớn hơn nếu placement algorithm hỗ trợ. Với balanced random membership, thêm một node vào n nodes có thể chuyển khoảng 1/(n+1) keys theo kỳ vọng, không guarantee worst-case bytes hoặc QPS.",
+          "en": "Hash keys into token space and choose distinct topology-aware owners. Virtual nodes divide data into ranges to balance assignments/recovery work; supported placement algorithms can weight larger nodes. Under balanced random membership, adding a node to n nodes may move an expected roughly 1/(n+1) of keys, not a worst-case guarantee for bytes or QPS."
+        },
+        {
+          "vi": "Ring demo dưới minh họa placement/collision và key movement. Một hot key vẫn thuộc một replica group dù bạn thêm hàng nghìn vnodes. Online bootstrap cần stream snapshot + mutation catch-up và ownership epoch để chuyển quyền không bỏ writes; xóa một token khỏi config không tự copy data an toàn.",
+          "en": "The ring demo illustrates placement/collisions and key movement. Hot keys remain in one replica group even with thousands of virtual nodes. Online bootstrapping needs snapshot streaming, mutation catch-up and ownership epochs to transfer safely; deleting a token from configuration does not safely migrate data."
+        }
+      ],
+      "experiment": "hash-ring"
+    },
+    {
+      "id": "quorums",
+      "title": {
+        "vi": "6. Quorum overlap có giả định và không là linearizability",
+        "en": "6. Quorum overlaps have assumptions and are not linearizability"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với cùng fixed home set N, R+W>N bảo đảm read set và acknowledged write set giao ít nhất R+W−N node. Muốn đọc được version thích hợp còn cần correct version comparison/reconciliation, durable ACK, membership stability và concurrency semantics. Concurrent/partial writes, sloppy fallback và read protocol có thể làm hành vi khác với “latest real-time write”; không gọi quorum arithmetic là proof của CAS/linearizability.",
+          "en": "Within one fixed home set N, R+W>N ensures at least R+W−N overlapping nodes. Returning appropriate versions additionally requires correct comparisons/reconciliation, durable acknowledgements, stable membership and concurrency semantics. Concurrent/partial writes, sloppy fallbacks and read protocols differ from latest-real-time-write behavior; quorum arithmetic does not prove CAS or linearizability."
+        },
+        {
+          "vi": "N3/W2/R2 cần hai reachable homes cho mỗi loại operation và không chịu được partition 1|1|1 theo home quorum. N3/W1/R3 làm writes dễ hơn nhưng read cần cả ba; W1 không có nghĩa luôn available khi target unreachable/full. Demo chỉ xét fixed-set intersection và sufficient response count, không chạy storage hay conflicts.",
+          "en": "N3/W2/R2 needs two reachable homes per operation type and cannot serve home quorums through a 1|1|1 partition. N3/W1/R3 makes writes easier but requires all three for reads; W1 is not available when targets are unreachable/full. The demo checks fixed-set intersections and response counts, not storage or conflicts."
+        }
+      ],
+      "experiment": "quorum"
+    },
+    {
+      "id": "failure-repair",
+      "title": {
+        "vi": "7. Hints, read repair và anti-entropy bổ sung cho nhau",
+        "en": "7. Hints, read repair and anti-entropy complement each other"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sloppy quorum có thể ghi sang fallback node ngoài home set, gắn intended owner và version để hinted handoff sau. Availability tăng theo policy nhưng W acknowledgements ở fallback không còn chứng minh overlap với một home read set. Hints có bounded retention/disk và có thể mất nếu holder hỏng; cần backpressure/expiry metrics, không xem là permanent replication.",
+          "en": "Sloppy quorums may write to fallback nodes outside the home set, retaining intended owners/versions for hinted handoff. Availability improves under the policy, but fallback acknowledgements no longer prove overlap with home reads. Hints have bounded retention/disk and can be lost with holders; monitor/backpressure/expire them rather than treating them as permanent replication."
+        },
+        {
+          "vi": "Read repair sửa versions khác nhau cho những keys được đọc khi policy cho phép; cold keys có thể stale mãi nếu không có background anti-entropy. Range repair so differences và stream state, gồm tombstones/version context. Permanent node replacement/re-replication là workflow khác temporary handoff: phải rebuild đủ copies và tránh làm recovery traffic gây overload domino.",
+          "en": "Read repair addresses differing versions of read keys when policy allows; cold keys can remain stale indefinitely without anti-entropy. Range repair compares differences and streams state including tombstones/version contexts. Permanent replacement/re-replication differs from temporary handoff: restore sufficient copies without recovery traffic causing cascading overload."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Các tầng sửa dữ liệu",
+          "en": "Repair layers"
+        },
+        "caption": {
+          "vi": "Không cơ chế đơn lẻ nào bao phủ mọi fault; repair phải được vận hành và giám sát.",
+          "en": "No single mechanism covers every fault; repair requires operation and monitoring."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Transient miss",
+              "en": "Transient misses"
+            },
+            "detail": {
+              "vi": "Bounded hints giữ intended destination/version.",
+              "en": "Bounded hints retain intended destinations/versions."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Read divergence",
+              "en": "Read divergence"
+            },
+            "detail": {
+              "vi": "Reconcile/read repair khi key được đọc.",
+              "en": "Reconcile/read-repair accessed keys."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Cold divergence",
+              "en": "Cold divergence"
+            },
+            "detail": {
+              "vi": "Scheduled range anti-entropy và throttled streaming.",
+              "en": "Schedule range anti-entropy and throttle streaming."
+            },
+            "icon": "compare"
+          },
+          {
+            "title": {
+              "vi": "Permanent replacement",
+              "en": "Permanent replacement"
+            },
+            "detail": {
+              "vi": "Epoch-aware bootstrap, restore copies và verify.",
+              "en": "Bootstrap under epochs, restore copies and verify."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
+    },
+    {
+      "id": "merkle",
+      "title": {
+        "vi": "8. Merkle tree định vị divergent ranges, không tự chọn winner",
+        "en": "8. Merkle trees locate divergent ranges without choosing winners"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cùng key-range boundaries và canonical record representation tạo leaf digests rồi parent digests. Matching root cho biết represented states khớp với giả định collision-resistant hashing và cùng encoding/repair semantics. Root khác thì descend branches khác; tree có thể đại diện range buckets nên một leaf mismatch còn cần scan/stream nhiều records, không nhất thiết một key như demo.",
+          "en": "Matching range boundaries and canonical record representations produce leaf and parent digests. Equal roots indicate matching represented states under collision-resistant hashing and identical encodings/repair semantics. Different roots lead into differing branches. Real leaves can represent range buckets requiring many records to scan/stream, unlike this single-key-leaf demo."
+        },
+        {
+          "vi": "Tree construction vẫn đọc/hash data, incremental maintenance vẫn tốn writes, và repairing bytes vẫn tốn network/IO. Nếu mọi range khác, không có magic sublinear full repair. Concurrent mutations cần snapshot hoặc repair/session semantics để comparison không báo kết luận sai từ hai thời điểm không tương thích. Phải include delete/version/context state thích hợp; chỉ hash value text có thể bỏ sót tombstone hoặc causality khác.",
+          "en": "Tree construction reads/hashes data, incremental maintenance costs writes, and repairs consume network/IO. Fully divergent ranges do not receive magical sublinear repairs. Concurrent mutations need snapshot or repair-session semantics to avoid incompatible-time comparisons. Include appropriate deletion/version/context state: hashing only value text can miss tombstones or differing causality."
+        }
+      ],
+      "experiment": "merkle-repair"
+    },
+    {
+      "id": "conflicts",
+      "title": {
+        "vi": "9. LWW, causal siblings và CRDT có semantics khác nhau",
+        "en": "9. LWW, causal siblings and CRDTs have different semantics"
+      },
+      "paragraphs": [
+        {
+          "vi": "LWW chọn theo total ordering của timestamp/tie-breaker; có thể discard concurrent update và clock skew làm user edit sau có timestamp nhỏ hơn. HLC cải thiện time/causal properties theo protocol nhưng không tự resolve application intent. Version vectors/context có thể phát hiện dominates hay concurrent; nếu client bỏ context hoặc hệ thống prune metadata quá mạnh, guarantee suy giảm. Trả siblings chỉ giữ evidence, application vẫn phải merge đúng và giới hạn sibling explosion.",
+          "en": "LWW uses a total timestamp/tie-breaker ordering, potentially discarding concurrent updates; skew can give later user edits smaller timestamps. HLC properties do not automatically resolve application intent. Version vectors/contexts can distinguish dominance from concurrency, but omitted contexts or aggressive pruning weaken guarantees. Returning siblings preserves evidence, while applications still need correct merges and bounded sibling growth."
+        },
+        {
+          "vi": "CRDT định nghĩa merge cho data type và update model cụ thể; convergence không đồng nghĩa giữ mọi product invariant. Ví dụ counter merge không tự ngăn inventory âm, set add/remove có policy khác nhau và retry duplicate increments cần operation semantics. Chọn conflict behavior bằng business meaning thay vì gắn nhãn “no data loss” cho mọi vector clock/CRDT.",
+          "en": "CRDTs define merges for specific data types/update models; convergence does not preserve every product invariant. Merged counters do not inherently prevent negative inventory, sets have different add/remove policies and duplicate increments need operation semantics. Choose conflicts by business meaning rather than labeling all vector clocks/CRDTs as lossless."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Policy conflict KV",
+            "en": "KV conflict policy"
+          },
+          {
+            "vi": "Giữ lại điều gì",
+            "en": "What it retains"
+          },
+          {
+            "vi": "Điều phải chấp nhận",
+            "en": "What must be accepted"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "LWW",
+              "en": "LWW"
+            },
+            {
+              "vi": "Một deterministic winner theo ordering đã định nghĩa.",
+              "en": "One deterministic winner under defined ordering."
+            },
+            {
+              "vi": "Concurrent user intent có thể bị discard; skew/tie-breaker quan trọng.",
+              "en": "Concurrent intent may be discarded; skew/tie-breakers matter."
+            }
+          ],
+          [
+            {
+              "vi": "Causal siblings",
+              "en": "Causal siblings"
+            },
+            {
+              "vi": "Incomparable versions/context để application resolve.",
+              "en": "Incomparable versions/contexts for application resolution."
+            },
+            {
+              "vi": "Metadata/siblings growth và context lifecycle.",
+              "en": "Metadata/sibling growth and context lifecycles."
+            }
+          ],
+          [
+            {
+              "vi": "CRDT",
+              "en": "CRDT"
+            },
+            {
+              "vi": "Data-type-specific convergent state/operations.",
+              "en": "Data-type-specific convergent states/operations."
+            },
+            {
+              "vi": "Chỉ guarantee trong assumptions; không thay arbitrary transactions.",
+              "en": "Guarantees depend on assumptions; not arbitrary transactions."
+            }
+          ],
+          [
+            {
+              "vi": "Consensus/CAS",
+              "en": "Consensus/CAS"
+            },
+            {
+              "vi": "Serialized updates theo linearizable protocol.",
+              "en": "Serialized updates under a linearizable protocol."
+            },
+            {
+              "vi": "Quorum partition có thể unavailable; cost/latency khác.",
+              "en": "Quorum partitions may be unavailable; costs/latencies differ."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "engine",
+      "title": {
+        "vi": "10. WAL durability, LSM và version-aware reads",
+        "en": "10. WAL durability, LSMs and version-aware reads"
+      },
+      "paragraphs": [
+        {
+          "vi": "Replica ghi WAL, apply memtable rồi flush immutable SSTables và compact theo engine. “append log” không tự có crash durability nếu chưa đạt fsync/group-commit/storage contract. ACK policy phải nói persist tới đâu và bao nhiêu replicas; replica process memory còn sống không thay stable storage khi failure model gồm node loss. Disk corruption cần checksums/scrubbing và repair/backup riêng.",
+          "en": "Replicas write WALs, apply memtables, flush immutable SSTables and compact. Appending logs is not crash durability without the required fsync/group-commit/storage contract. ACK policies specify persistence boundaries and replica counts; process memory does not replace stable storage under node-loss models. Corruption also needs checksums/scrubbing, repair and backups."
+        },
+        {
+          "vi": "Read merge memtables/SSTables theo version/tombstone semantics, không đơn giản gặp file mới nhất là trả nếu ordering không đủ. Bloom filters loại chắc chắn không có key theo representation/assumptions, positive vẫn cần lookup; filter false positive tăng IO chứ không cho phép bỏ dữ liệu. Compaction có write/read/space amplification trade-offs; reserve disk cho concurrent outputs và repair thay vì chờ disk full.",
+          "en": "Reads merge memtables/SSTables under version/tombstone semantics rather than always returning the first matching newer file. Bloom filters exclude definitely absent keys under their representation/assumptions; positives still require lookup. False positives add IO rather than justify dropping records. Compaction trades read/write/space amplification, requiring disk reserve for overlapping outputs and repairs."
+        }
+      ]
+    },
+    {
+      "id": "membership",
+      "title": {
+        "vi": "11. Failure suspicion khác ownership transfer",
+        "en": "11. Failure suspicion differs from ownership transfer"
+      },
+      "paragraphs": [
+        {
+          "vi": "Heartbeat/gossip lan truyền observations; timeout chỉ là suspicion vì partition/GC pause cũng có thể làm node im lặng. Gossip convergence dựa vào network/fanout assumptions, không universal O(log n) completion bound. Permanent removal hoặc ownership change cần authorized topology workflow, epochs và bootstrap/stream catch-up; không tự xóa node khỏi ring ngay sau một ping miss.",
+          "en": "Heartbeats/gossip propagate observations; timeouts indicate suspicion because partitions/pauses can silence live nodes. Gossip convergence depends on network/fanout assumptions, not a universal logarithmic completion bound. Permanent removal/ownership changes need authorized topology workflows, epochs and bootstrap/stream catch-up rather than automatic ring deletion after one missed ping."
+        },
+        {
+          "vi": "Range migration phải giữ đủ replicas phục vụ reads/writes, transfer snapshot và tail mutations, verify rồi switch placement. Stale clients/coordinators cần refresh/forward/reject theo epoch; tránh old owner tiếp tục ACK writes ngoài active durability set. Throttle streaming/repair theo disk latency và queue depth, canary removal một node/AZ để kiểm capacity khi thiếu replica.",
+          "en": "Range migrations preserve serving replicas, transfer snapshots/tail mutations, verify and switch placement. Stale clients/coordinators refresh/forward/reject under epochs so old owners do not acknowledge outside active durability sets. Throttle streaming/repairs by disk latency/queue depth and test node/AZ removals under reduced replica capacity."
+        }
+      ]
+    },
+    {
+      "id": "deletion",
+      "title": {
+        "vi": "12. Tombstone GC cần chứng minh stale value không quay lại",
+        "en": "12. Tombstone collection must prevent stale-value resurrection"
+      },
+      "paragraphs": [
+        {
+          "vi": "Delete được replicate như một versioned mutation. Nếu tombstone biến mất ở A/B trong khi C offline còn old value, C quay lại hoặc repair có thể resurrect key. Chọn tombstone lifetime cùng repair completion, max offline/rejoin policy, backup restore và topology replacement rules; age timer một mình không chứng minh an toàn. Một node offline quá safety bound có thể phải rebuild trước rejoin.",
+          "en": "Deletions replicate as versioned mutations. If tombstones disappear from A/B while offline C retains old values, C’s return/repair can resurrect keys. Coordinate lifetimes with completed repair, maximum offline/rejoin policies, backup restores and topology rules; age timers alone do not establish safety. Nodes offline beyond safety bounds may require rebuilding before rejoining."
+        },
+        {
+          "vi": "TTL expiry cũng có distributed deletion semantics, clock assumptions và retention trade-offs; “hết TTL = ngay lập tức xóa mọi byte mọi replica/backup” là sai nếu engine không có contract đó. Tombstone-heavy workloads có thể tăng scans/compaction và tail latency; monitor distributions, không chỉ count total keys. Backup restore phải include delete history/watermark tương thích để không hồi sinh state đã xóa.",
+          "en": "TTL expiry also has distributed deletion semantics, clock assumptions and retention trade-offs; expiry does not inherently erase every replica/backup byte immediately. Tombstone-heavy workloads increase scans/compaction and tail latency; monitor distributions rather than total key counts alone. Restores need compatible deletion histories/watermarks to avoid resurrection."
+        }
+      ]
+    },
+    {
+      "id": "hot-regions",
+      "title": {
+        "vi": "13. Hot keys và nhiều region cần thay đổi semantics có chủ đích",
+        "en": "13. Hot keys and multiple regions need deliberate semantics"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hash phân bố key count, không bảo đảm QPS/bytes uniform. Hot reads có thể coalesce/cache hoặc add authorized read replicas với freshness policy; hot writes vào một key vẫn cần một merge/order model. Random suffix counter chia writes nhưng read phải sum/merge và retry dedup khác; không áp dụng cho arbitrary single-key CAS. Admission/tenant quotas chống một key hoặc customer làm nghẽn cả cluster.",
+          "en": "Hashing distributes key counts, not necessarily QPS/bytes. Hot reads can be coalesced/cached or served by authorized replicas under freshness policies; hot-key writes still need merge/order models. Random-suffix counters split writes but change aggregate reads and retry deduplication; they do not preserve arbitrary single-key CAS. Admission/tenant quotas prevent cluster-wide interference."
+        },
+        {
+          "vi": "Local quorum trong mỗi region không tự tạo global linearizability. Async cross-region replication có lag và conflict story; region disaster có RPO tùy những ACK được bảo vệ ở đâu. Global consensus hoặc home-region serialized writes cộng WAN latency/availability trade-offs. Nêu rõ read-your-writes khi user đổi region: session token, route home hoặc wait watermark có deadline; sticky routing đơn lẻ không bảo vệ mọi failover.",
+          "en": "Per-region local quorums do not create global linearizability. Asynchronous cross-region replication introduces lag/conflicts, with disaster RPO determined by ACK protection. Global consensus/home-region serialization incurs WAN latency/availability trade-offs. Define read-your-writes across region changes through session tokens, home routing or bounded watermark waits; stickiness alone does not cover every failover."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "14. Đo unknown outcomes, divergence và khả năng repair",
+        "en": "14. Measure unknown outcomes, divergence and repair capacity"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metric gồm client p50/p99 theo key/value/consistency, replica RPC fanout, ACK durability latency, ambiguous timeout rate, hint backlog/age, repair coverage/age, tombstone distributions, pending compaction, disk free reserve và bootstrap duration. Trace correlation không log raw sensitive key/value; tenant isolation, TLS/auth, at-rest keys/rotation và administrative audit là baseline.",
+          "en": "Metrics include latency by keys/values/consistency, replica RPC fanout, durable-ACK latency, ambiguous timeouts, hint ages/backlogs, repair coverage/ages, tombstone distributions, compaction backlog, disk reserve and bootstrap time. Correlation should not log raw sensitive keys/values. Baselines include tenant isolation, TLS/authentication, at-rest keys/rotation and administrative audits."
+        },
+        {
+          "vi": "Test coordinator crash sau một replica ACK, timeout sau W durable ACK nhưng trước response, concurrent writes qua partition, hint holder mất, cold-key repair, old node quay lại sau tombstone GC và topology change lúc write. Compare final versions/context/tombstones, không chỉ successful response count. Repair chỉ hội tụ nếu còn dữ liệu đúng và protocol/conflict policy có thể reconcile; nó không thay backup chống operator delete hoặc mọi replica cùng corruption.",
+          "en": "Test coordinator crashes after one ACK, timeouts after W durable ACKs before replies, partitioned concurrent writes, lost hint holders, cold-key repair, old-node return after tombstone collection and topology changes during writes. Compare versions/contexts/tombstones rather than successful response counts. Repair converges only with surviving correct data and suitable protocols/conflict policies; it does not replace backups against operator deletions or all-replica corruption."
+        }
+      ]
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "15. Luyện giải thích failure bằng state cụ thể",
+        "en": "15. Explain failures using concrete state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ ba homes, viết version trên từng node và ghi rõ ACK nào đã về client. Sau đó thêm timeout hoặc partition rồi thực hiện GET thật theo declared R/policy. Cách này lộ assumptions tốt hơn việc chỉ viết W+R>N.",
+          "en": "Draw three homes, write versions on each and mark which ACKs reached clients. Add a timeout/partition and perform a GET under the stated R/policy. This exposes assumptions better than writing W+R>N alone."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "N3/W2/R2 có phải linearizable không?",
+            "en": "Is N3/W2/R2 linearizable?"
+          },
+          "answer": [
+            {
+              "vi": "Không chỉ từ số đó. Có fixed-set overlap, nhưng read/version protocol, concurrent/partial writes và topology/sloppy semantics vẫn quyết định behavior. Nếu cần linearizable CAS hãy dùng protocol có proof phù hợp, chẳng hạn consensus-backed range và correct read path.",
+              "en": "Not from those numbers alone. Fixed-set overlap exists, but read/version protocols, concurrent/partial writes and topology/sloppy semantics determine behavior. Linearizable CAS needs a suitable protocol such as consensus-backed ranges with correct reads."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "PUT timeout có nên gửi rollback tới mọi replica?",
+            "en": "Should a timed-out PUT trigger rollbacks on every replica?"
+          },
+          "answer": [
+            {
+              "vi": "Timeout là unknown, có thể đã W ACK hoặc chỉ partial. Rollback ad hoc race với retry/concurrent writes và không an toàn. Dùng stable operation identity nếu supported, inspect/reconcile context theo API; cần transactions thì chọn protocol phù hợp.",
+              "en": "Timeouts are ambiguous: W may have acknowledged or only partial writes may exist. Ad hoc rollbacks race retries/concurrent writes. Use supported stable identities and contextual reconciliation, or a transaction protocol when required."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Read repair có thay được full background repair không?",
+            "en": "Can read repair replace background repair?"
+          },
+          "answer": [
+            {
+              "vi": "Không cho cold keys chưa đọc hoặc hint đã mất. Cần range anti-entropy coverage theo retention/deletion safety, gồm repair scheduling và capacity. Read repair policy cũng có thể tăng latency và khác giữa engines.",
+              "en": "Not for unread cold keys or lost hints. Range anti-entropy needs coverage compatible with retention/deletion safety plus scheduling/capacity. Read-repair policies also affect latency and differ across engines."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Merkle roots giống nhau có nghĩa mọi thứ tuyệt đối giống nhau?",
+            "en": "Do matching Merkle roots mean absolutely everything is identical?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ represented data theo cùng range, encoding, snapshot semantics và collision assumptions. Nếu bỏ tombstones/context khỏi encoding thì root không chứng minh chúng bằng nhau. Digest comparison không chọn winner và không miễn phí tree construction/IO.",
+              "en": "Only represented state under matching ranges, encodings, snapshot semantics and collision assumptions. Omitting tombstones/contexts means roots cannot prove those equal. Comparisons do not select winners or eliminate construction/IO costs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Node offline lâu trở lại sau GC tombstone thì sao?",
+            "en": "What if a long-offline node returns after tombstone collection?"
+          },
+          "answer": [
+            {
+              "vi": "Có nguy cơ resurrect stale values. Rejoin/rebuild và repair/retention policy phải ngăn điều đó, không chỉ tin timestamp cao/thấp. Test restore và replacement paths cùng deletion history.",
+              "en": "Stale values may resurrect. Rejoin/rebuild and repair/retention policies must prevent this instead of relying only on timestamp comparisons. Test restores/replacements against deletion histories."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Thêm vnodes có chữa hot key không?",
+            "en": "Do more virtual nodes fix a hot key?"
+          },
+          "answer": [
+            {
+              "vi": "Không; một key vẫn tới cùng replica group. Cache/coalesce reads, quota hoặc đổi data model cho writes. Random suffix chỉ đúng khi aggregation/merge semantics phù hợp; không giữ arbitrary CAS nguyên trạng.",
+              "en": "No: one key still reaches one replica group. Cache/coalesce reads, apply quotas or change write models. Random suffixes require suitable aggregation/merge semantics and do not preserve arbitrary CAS."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Append WAL rồi ACK có đủ durable không?",
+            "en": "Is appending a WAL then acknowledging sufficient durability?"
+          },
+          "answer": [
+            {
+              "vi": "Phải định nghĩa append đã tới đâu: userspace/kernel buffer hay stable storage, fsync/group commit và số replica ACK. Durability guarantee theo process/node/AZ failure khác nhau; không lấy tên WAL làm proof.",
+              "en": "Define whether appends reached user/kernel buffers or stable storage, fsync/group commits and acknowledged replica counts. Process/node/AZ failures require different guarantees; WAL terminology is not proof."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Gossip báo node dead có nên reassign ngay tất cả ranges?",
+            "en": "Should gossip suspicion immediately reassign every range?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Suspect có thể là network pause; ownership change cần controlled topology epoch và data transfer. Phân biệt transient hints với permanent replacement, throttle repair để không tạo cascade.",
+              "en": "No. Suspicion can reflect network pauses; ownership changes require controlled epochs/data transfers. Distinguish temporary hints from permanent replacement and throttle repair against cascades."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

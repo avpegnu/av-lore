@@ -1,5 +1,5 @@
-# Draft Chat chưa đưa vào website
+# Draft Chat đã được tiếp tục
 
-Lưu ngày 21/10/2026 khi chủ sở hữu yêu cầu tạm dừng. `chat.patch` chứa hai mô phỏng đang viết dở: session/gateway routing và gap-aware sync. Patch bao gồm component, model và wiring/style; chưa có chapter, bản Anh hoặc kiểm thử.
+Patch trong thư mục này là checkpoint ngày 21/10/2026. Đã áp dụng ngày 22/10/2026 và hoàn thiện thành `src/components/ChatPlayground.tsx`, `src/lib/chat-models.ts` cùng `src/content/handbook/chat.json`, bản Anh và kiểm thử. **Không apply lại patch lên source hiện tại.**
 
-Trước khi tiếp tục, đọc `../HANDBOOK_PROGRESS.md` và kiểm tra working tree. Có thể thử `git apply --unidiff-zero --check docs/work-in-progress/chat.patch` từ repo root; chỉ apply nếu còn phù hợp với source hiện tại. Nếu file đã thay đổi, đối chiếu và port từng phần, không ghi đè code mới. Draft không nằm trong build và chưa được xem là nội dung hoàn tất.
+Tiến độ mới nhất nằm trong `../HANDBOOK_PROGRESS.md`. Giữ bản patch làm lịch sử của checkpoint; source hiện tại mới là bản chuẩn.

@@ -11,7 +11,11 @@ const errors=[];
 page.on('pageerror',e=>errors.push({route:page.url(),message:String(e)}));
 const base=process.env.PREVIEW_URL||'http://127.0.0.1:4322/av-lore';
 const contentDirectory=process.env.HANDBOOK_CONTENT_DIR||'src/content/handbook';
-const lessons=fs.readdirSync(contentDirectory).filter(f=>f.endsWith('.json')).map(f=>JSON.parse(fs.readFileSync(path.join(contentDirectory,f),'utf8')));
+const allLessons=fs.readdirSync(contentDirectory).filter(f=>f.endsWith('.json')).map(f=>JSON.parse(fs.readFileSync(path.join(contentDirectory,f),'utf8')));
+const requestedIds=(process.env.HANDBOOK_IDS||'').split(',').filter(Boolean);
+assert.ok(requestedIds.every(id=>allLessons.some(l=>l.id===id)),'Unknown HANDBOOK_IDS entry');
+const lessons=requestedIds.length?allLessons.filter(l=>requestedIds.includes(l.id)):allLessons;
+assert.ok(lessons.length,'No handbook lessons selected');
 const routes=lessons.map(l=>(l.group==='case'?'handbook/system-design/':l.group==='episode'?'episodes/':l.group==='ai'?'ai-systems/':'system-design/')+l.id+'/');
 fs.mkdirSync('artifacts',{recursive:true});
 const report=[];
@@ -50,9 +54,13 @@ for(const locale of ['','en/'])for(const route of routes){
     const range=worksheet.locator('input[type=range]').first();
     const before=await worksheet.innerHTML();
     if(await range.count()){
-      await range.focus();await page.keyboard.press('ArrowRight');
+      await range.focus();
+      const direction=await range.evaluate(el=>Number(el.value)>=Number(el.max)?'ArrowLeft':'ArrowRight');
+      await page.keyboard.press(direction);
+    }else if(await worksheet.locator('input[type=checkbox]').count()){
+      await worksheet.locator('input[type=checkbox]').first().click();
     }else{
-      await worksheet.locator('.worksheet-choices button').last().click();
+      await worksheet.locator('.worksheet-choices button,button[aria-pressed=false]').last().click();
     }
     await page.waitForFunction(({index,previous})=>document.querySelectorAll('main .handbook-experiment')[index]?.innerHTML!==previous,{index:i,previous:before});
   }
@@ -89,7 +97,7 @@ for(const locale of ['','en/'])for(const route of routes){
     const overflow=await page.locator('.learning-flow,.learning-flow li > p,.learning-flow li > strong,.learning-card,.planner-checklist').evaluateAll(elements=>elements.filter(el=>el.clientWidth>0&&el.scrollWidth>el.clientWidth+1).map(el=>el.textContent.slice(0,100)));
     assert.deepEqual(overflow,[],'Visual content overflow '+locale+route);
   }
-  if(locale)await page.waitForFunction(()=>![...document.querySelectorAll('main astro-island[data-ui-ready=true]')].some(el=>/[ăâđêôơưĂÂĐÊÔƠƯ\u1EA0-\u1EF9]/.test(el.innerText)));
+  if(locale)await page.waitForFunction(()=>![...document.querySelectorAll('main astro-island[data-ui-ready=true]')].some(el=>(()=>{const clone=el.cloneNode(true);clone.querySelectorAll('[translate=no],script,style,template').forEach(n=>n.remove());return /[ăâđêôơưĂÂĐÊÔƠƯ\u1EA0-\u1EF9]/.test(clone.textContent);})()));
   await page.screenshot({path:'artifacts/handbook-'+(locale?'en-':'vi-')+route.split('/').filter(Boolean).at(-1)+'-mobile.png',fullPage:true});
   report.push({route:locale+route,interaction:'passed'});
 }

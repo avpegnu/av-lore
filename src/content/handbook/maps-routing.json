@@ -1,0 +1,1185 @@
+{
+  "id": "maps-routing",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Maps & Routing: tiles, đường đi và ETA",
+    "en": "Designing Maps & Routing: tiles, paths and ETA"
+  },
+  "summary": {
+    "vi": "Khám phá viewport cache, Dijkstra/A* và traffic trust; nối rendering, versioned routing và GPS processing thành một hệ thống có freshness rõ.",
+    "en": "Explore viewport caches, Dijkstra/A* and traffic trust, connecting rendering, versioned routing and GPS processing with explicit freshness."
+  },
+  "prerequisites": [
+    "proximity",
+    "caching",
+    "messaging",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "dsa",
+    "network",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Rendering, routing và traffic ingestion có SLO và bottleneck khác nhau.",
+      "en": "Rendering, routing and traffic ingestion have different SLOs and bottlenecks."
+    },
+    {
+      "vi": "Viewport hữu hạn; pyramid tăng 4^z; cache identity cần version và variants đúng.",
+      "en": "Viewports are bounded; pyramids grow as 4^z; cache identities need correct versions and variants."
+    },
+    {
+      "vi": "Directed graph, turn constraints và coherent weights quyết định route có đúng không.",
+      "en": "Directed graphs, turn constraints and coherent weights determine route correctness."
+    },
+    {
+      "vi": "GPS matching cần chuỗi; ETA cần freshness/quality và prediction theo lúc tới segment.",
+      "en": "GPS matching needs sequences; ETA needs fresh, qualified, arrival-time predictions."
+    },
+    {
+      "vi": "Batching, offline và privacy đều có policy/giới hạn phải nêu rõ.",
+      "en": "Batching, offline behavior and privacy need explicit policies and limits."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ thao tác tới đúng plane",
+      "en": "Choose the plane for the action"
+    },
+    "caption": {
+      "vi": "Dùng chung compatible manifests nhưng tách scaling và failure behavior.",
+      "en": "Share compatible manifests while separating scaling and failure behavior."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Vẽ bản đồ",
+          "en": "Render"
+        },
+        "detail": {
+          "vi": "Viewport keys → cache/CDN → compatible renderer assets.",
+          "en": "Viewport keys → cache/CDN → compatible renderer assets."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Tìm đường",
+          "en": "Route"
+        },
+        "detail": {
+          "vi": "Snap → legal graph/profile → traffic snapshot → alternatives.",
+          "en": "Snap → legal graph/profile → traffic snapshot → alternatives."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Học traffic",
+          "en": "Update traffic"
+        },
+        "detail": {
+          "vi": "Sequenced fixes → matching → segment/time aggregates.",
+          "en": "Sequenced fixes → matching → segment/time aggregates."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Vận hành",
+          "en": "Operate"
+        },
+        "detail": {
+          "vi": "Observe freshness, closures, version rollout và privacy.",
+          "en": "Observe freshness, closures, version rollout and privacy."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Ba hệ thống ghép lại, không phải một database lớn",
+        "en": "1. Three cooperating systems rather than one large database"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thiết kế maps cần tách rendering, route computation và location-to-traffic pipeline. Rendering chủ yếu phân phối assets/cache; routing là tính toán trên road graph; traffic là stream có dữ liệu nhiễu và độ trễ. Ba luồng dùng SLO và scaling knobs khác nhau. Bài này chọn driving navigation với bản đồ, route alternatives, ETA và rerouting; places/reviews, Street View và transit nằm ngoài scope. Đây là kiến trúc học tập, không khẳng định sơ đồ nội bộ của bất kỳ công ty nào.",
+          "en": "Mapping combines rendering, route computation and a location-to-traffic pipeline. Rendering distributes cached assets; routing computes over road graphs; traffic processes noisy, delayed streams. Each path needs different SLOs and scaling controls. This lesson covers driving maps, alternatives, ETA and rerouting; places/reviews, imagery and transit are outside scope. It is an educational architecture rather than a claim about any company’s private system."
+        },
+        {
+          "vi": "Chốt p99 route latency theo region/mode, tỷ lệ tile load hoàn tất, độ mới traffic và ETA error theo loại chuyến đi. “Sai số vài phần trăm” chưa đủ nếu chưa định nghĩa ground truth, horizon, tập chuyến và tail error. Người dùng phải biết khi đang dùng offline/stale estimate. Location upload là opt-in có policy rõ; không cần raw traces dài hạn để đáp ứng mọi chức năng.",
+          "en": "Define route p99 by region/mode, completed tile-load rates, traffic freshness and ETA error by trip class. A percentage target is incomplete without ground truth, prediction horizon, trip populations and tail errors. Expose offline/stale estimates. Location uploads need explicit opt-in policies; not every feature requires long-lived raw traces."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Rendering plane",
+            "en": "Rendering plane"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Versioned tiles, bounded viewport và client/CDN caches.",
+              "en": "Versioned tiles, bounded viewports and client/CDN caches."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Routing plane",
+            "en": "Routing plane"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Legal paths trên directed graph, turn costs và coherent traffic weights.",
+              "en": "Legal directed-graph paths, turn costs and coherent traffic weights."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Traffic plane",
+            "en": "Traffic plane"
+          },
+          "icon": "chart",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "GPS sequence → matching → segment aggregates, kèm freshness/privacy.",
+              "en": "GPS sequences → matching → segment aggregates with freshness/privacy."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "2. Tính từng plane riêng",
+        "en": "2. Size each plane separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định một tỷ daily users, mỗi người navigation năm phút, GPS một fix/giây, upload theo batch 15 fixes và một route request/ngày. Ta có 300 tỷ fixes/ngày, khoảng 3,47 triệu fixes/giây trung bình; 20 tỷ upload requests/ngày, khoảng 231 nghìn/giây. Route requests trung bình khoảng 11,6 nghìn/giây; peak factor năm cho khoảng 57,9 nghìn/giây. Batching giảm request overhead, không làm số fixes biến mất. Tính riêng peak theo múi giờ, batch cuối thiếu fixes, retries, reroute queries và fan-out.",
+          "en": "Assume a billion daily users, five navigation minutes per user, one GPS fix/second, batches of fifteen fixes and one route request/day. This yields 300 billion fixes/day, about 3.47 million/second on average; twenty billion upload requests/day, about 231 thousand/second. Average route traffic is about 11.6 thousand/second, or 57.9 thousand at a fivefold peak. Batching reduces request overhead, not fix counts. Separately account for time-zone peaks, incomplete final batches, retries, reroutes and fan-out."
+        },
+        {
+          "vi": "Trong XYZ pyramid, zoom z có 4^z tiles. Tổng zoom 0 tới 21 là (4^22 − 1)/3 = 5.864.062.014.805 tiles. Nếu mọi tile cố định 25 KB thập phân, payload khoảng 146,6 PB. Đây là dense upper-budget example, không phải lượng dữ liệu bắt buộc: có sparse regions, empty-tile sharing, content-addressed assets và on-demand generation. Cost phải đo cả CDN bytes, origin misses, device work, routing RAM/CPU, stream processing và privacy/storage; không mặc định một plane luôn đắt nhất.",
+          "en": "An XYZ pyramid has 4^z tiles at zoom z. Levels zero through twenty-one contain (4^22 − 1)/3 = 5,864,062,014,805 tiles. Assuming a constant decimal 25 KB each gives roughly 146.6 PB. This dense budget is not mandatory storage: sparse regions, shared empty tiles, content-addressed assets and on-demand generation change it. Measure CDN bytes, origin misses, device work, routing memory/CPU, streaming and privacy/storage rather than assuming one plane always dominates."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Workload giả định",
+            "en": "Assumed workload"
+          },
+          {
+            "vi": "Phép tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Trung bình",
+            "en": "Average"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Location fixes",
+              "en": "Location fixes"
+            },
+            {
+              "vi": "1B ×300 /86.400",
+              "en": "1B ×300 /86,400"
+            },
+            {
+              "vi": "≈3,47M/s",
+              "en": "≈3.47M/s"
+            }
+          ],
+          [
+            {
+              "vi": "Batch uploads",
+              "en": "Batch uploads"
+            },
+            {
+              "vi": "1B ×20 /86.400",
+              "en": "1B ×20 /86,400"
+            },
+            {
+              "vi": "≈231K/s",
+              "en": "≈231K/s"
+            }
+          ],
+          [
+            {
+              "vi": "Route requests",
+              "en": "Route requests"
+            },
+            {
+              "vi": "1B /86.400",
+              "en": "1B /86,400"
+            },
+            {
+              "vi": "≈11,6K/s",
+              "en": "≈11.6K/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak routes",
+              "en": "Peak routes"
+            },
+            {
+              "vi": "11,6K ×5",
+              "en": "11.6K ×5"
+            },
+            {
+              "vi": "≈57,9K/s",
+              "en": "≈57.9K/s"
+            }
+          ],
+          [
+            {
+              "vi": "Dense pyramid payload",
+              "en": "Dense pyramid payload"
+            },
+            {
+              "vi": "5,864T ×25KB",
+              "en": "5.864T ×25KB"
+            },
+            {
+              "vi": "≈146,6PB",
+              "en": "≈146.6PB"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "3. API trả version, freshness và giới hạn rõ",
+        "en": "3. APIs expose versions, freshness and bounds"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách quota và concurrency pools cho tile, route và location endpoints để ingest surge không làm navigation timeout. Route input gồm mode, avoidance, departure time và units/coordinate order rõ; geocoding cần disambiguation, snapping cần biết đúng chiều đường và access profile. Response cần route ID, request generation, graph/profile/traffic versions và thời điểm estimate. Không dùng cache key chỉ có hai tọa độ nếu mode, departure time hoặc avoidance khác nhau.",
+          "en": "Separate quotas and concurrency pools for tiles, routes and location uploads so ingestion spikes cannot starve navigation. Route inputs include mode, avoidance, departure time and explicit units/coordinate order. Geocoding needs disambiguation, while snapping considers direction and access profiles. Responses carry route IDs, request generations, graph/profile/traffic versions and estimate times. Endpoints alone are insufficient cache keys when modes, departure times or avoidance differ."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/tiles/{mapVersion}/{source}/{z}/{x}/{y}.pbf",
+          "description": {
+            "vi": "Immutable vector tile theo version/schema; auth và Cache-Control được chốt riêng.",
+            "en": "Immutable versioned/schema-aware vector tile with explicit authorization and cache headers."
+          },
+          "response": "200 binary tile + ETag + Cache-Control",
+          "notes": [
+            {
+              "vi": "Style, glyph và sprite dependencies cũng cần compatible versions.",
+              "en": "Styles, glyphs and sprites need compatible versions too."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/routes",
+          "description": {
+            "vi": "Tìm legal routes theo departure time/profile. Ví dụ dưới dùng [longitude,latitude].",
+            "en": "Find legal routes by departure time/profile. Coordinates below use [longitude,latitude]."
+          },
+          "request": "{ \"origin\": [105.84,21.03], \"destination\": [105.90,21.05], \"mode\": \"car\", \"departAt\": \"2026-10-22T08:00:00Z\", \"requestGeneration\": 7 }",
+          "response": "200 { routeId, alternatives:[{polyline,distanceM,etaSec}], graphVersion, trafficVersion, estimatedAt, requestGeneration }",
+          "notes": [
+            {
+              "vi": "Client bỏ response generation cũ; đây là API minh họa của nền tảng.",
+              "en": "Clients discard stale response generations; this is the teaching platform API."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/location-batches",
+          "description": {
+            "vi": "Bounded opt-in batch, stable fix sequence để retry/dedup.",
+            "en": "Bounded opt-in batch with stable fix sequences for retries/deduplication."
+          },
+          "request": "{ sessionId, batchId, fixes:[{seq,observedAt,lon,lat,accuracyM,speedMps,headingDeg}] }",
+          "response": "202 { batchId, acceptedAt, boundary: \"replicated-log\" }",
+          "notes": [
+            {
+              "vi": "202 chỉ ACK boundary đã định nghĩa, không chứng minh map matching hay traffic publication xong.",
+              "en": "The ACK proves the stated boundary rather than completed matching or traffic publication."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/v1/routes/{routeId}/updates?after={cursor}",
+          "description": {
+            "vi": "Poll/SSE cho ETA hoặc alternative mới, có cursor/reconnect contract.",
+            "en": "Poll/SSE for ETA changes or alternatives with cursor/reconnection contracts."
+          },
+          "response": "200 { cursor, estimatedAt, trafficVersion, etaSec, alternative?, stale }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Trace rendering, route và traffic độc lập",
+        "en": "4. Trace rendering, routes and traffic independently"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tiles có thể cache lâu theo immutable version; route weights đổi nhanh; GPS raw cần retention ngắn. Dùng manifest để ghép những versions tương thích thay vì bắt mọi thành phần luôn có cùng một số version. Một request route pin graph/profile và coherent weight snapshot trong suốt tính toán; một active route có thể tiếp tục dùng generation cũ theo policy khi map mới publish. Xem từng trace dưới đây để phân biệt request đồng bộ với processing bất đồng bộ.",
+          "en": "Tiles can be long-cached under immutable versions; route weights change quickly; raw GPS needs short retention. Manifests bind compatible versions rather than requiring every component to share an identical version number. A route request pins graph/profile and coherent weights for its calculation. Active routes may retain older generations under explicit policies after publication. The traces separate synchronous requests from asynchronous processing."
+        }
+      ],
+      "diagram": {
+        "id": "maps-three-planes",
+        "title": {
+          "vi": "Ba luồng có tốc độ thay đổi khác nhau",
+          "en": "Three paths with different rates of change"
+        },
+        "caption": {
+          "vi": "Tiles dùng immutable map version; route dùng graph version và weight snapshot; location processing giữ session locality trước khi aggregate theo segment.",
+          "en": "Tiles use immutable map versions; routes use graph versions and weight snapshots; location processing preserves session locality before segment aggregation."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "device",
+            "label": {
+              "vi": "Mobile / renderer",
+              "en": "Mobile / renderer"
+            },
+            "detail": {
+              "vi": "Cache tiles, active route và consent state; buffer GPS có sequence và giới hạn thời gian/dung lượng.",
+              "en": "Caches tiles/routes and consent state; buffers sequenced GPS with age/size bounds."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "cdn",
+            "label": {
+              "vi": "Tile CDN",
+              "en": "Tile CDN"
+            },
+            "detail": {
+              "vi": "Cache versioned tile keys theo headers và auth policy; style/glyph/sprite dependencies có version tương thích.",
+              "en": "Caches versioned tiles under explicit headers/auth policies with compatible style/glyph/sprite versions."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "tiles",
+            "label": {
+              "vi": "Tile objects",
+              "en": "Tile objects"
+            },
+            "detail": {
+              "vi": "Immutable assets đã publish; sparse generation có queue/negative caching và chống cache stampede.",
+              "en": "Published immutable assets; sparse generation needs queuing, negative caching and stampede controls."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "manifest",
+            "label": {
+              "vi": "Map manifest",
+              "en": "Map manifest"
+            },
+            "detail": {
+              "vi": "Manifest ghép tile sources, graph, geocoder, profiles và schema; rollout/rollback giữ old generation còn đọc được.",
+              "en": "Pins tile sources, graphs, geocoders, profiles and schemas; rollouts retain readable old generations."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Regional gateway",
+              "en": "Regional gateway"
+            },
+            "detail": {
+              "vi": "Quota route/location tách biệt; validate principal và region, không để upload surge làm nghẽn route queries.",
+              "en": "Separates route/location quotas and validates principals/regions so uploads cannot starve routing."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "edge"
+          },
+          {
+            "id": "nav",
+            "label": {
+              "vi": "Navigation API",
+              "en": "Navigation API"
+            },
+            "detail": {
+              "vi": "Geocode/snap endpoints, select mode/profile, route generation và response freshness metadata.",
+              "en": "Resolves/snaps endpoints, selects mode/profile and returns route generations/freshness."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "router",
+            "label": {
+              "vi": "Routing engine",
+              "en": "Routing engine"
+            },
+            "detail": {
+              "vi": "Turn-aware directed graph, hierarchy và coherent traffic snapshot; urgent closures là hard constraints.",
+              "en": "Uses turn-aware directed graphs, hierarchies and coherent traffic snapshots; closures are hard constraints."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "weights",
+            "label": {
+              "vi": "Traffic / ETA evidence",
+              "en": "Traffic / ETA evidence"
+            },
+            "detail": {
+              "vi": "Segment identity gắn graph version; live/historical predictions có age, sample quality và fallback.",
+              "en": "Pins segment identity to graph versions; live/historical predictions carry age, quality and fallback policies."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "ingest",
+            "label": {
+              "vi": "Location ingest",
+              "en": "Location ingest"
+            },
+            "detail": {
+              "vi": "Consent/auth, batch bounds, session + fix sequence dedup; ACK theo durable boundary đã nêu.",
+              "en": "Checks consent/auth/batch bounds, deduplicates session/fix sequences and ACKs at a defined durable boundary."
+            },
+            "x": 130,
+            "y": 730,
+            "kind": "service"
+          },
+          {
+            "id": "log",
+            "label": {
+              "vi": "Location stream",
+              "en": "Location stream"
+            },
+            "detail": {
+              "vi": "Session-keyed ordering cho matching; retention ngắn, retry/deletion và tenant access controls.",
+              "en": "Preserves session ordering for matching with short retention, retries/deletion and access controls."
+            },
+            "x": 430,
+            "y": 730,
+            "kind": "queue"
+          },
+          {
+            "id": "matcher",
+            "label": {
+              "vi": "Match / aggregate",
+              "en": "Match / aggregate"
+            },
+            "detail": {
+              "vi": "Sequence-aware map matching rồi repartition theo segment/time; lọc quality và chống probes thiên lệch.",
+              "en": "Matches sequences before repartitioning by segment/time, filtering quality and biased probes."
+            },
+            "x": 740,
+            "y": 730,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "tile",
+            "label": {
+              "vi": "Mở bản đồ",
+              "en": "Load the map"
+            },
+            "steps": [
+              {
+                "from": "device",
+                "to": "manifest",
+                "description": {
+                  "vi": "Client chọn manifest đã publish và pin một map generation.",
+                  "en": "The client selects a published manifest and pins a generation."
+                }
+              },
+              {
+                "from": "device",
+                "to": "cdn",
+                "description": {
+                  "vi": "Fetch viewport tile keys cùng source/schema/version.",
+                  "en": "Fetch viewport tiles with matching source/schema/version."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "tiles",
+                "description": {
+                  "vi": "Cache miss lấy object đã publish, áp dụng explicit cache policy.",
+                  "en": "Misses fetch published objects under explicit cache policies."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "device",
+                "description": {
+                  "vi": "Renderer ghép geometry/style/glyph/sprite tương thích.",
+                  "en": "The renderer combines compatible geometry/styles/glyphs/sprites."
+                }
+              }
+            ]
+          },
+          {
+            "id": "route",
+            "label": {
+              "vi": "Tìm route có traffic",
+              "en": "Compute a traffic-aware route"
+            },
+            "steps": [
+              {
+                "from": "device",
+                "to": "gateway",
+                "description": {
+                  "vi": "Gửi endpoints, departure time, mode/profile và request generation.",
+                  "en": "Send endpoints, departure time, mode/profile and request generation."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "nav",
+                "description": {
+                  "vi": "Route request dùng quota riêng và regional selection.",
+                  "en": "Apply separate route quotas and regional selection."
+                }
+              },
+              {
+                "from": "nav",
+                "to": "router",
+                "description": {
+                  "vi": "Snap endpoints và yêu cầu graph/profile generation tương thích.",
+                  "en": "Snap endpoints and request compatible graph/profile generations."
+                }
+              },
+              {
+                "from": "router",
+                "to": "weights",
+                "description": {
+                  "vi": "Đọc coherent weight snapshot cùng closure constraints và freshness.",
+                  "en": "Read coherent weights with closure constraints and freshness."
+                }
+              },
+              {
+                "from": "router",
+                "to": "nav",
+                "description": {
+                  "vi": "Trả legal candidate paths, distance, durations và metadata.",
+                  "en": "Return legal candidate paths, distances, durations and metadata."
+                }
+              },
+              {
+                "from": "nav",
+                "to": "device",
+                "description": {
+                  "vi": "Client chỉ apply nếu request generation còn mới; hiển thị ETA confidence/staleness.",
+                  "en": "Apply only current request generations and expose ETA confidence/staleness."
+                }
+              }
+            ]
+          },
+          {
+            "id": "traffic",
+            "label": {
+              "vi": "GPS thành traffic evidence",
+              "en": "Turn GPS into traffic evidence"
+            },
+            "steps": [
+              {
+                "from": "device",
+                "to": "gateway",
+                "description": {
+                  "vi": "Upload batch có session/fix IDs, timestamps, accuracy và consent scope.",
+                  "en": "Upload a batch with session/fix IDs, timestamps, accuracy and consent scope."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "ingest",
+                "description": {
+                  "vi": "Validate batch size, clock bounds và quyền gửi dữ liệu.",
+                  "en": "Validate batch sizes, clock bounds and upload permissions."
+                }
+              },
+              {
+                "from": "ingest",
+                "to": "log",
+                "description": {
+                  "vi": "Append đạt durable acceptance boundary trước ACK; retry giữ IDs.",
+                  "en": "Reach the durable acceptance boundary before ACKs; retries preserve IDs."
+                },
+                "async": true
+              },
+              {
+                "from": "log",
+                "to": "matcher",
+                "description": {
+                  "vi": "Giữ sequence locality, xử lý duplicate/out-of-order/gap trước map matching.",
+                  "en": "Preserve sequence locality and handle duplicates/out-of-order/gaps before matching."
+                },
+                "async": true
+              },
+              {
+                "from": "matcher",
+                "to": "weights",
+                "description": {
+                  "vi": "Aggregate matched segments theo time/version với quality/freshness metadata.",
+                  "en": "Aggregate matched segments by time/version with quality/freshness metadata."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "rollout",
+            "label": {
+              "vi": "Publish map generation",
+              "en": "Publish a map generation"
+            },
+            "steps": [
+              {
+                "from": "manifest",
+                "to": "tiles",
+                "description": {
+                  "vi": "Kiểm immutable objects, schema và dependency availability trước manifest publication.",
+                  "en": "Verify immutable objects, schemas and dependencies before manifest publication."
+                }
+              },
+              {
+                "from": "manifest",
+                "to": "router",
+                "description": {
+                  "vi": "Warm compatible graph/hierarchy/profile generation; query không trộn graph mới với shortcuts cũ.",
+                  "en": "Warm compatible graphs/hierarchies/profiles without mixing new graphs and old shortcuts."
+                }
+              },
+              {
+                "from": "matcher",
+                "to": "weights",
+                "description": {
+                  "vi": "Matching và traffic weights dùng segment mapping của đúng graph version.",
+                  "en": "Matching and traffic weights use segment mappings for the correct graph version."
+                },
+                "async": true
+              },
+              {
+                "from": "manifest",
+                "to": "device",
+                "description": {
+                  "vi": "Chuyển generation theo policy; giữ route/offline compatibility hoặc yêu cầu refresh rõ.",
+                  "en": "Switch generations under explicit route/offline compatibility or refresh policies."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "tiles",
+      "title": {
+        "vi": "5. Tile pyramid và viewport cache",
+        "en": "5. Tile pyramids and viewport caches"
+      },
+      "paragraphs": [
+        {
+          "vi": "XYZ/Web Mercator dùng 2^z tiles theo mỗi chiều ở zoom z, x đi từ tây sang đông và y từ bắc xuống nam. Projection cắt ở khoảng ±85,0511° latitude và làm méo diện tích; không phải toàn bộ mặt cầu thành một hình vuông không biến dạng. Client chỉ yêu cầu tiles giao viewport và phần overscan/prefetch có budget, không tải cả level. Khi pan một đoạn nhỏ, nhiều keys cũ được tái sử dụng; khi đổi immutable version, cache keys phải tách biệt.",
+          "en": "XYZ/Web Mercator uses 2^z tiles along each axis at zoom z, with x increasing eastward and y southward. It clips near ±85.0511° latitude and distorts area rather than flattening the entire sphere without distortion. Clients request viewport intersections plus budgeted overscan/prefetch, not an entire level. Small pans reuse keys, while immutable version changes separate them."
+        },
+        {
+          "vi": "Bài thử chỉ dùng synthetic grid và local cache; không tải map assets ngoài mạng. Nó cố ý giữ payload size cố định để bạn nhìn mức tăng của pyramid riêng khỏi caching. Client thực cần bounded cache/eviction, cancellation khi pan nhanh, priorities cho visible tiles và request coalescing. Với private tiles, CDN key và authorization không được để response của tenant này lộ sang tenant khác.",
+          "en": "The experiment uses a synthetic grid and local cache without fetching external map assets. Fixed payload size isolates pyramid growth from caching. Real clients need bounded eviction, cancellation during rapid pans, visible-tile priorities and coalescing. Private tiles require cache keys and authorization that prevent cross-tenant exposure."
+        }
+      ],
+      "experiment": "maps-tiles"
+    },
+    {
+      "id": "representations",
+      "title": {
+        "vi": "6. Raster và vector đổi nơi trả chi phí",
+        "en": "6. Raster and vector move costs between components"
+      },
+      "paragraphs": [
+        {
+          "vi": "Raster tile là ảnh đã render; client chủ yếu ghép ảnh, còn style/labels thường đã baked-in. Vector tile chứa geometry/attributes để renderer vẽ theo style. Điều đó giúp restyle, rotation và labels linh hoạt, nhưng cần GPU/CPU, fonts, glyphs, sprites và schema compatibility trên device. Vector không luôn nhỏ hơn raster: hình học dày, zoom, style và compression quyết định payload thực. Thử thiết bị yếu, bandwidth thấp và complex labels trước khi chốt.",
+          "en": "Raster tiles contain rendered images; clients mostly compose them with styles/labels often baked in. Vector tiles provide geometry/attributes for styled rendering, enabling flexible restyling, rotation and labels at the cost of device GPU/CPU, fonts, glyphs, sprites and schema compatibility. Vector payloads are not invariably smaller: geometry density, zoom, styles and compression matter. Test weak devices, constrained bandwidth and complex labels."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Quyết định",
+            "en": "Decision"
+          },
+          {
+            "vi": "Raster",
+            "en": "Raster"
+          },
+          {
+            "vi": "Vector",
+            "en": "Vector"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Style change",
+              "en": "Style change"
+            },
+            {
+              "vi": "Thường cần assets render theo style khác.",
+              "en": "Often needs separately rendered assets."
+            },
+            {
+              "vi": "Có thể giữ geometry và đổi compatible style.",
+              "en": "Can retain geometry and change compatible styles."
+            }
+          ],
+          [
+            {
+              "vi": "Client cost",
+              "en": "Client cost"
+            },
+            {
+              "vi": "Image decode/composition; vẫn tốn texture memory.",
+              "en": "Image decoding/composition still uses texture memory."
+            },
+            {
+              "vi": "Geometry decode, layout, collision và GPU rendering.",
+              "en": "Geometry decoding, layout, collision handling and GPU rendering."
+            }
+          ],
+          [
+            {
+              "vi": "Cache identity",
+              "en": "Cache identity"
+            },
+            {
+              "vi": "Version, style, scale và format cần trong key nếu ảnh khác.",
+              "en": "Include version/style/scale/format when image bytes differ."
+            },
+            {
+              "vi": "Version/source/schema trong data key; style dependencies quản lý riêng.",
+              "en": "Data keys include version/source/schema with separately managed style dependencies."
+            }
+          ],
+          [
+            {
+              "vi": "Sparse generation",
+              "en": "Sparse generation"
+            },
+            {
+              "vi": "Có thể render lazy nhưng cần giới hạn CPU/miss storms.",
+              "en": "Lazy rendering needs CPU/miss-storm limits."
+            },
+            {
+              "vi": "Có thể generate lazy với cùng yêu cầu publication/compatibility.",
+              "en": "Lazy generation still needs publication/compatibility rules."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "routing",
+      "title": {
+        "vi": "7. Legal path cần nhiều hơn node gần nhất",
+        "en": "7. Legal paths need more than nearby nodes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Road network là directed graph: one-way roads, access restrictions và travel mode quyết định cạnh hợp lệ. Nếu chỉ lưu intersection nodes và segment weights, ta chưa biểu diễn được mọi turn restriction. Có thể dùng edge-expanded graph hoặc search state chứa incoming edge để tính cấm rẽ, U-turn và turn penalties. Origin/destination giữa một road segment cần snapping theo profile và vị trí dọc cạnh; chọn nearest intersection có thể dẫn tới route sai hoặc vòng xa.",
+          "en": "A road network is directed: one-way streets, access restrictions and travel modes determine valid edges. Intersection nodes and segment weights alone do not represent every turn restriction. Edge-expanded graphs or states containing incoming edges can model prohibited turns, U-turns and penalties. Endpoints inside segments need profile-aware snapping and positions along edges; the nearest intersection can yield incorrect or unnecessarily long routes."
+        },
+        {
+          "vi": "Dijkstra đúng với nonnegative fixed weights, nhưng có thể khám phá rất nhiều nodes. A* thêm heuristic có cùng đơn vị với cost; straight-line distance chia maximum feasible speed là time lower bound khi bound đúng. Trong toy graph, A* dùng consistent heuristic nên có thể dừng khi goal được settled. Heuristic quá cao, sai đơn vị hoặc cập nhật edge weights ngay giữa query có thể phá lý do đúng. Không khẳng định A* luôn khám phá ít hơn mọi graph/tie-breaking; so sánh cost trước, rồi mới so work.",
+          "en": "Dijkstra handles fixed nonnegative weights but can explore many nodes. A* adds a heuristic in the same units as the cost; straight-line distance divided by a valid maximum feasible speed lower-bounds travel time. The toy graph uses a consistent heuristic and stops when the goal is settled. Overestimates, unit mistakes or changing weights during a query can invalidate the correctness argument. A* does not universally explore fewer nodes under every graph/tie rule: compare costs before work."
+        }
+      ],
+      "experiment": "maps-routing"
+    },
+    {
+      "id": "hierarchies",
+      "title": {
+        "vi": "8. Preprocessing và customization không phải cùng một bước",
+        "en": "8. Preprocessing and customization are different steps"
+      },
+      "paragraphs": [
+        {
+          "vi": "Contraction Hierarchies thêm shortcuts để bỏ qua một số nodes nhưng vẫn bảo toàn shortest-path semantics của graph/cost model được chuẩn bị. Classic CH phụ thuộc metric; khi weights đổi, shortcuts cũ không tự còn hợp lệ. Các họ customizable hierarchies hoặc multi-level partitioning tách phần chuẩn bị topology khỏi phần customization theo weights, giúp update nhanh hơn trong những điều kiện phù hợp. Runtime/preprocessing tính bằng ms hay giây phải được đo trên graph, hardware và update workload thật; không phải guarantee từ tên thuật toán.",
+          "en": "Contraction Hierarchies add shortcuts that bypass some nodes while preserving the prepared graph/cost model’s shortest-path semantics. Classic CH depends on metrics, so old shortcuts do not automatically remain valid after weight changes. Customizable hierarchy and multi-level partition families separate topology preparation from metric customization, enabling faster updates under appropriate conditions. Millisecond or second runtimes must be measured for actual graphs, hardware and updates rather than inferred from algorithm names."
+        },
+        {
+          "vi": "Một snapshot gồm graph topology, access profile, closure constraints, traffic weights và customized data tương thích. Publish snapshot mới theo generation, warm trước khi chuyển traffic và giữ rollback. Query không trộn graph version mới với shortcuts/segment IDs cũ. Cross-region route cần boundary/overlay protocol đủ để giữ tính đúng; không chọn hai local shortest paths độc lập rồi hy vọng ghép lại thành global optimum. Bidirectional search cũng cần termination bound đúng, không dừng ở lần hai frontiers gặp nhau đầu tiên.",
+          "en": "A snapshot binds compatible topology, access profiles, closures, weights and customized data. Publish by generation, warm before traffic switches and retain rollback. Queries must not mix new graphs with old shortcuts or segment IDs. Cross-region routes need boundary/overlay protocols that preserve correctness rather than independently choosing two local paths and hoping they form a global optimum. Bidirectional searches also need valid termination bounds, not merely their first frontier intersection."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Đưa traffic update vào serving",
+          "en": "Serve a traffic update"
+        },
+        "caption": {
+          "vi": "Urgent closure có đường xử lý riêng nếu customization chậm; fallback không được mở lại đường cấm.",
+          "en": "Urgent closures need a separate path when customization lags; fallbacks must not reopen prohibited roads."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Validate",
+              "en": "Validate"
+            },
+            "detail": {
+              "vi": "Kiểm segment mapping, units, timestamp và quality.",
+              "en": "Validate segment mappings, units, timestamps and quality."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Customize",
+              "en": "Customize"
+            },
+            "detail": {
+              "vi": "Tạo compatible weight/overlay generation ngoài request path.",
+              "en": "Prepare compatible weights/overlays outside requests."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Check/publish",
+              "en": "Check and publish"
+            },
+            "detail": {
+              "vi": "Chạy correctness probes rồi atomically chuyển serving pointer.",
+              "en": "Run correctness probes and atomically switch serving pointers."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Observe",
+              "en": "Observe"
+            },
+            "detail": {
+              "vi": "Theo dõi route quality/freshness và rollback nếu cần.",
+              "en": "Track route quality/freshness and roll back when necessary."
+            },
+            "icon": "chart"
+          }
+        ]
+      }
+    },
+    {
+      "id": "matching",
+      "title": {
+        "vi": "9. GPS sequence thành segment evidence",
+        "en": "9. Turn GPS sequences into segment evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "GPS có measurement noise, sampling gaps và clock errors; một fix gần đường nhất chưa chắc nằm trên đường đó. Map matching xét chuỗi positions, accuracy, heading, time gaps và tính hợp lý của đường đi giữa candidates. HMM là một cách biểu diễn emission/transition likelihood; không có thuật toán nào bảo đảm đúng khi dữ liệu quá thưa hoặc nhiễu. Khi chất lượng thấp, có thể không publish speed thay vì cố gán một segment sai.",
+          "en": "GPS contains measurement noise, sampling gaps and clock errors; the nearest road to one fix may be wrong. Map matching considers position sequences, accuracy, headings, time gaps and plausible paths between candidates. HMMs are one way to represent emission/transition likelihoods, but no algorithm guarantees correct matches under arbitrarily sparse or noisy observations. Low-quality inputs may justify withholding speeds rather than forcing wrong segment assignments."
+        },
+        {
+          "vi": "Trước matching, partition theo session hoặc cơ chế giữ locality của chuỗi, có bounded reorder buffer và policy cho duplicate/gap. Segment chưa biết chắc ở raw ingest; sau matching mới repartition theo graph version + segment + time bucket để aggregate. Lọc impossible jumps, parked devices và outliers, nhưng không loại mọi speed thấp vì đó có thể là traffic jam thật. Crowd probes thiên lệch theo device, vehicle và coverage; sample count cao không tự chứng minh representativeness.",
+          "en": "Before matching, partition by session or another sequence-locality mechanism, using bounded reordering and duplicate/gap policies. Raw ingestion does not yet know segments reliably; repartition by graph version, segment and time bucket after matching. Filter impossible jumps, parked devices and outliers without discarding all slow observations, which may reflect real congestion. Probe populations vary by device, vehicle and coverage; large counts do not prove representativeness."
+        }
+      ]
+    },
+    {
+      "id": "eta",
+      "title": {
+        "vi": "10. Historical, live và dự báo tại lúc tới segment",
+        "en": "10. Historical, live and arrival-time predictions"
+      },
+      "paragraphs": [
+        {
+          "vi": "ETA không chỉ là distance chia speed limit. Có historical profile theo time-of-week, live evidence kèm age/quality, turn/intersection delay và correction model. Với chuyến 40 phút, segment ở phút 35 cần tốc độ dự kiến lúc xe tới, không chỉ tốc độ ở thời điểm query. Time-dependent routing cần semantics nhất quán; các thuật toán phổ biến dựa vào FIFO assumptions, nên không gắn arbitrary changing functions vào edge rồi mặc định Dijkstra vẫn đúng.",
+          "en": "ETA is more than distance divided by speed limit. It combines time-of-week history, live evidence with age/quality, turn/intersection delays and correction models. A segment reached thirty-five minutes into a forty-minute trip needs expected conditions on arrival rather than only current speeds. Time-dependent routing requires coherent semantics; common algorithms rely on FIFO assumptions, so arbitrary changing edge functions do not automatically preserve Dijkstra correctness."
+        },
+        {
+          "vi": "Lab dùng công thức blend speed đơn giản để nhìn trust giảm theo age và sample count. Nó không thay thế model forecast hoặc uncertainty calibration. Blending speeds rồi đổi sang time cũng khác averaging travel times. Đánh giá ETA theo horizon/region/mode, phân biệt route selection error với travel-time prediction error và tránh train/test leakage từ tương lai. Closures là hard constraints: hết live data không được fallback historical rồi cho đi vào đường đã cấm.",
+          "en": "The lab uses simple speed blending to show trust declining with age and sample count. It is not a forecasting model or calibrated uncertainty estimator. Blending speeds before converting to time also differs from averaging travel times. Evaluate ETA by horizon/region/mode, distinguish route-selection from prediction errors and avoid future-data leakage. Closures remain hard constraints: missing live data must not fall back to history and reopen prohibited roads."
+        }
+      ],
+      "experiment": "maps-eta"
+    },
+    {
+      "id": "batch-reroute",
+      "title": {
+        "vi": "11. Batching có độ trễ; reroute cần chống flapping",
+        "en": "11. Batching adds delay; rerouting needs hysteresis"
+      },
+      "paragraphs": [
+        {
+          "vi": "Upload 15 fixes một lần giảm request count khoảng 15 lần trong batch đầy, nhưng fix cũ nhất chờ gần 15 giây trước network/queue/matching delay. Device cần bounded buffer, consent, retry IDs, backoff/jitter và thích nghi sampling với battery/network; không thể hứa batching gần như miễn phí cho mọi freshness target. Tách local navigation feedback khỏi analytics upload: client vẫn có thể kiểm deviation với active route khi backend chưa nhận batch mới.",
+          "en": "Uploading fifteen fixes per full batch cuts request counts roughly fifteenfold, while the oldest fix waits almost fifteen seconds before network, queue and matching delays. Devices need bounded buffers, consent, stable retry IDs, backoff/jitter and battery/network-aware sampling. Batching is not free under every freshness target. Keep local navigation feedback separate from analytics uploads: clients can check deviations against active routes before servers receive new batches."
+        },
+        {
+          "vi": "GPS noise gần đường song song dễ tạo false deviation. Dùng accuracy, heading, vài observations và map-matched progress để quyết định reroute, đồng thời có đường xử lý nhanh cho tình huống thật. Server có thể gợi ý alternative nếu lợi ích đủ lớn, theo absolute/relative threshold, cooldown và ETA uncertainty; nếu không, route sẽ đổi qua lại giữa hai lựa chọn gần bằng nhau. Closures có thể buộc reroute dù threshold tiết kiệm thời gian chưa đạt. Responses cũ cần request generation guard.",
+          "en": "Noise near parallel roads can create false deviations. Use accuracy, heading, multiple observations and matched progress, with a fast path for genuine changes. Server alternatives should clear absolute/relative benefits, cooldown and uncertainty criteria to avoid flapping between near-equal routes. Closures can force reroutes regardless of savings thresholds. Stale responses require request-generation guards."
+        }
+      ]
+    },
+    {
+      "id": "data-version",
+      "title": {
+        "vi": "12. Versioned identities và offline packages",
+        "en": "12. Versioned identities and offline packages"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dữ liệu tối thiểu gồm graph segments với direction/access/turn mapping, immutable tile objects, map manifest, timestamped traffic evidence, route snapshot và sequenced location fixes. Không giả định segment ID giữ nguyên qua mọi rebuild; traffic processor cần version mapping hoặc rebuild theo graph mới. Active route lưu graph/profile generation và expiry policy để biết khi nào cần refresh. Dữ liệu render và graph có thể khác độ chi tiết nhưng phải tương thích về semantics mà sản phẩm cam kết.",
+          "en": "Minimum records include directional/access-aware segments and turn mappings, immutable tiles, map manifests, timestamped traffic evidence, route snapshots and sequenced fixes. Segment IDs need not survive every rebuild; traffic processors need version mappings or processing against new graphs. Active routes retain graph/profile generations and refresh/expiry policies. Rendering and routing may differ in detail but must satisfy the product’s compatibility commitments."
+        },
+        {
+          "vi": "Offline package có manifest, checksums, compatible tiles/style/glyphs và routing subgraph/profile nếu hứa offline routing. Tải tiles đơn thuần chưa đủ tìm đường offline. Cần quota, partial-download recovery và atomic activation; region boundary có thể làm route vượt package không tính được. Khi mất mạng, giữ route đang đi và công bố traffic không còn fresh; historical offline estimate không có real-time closure coverage nếu chưa nhận update.",
+          "en": "Offline packages need manifests, checksums, compatible tiles/styles/glyphs and routing subgraphs/profiles if offline routing is promised. Tiles alone do not enable offline pathfinding. Quotas, partial-download recovery and atomic activation matter, while trips beyond package boundaries may be unsupported. During outages, retain active routes and expose stale traffic; historical offline estimates lack real-time closure coverage without updates."
+        }
+      ]
+    },
+    {
+      "id": "privacy-operations",
+      "title": {
+        "vi": "13. Location privacy và failure drills",
+        "en": "13. Location privacy and failure drills"
+      },
+      "paragraphs": [
+        {
+          "vi": "Location traces có thể liên kết về nhà hoặc nơi làm việc dù đã đổi session IDs. Truncate trip ends, aggregate, threshold theo đủ distinct devices và hạn chế retention giúp giảm một số rủi ro, nhưng không bảo đảm anonymity. Cần consent/access policy, encryption, audit, raw-data minimization, deletion và xử lý replicas/backups theo retention đã công bố. Đừng đưa tọa độ raw hoặc trace IDs vào unbounded metric labels. Công cụ admin và logs cũng là đường lộ dữ liệu nếu không kiểm soát.",
+          "en": "Location traces can reveal homes or workplaces despite rotating session IDs. Trimming trip ends, aggregation, sufficient distinct-device thresholds and limited retention mitigate some risks without guaranteeing anonymity. Apply consent/access policies, encryption, auditing, minimization, deletion and documented replica/backup retention. Keep raw coordinates and trace IDs out of unbounded metric labels. Administrative tools and logs also need access controls."
+        },
+        {
+          "vi": "Chạy drill cho tile origin outage, traffic stream lag, map publication lỗi, closure mới, region overload và sparse/noisy probes. Theo dõi visible-tile latency, cache byte hit, route p99/no-route rate, ETA error, probe-to-weight lag và version mismatch. Routing ảnh hưởng traffic thật: cùng đưa mọi người vào một đường phụ có thể làm prediction sai; alternatives cần policy tránh feedback loop và phải tôn trọng legality/community constraints. Không gọi một adaptive policy là tối ưu toàn thành phố nếu chưa có model và evidence.",
+          "en": "Drill tile-origin failures, traffic lag, broken map publication, new closures, regional overload and sparse/noisy probes. Track visible-tile latency, byte hits, route p99/no-route rates, ETA errors, probe-to-weight lag and version mismatches. Routing itself changes traffic: sending everyone down one side road can invalidate predictions. Alternative policies must account for feedback and legal/community constraints. Adaptive routing is not proof of citywide optimality without models and evidence."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure",
+            "en": "Failure"
+          },
+          {
+            "vi": "Hành vi cần thấy",
+            "en": "Required behavior"
+          },
+          {
+            "vi": "Điều không được ngầm hứa",
+            "en": "Avoid implying"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Traffic stale",
+              "en": "Stale traffic"
+            },
+            {
+              "vi": "Fallback có age/quality, giữ closure constraints.",
+              "en": "Fallback with age/quality while retaining closures."
+            },
+            {
+              "vi": "Historical speed không chứng minh đường đang mở.",
+              "en": "Historical speeds do not prove open roads."
+            }
+          ],
+          [
+            {
+              "vi": "Tile origin down",
+              "en": "Tile origin down"
+            },
+            {
+              "vi": "CDN/client cache tiếp tục trong policy; miss degrade rõ.",
+              "en": "Serve cached assets within policy; expose misses/degradation."
+            },
+            {
+              "vi": "Cache không có mọi viewport/version.",
+              "en": "Caches do not contain every viewport/version."
+            }
+          ],
+          [
+            {
+              "vi": "Map generation lỗi",
+              "en": "Broken generation"
+            },
+            {
+              "vi": "Rollback compatible manifest/graph, giữ old assets.",
+              "en": "Roll back compatible manifests/graphs and retain old assets."
+            },
+            {
+              "vi": "Đổi một version number không tự sửa segment mappings.",
+              "en": "One version number does not repair segment mappings."
+            }
+          ],
+          [
+            {
+              "vi": "Region overload",
+              "en": "Regional overload"
+            },
+            {
+              "vi": "Admission control, bounded query queues, quota isolation.",
+              "en": "Admission controls, bounded queues and isolated quotas."
+            },
+            {
+              "vi": "Cross-region fallback không tự giữ graph/cache warm.",
+              "en": "Cross-region fallbacks are not automatically warm or compatible."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi về correctness và freshness",
+        "en": "14. Questions about correctness and freshness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hãy đi từ một thao tác người dùng tới data/version boundary, rồi thử network failure hoặc stale data tại boundary đó. Nếu không giải thích được map version và weight snapshot, một danh sách CDN/Kafka/cache chưa đủ chứng minh route đúng.",
+          "en": "Trace a user action to its data/version boundary, then introduce network failures or stale data there. CDN/Kafka/cache names alone do not establish route correctness without map-version and weight-snapshot semantics."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Tại sao không tải mọi tile của một zoom?",
+            "en": "Why not download every tile at a zoom?"
+          },
+          "answer": [
+            {
+              "vi": "Số tiles tăng 4^z trong khi viewport chỉ giao một số ít tiles. Fetch visible keys, budget overscan, reuse cache và cancel khi pan. Full pyramid storage là bài toán khác với một viewport; sparse generation và asset sharing có thể giảm storage.",
+              "en": "World tiles grow as 4^z while viewports intersect few of them. Fetch visible keys with budgeted overscan, reuse caches and cancel obsolete requests. Full-pyramid storage differs from viewport fetching; sparse generation and sharing can reduce storage."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vector có luôn tiết kiệm hơn raster không?",
+            "en": "Are vectors always cheaper than rasters?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Vector hỗ trợ restyle và dynamic labels nhưng chuyển decode/layout/render work sang client và cần dependencies. Payload/cost phụ thuộc geometry, style, zoom và device. So bytes, CPU/GPU, memory và latency thực trước khi chọn.",
+              "en": "No. Vectors support restyling and dynamic labels while moving decoding/layout/rendering and dependencies to clients. Costs depend on geometry, style, zoom and devices. Measure bytes, CPU/GPU, memory and latency."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "A* dùng distance làm heuristic cho time có đúng không?",
+            "en": "Can A* use distance as a travel-time heuristic?"
+          },
+          "answer": [
+            {
+              "vi": "Phải đổi units và có lower bound đúng: distance chia maximum feasible speed. Heuristic nhất quán trong lab vì edge cost ít nhất một phút/km và traffic chỉ tăng cost. Real graph có turns/profile/time dependence; heuristic overestimate hoặc stale snapshot có thể làm kết quả sai.",
+              "en": "Convert units and establish a valid lower bound, such as distance divided by maximum feasible speed. The lab is consistent because edges cost at least a minute/km and traffic only increases costs. Real turns/profiles/time dependence need careful bounds and snapshots."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có thể cập nhật traffic weights trong khi query đang search không?",
+            "en": "Can traffic weights change during an active search?"
+          },
+          "answer": [
+            {
+              "vi": "Không mặc định vẫn đúng theo proof fixed weights. Pin coherent snapshot hoặc dùng thuật toán/protocol có contract time-dependent rõ. Graph, shortcuts/customization, profiles và closures cần compatible generations. Urgent closures cần riêng cơ chế bảo đảm legal path.",
+              "en": "Fixed-weight correctness arguments do not automatically survive such changes. Pin coherent snapshots or use explicit time-dependent algorithms/protocols. Graphs, customized data, profiles and closures need compatible generations with urgent-closure handling."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Partition raw fixes theo segment có dễ không?",
+            "en": "Can raw fixes simply be partitioned by segment?"
+          },
+          "answer": [
+            {
+              "vi": "Segment chưa biết chắc trước map matching. Giữ locality chuỗi theo session, xử lý duplicate/gaps/out-of-order, match rồi repartition theo version/segment/time. Một fix gần nhất không đủ khi có parallel roads hoặc noisy GPS.",
+              "en": "Reliable segments are not known before matching. Preserve session locality, handle duplicates/gaps/reordering, match sequences and then repartition by version/segment/time. Nearest-road matching of one noisy fix is insufficient."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Batch 15 fixes có miễn phí về freshness không?",
+            "en": "Are fifteen-fix batches free in freshness terms?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Giảm request overhead nhưng fix đầu chờ gần batch interval rồi thêm network/queue/processing. Tách local navigation khỏi analytics upload, đo end-to-end lag và chọn battery/freshness policy. ACK 202 cũng chưa có nghĩa traffic đã publish.",
+              "en": "No. Request overhead falls while early fixes wait almost a batch interval plus transport/processing. Separate local navigation from analytics, measure end-to-end lag and choose battery/freshness policies. A 202 ACK does not prove traffic publication."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Live speed hết hạn thì bỏ mọi constraint và dùng history?",
+            "en": "Should expired live speeds remove all constraints?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Speed estimate có thể fallback nhưng closures, access và turn restrictions là constraints riêng. Offline/stale mode cần nói rõ giới hạn real-time evidence; history không chứng minh đường đang thông.",
+              "en": "No. Speed estimates may fall back, but closures, access and turn restrictions remain separate constraints. Expose stale/offline evidence limits; history does not establish current road availability."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đổi session ID và aggregate có đủ bảo đảm ẩn danh?",
+            "en": "Do rotating IDs and aggregation guarantee anonymity?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Trajectories và sparse regions vẫn dễ linkage. Minimize raw retention, enforce access/consent/deletion, kiểm distinct-device thresholds và giới hạn logging. Privacy cần threat model và policy; một thuật ngữ k-anonymity không thay toàn bộ thiết kế.",
+              "en": "No. Trajectories and sparse regions can still permit linkage. Minimize retention, enforce access/consent/deletion, validate distinct-device thresholds and constrain logs. Privacy needs threat models and policies beyond naming k-anonymity."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1162 @@
+{
+  "id": "metrics-alerts",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Metrics & Alerting: cardinality, rollups và evidence",
+    "en": "Designing Metrics & Alerting: cardinality, rollups and evidence"
+  },
+  "summary": {
+    "vi": "Thử label cardinality, gauge downsampling và pending/firing/no-data; thiết kế ingestion, retention, histogram queries và on-call routing với semantics rõ.",
+    "en": "Explore cardinality, gauge downsampling and pending/firing/no-data states; design ingestion, retention, histogram queries and routing under explicit semantics."
+  },
+  "prerequisites": [
+    "reliability",
+    "databases",
+    "messaging",
+    "networking"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "observability",
+    "network",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Cardinality/churn là observed identities; drop/hash labels không tự giải đúng aggregation/privacy.",
+      "en": "Cardinality/churn concern observed identities; label dropping/hashing does not inherently solve aggregation/privacy."
+    },
+    {
+      "vi": "Metric units/type/temporality quyết định storage, rollup và query semantics.",
+      "en": "Units/types/temporality determine storage, rollups and queries."
+    },
+    {
+      "vi": "Weighted mean dùng sum/count; arbitrary counter rate/p99 cần thông tin khác.",
+      "en": "Weighted means use sums/counts; arbitrary counter rates/p99s need different information."
+    },
+    {
+      "vi": "For dùng elapsed time của stable alert identity; no data/query error không tự là healthy zero.",
+      "en": "Pending durations use stable-identity elapsed time; absence/errors are not healthy zeros."
+    },
+    {
+      "vi": "Alert routing và meta-monitoring phải kiểm end-to-end evidence/delivery, không chỉ process health.",
+      "en": "Routing/meta-monitoring validate evidence/delivery end to end rather than process health alone."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ sample tới một hành động đáng tin",
+      "en": "From samples to reliable actions"
+    },
+    "caption": {
+      "vi": "Bắt đầu với meaning và evidence, rồi mới tối ưu bytes và query throughput.",
+      "en": "Start with meaning/evidence before optimizing bytes and queries."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Instrument",
+          "en": "Instrument"
+        },
+        "detail": {
+          "vi": "Identity, units, temporality và label budgets.",
+          "en": "Define identities, units, temporality and label budgets."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Store/roll up",
+          "en": "Store and roll up"
+        },
+        "detail": {
+          "vi": "Durability, compression và type-specific fidelity.",
+          "en": "Preserve durability and type-specific fidelity."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Query/evaluate",
+          "en": "Query and evaluate"
+        },
+        "detail": {
+          "vi": "Compatible aggregation, freshness và alert state.",
+          "en": "Use compatible aggregation, freshness and alert states."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Route/recover",
+          "en": "Route and recover"
+        },
+        "detail": {
+          "vi": "Owned actionable pages và independent monitoring.",
+          "en": "Route owned actionable pages and monitor independently."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Metrics là evidence cho vận hành, không chỉ đường chart",
+        "en": "1. Metrics are operational evidence rather than chart lines"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hệ thống cần thu thập metrics của service và host, hỗ trợ truy vấn theo khoảng thời gian, tính trước các chỉ số bằng recording rules và chuyển cảnh báo tới người trực on-call. Trước khi chọn TSDB, hãy chốt số active series, chu kỳ lấy mẫu, thời gian giữ dữ liệu và loại truy vấn. Trong bài này, ta giả định 10 triệu active series, lấy mẫu mỗi 10 giây, truy vấn dữ liệu gần đây dưới một giây với workload đã giới hạn; dữ liệu cũ được giữ tối đa hai năm ở độ phân giải thấp hơn. Đây là mục tiêu thiết kế để tính toán, không phải benchmark của một sản phẩm.",
+          "en": "The system collects service and host metrics, supports time-range queries, precomputes measurements through recording rules and routes alerts to on-call responders. Before selecting a TSDB, define active series, sampling intervals, retention and query workloads. This lesson assumes ten million active series, ten-second sampling, bounded recent-data queries below one second and coarser retention up to two years. These are design targets for calculation rather than product benchmarks."
+        },
+        {
+          "vi": "Metrics thường trả lời “đang có bao nhiêu lỗi?” hoặc “latency đang tăng ở đâu?”. Logs lưu chi tiết từng sự kiện; traces theo dõi một request đi qua các component. Chúng bổ trợ nhau nhưng có cách lưu và chi phí khác nhau. Có thể gắn exemplar để từ một histogram sample mở trace liên quan; không cần đưa request ID thành label trên mọi series.",
+          "en": "Metrics commonly answer how many errors occur or where latency is increasing. Logs retain individual event details; traces follow requests across components. These signals complement one another but have different storage and cost models. Exemplars can link histogram observations to related traces without placing request IDs on every metric series."
+        },
+        {
+          "vi": "Phải phân biệt dữ liệu đã được chấp nhận, đã bền trên storage và đã xuất hiện trong query. Ghi rõ mức mất dữ liệu cho phép, độ trễ ingest-to-query, cách xử lý partial results và mục tiêu chuyển cảnh báo. Một cluster monitoring riêng giảm phụ thuộc vào ứng dụng, nhưng vẫn có thể dùng chung network, DNS, tài khoản cloud hoặc pager. Vì vậy cần kiểm tra end-to-end từ một failure domain khác, thay vì chỉ hỏi process monitoring còn chạy hay không.",
+          "en": "Distinguish accepted data, durable storage and query-visible data. Define tolerated loss, ingest-to-query delay, partial-result behavior and alert-delivery targets. A separate monitoring cluster reduces application dependencies but can still share networks, DNS, cloud accounts or pagers. Test end-to-end behavior from another failure domain rather than checking only whether the monitoring process is alive."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Identity và units",
+            "en": "Identities and units"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Metric type, labels/resource/scope và temporality quyết định có thể merge gì.",
+              "en": "Types, labels/resources/scopes and temporality determine valid merges."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Cost và fidelity",
+            "en": "Cost and fidelity"
+          },
+          "icon": "chart",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Cardinality/churn, retention, query work và data fidelity đều cần budget.",
+              "en": "Cardinality/churn, retention, query work and fidelity all need budgets."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Evidence và action",
+            "en": "Evidence and action"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "True/false/no data/query error khác nhau; firing alert khác notification/human action.",
+              "en": "True/false/no-data/query-error states differ, as do firing, notification and human action."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Samples/s chưa bao gồm series metadata và query work",
+        "en": "2. Samples/second exclude metadata and query work"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với 10 triệu active series và chu kỳ 10 giây, hệ thống nhận 1 triệu logical samples mỗi giây, tương đương 86,4 tỷ samples mỗi ngày. Nếu dự trù 16 B cho timestamp và giá trị raw, payload là 1,3824 TB/ngày theo đơn vị thập phân. Giả sử workload đo được cho phép dự trù 2 B/sample sau compression, payload còn 172,8 GB/ngày. Giữ 15 ngày và hai bản sao cần 5,184 TB cho phần payload này. Hai byte là giả định phải kiểm chứng bằng dữ liệu thật; nó không phải mức compression được bảo đảm.",
+          "en": "Ten million active series sampled every ten seconds produce one million logical samples per second, or 86.4 billion per day. Budgeting sixteen B for a raw timestamp/value pair gives 1.3824 decimal TB/day. If workload measurements justify a two-B compressed planning estimate, payload becomes 172.8 GB/day. Fifteen days with two copies require 5.184 TB for that payload. Two B must be verified against actual data rather than treated as guaranteed compression."
+        },
+        {
+          "vi": "Con số trên chưa tính index, WAL, in-memory head, compaction, metadata và query CPU. Hai HA collectors cùng scrape một target có thể nhân physical ingest; đây là hệ số khác với storage replication. Một classic histogram có B bucket series cộng thêm sum và count tạo B + 2 series cho mỗi label set. Native histogram có cách biểu diễn và chi phí khác. Active series cao gây tốn head; churn cao liên tục tạo series mới dù số series đồng thời không tăng. Do đó không thể dự báo toàn bộ chi phí chỉ bằng bytes/sample hoặc thời gian retention.",
+          "en": "These figures exclude indexes, WALs, in-memory heads, compaction, metadata and query CPU. Two HA collectors scraping the same target may multiply physical ingestion separately from storage replication. A classic histogram with B bucket series plus sum and count creates B + 2 series per label set; native histograms have different representations and costs. Many active series consume head resources, while churn creates new identities even without increasing concurrent series. Bytes/sample or retention alone cannot predict total cost."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sizing metrics",
+            "en": "Metrics sizing"
+          },
+          {
+            "vi": "Công thức giả định",
+            "en": "Assumed calculation"
+          },
+          {
+            "vi": "Kết quả payload",
+            "en": "Payload result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Logical samples/s",
+              "en": "Logical samples/s"
+            },
+            {
+              "vi": "10M /10s",
+              "en": "10M /10s"
+            },
+            {
+              "vi": "1M/s",
+              "en": "1M/s"
+            }
+          ],
+          [
+            {
+              "vi": "Samples/day",
+              "en": "Samples/day"
+            },
+            {
+              "vi": "1M ×86.400",
+              "en": "1M ×86,400"
+            },
+            {
+              "vi": "86,4B/day",
+              "en": "86.4B/day"
+            }
+          ],
+          [
+            {
+              "vi": "Raw timestamp/value",
+              "en": "Raw timestamp/value"
+            },
+            {
+              "vi": "86,4B ×16B",
+              "en": "86.4B ×16B"
+            },
+            {
+              "vi": "1,3824TB/day",
+              "en": "1.3824TB/day"
+            }
+          ],
+          [
+            {
+              "vi": "Assumed compressed payload",
+              "en": "Assumed compressed payload"
+            },
+            {
+              "vi": "86,4B ×2B",
+              "en": "86.4B ×2B"
+            },
+            {
+              "vi": "172,8GB/day",
+              "en": "172.8GB/day"
+            }
+          ],
+          [
+            {
+              "vi": "15-day replicated payload",
+              "en": "15-day replicated payload"
+            },
+            {
+              "vi": "172,8GB ×15 ×2",
+              "en": "172.8GB ×15 ×2"
+            },
+            {
+              "vi": "5,184TB trước overhead",
+              "en": "5.184TB before overhead"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "types",
+      "title": {
+        "vi": "3. Counter, gauge và histogram có merge semantics riêng",
+        "en": "3. Counters, gauges and histograms have different merges"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong Prometheus, một series được nhận diện bằng metric name và toàn bộ label set. OpenTelemetry còn mô tả resource, instrumentation scope, unit, data type, attributes và temporality. Khi exporter chuyển đổi giữa hai mô hình, phải giữ đúng ý nghĩa dữ liệu, không chỉ đổi tên field. Ví dụ, counter đếm số request tích lũy có thể reset khi process restart; gauge đo mức hiện tại như số connection; histogram mô tả phân phối của nhiều quan sát bằng count, sum và các bucket hoặc schema tương thích.",
+          "en": "Prometheus identifies a series by metric name and its full label set. OpenTelemetry additionally describes resources, instrumentation scopes, units, data types, attributes and temporality. Exporters must preserve meaning when mapping these models rather than merely rename fields. A request counter accumulates events and may reset on restart; a gauge measures a current level such as connection count; histograms describe observation distributions through counts, sums and compatible buckets or schemas."
+        },
+        {
+          "vi": "Delta biểu diễn lượng thay đổi trong một khoảng thời gian; cumulative tích lũy từ một start time. Chuyển đổi cần nhớ trạng thái và xử lý reset, khoảng trống hoặc các khoảng bị chồng lấn. Hai process cùng ghi cumulative counter có start time và reset riêng: xóa instance label không tự biến chúng thành một counter hợp lệ. Cần giữ writer identity đến nơi aggregation đúng, hoặc dùng SDK view/collector có cơ chế reaggregation phù hợp. Rate của counter vì vậy không được tính bằng cách lấy average của các giá trị như với gauge.",
+          "en": "Delta points describe changes over an interval; cumulative points accumulate from a start time. Conversion requires state and policies for resets, gaps and overlapping intervals. Independent cumulative writers have separate start times and resets: deleting their instance labels does not create one valid counter. Retain writer identities until the correct aggregation boundary or use SDK views/collectors with suitable reaggregation. Counter rates therefore cannot be obtained by averaging values as if they were gauges."
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "4. Data plane và rule control plane tách nhau",
+        "en": "4. Separate data and rule control planes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Data plane nên dùng protocol ingestion thực như OTLP hoặc phiên bản remote write mà backend hỗ trợ, kèm contract về encoding, compression, authentication và retry. JSON bên dưới chỉ minh họa logical data model; nó không thay thế wire format của protocol. Query API cần giới hạn tenant, time range, step và lượng dữ liệu xử lý, đồng thời trả metadata về freshness và phần dữ liệu bị thiếu.",
+          "en": "The data plane should use an actual ingestion protocol such as OTLP or a supported remote-write version, with explicit encoding, compression, authentication and retry contracts. The JSON below illustrates a logical model rather than replacing the protocol wire format. Query APIs need tenant, time-range, step and work limits alongside freshness and completeness metadata."
+        },
+        {
+          "vi": "Control plane quản lý rule owner, version, validation và rollout độc lập với luồng samples. Các endpoint ghi rule dưới đây là API giả định của nền tảng ta thiết kế. Không hiểu chúng thành lệnh POST được hỗ trợ sẵn bởi Prometheus: API rules của Prometheus chủ yếu cho phép xem các rules hiện được nạp; cấu hình rule phải đi qua cơ chế triển khai và reload phù hợp.",
+          "en": "The control plane manages rule ownership, versions, validation and rollout independently of samples. The write-rule endpoints below belong to the hypothetical platform designed here. They are not built-in Prometheus POST endpoints: its rules API primarily inspects loaded rules, while configuration changes require an appropriate deployment and reload mechanism."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/metrics",
+          "description": {
+            "vi": "OTLP-compatible gateway chỉ khi triển khai đúng protocol; logical shape minh họa.",
+            "en": "Use an OTLP-compatible gateway only with correct protocol support; this shows logical shape."
+          },
+          "request": "logical: { resource, scope, metrics: [{ name, unit, type, temporality, points[] }] }",
+          "response": "protocol-specific accepted/rejected/partial result"
+        },
+        {
+          "method": "GET",
+          "path": "/platform/v1/query-range?query=...&start=...&end=...&step=30s",
+          "description": {
+            "vi": "Custom tenant-aware query gateway trên chosen engine.",
+            "en": "A custom tenant-aware query gateway over the chosen engine."
+          },
+          "response": "200 { series[], resolution, asOf, partial, warnings[] }"
+        },
+        {
+          "method": "POST",
+          "path": "/platform/v1/alert-rules",
+          "description": {
+            "vi": "Custom versioned config API với owner/runbook/dry-run/tests và authorization.",
+            "en": "Custom versioned rules with authorization, owners/runbooks and tests/dry runs."
+          },
+          "request": "{ ruleId, expectedVersion, expression, for, owner, runbook, routingPolicy }",
+          "response": "200 { version, validation, rolloutState } | 409"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "5. Buffer, shards và query layer có trade-off riêng",
+        "en": "5. Buffers, shards and query layers have their own trade-offs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Collectors tìm targets qua service discovery, pull dữ liệu từ exporter hoặc nhận push, rồi validate và chuyển tiếp tới storage. Có thể thêm Kafka để buffer hoặc fan-out; cũng có thiết kế dùng local WAL và remote-write queue mà không cần Kafka. Nếu API ACK sau khi ghi durable queue, ACK đó chỉ chứng minh đạt boundary của queue, chưa chứng minh dữ liệu đã query được trong TSDB. Một backlog lớn có thể làm dashboard và alert cũ đi dù các process đều đang healthy.",
+          "en": "Collectors discover targets, pull exporters or accept pushes, then validate and forward data. Kafka may provide buffering or fan-out, but local WAL and remote-write queues can also serve designs without Kafka. An ACK after durable queue acceptance proves only that queue boundary, not TSDB query visibility. Large backlogs can make dashboards and alerts stale even while processes remain healthy."
+        },
+        {
+          "vi": "Có thể shard theo tenant và series, nhưng phải đo phân bố để tránh hot shard. Query tổng hợp rộng sẽ fan-out tới nhiều shards nên ingestion throughput không tự bảo đảm query latency. HA collectors và storage replicas cần quy tắc dedup/election rõ ràng; không xóa replica label một cách mù quáng nếu nó làm trộn các writers độc lập. Cache key của query phải chứa tenant, expression, step, time range, resolution và generation liên quan. Dữ liệu cache dùng cho dashboard cũng cần giới hạn freshness trước khi dùng để paging.",
+          "en": "Sharding by tenant and series requires measured distribution to avoid hot shards. Broad queries fan out across shards, so ingestion throughput does not guarantee query latency. HA collectors and replicas need explicit deduplication or election rules rather than blindly removing replica labels and merging independent writers. Query cache keys must include tenant, expression, step, time range, resolution and relevant generations. Dashboard caches also need freshness bounds before their results are used for paging."
+        }
+      ],
+      "diagram": {
+        "id": "metrics-freshness-and-alerts",
+        "title": {
+          "vi": "Sample freshness đi xuyên ingest, query và alert delivery",
+          "en": "Sample freshness spans ingestion, queries and alert delivery"
+        },
+        "caption": {
+          "vi": "Buffer là optional design choice; ACK, storage durability, query completeness và notification là các boundary khác nhau. Independent watchdog vẫn cần kiểm shared dependencies.",
+          "en": "Buffers are optional; acceptance, storage durability, query completeness and notifications are different boundaries. Independent watchdogs still need shared-dependency checks."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "targets",
+            "label": {
+              "vi": "Service / SDK",
+              "en": "Service / SDK"
+            },
+            "detail": {
+              "vi": "Counters/gauges/histograms với units, attributes và temporality; bounded instrumentation overhead.",
+              "en": "Exports counters/gauges/histograms with units, attributes and temporality under bounded overhead."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "discovery",
+            "label": {
+              "vi": "Target discovery",
+              "en": "Target discovery"
+            },
+            "detail": {
+              "vi": "Orchestrator/control plane cung cấp expected targets; missing discovery khác healthy target.",
+              "en": "Orchestrators/control planes provide expected targets; missing discovery does not establish health."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "collector",
+            "label": {
+              "vi": "Collector / scraper",
+              "en": "Collector / scraper"
+            },
+            "detail": {
+              "vi": "Pull hoặc OTLP push, validate identity/quota, batch và bounded retry/drop policy.",
+              "en": "Collects by pull or OTLP push, validates identities/quotas and batches with bounded retry/drop policies."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "buffer",
+            "label": {
+              "vi": "Optional ingest buffer",
+              "en": "Optional ingest buffer"
+            },
+            "detail": {
+              "vi": "Durable queue/remote-write WAL theo architecture; backlog phải lộ freshness lag.",
+              "en": "Durable queues/remote-write WALs depend on architecture; backlog freshness lag stays visible."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "queue"
+          },
+          {
+            "id": "tsdb",
+            "label": {
+              "vi": "Time-series storage",
+              "en": "Time-series storage"
+            },
+            "detail": {
+              "vi": "Head/WAL/index và compressed blocks; shard/replica/HA dedup policies rõ.",
+              "en": "Uses heads/WALs/indexes/compressed blocks with explicit sharding/replication/HA deduplication."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "cold",
+            "label": {
+              "vi": "Long retention blocks",
+              "en": "Long retention blocks"
+            },
+            "detail": {
+              "vi": "Type-aware rollups, manifests và retention; coarse data không giữ mọi query semantics.",
+              "en": "Retains manifests and type-aware rollups; coarse data does not preserve arbitrary query semantics."
+            },
+            "x": 1040,
+            "y": 710,
+            "kind": "store"
+          },
+          {
+            "id": "query",
+            "label": {
+              "vi": "Query service",
+              "en": "Query service"
+            },
+            "detail": {
+              "vi": "Tenant-aware fanout, cost limits, freshness/partial metadata và compatible aggregation.",
+              "en": "Performs tenant-aware fanout, cost limits, freshness/partial reporting and compatible aggregation."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "dash",
+            "label": {
+              "vi": "Dashboard",
+              "en": "Dashboard"
+            },
+            "detail": {
+              "vi": "Hiển thị units/resolution/as-of, không giả missing là zero.",
+              "en": "Displays units/resolution/as-of metadata without treating missing data as zero."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "rules",
+            "label": {
+              "vi": "Rule evaluator",
+              "en": "Rule evaluator"
+            },
+            "detail": {
+              "vi": "Stable alert label identity, expression evidence, pending/for state và evaluation errors.",
+              "en": "Tracks stable alert identities, expression evidence, pending durations and evaluation errors."
+            },
+            "x": 740,
+            "y": 710,
+            "kind": "worker"
+          },
+          {
+            "id": "route",
+            "label": {
+              "vi": "Alert routing",
+              "en": "Alert routing"
+            },
+            "detail": {
+              "vi": "Group/dedup/inhibit/silence và route theo ownership/runbook; delivery có retry/receipt limits.",
+              "en": "Groups/deduplicates/inhibits/silences and routes under ownership/runbooks with delivery limits."
+            },
+            "x": 430,
+            "y": 710,
+            "kind": "service"
+          },
+          {
+            "id": "watchdog",
+            "label": {
+              "vi": "External watchdog",
+              "en": "External watchdog"
+            },
+            "detail": {
+              "vi": "Independent heartbeat/black-box checks và alternate escalation; không chỉ tự scrape mình.",
+              "en": "Runs independent heartbeat/black-box checks and alternate escalation, not only self-scrapes."
+            },
+            "x": 130,
+            "y": 710,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "ingest",
+            "label": {
+              "vi": "Collect và durable ingest",
+              "en": "Collect and durably ingest"
+            },
+            "steps": [
+              {
+                "from": "discovery",
+                "to": "collector",
+                "description": {
+                  "vi": "Publish expected targets/identity và policy; discovery lag có metric riêng.",
+                  "en": "Publish expected targets/identities/policies with separate discovery-lag metrics."
+                },
+                "async": true
+              },
+              {
+                "from": "collector",
+                "to": "targets",
+                "description": {
+                  "vi": "Pull scrape qua reachable/authenticated endpoint; push variant nhận OTLP theo contract riêng.",
+                  "en": "Pull authenticated reachable endpoints; push variants receive OTLP under separate contracts."
+                }
+              },
+              {
+                "from": "targets",
+                "to": "collector",
+                "description": {
+                  "vi": "Return typed samples; failed scrape chỉ nói collection path không thành công.",
+                  "en": "Return typed samples; failed scrapes establish collection failure rather than definitive service death."
+                }
+              },
+              {
+                "from": "collector",
+                "to": "buffer",
+                "description": {
+                  "vi": "Batch validation, cardinality budgets và bounded retries; acceptance boundary được document.",
+                  "en": "Validate batches/cardinality budgets and bound retries under documented acceptance."
+                },
+                "async": true
+              },
+              {
+                "from": "buffer",
+                "to": "tsdb",
+                "description": {
+                  "vi": "Persist samples theo ordering/dedup/durability policy và expose lag.",
+                  "en": "Persist samples under ordering/deduplication/durability policies and expose lag."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "query",
+            "label": {
+              "vi": "Range query có resolution và completeness",
+              "en": "Range queries preserve resolution/completeness metadata"
+            },
+            "steps": [
+              {
+                "from": "dash",
+                "to": "query",
+                "description": {
+                  "vi": "Tenant-authorized expression/time range/step; cost budget và deadline.",
+                  "en": "Submit authorized expressions/ranges/steps with cost budgets/deadlines."
+                }
+              },
+              {
+                "from": "query",
+                "to": "tsdb",
+                "description": {
+                  "vi": "Fetch matching recent series, respect replica/HA dedup policy.",
+                  "en": "Fetch recent matching series under replica/HA deduplication policies."
+                }
+              },
+              {
+                "from": "query",
+                "to": "cold",
+                "description": {
+                  "vi": "Fetch compatible coarse blocks khi retention/resolution cho phép.",
+                  "en": "Fetch compatible coarse blocks when retention/resolution permit."
+                }
+              },
+              {
+                "from": "query",
+                "to": "dash",
+                "description": {
+                  "vi": "Merge type-aware và return warnings/partial/as-of; không che missing shard.",
+                  "en": "Merge by type and return warnings/partial/as-of metadata without hiding missing shards."
+                }
+              }
+            ]
+          },
+          {
+            "id": "alert",
+            "label": {
+              "vi": "Evaluate rồi mới route notification",
+              "en": "Evaluate before routing notifications"
+            },
+            "steps": [
+              {
+                "from": "rules",
+                "to": "query",
+                "description": {
+                  "vi": "Evaluate expression theo schedule/labels; không dùng stale dashboard cache tùy tiện.",
+                  "en": "Evaluate scheduled expressions/labels without arbitrary stale dashboard caches."
+                }
+              },
+              {
+                "from": "query",
+                "to": "tsdb",
+                "description": {
+                  "vi": "Read required evidence/time window với known freshness.",
+                  "en": "Read required evidence/windows under known freshness."
+                }
+              },
+              {
+                "from": "query",
+                "to": "rules",
+                "description": {
+                  "vi": "Return true/false/absent/error semantics rõ, không collapse thành 0.",
+                  "en": "Return explicit true/false/absent/error semantics rather than collapsing them to zero."
+                }
+              },
+              {
+                "from": "rules",
+                "to": "route",
+                "description": {
+                  "vi": "Firing alerts sau for policy; labels ổn định để HA dedup/group.",
+                  "en": "Send firing alerts under duration policies using stable grouping/HA identities."
+                },
+                "async": true
+              },
+              {
+                "from": "route",
+                "to": "watchdog",
+                "description": {
+                  "vi": "Delivery health/heartbeat kiểm từ ngoài; paging retry không chứng minh human receipt.",
+                  "en": "Check delivery health/heartbeats externally; retries do not establish human receipt."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "retention",
+            "label": {
+              "vi": "Rollup và monitor monitoring",
+              "en": "Roll up data and monitor the monitor"
+            },
+            "steps": [
+              {
+                "from": "tsdb",
+                "to": "cold",
+                "description": {
+                  "vi": "Write verified blocks/manifests và type-specific rollups; retention deletion không trước durable publication.",
+                  "en": "Publish verified blocks/manifests/type-specific rollups before relevant retention deletion."
+                },
+                "async": true
+              },
+              {
+                "from": "watchdog",
+                "to": "query",
+                "description": {
+                  "vi": "Black-box canary query kiểm ingest-to-visible latency/availability.",
+                  "en": "Canary queries test end-to-end ingestion visibility/availability."
+                }
+              },
+              {
+                "from": "watchdog",
+                "to": "route",
+                "description": {
+                  "vi": "Independent dead-man/alternate-route policy khi primary monitoring path silent.",
+                  "en": "Use independent dead-man/alternate-route policies when monitoring paths go silent."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "cardinality",
+      "title": {
+        "vi": "6. Cardinality là observed identities; Cartesian product chỉ là bound",
+        "en": "6. Cardinality counts observed identities; products are bounds"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cardinality là số series thực sự xuất hiện với các identities khác nhau. Tích số giá trị của từng label là upper bound của các combinations có thể có, không phải số đo thực tế khi các labels tương quan hoặc nhiều combinations không xuất hiện. Raw URL, user ID, request ID và deployment ID đổi liên tục dễ làm tăng active series hoặc churn. Hash mỗi ID thành một giá trị riêng vẫn giữ gần như nguyên cardinality; hashing cũng không tự bảo đảm ẩn danh.",
+          "en": "Cardinality counts actually observed series identities. Multiplying distinct label-value counts gives an upper bound on possible combinations rather than an actual count when labels correlate or combinations never appear. Raw URLs, user IDs, request IDs and rapidly changing deployment IDs can increase active series or churn. Hashing each ID to a distinct value largely preserves cardinality and does not inherently guarantee anonymity."
+        },
+        {
+          "vi": "Thay raw path /users/123 bằng route template /users/{id} thường giữ được thông tin hữu ích mà không tạo một series cho từng người. Đặt budget cho active series, new series và sample rate theo tenant; chỉ rõ metric/owner nào tạo chi phí. Khi vượt budget, reject, drop hay aggregate đều phải có tín hiệu theo dõi. Việc drop một label có thể khiến samples từ hai writers va chạm; muốn gộp đúng cần aggregation hiểu type và temporality. Bài thử dưới đây cho phép tách upper bound khỏi giả định về tỷ lệ combinations được quan sát.",
+          "en": "Using /users/{id} instead of raw paths such as /users/123 often preserves useful information without one series per user. Budget active series, new series and sample rates per tenant, attributing costs to metrics and owners. Rejection, dropping or aggregation after a limit must be observable. Dropping labels may collide independent writers, so valid aggregation must understand types and temporality. The experiment separates possible combinations from assumed observed coverage."
+        }
+      ],
+      "experiment": "metrics-cardinality"
+    },
+    {
+      "id": "collection",
+      "title": {
+        "vi": "7. Failed scrape và silence không có cùng một nghĩa",
+        "en": "7. Failed scrapes and silence have different meanings"
+      },
+      "paragraphs": [
+        {
+          "vi": "Pull cho collector biết target nào đáng lẽ phải có dữ liệu và scrape có thành công hay không. Scrape fail có thể do network, authentication, exporter hoặc timeout; nó chưa chứng minh process service đã chết. Một target biến mất khỏi discovery cũng khác với known target trả up = 0. Push thuận tiện với một số mạng hoặc workload ngắn hạn, nhưng cần heartbeat và lifecycle policy để sample cũ không bị hiểu thành job vẫn khỏe.",
+          "en": "Pull collection reveals which targets are expected and whether scrapes succeed. Failures can arise from networks, authentication, exporters or timeouts without proving that the service process died. A target disappearing from discovery also differs from a known target returning up = 0. Push suits some networks and short-lived workloads, but needs heartbeat and lifecycle policies so old samples do not imply healthy jobs."
+        },
+        {
+          "vi": "Retry queue phải có giới hạn memory/disk, backpressure, drop metrics và contract về durable acceptance. Instrumentation trong ứng dụng cũng cần overhead có giới hạn khi backend hỏng. Engine phải quy định cách xử lý timestamp quá cũ, out-of-order samples, duplicates và staleness. Đặc biệt, mất một scrape chưa chắc làm query trả “không có dữ liệu” ngay: lookback hoặc range selector có thể vẫn tìm thấy samples cũ. Thiết kế no-data alert dựa trên query thực, không chỉ trạng thái request scrape cuối.",
+          "en": "Retry queues need bounded memory/disk, backpressure, drop metrics and durable-acceptance contracts. Application instrumentation also needs bounded overhead during backend failures. Engines must define old timestamps, out-of-order samples, duplicates and staleness. A missed scrape does not necessarily remove a query result immediately because lookback or range selectors may still find older samples. Design no-data alerts against actual query semantics rather than only the last scrape request."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Collection choice",
+            "en": "Collection choice"
+          },
+          {
+            "vi": "Điểm thuận lợi",
+            "en": "Strength"
+          },
+          {
+            "vi": "Điểm phải thiết kế",
+            "en": "Required design"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Pull/scrape",
+              "en": "Pull/scrape"
+            },
+            {
+              "vi": "Collector kiểm cadence/expected targets.",
+              "en": "Collectors control cadence/expected targets."
+            },
+            {
+              "vi": "Reachability/auth/discovery, failed collection không luôn service death.",
+              "en": "Handle reachability/auth/discovery without equating failures to process death."
+            }
+          ],
+          [
+            {
+              "vi": "Push/OTLP",
+              "en": "Push/OTLP"
+            },
+            {
+              "vi": "SDK/agent export theo lifecycle/network needs.",
+              "en": "SDKs/agents export under lifecycle/network needs."
+            },
+            {
+              "vi": "Bounded retries, identity/temporality, silence/expiry và quotas.",
+              "en": "Bound retries, preserve semantics and handle silence/expiry/quotas."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "storage-rollup",
+      "title": {
+        "vi": "8. Downsample theo metric type, không chỉ lấy average",
+        "en": "8. Downsample by metric type rather than averages alone"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một TSDB có thể dùng in-memory head, WAL bền, compressed immutable blocks và indexes. Ghi vào userspace buffer chưa tương đương đạt mọi contract bền sau crash; cần biết ACK gắn với boundary nào. Timestamp delta/delta-of-delta và XOR giữa float values tận dụng dữ liệu lặp đều, nhưng hiệu quả phụ thuộc workload. Compaction và chuyển dữ liệu sang cold tier cần publication/manifest nhất quán; chỉ xóa hot blocks khi dữ liệu cold đã được xác minh và query routing có thể đọc nó.",
+          "en": "A TSDB may use an in-memory head, durable WAL, compressed immutable blocks and indexes. Writing to a userspace buffer does not satisfy every crash-durability contract; identify the ACK boundary. Timestamp delta/delta-of-delta and float XOR exploit regularity, but results depend on workload. Compaction and cold-tier transfers need consistent publication/manifests; delete hot blocks only after verified cold publication and usable query routing."
+        },
+        {
+          "vi": "Đối với gauge được lấy mẫu cách đều, lưu min/max/sum/count của mỗi bucket giữ được cực trị và sample-weighted mean. Khi bucket cuối có ít samples hơn, average của các bucket means làm mỗi bucket có trọng số như nhau và cho kết quả sai; đúng là tổng sum chia tổng count. Tuy nhiên, những trường này không giữ được vị trí/thời lượng spike, arbitrary percentile hay reset-aware counter rate. Time-weighted mean còn cần durations và gap policy. Mỗi retention tier phải công bố loại query nào vẫn có ý nghĩa sau khi downsample.",
+          "en": "For regularly sampled gauges, bucket minima, maxima, sums and counts preserve extrema and sample-weighted means. Averaging bucket means weights buckets equally and fails when the last bucket has fewer samples; divide total sums by total counts instead. These fields still lose spike timing/duration, arbitrary percentiles and reset-aware counter rates. Time-weighted means additionally require durations and gap policies. Each retention tier must state which queries remain meaningful after downsampling."
+        }
+      ],
+      "experiment": "metrics-rollup"
+    },
+    {
+      "id": "histograms",
+      "title": {
+        "vi": "9. Không average p99; merge distribution rồi mới tính",
+        "en": "9. Merge distributions before quantiles instead of averaging p99"
+      },
+      "paragraphs": [
+        {
+          "vi": "Không thể average p99 của các instances để có global p99. Giả sử A nhận 1.000 requests, tất cả mất 1 ms; B nhận 10 requests, tất cả mất 100 ms. Theo định nghĩa nearest-rank trên 1.010 raw requests, global p99 vẫn là 1 ms, trong khi average của hai p99 là 50,5 ms. Một giá trị quantile không chứa đủ distribution hoặc trọng số để merge; kể cả weighted average của các p99 cũng không giải được bài toán tổng quát. Các trường sum/count của summary có thể aggregate theo semantics của chúng, nhưng không biến quantile fields thành mergeable.",
+          "en": "Instance p99s cannot be averaged into a global p99. Suppose A receives 1,000 requests taking one ms each, while B receives ten taking 100 ms each. Nearest-rank p99 over all 1,010 raw requests is still one ms, while the average of instance p99s is 50.5 ms. A quantile value lacks the distribution and weighting information needed for merging; even weighted p99 averages do not solve the general problem. Summary sums/counts can aggregate according to their own semantics, but do not make quantile fields mergeable."
+        },
+        {
+          "vi": "Với classic histograms, cần bucket boundaries tương thích và giữ label le khi cộng rate của các bucket counts. Native histograms cũng có quy tắc tương thích schema/resolution. Sau khi merge distribution mới ước lượng quantile. Kết quả có sai số do buckets, sketches và sampling; không được gọi nó là exact raw percentile trong mọi engine. Ví dụ PromQL dưới dùng seconds theo tên metric; chỉ nhân 1.000 tại nơi hiển thị nếu muốn milliseconds.",
+          "en": "Classic histograms require compatible bucket boundaries and preservation of the le label while summing bucket-count rates. Native histograms also have schema/resolution compatibility rules. Estimate quantiles after merging distributions. Buckets, sketches and sampling introduce error, so the result is not universally an exact raw percentile. The PromQL example uses seconds as indicated by the metric name; multiply by 1,000 at presentation time if milliseconds are needed."
+        }
+      ],
+      "code": {
+        "language": "promql",
+        "content": "histogram_quantile(\n  0.99,\n  sum by (service, le) (\n    rate(http_request_duration_seconds_bucket[5m])\n  )\n)",
+        "caption": {
+          "vi": "Classic-histogram example; validate bucket compatibility, labels, units và traffic population trước dùng alert.",
+          "en": "Classic-histogram example; validate buckets, labels, units and traffic populations before alerting."
+        }
+      }
+    },
+    {
+      "id": "query",
+      "title": {
+        "vi": "10. Query completeness, caching và noisy neighbors",
+        "en": "10. Query completeness, caching and noisy neighbors"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một range query cần start, end và step, nhưng cách đọc dữ liệu còn phụ thuộc range selectors, lookback và resolution. Khi ghép hot/cold tiers, tránh tính trùng vùng overlap và không dùng dữ liệu coarse cho phép tính mà rollup không còn hỗ trợ. Nếu một shard timeout, query phải trả warning hoặc fail theo contract; không âm thầm trình bày partial result như đầy đủ. Dashboard có thể chấp nhận best-effort, còn paging hoặc xác nhận SLO thường cần policy chặt hơn về completeness và freshness.",
+          "en": "A range query needs start, end and step, but reading behavior also depends on range selectors, lookback and resolution. Combining hot/cold tiers must avoid overlap double-counting and calculations unsupported by coarse rollups. A timed-out shard must produce warnings or failure according to contract, rather than silently presenting partial results as complete. Dashboards may allow best-effort behavior, while paging and SLO validation often require stricter completeness and freshness."
+        },
+        {
+          "vi": "Recording rules giảm query work bằng cách lưu trước aggregates, đổi lại có thêm state, evaluation lag, owner và dependency vào rule version. Cần quota theo tenant cho time range, matched series, concurrency và query cost; có cancellation và fair scheduling để một dashboard regex quá rộng không làm nghẽn alert evaluator. Đo riêng ingestion, head/index, churn, storage, compaction và query/rule CPU. Tối ưu một con số bytes không tự tối ưu toàn hệ thống.",
+          "en": "Recording rules reduce query work by storing precomputed aggregates, at the cost of state, evaluation lag, ownership and version dependencies. Tenant quotas on time ranges, matched series, concurrency and work, alongside cancellation and fair scheduling, prevent broad dashboard regexes from starving alert evaluators. Measure ingestion, heads/indexes, churn, storage, compaction and query/rule CPU separately; optimizing payload bytes alone does not optimize the system."
+        }
+      ]
+    },
+    {
+      "id": "alert-state",
+      "title": {
+        "vi": "11. Pending/for dựa elapsed time của stable alert identity",
+        "en": "11. Pending durations use elapsed time for stable alert identities"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi expression trả một phần tử có điều kiện đúng, label set của phần tử đó nhận một alert instance và bắt đầu pending. Với for: 3m, cùng identity phải còn active qua các lần đánh giá cần thiết và đã trôi qua ít nhất ba phút kể từ first true. Nếu evaluate mỗi phút và first true tại t7, thì sớm nhất firing ở t10. Các lần t7, t8, t9 chỉ trải qua hai phút. Không đưa current value thay đổi liên tục vào labels vì nó có thể tạo instance mới; đặt thông tin đó trong annotations.",
+          "en": "When an expression returns an element satisfying its condition, that label set identifies an alert instance and starts pending. With for: 3m, the same identity must remain active through the required evaluations and at least three minutes must elapse from first true. If evaluations run every minute and first true is at minute seven, firing begins no earlier than ten. Evaluations at seven, eight and nine span only two minutes. Put changing current values in annotations rather than labels that could create new identities."
+        },
+        {
+          "vi": "Điều kiện false, expression không trả dữ liệu và query bị lỗi cần policy riêng. Demo dưới làm mất expression result tại t10, hiển thị NO_DATA và reset pending; nó không đồng nhất một scrape miss với việc PromQL lập tức mất sample. keep_firing_for giữ một alert đã firing thêm một khoảng khi điều kiện biến mất; for kiểm soát lần firing đầu. Cả hai cũng khác group_wait, group_interval hoặc repeat_interval của notification routing. Cảnh báo đã firing chưa chứng minh người trực đã nhận hay đã phản hồi.",
+          "en": "False conditions, absent expression results and query errors need distinct policies. The demo removes the result at minute ten, exposes NO_DATA and resets pending; it does not equate a missed scrape with immediate PromQL sample absence. keep_firing_for retains an already-firing alert after its condition disappears, while for governs initial firing. Both differ from routing group_wait, group_interval or repeat_interval. A firing alert does not prove responder delivery or acknowledgment."
+        }
+      ],
+      "experiment": "metrics-alert"
+    },
+    {
+      "id": "slo-rules",
+      "title": {
+        "vi": "12. Burn rate cần denominator và error-budget contract",
+        "en": "12. Burn rates need denominators and error-budget contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Burn rate cho biết error budget đang được tiêu thụ nhanh gấp bao nhiêu lần mức cho phép: observed bad fraction chia allowed bad fraction. SLO 99,9% cho phép bad fraction 0,001; tỷ lệ lỗi 1% tương ứng burn rate 10. Nếu duy trì mức này một giờ trong window 30 ngày = 720 giờ, phần budget tiêu thụ là 10/720, khoảng 1,39%. Multi-window alert kết hợp evidence ngắn và dài để cân bằng detection nhanh với false positives; chọn thresholds và page/ticket theo tác động lên sản phẩm.",
+          "en": "Burn rate measures how quickly the error budget is consumed relative to its allowed rate: observed bad fraction divided by allowed bad fraction. A 99.9% SLO permits 0.001 bad fraction; one-percent errors imply burn rate ten. Sustaining that rate for an hour within a thirty-day, 720-hour window consumes 10/720, about 1.39% of the budget. Multi-window alerts combine short and long evidence to balance fast detection and false positives, with thresholds and page/ticket choices tied to product impact."
+        },
+        {
+          "vi": "Cần định nghĩa request nào eligible và sự kiện nào là bad. Zero traffic, sample quá ít, numerator series không tồn tại và telemetry outage không đều có nghĩa “không lỗi”. YAML dưới chỉ minh họa một error-fraction threshold; nó chưa phải policy SLO multi-window hoàn chỉnh. Zero fallback cho numerator chỉ tạo ở nơi total series tồn tại; điều kiện denominator > 0 loại no-traffic khỏi alert này, nên cần policy riêng cho no-traffic và missing telemetry. Validate rules và thử dữ liệu replay trước rollout.",
+          "en": "Define eligible requests and bad events. No traffic, very few samples, absent numerator series and telemetry outages do not all mean zero errors. The YAML illustrates one error-fraction threshold rather than a complete multi-window SLO policy. Numerator zero fallback applies only where total series exist; the positive-denominator condition excludes no-traffic from this alert, requiring separate policies for no traffic and missing telemetry. Validate rules and replay data before rollout."
+        }
+      ],
+      "code": {
+        "language": "yaml",
+        "content": "groups:\n  - name: example-http\n    rules:\n      - record: service:http_requests:rate5m\n        expr: sum by (service) (rate(http_requests_total[5m]))\n      - record: service:http_errors:rate5m\n        expr: |\n          sum by (service) (rate(http_requests_total{status=~\"5..\"}[5m]))\n          or on (service) (0 * service:http_requests:rate5m)\n      - alert: ElevatedHttpErrorFraction\n        expr: |\n          (service:http_errors:rate5m / service:http_requests:rate5m > 0.01)\n          and on (service) (service:http_requests:rate5m > 0)\n        for: 3m\n        labels:\n          severity: page\n        annotations:\n          summary: \"Elevated HTTP errors for {{ $labels.service }}\"\n          description: \"Observed fraction: {{ $value }}\"",
+        "caption": {
+          "vi": "Example labels/metric names/eligibility cần phù hợp instrumentation; missing-data rules và ownership routing được quản lý riêng.",
+          "en": "Adapt labels/names/eligibility to instrumentation; manage missing-data rules and ownership/routing separately."
+        }
+      }
+    },
+    {
+      "id": "routing-meta",
+      "title": {
+        "vi": "13. Firing alert chưa phải một human đã nhận page",
+        "en": "13. Firing does not establish that a human received a page"
+      },
+      "paragraphs": [
+        {
+          "vi": "Routing gom các alert liên quan, dedup HA evaluators theo stable normalized labels, dùng inhibition để giảm symptom flood của một incident và áp dụng silence có owner/expiry. Xử lý evaluator replica labels theo alert identity policy để hai evaluator không vô tình tạo hai page độc lập. Transport có retry và receipt riêng; on-call acknowledgment và escalation là workflow tiếp theo, không thể suy ra chỉ từ HTTP success của một webhook.",
+          "en": "Routing groups related alerts, deduplicates HA evaluators using stable normalized labels, inhibits symptom floods from one incident and applies owned, expiring silences. Handle evaluator replica labels according to alert identity policy so two evaluators do not generate independent pages. Transports have retries and receipts; responder acknowledgment and escalation are subsequent workflows rather than implications of a successful webhook response."
+        },
+        {
+          "vi": "Ưu tiên page cho triệu chứng ảnh hưởng người dùng hoặc SLO budget burn có hành động xử lý rõ. Cause signals có thể dùng cho dashboard/ticket, hoặc page khi chúng báo nguy cơ có hành động ngăn chặn cụ thể; không có quy tắc cấm mọi cause alert. Mỗi page cần owner, severity, runbook và context. Đánh giá actionability, detection time và incidents bị bỏ sót thay vì chỉ đếm số page giảm được. External dead-man/canary giúp phát hiện monitoring im lặng, nhưng vẫn cần thử các dependency dùng chung và đường escalation thay thế.",
+          "en": "Prioritize pages for user-impacting symptoms or actionable SLO budget burn. Cause signals may belong on dashboards or tickets, or justify pages when they identify a concrete preventive action; not all cause alerts are forbidden. Each page needs ownership, severity, runbooks and context. Assess actionability, detection time and missed incidents rather than merely reduced page counts. External dead-man checks or canaries detect silent monitoring failures, but shared dependencies and alternative escalation still need testing."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Từ evidence tới hành động",
+          "en": "From evidence to action"
+        },
+        "caption": {
+          "vi": "Rule timers, routing timers và human acknowledgment là ba tầng khác.",
+          "en": "Rule timers, routing timers and human acknowledgment are distinct layers."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Evaluate",
+              "en": "Evaluate"
+            },
+            "detail": {
+              "vi": "Fresh compatible evidence và stable alert labels.",
+              "en": "Use fresh compatible evidence and stable identities."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Pending/firing",
+              "en": "Pending and firing"
+            },
+            "detail": {
+              "vi": "For/keep-firing policy theo incident detection needs.",
+              "en": "Apply duration policies for detection needs."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Group/route",
+              "en": "Group and route"
+            },
+            "detail": {
+              "vi": "Dedup, inhibition, owned silence và escalation.",
+              "en": "Deduplicate, inhibit and apply owned silences/escalation."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Act/review",
+              "en": "Act and review"
+            },
+            "detail": {
+              "vi": "Human receipt/runbook, recovery và quality review.",
+              "en": "Acknowledge, act, recover and review quality."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "14. Governance và self-monitoring là một phần hệ thống",
+        "en": "14. Governance and self-monitoring are part of the system"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bảo vệ ingest, query, rule và config APIs theo tenant. Đặt policy cho PII, unit và metric-name stability; tránh secrets, card data hoặc user IDs trong labels không giới hạn hay dashboard công khai. Instrumentation changes cần lint và cardinality budget. Rule changes cần version, replay/unit tests và canary. Ngoài app metrics, theo dõi collector drops, ingest-to-query lag, rule evaluation lag, query failures và việc notification thực sự được chuyển tới người trực.",
+          "en": "Protect ingestion, queries, rules and configuration by tenant. Govern PII, units and metric-name stability; keep secrets, card data and user IDs out of unbounded labels or public dashboards. Instrumentation changes need linting and cardinality budgets. Rule changes need versions, replay/unit tests and canaries. Alongside application metrics, monitor collector drops, ingest-to-query lag, rule evaluation lag, query failures and actual responder notification delivery."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault metrics",
+            "en": "Metrics fault"
+          },
+          {
+            "vi": "Evidence/invariant cần kiểm",
+            "en": "Required evidence/invariant"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "High-cardinality deploy",
+              "en": "High-cardinality deployment"
+            },
+            {
+              "vi": "Tenant budget/drop signal visible; các team khác vẫn phục vụ.",
+              "en": "Expose budget/drop signals and preserve other tenants."
+            }
+          ],
+          [
+            {
+              "vi": "One HA collector fails",
+              "en": "One HA collector fails"
+            },
+            {
+              "vi": "No unintended double-count hoặc silent collection gap.",
+              "en": "Avoid unintended double counts and expose collection gaps."
+            }
+          ],
+          [
+            {
+              "vi": "Absent/error query",
+              "en": "Absent or failed queries"
+            },
+            {
+              "vi": "Không tự convert thành healthy zero.",
+              "en": "Do not silently convert failures/absence into healthy zeros."
+            }
+          ],
+          [
+            {
+              "vi": "Rollup uneven buckets",
+              "en": "Uneven rollup buckets"
+            },
+            {
+              "vi": "Sum/count weighted means; extrema/percentile semantics đúng.",
+              "en": "Preserve weighted means and correct extrema/quantile semantics."
+            }
+          ],
+          [
+            {
+              "vi": "Stale dashboard cache",
+              "en": "Stale dashboard caches"
+            },
+            {
+              "vi": "Paging biết freshness/completeness, không dùng old evidence mù.",
+              "en": "Paging validates freshness/completeness instead of stale evidence."
+            }
+          ],
+          [
+            {
+              "vi": "Monitoring region silent",
+              "en": "Monitoring regions go silent"
+            },
+            {
+              "vi": "Independent canary/watchdog và verified alternate escalation.",
+              "en": "Use independent canaries/watchdogs and verified alternate routes."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "15. Câu hỏi phỏng vấn về metric meaning và alert quality",
+        "en": "15. Interview questions on metric meaning and alert quality"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi trình bày thiết kế, giải thích series identity, unit, temporality, query population và freshness trước khi chọn tên TSDB. Với alert, vẽ một timeline có first true, evaluation cadence, thời điểm firing và policy khi thiếu dữ liệu hoặc query lỗi. Dùng câu hỏi dưới đây để kiểm tra cả ý nghĩa phép tính lẫn đường vận hành sau cảnh báo.",
+          "en": "Explain series identity, units, temporality, query populations and freshness before selecting a TSDB. For alerts, draw first true, evaluation cadence, firing time and missing-data/query-error policies on a timeline. Use the questions below to test both calculation semantics and the operational path after firing."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Thêm userId label có phải luôn nhân đúng một triệu series?",
+            "en": "Does adding user IDs always multiply series by exactly one million?"
+          },
+          "answer": [
+            {
+              "vi": "Product label-values là upper bound; observed sparse/correlated combinations mới là actual. Tuy vậy unbounded IDs/churn có thể phá budget; hashing không giảm distinctness. Enforce tenant-aware limits và instrumentation views đúng semantics.",
+              "en": "Products bound possible combinations; observed sparse/correlated combinations determine actual counts. IDs/churn can still exhaust budgets, and hashing preserves distinctness. Apply tenant limits and semantically correct views."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Drop instance label có merge được hai counters không?",
+            "en": "Does dropping instance labels correctly merge two counters?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động. Independent cumulative writers có reset/timestamps riêng; relabel collision không là aggregation. Dùng reset/temporality-aware sum/view hoặc giữ writer identity tới đúng query aggregation boundary.",
+              "en": "Not automatically. Independent cumulative writers have separate resets/timestamps; collisions are not aggregation. Use appropriate views/sums or retain identities to the correct query boundary."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Min/max/sum/count có khôi phục mọi rate/p99 không?",
+            "en": "Can extrema/sums/counts recover all rates and p99s?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Gauge sample means/extrema được giữ, nhưng counter resets/boundaries, percentile distribution và time weighting cần thêm semantics/state. Compatible histograms/sketches cho quantile estimates, không average instance p99.",
+              "en": "No. Gauge sample means/extrema survive, while counter resets/boundaries, distributions and time weights need additional information. Merge compatible distributions for estimated quantiles rather than average instance p99s."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "For3m, first true t7, evaluate mỗi phút thì fire t9 hay10?",
+            "en": "With three-minute duration and first true at seven, does minute evaluation fire at nine or ten?"
+          },
+          "answer": [
+            {
+              "vi": "Sớm nhất t10 nếu condition/identity còn active; ba observations t7,t8,t9 mới elapsed2m. Missing/changed labels và query behavior có thể reset/delay; for không là group_wait hoặc human delivery timer.",
+              "en": "No earlier than ten with continuously active identity/conditions: observations at seven/eight/nine span two minutes. Missing data or changing identities can reset/delay durations; routing/human timers differ."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Scrape fail có nghĩa service down không?",
+            "en": "Does a failed scrape mean the service is down?"
+          },
+          "answer": [
+            {
+              "vi": "Nó nói collection path failed, có thể network/auth/exporter/timeout. Correlate target/discovery/black-box signals; silence/missing query không tự là zero hoặc healthy.",
+              "en": "It indicates collection failure, potentially from networks/auth/exporters/timeouts. Correlate discovery/black-box signals without treating silence as healthy zeros."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Compression2B/sample có đủ dự báo bill không?",
+            "en": "Do two B/sample suffice to predict costs?"
+          },
+          "answer": [
+            {
+              "vi": "Đó là assumption cần đo. Head/index/WAL/churn/histograms/replicas/compaction/query CPU và retention có costs riêng; sample payload không là toàn bill.",
+              "en": "It is a measured-planning assumption. Heads/indexes/WALs/churn/histograms/replicas/compaction/query CPU/retention also cost resources; payload bytes are not the whole bill."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bật Kafka buffer có đảm bảo alert luôn fresh không?",
+            "en": "Does buffering in Kafka guarantee fresh alerts?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Durable backlog có thể giữ data nhưng delay query evidence, alerting nhìn dữ liệu cũ. Theo dõi accepted→query-visible latency, rule freshness và bound backlog/drop/recovery policy.",
+              "en": "No. Durable backlogs preserve data while delaying query evidence. Track acceptance-to-visibility, rule freshness and bounded backlog/drop/recovery policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Giảm số pages có đủ chứng minh alert tốt hơn?",
+            "en": "Do fewer pages prove better alerting?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu bỏ lọt incidents. Đo actionability, precision/recall theo incident review, detection time, owner/runbook và paging delivery. SLO multi-window/low-volume/no-data policy cần match product impact.",
+              "en": "Not when incidents are missed. Measure actionability, incident precision/recall, detection, ownership/runbooks and delivery, matching SLO/volume/no-data policies to impact."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

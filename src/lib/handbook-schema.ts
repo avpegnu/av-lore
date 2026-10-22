@@ -88,7 +88,7 @@ const sectionSchema = z.object({
     )
     .optional(),
   experiment: z
-    .enum(['feed-fanout', 'kv-budget', 'capacity','context-budget','roofline','availability','interview-plan','latency','handshake','transport','saturation','balancer','hash-ring','cache-eviction','cache-burst','db-isolation','lsm','sharding','replication-lag','quorum','raft','consumer-groups','delivery-crash','offset-gaps','rate-race','counter-race','id-bits','id-locality','dependency-availability','retry-storm','circuit-breaker','url-space','redirect-cache'])
+    .enum(['feed-fanout', 'kv-budget', 'capacity','context-budget','roofline','availability','interview-plan','latency','handshake','transport','saturation','balancer','hash-ring','cache-eviction','cache-burst','db-isolation','lsm','sharding','replication-lag','quorum','raft','consumer-groups','delivery-crash','offset-gaps','rate-race','counter-race','id-bits','id-locality','dependency-availability','retry-storm','circuit-breaker','url-space','redirect-cache','chat-routing','chat-sync','notification-crash','notification-pipeline','prefix-index','suggestion-race','crawl-frontier','bloom-budget','video-dag','video-abr','video-bandwidth','sync-chunks','sync-conflict','geo-cover','geo-quadtree','merkle-repair','payment-retry','payment-ledger','board-replay','board-shards','click-windows','click-sink','booking-nights','booking-expiry','metrics-cardinality','metrics-rollup','metrics-alert','maps-tiles','maps-routing','maps-eta','nearby-fanout','nearby-viewer','nearby-recovery','object-erasure','object-multipart','object-reader','exchange-book','exchange-recovery','exchange-risk'])
     .optional(),
 });
 export const handbookSchema = z.object({

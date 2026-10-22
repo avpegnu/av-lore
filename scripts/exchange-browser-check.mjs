@@ -1,0 +1,29 @@
+import {chromium} from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const base=process.env.PREVIEW_URL||'http://127.0.0.1:4322/av-lore',report=[],errors=[];
+fs.mkdirSync('artifacts',{recursive:true});
+const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
+try {
+const context=await browser.newContext({viewport:{width:1500,height:1100},reducedMotion:'reduce'}),page=await context.newPage();page.on('pageerror',e=>errors.push(String(e)));
+async function rangeTo(el,n){await el.focus();await page.keyboard.press('Home');for(let i=0;i<n;i++)await page.keyboard.press('ArrowRight');assert.equal(await el.inputValue(),String(n));}
+for(const locale of ['vi','en']){
+await page.goto(base+(locale==='en'?'/en':'')+'/handbook/system-design/exchange/');if(locale==='en')await page.waitForFunction(()=>document.documentElement.dataset.languageReady==='true');
+const labs=page.locator('.exchange-playground');assert.equal(await labs.count(),3);
+for(const lab of await labs.all()){await lab.scrollIntoViewIfNeeded();await lab.locator('xpath=ancestor::astro-island[1]').evaluate(async el=>{if(el.dataset.uiReady==='true')return;await new Promise(r=>el.addEventListener('av-lore:island-ready',r,{once:true}));});}
+const book=labs.nth(0),recovery=labs.nth(1),risk=labs.nth(2),cut=n=>book.locator('.exchange-actions button').filter({hasText:new RegExp('^#'+n+'$')}).click();
+await cut(5);assert.equal(await book.locator('dd').nth(2).textContent(),'2');assert.deepEqual(await book.locator('tbody tr').first().locator('td').allTextContents(),['5/0','MA:A → BT:T1','100','5']);
+await cut(10);const asks=book.locator('.exchange-sides section').nth(1).locator('li');assert.equal(await asks.first().locator('span').first().textContent(),'ME:E');assert.equal(await asks.last().locator('span').first().textContent(),'MC:C3');
+await cut(11);assert.deepEqual(await book.locator('tbody tr').last().locator('td').allTextContents(),['11/1','MC:C3 → BT:T3','101','1']);const fills=await book.locator('tbody tr').count();
+await cut(12);assert.equal(await book.locator('dd').nth(1).textContent(),'DUPLICATE');assert.equal(await book.locator('dd').nth(2).textContent(),'0');assert.equal(await book.locator('tbody tr').count(),fills);
+await cut(13);assert.equal(await book.locator('dd').nth(3).textContent(),'19');assert.equal(await book.locator('.exchange-sides section').nth(1).locator('li').count(),0);
+await cut(16);assert.equal(await book.locator('dd').nth(0).textContent(),'HALTED');assert.equal(await book.locator('dd').nth(1).textContent(),'HALTED_REJECT');await cut(17);assert.equal(await book.locator('dd').nth(0).textContent(),'CONTINUOUS');assert.equal(await book.locator('dd').nth(3).textContent(),'25');
+await rangeTo(recovery.locator('input[type=range]'),13);assert.equal(await recovery.locator('dd').last().textContent(),'BLOCKED_AUTHORITY');await recovery.locator('input[type=checkbox]').check();assert.equal(await recovery.locator('dd').last().textContent(),'READY_NEW_EPOCH');assert.equal(await recovery.locator('[data-state=uncommitted]').textContent(),'#14');await recovery.locator('input[type=range]').focus();await page.keyboard.press('ArrowLeft');assert.equal(await recovery.locator('dd').last().textContent(),'CATCHING_UP');
+assert.deepEqual(await risk.locator('dd').allTextContents(),['300','700 / 0','1','0']);await risk.locator('input[type=checkbox]').uncheck();assert.deepEqual(await risk.locator('dd').allTextContents(),['-300','700 / 600','2','0']);await rangeTo(risk.locator('input[type=range]'),6);assert.deepEqual(await risk.locator('dd').allTextContents(),['1100','0 / 600','2','700']);await risk.locator('input[type=checkbox]').check();assert.deepEqual(await risk.locator('dd').allTextContents(),['1000','0 / 0','1','0']);
+if(locale==='en'){await page.waitForFunction(()=>![...document.querySelectorAll('.exchange-playground')].some(el=>/[ăâđêôơưĂÂĐÊÔƠƯ\u1EA0-\u1EF9]/.test(el.innerText)));assert.equal((await recovery.locator('label.worksheet-toggle').textContent()).trim(),'External authority has fenced the old publisher');}
+await cut(10);for(const width of [1500,390]){await page.setViewportSize({width,height:1100});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);assert.deepEqual(await page.locator('.exchange-sides section,.exchange-risk-steps li,.exchange-playground .worksheet-results > div').evaluateAll(els=>els.filter(el=>el.scrollWidth>el.clientWidth+1).map(el=>el.textContent.slice(0,90))),[]);for(let i=0;i<3;i++){await labs.nth(i).evaluate(el=>el.scrollIntoView({block:'start'}));await page.evaluate(()=>window.scrollBy(0,-100));await page.screenshot({path:`artifacts/exchange-${locale}-${i}-${width}.png`});}await book.locator('.exchange-sides').scrollIntoViewIfNeeded();await page.screenshot({path:`artifacts/exchange-${locale}-book-${width}.png`});}report.push({locale,scenarios:'passed'});await page.setViewportSize({width:1500,height:1100});
+}
+for(const theme of JSON.parse(fs.readFileSync('src/lib/themes.json','utf8'))){await page.evaluate(id=>document.documentElement.dataset.theme=id,theme.id);const a=await new AxeBuilder({page}).include('.rich-handbook').withTags(['wcag2a','wcag2aa']).analyze();report.push({theme:theme.id,violations:a.violations.map(v=>({id:v.id,nodes:v.nodes.map(n=>n.target)}))});}
+}finally{await browser.close();fs.writeFileSync('artifacts/exchange-browser-report.json',JSON.stringify({report,errors},null,2));}
+assert.deepEqual(errors,[]);assert.ok(report.every(r=>!r.violations?.length),JSON.stringify(report.filter(r=>r.violations?.length)));console.log('Exchange: price-time/replace/duplicate/IOC/control replay, committed-prefix authority and shared risk reservation/release scenarios; VI/EN, keyboard, mobile and 9 theme accessibility passed.');

@@ -1,0 +1,1104 @@
+{
+  "id": "nearby-friends",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Nearby Friends: audience, chuyển động và thu hồi quyền",
+    "en": "Designing Nearby Friends: audiences, movement and revocation"
+  },
+  "summary": {
+    "vi": "Mô phỏng gateway fan-out, viewer movement và lost revocation; thiết kế live updates có authorized snapshots, explicit expiry và privacy contracts rõ.",
+    "en": "Explore gateway fan-out, viewer movement and lost revocations with authorized snapshots, explicit expiries and clear privacy contracts."
+  },
+  "prerequisites": [
+    "chat",
+    "proximity",
+    "caching",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "network",
+    "security",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Audience đến từ friend/visibility policy; radius chỉ là một lớp lọc sau authorization.",
+      "en": "Friendship/visibility policies define audiences; radii are another filter after authorization."
+    },
+    {
+      "vi": "Broker copies, local filtering và socket deliveries là các đơn vị capacity khác nhau.",
+      "en": "Broker copies, local filtering and socket deliveries are different capacity units."
+    },
+    {
+      "vi": "Viewer movement cũng cần recompute; không đợi friend publish.",
+      "en": "Viewer movement requires recomputation without waiting for friend publications."
+    },
+    {
+      "vi": "TTL/pub-sub không tự sửa lost final updates hoặc xóa client copies.",
+      "en": "TTLs/pub-sub do not automatically repair lost final updates or erase client copies."
+    },
+    {
+      "vi": "Revocation bảo vệ future disclosures theo contract; không thể thu hồi mọi dữ liệu đã nhận.",
+      "en": "Revocation protects future disclosures under contract but cannot recall all received data."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ consent tới một nearby dot có tuổi",
+      "en": "From consent to a time-bounded nearby dot"
+    },
+    "caption": {
+      "vi": "Giữ permission semantics độc lập với positional staleness.",
+      "en": "Keep permission semantics distinct from positional staleness."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Authorize",
+          "en": "Authorize"
+        },
+        "detail": {
+          "vi": "Friend graph, sharing scope, block và precision.",
+          "en": "Friendships, visibility, blocks and precision."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Accept latest",
+          "en": "Accept latest"
+        },
+        "detail": {
+          "vi": "Writer epoch/seq, age bounds và latest-state CAS.",
+          "en": "Writer epochs/sequences, age bounds and conditional state."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Fan-out/filter",
+          "en": "Fan out and filter"
+        },
+        "detail": {
+          "vi": "Gateway audience, movement recompute và bounded buffers.",
+          "en": "Gateway audiences, movement recomputation and bounded buffers."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Expire/recover",
+          "en": "Expire and recover"
+        },
+        "detail": {
+          "vi": "Client deadlines, policy changes và authorized snapshots.",
+          "en": "Client deadlines, policy changes and authorized snapshots."
+        },
+        "icon": "gauge"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Nearby Friends là audience có quyền, không chỉ radius",
+        "en": "1. Nearby Friends needs authorized audiences as well as radii"
+      },
+      "paragraphs": [
+        {
+          "vi": "Câu hỏi là “ai trong những friends cho phép tôi xem đang ở gần?”, khác với tìm bất kỳ restaurant hoặc stranger gần đây. Friend graph cho ta candidate set tương đối nhỏ, còn positions thay đổi. Baseline hỗ trợ opt-in, visibility subsets, block/unfriend, radius, initial snapshot và live updates. Turn-by-turn navigation và location history không nằm trong baseline. Chọn trước có chia sẻ tọa độ chính xác, coarse position hay chỉ distance band; không gửi precise coordinates rồi chỉ làm mờ ở UI nếu contract là coarse disclosure.",
+          "en": "The query asks which friends permitting this viewer are nearby, unlike discovering arbitrary restaurants or strangers. Friendships provide a relatively small candidate set while positions move. The baseline covers opt-in, visibility subsets, blocks/unfriending, radii, initial snapshots and live updates. Navigation and location history are outside scope. Decide whether disclosure includes precise coordinates, coarse positions or distance bands; UI blurring does not satisfy coarse disclosure after precise data was sent."
+        },
+        {
+          "vi": "Freshness của dot có thể eventual trong vài chục giây theo product policy, nhưng permission revocation cần contract riêng. Không dùng “eventual consistency chấp nhận được” để bỏ qua block hoặc tắt sharing. Ghi rõ thời điểm policy có hiệu lực, khả năng enforce khi network partition và việc không thể thu hồi dữ liệu đã gửi. Offline client phải thấy stale/unknown/expired thay vì một dot không có tuổi.",
+          "en": "Dot freshness may be eventual over tens of seconds under product policy, but permission revocation needs a separate contract. Acceptable positional staleness does not justify ignoring blocks or disabled sharing. Specify effective times, partition behavior and the inability to recall received data. Offline clients should expose stale, unknown or expired state rather than ageless dots."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Audience authorization",
+            "en": "Audience authorization"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Friendship, sharing subset, block và precision kiểm trước disclosure.",
+              "en": "Check friendships, visibility, blocks and precision before disclosure."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Freshness",
+            "en": "Freshness"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Observed time, accepted version và explicit expiry có ý nghĩa riêng.",
+              "en": "Observation times, accepted versions and explicit expiries serve different purposes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Recovery",
+            "en": "Recovery"
+          },
+          "icon": "route",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Live bus là accelerator; latest snapshot/policy authority sửa missed updates.",
+              "en": "Live buses accelerate; snapshots and policy authorities repair missed updates."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "2. Inbound nhỏ hơn logical fan-out nhiều lần",
+        "en": "2. Logical fan-out can greatly exceed input"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 100 triệu feature users, 10% active đồng thời: 10 triệu publishers. Update mỗi 30 giây cho khoảng 333 nghìn updates/giây. Nếu trung bình 400 friends và 10% là online authorized audience, mỗi update có khoảng 40 logical recipients, tức 13,3 triệu delivery/filter actions/giây trước multi-device. Đây là phép tính trung bình từ giả định; correlated social activity và hot users có thể làm tail cao hơn nhiều.",
+          "en": "Assume a hundred million feature users with ten percent concurrently active: ten million publishers. Thirty-second updates yield roughly 333 thousand updates/second. Four hundred friends with ten percent online and authorized imply forty logical recipients per update, or 13.3 million delivery/filter actions per second before multiple devices. These assumed averages omit correlated activity and hot-user tails."
+        },
+        {
+          "vi": "Một gateway có nhiều viewers quan tâm cùng publisher có thể dùng một broker subscription rồi phân phối local; do đó broker network copies không luôn bằng logical recipients. Local permission/distance work và socket bytes vẫn tồn tại. Server sizing cần đo connection memory, subscription state, TLS, CPU, network và slow-consumer queues. “100K connections/máy” chỉ có thể là benchmark có workload/limits rõ, không con số mặc định của WebSocket.",
+          "en": "Gateways hosting multiple viewers of one publisher can share broker subscriptions and distribute locally, so broker copies need not equal logical recipients. Local permission/distance work and socket bytes remain. Server sizing requires measurements of connection memory, subscription state, TLS, CPU, networks and slow-consumer queues. A connections-per-server number needs a specific workload/limit benchmark rather than being a WebSocket default."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Tầng",
+            "en": "Layer"
+          },
+          {
+            "vi": "Giả định",
+            "en": "Assumption"
+          },
+          {
+            "vi": "Rate trung bình",
+            "en": "Average rate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Publishers",
+              "en": "Publishers"
+            },
+            {
+              "vi": "100M ×10%",
+              "en": "100M ×10%"
+            },
+            {
+              "vi": "10M active",
+              "en": "10M active"
+            }
+          ],
+          [
+            {
+              "vi": "Inbound",
+              "en": "Inbound"
+            },
+            {
+              "vi": "10M /30s",
+              "en": "10M /30s"
+            },
+            {
+              "vi": "≈333K/s",
+              "en": "≈333K/s"
+            }
+          ],
+          [
+            {
+              "vi": "Audience",
+              "en": "Audience"
+            },
+            {
+              "vi": "400 ×10%",
+              "en": "400 ×10%"
+            },
+            {
+              "vi": "40 recipients/update",
+              "en": "40 recipients/update"
+            }
+          ],
+          [
+            {
+              "vi": "Logical fan-out",
+              "en": "Logical fan-out"
+            },
+            {
+              "vi": "333K ×40",
+              "en": "333K ×40"
+            },
+            {
+              "vi": "≈13,3M/s",
+              "en": "≈13.3M/s"
+            }
+          ],
+          [
+            {
+              "vi": "Gateway copies",
+              "en": "Gateway copies"
+            },
+            {
+              "vi": "Theo distinct gateways thực sự có viewers.",
+              "en": "Depends on actual distinct viewer gateways."
+            },
+            {
+              "vi": "Phải đo hoặc mô hình hóa placement.",
+              "en": "Measure or model placement."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Contract chia sẻ, snapshot và stream",
+        "en": "3. Sharing, snapshot and stream contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Không cho client tự subscribe user channel bất kỳ rồi tin rằng biết channel name là đủ quyền. Server xác thực principal, kiểm Origin/subprotocol/limits phù hợp cho WebSocket và chỉ dựng authorized subscriptions. Location frames dùng active writer/session epoch và monotonic seq; sender giữ chúng khi retry. ObservedAt, acceptedAt và expiresAt khác nhau, và client clock có giới hạn sai lệch chứ không quyết định global order.",
+          "en": "Clients must not subscribe to arbitrary user channels merely by knowing names. Servers authenticate principals, enforce appropriate WebSocket Origin/subprotocol/limits and construct authorized subscriptions. Location frames carry active writer/session epochs and monotonic sequences retained on retries. Observation, acceptance and expiry times differ; bounded client clock skew does not define global order."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/v1/nearby/socket",
+          "description": {
+            "vi": "Authenticated WebSocket upgrade; messages sau handshake dùng schema phía dưới.",
+            "en": "Authenticated WebSocket upgrade with the frame schema below."
+          },
+          "response": "101 Switching Protocols",
+          "notes": [
+            {
+              "vi": "Bound frame size/rate và outbound buffers; broker channels không public trực tiếp.",
+              "en": "Bound frames/rates/outbound buffers; do not expose private broker channels directly."
+            }
+          ]
+        },
+        {
+          "method": "PUT",
+          "path": "/v1/me/location-sharing",
+          "description": {
+            "vi": "Versioned sharing command; response công bố enforcement contract thay vì hứa instant ở mọi client.",
+            "en": "Versioned sharing commands expose enforcement contracts rather than promise instant client-wide effects."
+          },
+          "request": "{ enabled:false, expectedPolicyEpoch:4, commandId:\"stop-17\" }",
+          "response": "200 { enabled:false, policyEpoch:5, committedAt, enforcement:{mode:\"barrier-or-bounded-lease\", effectiveAt} }",
+          "notes": [
+            {
+              "vi": "Một triển khai chọn contract cụ thể và fail-closed behavior; mode string là chỗ mô tả policy, không hai mode tự tương đương.",
+              "en": "Implementations choose a concrete contract and fail-closed behavior; the string describes alternatives rather than equating them."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/v1/me/nearby?radiusKm=2",
+          "description": {
+            "vi": "Authorized latest-state snapshot; radius/precision bounds theo policy.",
+            "en": "Authorized latest-state snapshot with policy-bound radii/precision."
+          },
+          "response": "200 { snapshotGeneration, generatedAt, policyEpoch, friends:[{userId,version,distanceBand,observedAt,expiresAt}], complete }",
+          "notes": [
+            {
+              "vi": "Không coi missing record từ partial backend response là một removal có authority.",
+              "en": "Do not treat missing records in partial backend responses as authoritative removals."
+            }
+          ]
+        }
+      ],
+      "code": {
+        "language": "json",
+        "content": "{ \"type\":\"location\", \"writerEpoch\":12, \"seq\":71, \"observedAt\":\"...\", \"position\":{ \"lon\":105.84, \"lat\":21.03 }, \"accuracyM\":40 }\n{ \"type\":\"friend\", \"userId\":\"f-8\", \"consentEpoch\":6, \"version\":{ \"writerEpoch\":12, \"seq\":71 }, \"distanceBand\":\"1-2km\", \"observedAt\":\"...\", \"expiresAt\":\"...\" }\n{ \"type\":\"removed\", \"userId\":\"f-8\", \"policyEpoch\":7, \"reason\":\"sharing-disabled\" }",
+        "caption": {
+          "vi": "Logical example: fix sequence và policy epoch là namespaces khác; real timestamps/coordinates cần units và validation rõ.",
+          "en": "Logical example: fix sequences and policy epochs have different namespaces; real timestamps/coordinates need explicit units and validation."
+        }
+      }
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Latest state và policy mới là authority",
+        "en": "4. Latest state and policy provide authority"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một accepted location update ghi latest state bằng conditional version check rồi phát live hint. Nếu hint mất sau write, snapshot và reconciliation vẫn phục hồi được. Nếu cần durable event propagation, dùng outbox/log/CDC tương ứng; đừng gọi write cache rồi publish là atomic nếu chưa có protocol. Position data và policy không được stale giống nhau một cách vô điều kiện: disclosure cần enforce permission contract, còn dot chỉ được hiển thị trong freshness window.",
+          "en": "Accepted locations conditionally update latest state before emitting live hints. Lost hints after writes remain recoverable through snapshots/reconciliation. Durable propagation may use appropriate outbox/log/CDC protocols; cache writes plus publishes are not inherently atomic. Positional and policy staleness cannot be treated identically without conditions: disclosures enforce authorization contracts, while dots stay within freshness windows."
+        }
+      ],
+      "diagram": {
+        "id": "nearby-policy-and-recovery",
+        "title": {
+          "vi": "Friend audience, policy authority và latest-state recovery",
+          "en": "Friend audiences, policy authority and latest-state recovery"
+        },
+        "caption": {
+          "vi": "Pub/sub tăng tốc updates, không là authority cho permission hoặc recovery. Revoke và location frames có ordering/lease contract riêng.",
+          "en": "Pub/sub accelerates updates rather than authorizing disclosures or guaranteeing recovery. Revocations and location frames need explicit ordering/lease contracts."
+        },
+        "width": 1180,
+        "height": 820,
+        "nodes": [
+          {
+            "id": "publisher",
+            "label": {
+              "vi": "Publisher / devices",
+              "en": "Publisher / devices"
+            },
+            "detail": {
+              "vi": "Chỉ gửi khi opt-in; active writer/session epoch và seq được server kiểm, không tin clock client làm total order.",
+              "en": "Uploads only when opted in; servers validate writer/session epochs and sequences rather than trust client clocks for total order."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "ingress",
+            "label": {
+              "vi": "Location gateway",
+              "en": "Location gateway"
+            },
+            "detail": {
+              "vi": "Auth, bounded rate/accuracy/time checks; serialize accepted latest state theo writer policy.",
+              "en": "Authenticates, bounds rates/accuracy/times and serializes accepted latest state under writer policies."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "latest",
+            "label": {
+              "vi": "Latest state / expiry",
+              "en": "Latest state / expiry"
+            },
+            "detail": {
+              "vi": "Latest accepted version + observed/received/expiresAt; snapshot reads kiểm policy và freshness.",
+              "en": "Stores accepted versions and observed/received/expiry times; snapshot reads enforce policy/freshness."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "bus",
+            "label": {
+              "vi": "Sharded update bus",
+              "en": "Sharded update bus"
+            },
+            "detail": {
+              "vi": "Live user-channel hints có thể mất; per-gateway multiplex giảm broker copies nhưng vẫn cần local filtering.",
+              "en": "Live channel hints can be lost; gateway multiplexing reduces broker copies but retains local filtering."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "queue"
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Policy authority",
+              "en": "Policy authority"
+            },
+            "detail": {
+              "vi": "Friend/block/sharing/visibility và consent epoch; fail-closed khi không xác định current permission.",
+              "en": "Owns friendship/block/sharing/visibility and consent epochs; fails closed when current permissions are uncertain."
+            },
+            "x": 430,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Viewer gateway",
+              "en": "Viewer gateway"
+            },
+            "detail": {
+              "vi": "Chỉ subscribe authorized audience, kiểm disclosure contract, recompute khi viewer/friend di chuyển và bound queues.",
+              "en": "Subscribes to authorized audiences, enforces disclosure contracts, recomputes movements and bounds queues."
+            },
+            "x": 740,
+            "y": 400,
+            "kind": "edge"
+          },
+          {
+            "id": "viewer",
+            "label": {
+              "vi": "Viewer / devices",
+              "en": "Viewer / devices"
+            },
+            "detail": {
+              "vi": "Apply versioned updates/removals, explicit expiry timer và reconnect/snapshot; không tự cấp quyền từ channel name.",
+              "en": "Applies versioned updates/removals, expiry timers and snapshot recovery; channel names do not grant permission."
+            },
+            "x": 1040,
+            "y": 400,
+            "kind": "client"
+          },
+          {
+            "id": "control",
+            "label": {
+              "vi": "Sharing API",
+              "en": "Sharing API"
+            },
+            "detail": {
+              "vi": "Versioned opt-in/revoke/block commands; ACK semantics gắn với durable policy và distributed enforcement boundary.",
+              "en": "Accepts versioned consent/revoke/block commands with explicit durable-policy/enforcement ACK boundaries."
+            },
+            "x": 130,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "relay",
+            "label": {
+              "vi": "Policy changes / recovery",
+              "en": "Policy changes / recovery"
+            },
+            "detail": {
+              "vi": "Reliable policy-change propagation/reconciliation theo contract; gone notice chỉ là một phần UX cleanup.",
+              "en": "Propagates/reconciles policy changes reliably under contract; gone notices are only part of display cleanup."
+            },
+            "x": 430,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "reconcile",
+            "label": {
+              "vi": "Snapshot reconciliation",
+              "en": "Snapshot reconciliation"
+            },
+            "detail": {
+              "vi": "Periodic authorized latest-state refresh để sửa missed final update, TTL và mất last removal hint.",
+              "en": "Periodically refreshes authorized state after lost final updates, expiry or missed removal hints."
+            },
+            "x": 740,
+            "y": 700,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "publish",
+            "label": {
+              "vi": "Nhận một fix mới",
+              "en": "Accept a new fix"
+            },
+            "steps": [
+              {
+                "from": "publisher",
+                "to": "ingress",
+                "description": {
+                  "vi": "Gửi session/writer epoch và seq ổn định qua retry; accuracy và observed time có bounds.",
+                  "en": "Send stable writer/session epochs and sequences with bounded accuracy/times."
+                }
+              },
+              {
+                "from": "ingress",
+                "to": "policy",
+                "description": {
+                  "vi": "Kiểm active writer và consent policy theo authority contract.",
+                  "en": "Validate active writers and consent under authority contracts."
+                }
+              },
+              {
+                "from": "ingress",
+                "to": "latest",
+                "description": {
+                  "vi": "Conditional latest-state update không để old session/seq ghi đè state mới.",
+                  "en": "Conditionally update latest state without stale session/sequence overwrites."
+                }
+              },
+              {
+                "from": "latest",
+                "to": "bus",
+                "description": {
+                  "vi": "Publish live hint sau accepted state; mất hint sẽ được reconcile.",
+                  "en": "Publish a hint after acceptance; reconciliation recovers lost hints."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "deliver",
+            "label": {
+              "vi": "Deliver theo friend audience",
+              "en": "Deliver to the friend audience"
+            },
+            "steps": [
+              {
+                "from": "bus",
+                "to": "gateway",
+                "description": {
+                  "vi": "Một bản mỗi gateway có local viewers nếu multiplex; broker không tự cấp quyền.",
+                  "en": "Send one copy per interested gateway when multiplexing; broker delivery grants no permission."
+                },
+                "async": true
+              },
+              {
+                "from": "gateway",
+                "to": "policy",
+                "description": {
+                  "vi": "Kiểm current audience/disclosure generation, precision và fail-closed uncertainty.",
+                  "en": "Enforce current audience/disclosure generations, precision and fail-closed uncertainty."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "viewer",
+                "description": {
+                  "vi": "Gửi versioned position/distance hoặc removal khi ra radius; bounded coalescing.",
+                  "en": "Send versioned positions/distances or radius-exit removals with bounded coalescing."
+                }
+              }
+            ]
+          },
+          {
+            "id": "viewer-move",
+            "label": {
+              "vi": "Chính viewer đổi vị trí",
+              "en": "The viewer moves"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "gateway",
+                "description": {
+                  "vi": "Viewer update thay reference point của mọi candidate distance.",
+                  "en": "Viewer movement changes the reference point for all candidates."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "latest",
+                "description": {
+                  "vi": "Đọc/reuse đủ authorized fresh candidates; prune cần discovery policy không bỏ sót.",
+                  "en": "Read/reuse sufficient authorized fresh candidates; pruning needs gap-free discovery policies."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "viewer",
+                "description": {
+                  "vi": "Recompute entries/exits dù friends chưa có message mới.",
+                  "en": "Recompute entries/exits even without new friend messages."
+                }
+              }
+            ]
+          },
+          {
+            "id": "revoke",
+            "label": {
+              "vi": "Ngừng chia sẻ",
+              "en": "Revoke sharing"
+            },
+            "steps": [
+              {
+                "from": "publisher",
+                "to": "control",
+                "description": {
+                  "vi": "Command tắt sharing/block có expected policy generation và retry identity.",
+                  "en": "Send a sharing-off/block command with expected generation and retry identity."
+                }
+              },
+              {
+                "from": "control",
+                "to": "policy",
+                "description": {
+                  "vi": "Commit new consent epoch; xác định revocation barrier/lease semantics trước ACK.",
+                  "en": "Commit a consent epoch and define barrier/lease semantics before ACK."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "relay",
+                "description": {
+                  "vi": "Durable changes đưa tới relevant gateways, latest-state cleanup và reconciliation.",
+                  "en": "Propagate durable changes to gateways, state cleanup and reconciliation."
+                },
+                "async": true
+              },
+              {
+                "from": "relay",
+                "to": "gateway",
+                "description": {
+                  "vi": "Invalidate old permits và ngăn delayed frames; lost notice không tự cấp quyền gửi tiếp.",
+                  "en": "Invalidate old permits and reject delayed frames; lost notices do not renew disclosure rights."
+                },
+                "async": true
+              },
+              {
+                "from": "gateway",
+                "to": "viewer",
+                "description": {
+                  "vi": "Gone/invalidate giúp UI xóa dot; dữ liệu đã nhận không thể thu hồi hoàn toàn.",
+                  "en": "Removal/invalidation cleans displays but cannot fully recall received data."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recover",
+            "label": {
+              "vi": "Reconnect hoặc mất last hint",
+              "en": "Reconnect or lose the last hint"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "gateway",
+                "description": {
+                  "vi": "Reconnect với jitter; dựng lại subscriptions/authorization theo generation.",
+                  "en": "Reconnect with jitter and rebuild authorized subscriptions by generation."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "reconcile",
+                "description": {
+                  "vi": "Subscribe/buffer và snapshot có boundary; nếu không có replay thì reconcile định kỳ.",
+                  "en": "Coordinate subscription/buffering and snapshot boundaries; reconcile periodically without replay."
+                }
+              },
+              {
+                "from": "reconcile",
+                "to": "policy",
+                "description": {
+                  "vi": "Re-read current friend/visibility/block policy.",
+                  "en": "Read current friendships, visibility and blocks."
+                }
+              },
+              {
+                "from": "reconcile",
+                "to": "latest",
+                "description": {
+                  "vi": "Lấy latest authorized fresh versions, kể cả removals/absence.",
+                  "en": "Read authorized fresh latest versions, including removals/absence."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "viewer",
+                "description": {
+                  "vi": "Replace/reconcile snapshot generation; không hồi sinh dot từ event cũ tới trễ.",
+                  "en": "Reconcile snapshot generations without resurrecting dots from delayed events."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "fanout",
+      "title": {
+        "vi": "5. Đếm network copies và local work riêng",
+        "en": "5. Count broker copies separately from local work"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mô hình one-channel-per-publisher phù hợp khi audience là friend graph đã biết. Gateway có thể ref-count một subscription cho nhiều local viewer sessions; khi viewer cuối không còn quyền hoặc disconnect thì unsubscribe. Payload không được broadcast thẳng tới tất cả sockets trên gateway: phải lọc quyền, precision, freshness và radius cho từng viewer. Mỗi thiết kế cache/fan-out cần giữ tenant/environment scoping và broker ACL phù hợp.",
+          "en": "Per-publisher channels fit known friendship audiences. Gateways can reference-count subscriptions shared by local viewer sessions, unsubscribing when the last authorized viewer leaves. Do not broadcast payloads indiscriminately across sockets: filter authorization, precision, freshness and radius per viewer. Cache/fan-out designs need tenant/environment scope and suitable broker ACLs."
+        },
+        {
+          "vi": "Lab dùng exact placement của một synthetic audience. Tăng devices làm logical deliveries tăng; gom viewers vào ít gateways giảm broker copies nhưng không xóa local work. Global rates chỉ extrapolate cùng distribution lên 10 triệu publishers. Chưa tính protocol bytes, auth lookups, distance computation cost, skew hoặc updates bị coalesce; cần đo chúng trước capacity planning thực.",
+          "en": "The lab uses exact placement for one synthetic audience. More devices increase logical deliveries; fewer distinct gateways reduce broker copies without removing local work. Global rates extrapolate the same distribution to ten million publishers, excluding protocol bytes, authorization lookups, distance costs, skew and coalescing. Measure these before real capacity planning."
+        }
+      ],
+      "experiment": "nearby-fanout"
+    },
+    {
+      "id": "movement",
+      "title": {
+        "vi": "6. Recompute khi bên nào cũng có thể di chuyển",
+        "en": "6. Recompute when either participant moves"
+      },
+      "paragraphs": [
+        {
+          "vi": "Receiver-side filtering không chỉ chạy khi friend gửi một message. Khi viewer đổi vị trí hoặc radius, mọi candidate distance đều có thể đổi dù các friends đứng yên. Cần recompute entries/exits từ cached authorized fresh locations hoặc fetch đủ candidates. Nếu chỉ giữ những người đang trong radius, ta có thể không biết friend trước đó ở xa nay đã gần. Geometry thực dùng distance phù hợp với coordinate system; lab chỉ là planar km.",
+          "en": "Receiver-side filtering must not run only on friend messages. Viewer movement or radius changes can affect every candidate even when friends stay still. Recompute entries/exits from cached authorized fresh positions or fetch sufficient candidates. Retaining only currently nearby people can miss formerly distant friends becoming close. Real geometry needs coordinate-appropriate distances; the lab uses planar km."
+        },
+        {
+          "vi": "Gần radius boundary, GPS noise dễ làm friend vào/ra liên tục. Có thể dùng accuracy-aware bands, dwell time hoặc hysteresis, nhưng phải công bố semantics và bảo đảm không lộ precise data ngoài policy. A stale dot có thể do viewer movement, friend movement, age expiry hoặc policy revoke; gửi removal cần reason/version namespace rõ để delayed “near” frame không hồi sinh state đã bị loại.",
+          "en": "GPS noise near boundaries can cause repeated entries/exits. Accuracy-aware bands, dwell times or hysteresis need explicit semantics and must respect precision policies. Dots can become stale through either participant’s motion, expiry or revocation; removal reasons/version namespaces should prevent delayed nearby frames from resurrecting excluded state."
+        }
+      ],
+      "experiment": "nearby-viewer"
+    },
+    {
+      "id": "versions",
+      "title": {
+        "vi": "7. Timestamp không thay writer/consent ordering",
+        "en": "7. Timestamps do not replace writer or consent ordering"
+      },
+      "paragraphs": [
+        {
+          "vi": "Device clocks có thể skew, restart hoặc chạy nhanh; dùng msg.ts > lastSeen.ts làm tiêu chí duy nhất có thể chặn mọi fix đúng sau một timestamp tương lai. Dùng server-authorized writer/session generation và monotonic sequence trong generation; sequence lớn không tự thắng một consent epoch đã revoke. Multi-device cần product policy: một active location writer, hoặc deterministic merge theo device freshness/quality với authority rõ. Không để delayed old phone giành lại quyền viết chỉ bằng seq lớn.",
+          "en": "Device clocks can skew, restart or jump forward; timestamp-only ordering can suppress all legitimate updates after a future timestamp. Use server-authorized writer/session generations and monotonic sequences within generations; large sequences cannot override revoked consent. Multiple devices need an explicit active-writer or deterministic freshness/quality merge policy. A delayed old phone must not regain writer authority through a large sequence."
+        },
+        {
+          "vi": "Ghi observedAt cho age/quality, acceptedAt cho server processing và expiresAt cho disclosure/display deadline. Bound tuổi fix khi ingest và không làm một fix quá cũ thành fresh chỉ vì nó vừa tới cache. Latest-state CAS và outgoing ordering phải cùng contract; snapshot replacement/removal cũng có generation để client không merge một response cũ lên state mới.",
+          "en": "Observation times express age/quality, acceptance times server processing and expiry times disclosure/display deadlines. Bound fix age at ingestion rather than making old observations fresh merely because they arrived recently. Latest-state CAS and outgoing order need compatible contracts; snapshot replacement/removal generations prevent stale responses from overwriting new state."
+        }
+      ]
+    },
+    {
+      "id": "snapshot",
+      "title": {
+        "vi": "8. Subscribe và snapshot phải khép gap",
+        "en": "8. Close the subscription–snapshot gap"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đọc snapshot rồi subscribe có thể mất update xảy ra ở giữa. Có thể subscribe/buffer trước, đọc latest versions và merge bằng version guard; nếu cần strict point-in-time cut, thêm barrier/replay protocol phù hợp. Live bus lossy vẫn có thể mất update sau đó, nên periodic authorized snapshot/reconciliation là phần của contract. Mất final update khác mất một update giữa chuỗi: không có gì bảo đảm publisher sẽ gửi tiếp để tự sửa.",
+          "en": "Reading a snapshot before subscribing can lose intervening updates. Subscribe/buffer first, read latest versions and merge with guards; strict point-in-time cuts need suitable barrier/replay protocols. A lossy live bus may still lose later updates, so periodic authorized reconciliation belongs in the contract. Losing a final update differs from losing an intermediate one because another publication is not guaranteed."
+        },
+        {
+          "vi": "Một snapshot đầy đủ có thể loại những friends không còn visible; partial response cần complete/warnings để không biến backend outage thành authoritative removal. Reconnect phải rebuild friend/visibility state mới, không chỉ khôi phục subscriptions cached từ hôm trước. Thực hiện jitter, backoff, bounded snapshot batch và reconnect admission control để một gateway outage không gây thundering herd.",
+          "en": "Complete snapshots may remove no-longer-visible friends, while partial responses need completeness/warnings to avoid treating backend outages as authoritative removals. Reconnects rebuild current friendship/visibility state rather than reuse old subscriptions blindly. Jitter, backoff, bounded snapshot batches and admission controls prevent gateway failures from causing reconnect herds."
+        }
+      ]
+    },
+    {
+      "id": "revoke-expiry",
+      "title": {
+        "vi": "9. Revocation và expiry giải hai bài toán khác",
+        "en": "9. Revocation and expiry solve different problems"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tắt sharing phải commit policy generation mới và chặn future disclosure theo contract đã chốt. Best-effort “gone” event chỉ giúp UI cleanup; nó có thể mất cùng pub/sub. Một gateway giữ permission cache cũ phải bị invalidate, có bounded authorization lease, hoặc tham gia revocation barrier; khi không xác định được quyền, fail closed cho fresh disclosure. Không thể hứa globally instantaneous revocation khi vẫn chấp nhận serving permission stale qua partition.",
+          "en": "Disabling sharing commits a new policy generation and stops future disclosures under the stated contract. Best-effort removal events aid display cleanup but can be lost. Stale gateway permission caches require invalidation, bounded authorization leases or revocation barriers; uncertain fresh disclosures fail closed. Globally instantaneous revocation cannot be promised while stale permissions remain usable across partitions."
+        },
+        {
+          "vi": "TTL của backend key không tự xóa dot đã gửi tới client. Cần explicit expiresAt, local timer khi app hoạt động và kiểm lại khi resume; periodic snapshots sửa missed removals. Expiry notifications của storage là accelerator, không deadline delivery guarantee. Ngay cả protocol hoàn hảo cũng không thu hồi screenshots hoặc vị trí recipient đã biết. Lab tách current policy, new forwards và previously received copy để không nhầm ba trạng thái này.",
+          "en": "Backend key TTLs do not remove dots already delivered to clients. Use explicit expiries, active local timers, resume checks and periodic snapshot repair. Storage expiry notifications accelerate rather than guarantee deadline delivery. Even perfect protocols cannot recall screenshots or knowledge already received. The lab separates current policies, new forwards and previously received copies."
+        }
+      ],
+      "experiment": "nearby-recovery"
+    },
+    {
+      "id": "stateful-scaling",
+      "title": {
+        "vi": "10. Stateful tiers cần drain và resubscribe có giới hạn",
+        "en": "10. Stateful tiers need bounded draining and resubscription"
+      },
+      "paragraphs": [
+        {
+          "vi": "WebSocket gateway giữ connection state, subscriptions, latest candidates và send queues; thêm máy không chuyển các sockets đang sống sang máy mới. Deploy cần stop admitting, drain/reconnect có jitter, resume snapshot và giới hạn rate. Slow viewers nên được coalesce latest positions hoặc disconnect/resync thay vì queue vô hạn; policy removals không được rơi mất mãi vì chỉ ưu tiên location frames.",
+          "en": "Gateways hold connections, subscriptions, candidates and send queues. Adding machines does not move live sockets automatically. Deployments stop admission, drain or reconnect with jitter, restore snapshots and limit rates. Coalesce latest positions for slow viewers or disconnect/resynchronize instead of growing queues indefinitely; policy removals must not be indefinitely lost behind location frames."
+        },
+        {
+          "vi": "Redis classic Pub/Sub và sharded Pub/Sub có propagation khác nhau. Sharded channels dùng hash-slot routing qua SPUBLISH/SSUBSCRIBE; không mặc định đó là một ring ứng dụng tự lưu trong etcd. Client-side sharding là phương án khác với migration/subscription ownership riêng. Reshard/failover có reconnect/replay gaps cần latest snapshot recovery. Kafka không cần một topic cho mỗi user; có thể key nhiều users trong partitioned topics nếu thật sự cần durable log/replay, nhưng khi đó vẫn phải thiết kế viewer fan-out.",
+          "en": "Classic Redis and sharded Pub/Sub propagate differently. Sharded channels use hash-slot routing with SPUBLISH/SSUBSCRIBE, not necessarily an application ring stored in etcd. Client-side sharding is another choice with separate migration/subscription ownership. Failovers and resharding create gaps requiring snapshot recovery. Kafka need not use a topic per user: keyed users can share partitioned topics when durable replay is needed, while viewer fan-out still requires design."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Gateway budget",
+            "en": "Gateway budget"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Connection memory, local candidates, CPU, TLS và outbound bytes đều là limits.",
+              "en": "Connections, candidates, CPU, TLS and outbound bytes all impose limits."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Broker budget",
+            "en": "Broker budget"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Distinct gateway subscribers, hot channels và migration churn cần đo riêng.",
+              "en": "Measure distinct gateway subscribers, hot channels and migration churn."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Incident controls",
+            "en": "Incident controls"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Stretch interval/coalesce có freshness trade-off; giữ revoke priority và recovery.",
+              "en": "Longer intervals/coalescing trade freshness; retain revocation priority and recovery."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "battery",
+      "title": {
+        "vi": "11. Battery, precision và background limits độc lập",
+        "en": "11. Battery, precision and background limits are distinct"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixed 30-second GPS là giả định workload, không phải lời hứa OS background location luôn giao fix đúng lịch. Permissions, app lifecycle, device power mode và platform limits có thể trì hoãn hoặc ngừng updates. Sampling interval, transport batch delay và precision là các knobs khác nhau. Adaptive update khi di chuyển hoặc significant-change APIs có thể giảm work ở một số workload, nhưng không tự bảo đảm coarse precision hoặc một mức battery saving cố định.",
+          "en": "Thirty-second GPS is a workload assumption, not an OS promise of scheduled background fixes. Permissions, app lifecycle, power modes and platform limits can delay or stop updates. Sampling intervals, batching delays and precision are different controls. Adaptive movement updates or significant-change APIs may reduce work for some workloads without guaranteeing coarse precision or fixed battery savings."
+        },
+        {
+          "vi": "UI cần nêu sharing đang active với ai, độ mới và cách dừng. Không cần history cho latest nearby state: mặc định không giữ raw trajectories dài hạn. Coarsening trước disclosure giúp giới hạn precision nhưng không tự anonymity; repeated distance/radius queries có thể giúp triangulation nên cần query/rate/privacy policy. Logs, analytics và admin access cũng phải tuân retention/deletion, không chỉ primary cache.",
+          "en": "Interfaces should expose active sharing audiences, freshness and stop controls. Latest nearby state does not require long-lived trajectories. Coarsening disclosures limits precision without guaranteeing anonymity; repeated distance/radius queries can enable triangulation, requiring query/rate/privacy policies. Logs, analytics and administrative access also need retention/deletion controls."
+        }
+      ]
+    },
+    {
+      "id": "geo-regions",
+      "title": {
+        "vi": "12. Geo index là lựa chọn theo access pattern",
+        "en": "12. Choose spatial indexes by access patterns"
+      },
+      "paragraphs": [
+        {
+          "vi": "Friend-key fan-out hợp lý khi candidate set nhỏ, đã biết và cần push. Geo index cũng có thể phục vụ moving points, tùy write rate/query pattern/engine; không có quy tắc “moving friends thì index không dùng được”. Với nearby strangers, geographic discovery trở nên quan trọng hơn, nhưng authorization/safety vẫn cần riêng. Cell subscriptions phải cover radius conservatively và exact-filter; không cố định chỉ tám neighboring cells cho mọi zoom/radius.",
+          "en": "Friend-key fan-out suits small known candidate sets requiring push. Spatial indexes can also serve moving points depending on write rates, queries and engines; moving friends do not categorically rule them out. Geographic discovery matters more for strangers while authorization/safety remain separate. Cell subscriptions need conservative radius coverage and exact filtering rather than a universal eight-neighbor rule."
+        },
+        {
+          "vi": "Cross-region friends có thể dùng publisher/home-region relay và regional viewer gateways. Bỏ subscription cho friend đang rất xa tiết kiệm work nhưng cần coarse discovery hoặc periodic recheck để biết họ tới gần; nếu không sẽ tạo false negatives kéo dài. Multi-region policy revocation có latency/partition contract chặt hơn position freshness. Region failure phải preserve fail-closed permission behavior, không chỉ reroute socket tới bất kỳ region có cache.",
+          "en": "Cross-region friends may use publisher/home-region relays and regional viewer gateways. Skipping currently distant friends saves work but needs coarse discovery or periodic rechecks to detect approaches, otherwise false negatives persist. Multi-region policy revocation requires contracts distinct from positional freshness. Regional failover preserves fail-closed permissions rather than moving sockets to arbitrary cached regions."
+        }
+      ]
+    },
+    {
+      "id": "storage-failures",
+      "title": {
+        "vi": "13. Storage nhẹ không có nghĩa recovery miễn phí",
+        "en": "13. Light storage does not make recovery free"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lưu durable friend/block/visibility policy và consent epochs; latest locations giữ ít state theo retention. Nếu product thật sự cần history, justify purpose/retention và dùng time buckets để tránh một user partition tăng mãi. Versioned delete/tombstone hoặc policy authority phải ngăn delayed writes hồi sinh revoked data. Đừng suy TTL xóa mọi backup/log ngay tại cùng timestamp.",
+          "en": "Persist friendships, blocks, visibility and consent epochs, while retaining minimal latest-location state. If history is needed, justify its purpose/retention and time-bucket partitions to avoid unbounded per-user growth. Versioned deletions/tombstones or policy authorities must prevent delayed resurrection. TTLs do not erase every backup/log at the same instant."
+        },
+        {
+          "vi": "Theo dõi input rate, logical checks, broker copies, socket bytes, dropped/coalesced frames, p99 freshness và policy enforcement lag. Privacy failures không nên được đo bằng cách log precise coordinates của mọi disclosure; audit IDs/epochs với access controls và retention phù hợp. Drill cần bao gồm mất last update, mất revoke notice, expired key không có event, viewer di chuyển, gateway restart và policy authority partition.",
+          "en": "Track input rates, logical checks, broker copies, socket bytes, drops/coalescing, freshness p99 and policy-enforcement lag. Do not audit privacy by indiscriminately logging precise disclosures; use controlled, retained identifiers/epochs. Drill lost final updates, missed revocations, expiries without events, viewer movement, gateway restarts and authority partitions."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Tình huống",
+            "en": "Scenario"
+          },
+          {
+            "vi": "Cách phục hồi",
+            "en": "Recovery"
+          },
+          {
+            "vi": "Giới hạn cần nêu",
+            "en": "Required limit"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Mất pub/sub shard",
+              "en": "Pub/sub shard loss"
+            },
+            {
+              "vi": "Resubscribe có jitter và authorized snapshots.",
+              "en": "Resubscribe with jitter and authorized snapshots."
+            },
+            {
+              "vi": "Không có replay tự động chỉ nhờ Pub/Sub.",
+              "en": "Pub/Sub alone provides no automatic replay."
+            }
+          ],
+          [
+            {
+              "vi": "Mất revoke notice",
+              "en": "Lost revocation notice"
+            },
+            {
+              "vi": "Policy enforcement độc lập và expiry/reconciliation UI.",
+              "en": "Independent policy enforcement and display expiry/reconciliation."
+            },
+            {
+              "vi": "Dữ liệu đã nhận không thu hồi hoàn toàn.",
+              "en": "Received data cannot be fully recalled."
+            }
+          ],
+          [
+            {
+              "vi": "Viewer đổi vị trí",
+              "en": "Viewer moves"
+            },
+            {
+              "vi": "Recompute đủ cached candidates, entries và exits.",
+              "en": "Recompute sufficient candidates, entries and exits."
+            },
+            {
+              "vi": "Chỉ xử lý friend events sẽ bỏ sót.",
+              "en": "Friend-event-only filtering misses changes."
+            }
+          ],
+          [
+            {
+              "vi": "Policy authority không đọc được",
+              "en": "Policy authority unavailable"
+            },
+            {
+              "vi": "Fail closed theo barrier/lease contract.",
+              "en": "Fail closed under barrier/lease contracts."
+            },
+            {
+              "vi": "Không hứa vừa stale authorization vừa instant revoke.",
+              "en": "Do not combine stale authorization with instant-revoke promises."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "14. Câu hỏi về fan-out, privacy và recovery",
+        "en": "14. Questions about fan-out, privacy and recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hãy tách “được phép gửi”, “vừa gửi thêm”, và “client đang giữ bản sao cũ”. Vẽ một lost final message thay vì luôn giả định lần update tiếp theo sẽ sửa mọi lỗi.",
+          "en": "Separate authorization, new disclosures and old client copies. Draw a lost final message rather than assume another update will always repair failures."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "40 friends có luôn tạo 40 broker copies?",
+            "en": "Do forty friends always require forty broker copies?"
+          },
+          "answer": [
+            {
+              "vi": "Đó là logical recipients trước multi-device. Gateway multiplex có thể giảm distinct broker copies nếu nhiều viewers cùng gateway; local filtering/socket work vẫn còn. Đo placement, payload bytes và skew, không suy máy cần dùng chỉ từ connection count.",
+              "en": "These are logical recipients before multiple devices. Multiplexing reduces copies when viewers share gateways, while local filtering/socket work remains. Measure placements, bytes and skew rather than size from connections alone."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Friend không đổi vị trí thì viewer di chuyển có cần recompute?",
+            "en": "Must viewer movement recompute distances if friends stay still?"
+          },
+          "answer": [
+            {
+              "vi": "Có. Reference point thay đổi, nên cached candidates có thể vào/ra radius. Chỉ xử lý publisher events giữ stale dots và bỏ missed entries; prune candidates phải có discovery/recheck mechanism.",
+              "en": "Yes. A changing reference point causes entries/exits. Publisher-event-only filtering retains stale dots and misses entries; pruning needs discovery/recheck mechanisms."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Redis TTL hết thì dot tự biến mất ngay?",
+            "en": "Does backend TTL automatically remove a client dot?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Dot là bản sao đã gửi; expiry notification có thể trễ hoặc mất. Dùng explicit expiresAt, timer/resume checks và authorized snapshot reconciliation. Backend key absence không tự là một client event.",
+              "en": "No. Dots are delivered copies, and expiry notifications may be delayed or lost. Use explicit expiries, timers/resume checks and authorized reconciliation. Key absence is not itself a client event."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Gone event có đủ để enforce stop-sharing?",
+            "en": "Does a removal event enforce stopped sharing?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Authority commit consent epoch và outgoing disclosure cần contract invalidation/barrier/lease; uncertain permission fail closed. Gone là cleanup hint. Revocation không xóa screenshots hay dữ liệu recipient đã nhận.",
+              "en": "No. Authority commits and outgoing disclosures need invalidation/barrier/lease contracts with fail-closed uncertainty. Removals aid cleanup and cannot erase screenshots or received data."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dùng client timestamp để bỏ old fixes có đủ?",
+            "en": "Are client timestamps sufficient to reject old fixes?"
+          },
+          "answer": [
+            {
+              "vi": "Không với skew, restarts hoặc multi-device. Dùng authorized writer/session epoch và monotonic seq, policy epoch riêng, timestamp bounds cho freshness. Một old device không được thắng bằng seq hoặc clock lớn hơn.",
+              "en": "Not with skew, restarts or multiple devices. Use authorized writer/session epochs and monotonic sequences, separate policy epochs and freshness bounds. Old devices do not win through larger clocks/sequences."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Pub/sub mất một update có thể cứ đợi 30 giây?",
+            "en": "Can a lost update always wait for the next thirty-second update?"
+          },
+          "answer": [
+            {
+              "vi": "Không có bảo đảm update tiếp theo tồn tại: app có thể đóng ngay sau final fix hoặc revoke. Latest-state snapshot và periodic reconciliation phải sửa lost final state; reconnect cũng cần fresh authorization.",
+              "en": "Another update may never arrive after a final fix or revocation. Snapshots and periodic reconciliation must repair final-state loss, while reconnects need current authorization."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có nên bỏ mọi cross-region/far-away subscription?",
+            "en": "Should all distant or cross-region subscriptions be discarded?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi có discovery/recheck tránh bỏ lỡ friend di chuyển tới gần. Radius coverage phải conservative; multi-region permission contract khác position freshness. Đây là trade-off measured workload, không shortcut luôn đúng.",
+              "en": "Only with discovery/rechecks preventing missed approaches. Use conservative coverage and distinguish regional authorization from position freshness. This is a measured trade-off rather than a universal shortcut."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Significant-change API có bảo đảm vừa precise vừa fresh vừa ít pin?",
+            "en": "Do significant-change APIs guarantee precision, freshness and low power together?"
+          },
+          "answer": [
+            {
+              "vi": "Không. OS permissions/lifecycle và workload ảnh hưởng delivery; interval, precision và batching là knobs khác. Product cần show age/unknown states và chỉ xin precision/background access thực sự cần.",
+              "en": "No. Permissions, lifecycle and workloads affect delivery, while intervals, precision and batching differ. Expose age/unknown states and request only necessary precision/background access."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
