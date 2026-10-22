@@ -1,0 +1,2996 @@
+{
+  "id": "ep-amazon",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Checkout: từ cart intent đến stock, payment và shipment",
+    "en": "Building Checkout: from cart intent to stock, payments and shipments"
+  },
+  "summary": {
+    "vi": "11 giai đoạn, quote/order/failure traces và ba lab về cart merge, inventory expiry/late auth, shuffle isolation; giải thích rõ authority và recovery xuyên boundaries.",
+    "en": "Eleven stages, quote/order/failure traces and three labs explore cart merges, inventory expiry/late authorization and shuffle isolation under explicit authority/recovery boundaries."
+  },
+  "prerequisites": [
+    "reservations",
+    "payments",
+    "digital-wallet",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "database",
+    "cache",
+    "architecture"
+  ],
+  "takeaways": [
+    {
+      "vi": "Cart intent, queue receipt và stock hold là ba contracts khác nhau.",
+      "en": "Cart intent, queue receipts and stock holds are distinct contracts."
+    },
+    {
+      "vi": "Stock transition cần durable ownership/result cùng boundary; terminal release chỉ một lần.",
+      "en": "Stock transitions need durable ownership/results; release terminals apply once."
+    },
+    {
+      "vi": "Payment timeout giữ unknown, không tự decline hoặc release theo giả định.",
+      "en": "Payment timeouts remain unknown rather than implying declines."
+    },
+    {
+      "vi": "Saga cần participant idempotency, isolation guards và fallible compensation recovery.",
+      "en": "Sagas need participant identities, isolation guards and compensation recovery."
+    },
+    {
+      "vi": "Cells/shuffle subsets không loại shared dependency failures hoặc retry costs.",
+      "en": "Cells/shuffle subsets do not eliminate shared failures or retry costs."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Commit theo từng authority, recover toàn journey",
+      "en": "Commit at each authority and recover the journey"
+    },
+    "caption": {
+      "vi": "Không có một giant transaction tự bao phủ bank và warehouse.",
+      "en": "No automatic giant transaction spans banks and warehouses."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Quote",
+          "en": "Quote"
+        },
+        "detail": {
+          "vi": "Approve immutable total/promise.",
+          "en": "Approve immutable totals/promises."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Hold",
+          "en": "Hold"
+        },
+        "detail": {
+          "vi": "Atomic quantity + owner/expiry state.",
+          "en": "Atomic quantities and owner/expiry state."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Order",
+          "en": "Order"
+        },
+        "detail": {
+          "vi": "Durable workflow resolves uncertainty.",
+          "en": "Durable workflows resolve uncertainty."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Ship / reconcile",
+          "en": "Ship / reconcile"
+        },
+        "detail": {
+          "vi": "Shipment/capture identities và repair evidence.",
+          "en": "Shipment/capture identities and repair evidence."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Mỗi domain cần consistency khác nhau",
+        "en": "1. Each domain needs its own consistency"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một store không có một consistency knob chung. Browse catalog có thể hơi cũ; cart có thể giữ concurrent edits; inventory quyết ai sở hữu hàng; payment biết external money state; order giữ contract và tiến độ. Bài này xây checkout kiểu Amazon theo 11 pressures/giai đoạn, không mô tả inventory hiện tại của một công ty.",
+          "en": "A store has no single consistency knob. Catalogs tolerate bounded staleness; carts merge edits; inventory allocates goods; payments own external money evidence; orders retain contracts and progress. This lesson builds an Amazon-style checkout through eleven pressures, not a current company deployment inventory."
+        },
+        {
+          "vi": "Chọn hard-stock, no-backorder cho lab; nếu product cho oversell/backorder thì invariant và UX phải đổi có chủ đích. Cart item không là stock hold, queue token không là order confirmation, authorization không là captured/settled money. Những phân biệt này quan trọng hơn tên database.",
+          "en": "Labs assume hard stock without backorders. Allowing backorders changes invariants and UX deliberately. Cart items are not stock holds, queue tokens are not order confirmations, and authorization is not capture/settlement. These distinctions matter more than database names."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Browse / cart",
+            "en": "Browse / cart"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Stale display và conflicting intent có policy; không tự charge từ cached price.",
+              "en": "Bound stale displays and conflicting intent; never charge directly from cached prices."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Inventory / order",
+            "en": "Inventory / order"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Quantities, owners, state versions và accepted results cần recover được.",
+              "en": "Recover quantities, ownership, state versions and accepted results."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Money / fulfillment",
+            "en": "Money / fulfillment"
+          },
+          "icon": "route",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "External outcomes có ambiguity và irreversible effects; theo dõi identities riêng.",
+              "en": "External outcomes can be uncertain or irreversible; track separate identities."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "contract",
+      "title": {
+        "vi": "2. Chốt semantics của nút Place order",
+        "en": "2. Define what Place order promises"
+      },
+      "paragraphs": [
+        {
+          "vi": "Request gồm immutable cart/quote version, delivery choice và stable checkout identity. Backend xác nhận price/discount/tax/shipping/currency tại authority; nếu thay đổi vật chất, trả requote/consent thay silently charge amount khác. Retained request hash ngăn cùng identity bị tái dùng cho cart khác.",
+          "en": "Requests carry immutable cart/quote versions, delivery choices and stable checkout identities. Revalidate totals/currency at authority and obtain consent for material changes instead of silently charging another amount. Retained request hashes reject identity reuse with changed carts."
+        },
+        {
+          "vi": "Phân biệt ORDER_RECEIVED, PENDING_PAYMENT, CONFIRMED, ALLOCATED, PARTIALLY_SHIPPED, SHIPPED, CANCEL_PENDING và terminal states. Product có thể gọi received là “placed” nhưng phải nói rõ cho người dùng. Confirmation trong thiết kế này cần durable order state, hợp lệ inventory allocation và acceptable payment evidence; shipment/capture về sau có sub-state riêng.",
+          "en": "Distinguish received, payment pending, confirmed, allocated, partially shipped, shipped, cancellation pending and terminal states. Product labels must explain their guarantees. Confirmation here needs durable state, valid allocation and acceptable payment evidence; shipping/capture retain separate substates."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Intent khác commitment",
+          "en": "Intent differs from commitment"
+        },
+        "caption": {
+          "vi": "Mỗi mũi tên có persisted transition và recovery; không chỉ gọi function tuần tự.",
+          "en": "Each arrow requires persisted transitions and recovery, not merely sequential calls."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Requote",
+              "en": "Requote"
+            },
+            "detail": {
+              "vi": "Giữ immutable shopper-approved total.",
+              "en": "Retain immutable approved totals."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Reserve",
+              "en": "Reserve"
+            },
+            "detail": {
+              "vi": "Acquire current stock hold cho order.",
+              "en": "Acquire current order-specific holds."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Authorize",
+              "en": "Authorize"
+            },
+            "detail": {
+              "vi": "Resolve accepted/declined/unknown.",
+              "en": "Resolve accepted, declined or unknown evidence."
+            },
+            "icon": "compare"
+          },
+          {
+            "title": {
+              "vi": "Confirm",
+              "en": "Confirm"
+            },
+            "detail": {
+              "vi": "Commit state + durable next-step intent.",
+              "en": "Commit state and durable next-step intent."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 11 giai đoạn: bottleneck rồi boundary",
+        "en": "3. Eleven stages: bottlenecks before boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi stage có áp lực, lựa chọn, trade-off, điều kiện đi tiếp và exit criteria. Modular monolith phù hợp khi transaction locality và team size còn tốt; distributed workflow chỉ đáng chi phí khi boundaries thực sự tồn tại. Không xem số services hoặc server là thước đo trưởng thành.",
+          "en": "Each stage states pressure, decisions, trade-offs, next triggers and exit criteria. Modular monoliths fit local transactions and small teams; distributed workflows justify their cost only when boundaries actually exist. Service/server counts do not measure maturity."
+        }
+      ],
+      "stages": [
+        {
+          "id": "mvp",
+          "title": {
+            "vi": "Một store với local transactions",
+            "en": "One store with local transactions"
+          },
+          "description": {
+            "vi": "Modular app và relational DB giữ cart/order/inventory cùng một transaction domain khi team còn nhỏ. External payment vẫn ngoài transaction: payment record local không có nghĩa bank đã authorize/capture. Bắt đầu với idempotent order creation, stock invariants và pending UI.",
+            "en": "A modular app and relational database keep carts, orders and inventory local for a small team. External payment remains outside the transaction: local payment rows do not establish bank effects. Start with stable order identities, inventory invariants and pending UI."
+          },
+          "problem": {
+            "vi": "Cần bán đúng hàng và debug được checkout đầu tiên.",
+            "en": "The first checkout must sell correctly and be debuggable."
+          },
+          "decision": {
+            "vi": "Local transactions cho holds/order/intent, separate external effect identity.",
+            "en": "Use local holds/order/intent transactions and separate external effect identities."
+          },
+          "tradeoff": {
+            "vi": "Shared release/storage có blast radius; backups, restore và quotas vẫn cần.",
+            "en": "Shared releases/storage have broad impact; backups, restores and quotas remain necessary."
+          },
+          "nextPressure": {
+            "vi": "Browse traffic cạnh tranh resources của checkout.",
+            "en": "Browsing competes with checkout resources."
+          },
+          "exitCriteria": {
+            "vi": "Lost reply không duplicate order; payment timeout hiển thị pending.",
+            "en": "Lost replies preserve order identity; payment timeouts remain pending."
+          },
+          "diagram": {
+            "id": "checkout-stage-mvp",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Shopper",
+                  "en": "Shopper"
+                },
+                "detail": {
+                  "vi": "Giữ checkout request identity, hiển thị pending và quote đã xác nhận.",
+                  "en": "Retains checkout identities, pending state and acknowledged quotes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Local commerce DB",
+                  "en": "Local commerce DB"
+                },
+                "detail": {
+                  "vi": "Orders, inventory, holds và outbox có local transaction boundary.",
+                  "en": "Orders, inventory, holds and outbox share local transaction boundaries."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "pay",
+                "label": {
+                  "vi": "Payment boundary",
+                  "en": "Payment boundary"
+                },
+                "detail": {
+                  "vi": "Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                  "en": "Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary client → api: Auth, cart snapshot, validated quote, order identity và deadline.",
+                      "en": "Boundary client → api: Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "db",
+                    "description": {
+                      "vi": "Boundary api → db: Orders, inventory, holds và outbox có local transaction boundary.",
+                      "en": "Boundary api → db: Orders, inventory, holds and outbox share local transaction boundaries."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary api → pay: Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                      "en": "Boundary api → pay: Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "catalog",
+          "title": {
+            "vi": "Cache catalog theo staleness budget",
+            "en": "Cache catalogs under staleness budgets"
+          },
+          "description": {
+            "vi": "Images/static bytes qua CDN; product descriptions và browse offers có cache key theo locale/currency/customer segment khi cần. Cache không là quote authority. Checkout tính lại totals/tax/shipping/eligibility và xin shopper consent nếu material price đổi. Cold cache cần coalescing, bounded misses và warmup.",
+            "en": "Serve static bytes through CDNs and cache browsing by required locale/currency/segment. Caches are not quote authority. Checkout revalidates totals, tax, shipping and eligibility with consent for material changes. Bound cold-cache misses, coalesce and warm up."
+          },
+          "problem": {
+            "vi": "Page views lớn hơn orders và hot products làm database quá tải.",
+            "en": "Page views dominate orders and hot products overload databases."
+          },
+          "decision": {
+            "vi": "Isolate browse caches khỏi strict checkout authority.",
+            "en": "Separate browse caches from strict checkout authority."
+          },
+          "tradeoff": {
+            "vi": "Invalidation, stale offers và cache dependency tạo failure modes mới.",
+            "en": "Invalidation, stale offers and cache dependencies introduce failures."
+          },
+          "nextPressure": {
+            "vi": "Discovery cần recommendations nhưng không được kéo chậm checkout.",
+            "en": "Discovery needs recommendations without delaying checkout."
+          },
+          "exitCriteria": {
+            "vi": "Flush cache ở target traffic không đánh sập order database.",
+            "en": "Cache flushes at target traffic do not collapse order storage."
+          },
+          "diagram": {
+            "id": "checkout-stage-catalog",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Shopper",
+                  "en": "Shopper"
+                },
+                "detail": {
+                  "vi": "Giữ checkout request identity, hiển thị pending và quote đã xác nhận.",
+                  "en": "Retains checkout identities, pending state and acknowledged quotes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Catalog authority",
+                  "en": "Catalog authority"
+                },
+                "detail": {
+                  "vi": "Offer/price/eligibility versions; browse cache không là payment quote.",
+                  "en": "Offer, price and eligibility versions; browse caches are not binding quotes."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Browse cache / CDN",
+                  "en": "Browse cache / CDN"
+                },
+                "detail": {
+                  "vi": "Staleness budget, miss admission và cold-start protection.",
+                  "en": "Staleness budgets, miss admission and cold-start protection."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Local commerce DB",
+                  "en": "Local commerce DB"
+                },
+                "detail": {
+                  "vi": "Orders, inventory, holds và outbox có local transaction boundary.",
+                  "en": "Orders, inventory, holds and outbox share local transaction boundaries."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Boundary client → cache: Staleness budget, miss admission và cold-start protection.",
+                      "en": "Boundary client → cache: Staleness budgets, miss admission and cold-start protection."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary client → api: Auth, cart snapshot, validated quote, order identity và deadline.",
+                      "en": "Boundary client → api: Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Boundary api → catalog: Offer/price/eligibility versions; browse cache không là payment quote.",
+                      "en": "Boundary api → catalog: Offer, price and eligibility versions; browse caches are not binding quotes."
+                    }
+                  },
+                  {
+                    "from": "catalog",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Boundary catalog → cache: Staleness budget, miss admission và cold-start protection.",
+                      "en": "Boundary catalog → cache: Staleness budgets, miss admission and cold-start protection."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "db",
+                    "description": {
+                      "vi": "Boundary api → db: Orders, inventory, holds và outbox có local transaction boundary.",
+                      "en": "Boundary api → db: Orders, inventory, holds and outbox share local transaction boundaries."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "recs",
+          "title": {
+            "vi": "Offline item relationships, online bounded lookups",
+            "en": "Offline item relationships and bounded lookups"
+          },
+          "description": {
+            "vi": "Build top similar-item lists từ eligible historical interactions, sau đó online merge một tập nhỏ seeds và filter availability/eligibility. Không tạo all item-pairs matrix không bound; sparse co-occurrence/approximation/limits theo popularity giúp cost. New items cần metadata/popular fallback và model freshness có version.",
+            "en": "Build top similar-item lists from eligible histories, then merge a bounded seed set online and filter eligibility. Bound sparse co-occurrence and popularity instead of materializing unrestricted pairs. New items need fallback and versioned freshness."
+          },
+          "problem": {
+            "vi": "Personalization đắt nếu mỗi page so mọi shopper với mọi shopper.",
+            "en": "Per-page comparisons across all shoppers are expensive."
+          },
+          "decision": {
+            "vi": "Precompute reusable item features/neighbors và bound online fan-out.",
+            "en": "Precompute reusable neighbors/features and bound online fan-out."
+          },
+          "tradeoff": {
+            "vi": "Cold start, stale trends, privacy và popularity bias cần review.",
+            "en": "Cold starts, stale trends, privacy and popularity bias need review."
+          },
+          "nextPressure": {
+            "vi": "Teams/deploy coupling thúc đẩy API ownership boundaries.",
+            "en": "Team and deployment coupling motivate API ownership."
+          },
+          "exitCriteria": {
+            "vi": "Recommendation outage dùng fallback/hide module, không block order.",
+            "en": "Recommendation failures degrade independently of ordering."
+          },
+          "diagram": {
+            "id": "checkout-stage-recs",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Committed event log",
+                  "en": "Committed event log"
+                },
+                "detail": {
+                  "vi": "Stable event IDs, replay/checkpoints và deletion/retention policies.",
+                  "en": "Stable identities, replay/checkpoints and deletion/retention policies."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "recs",
+                "label": {
+                  "vi": "Recommendation lookup",
+                  "en": "Recommendation lookup"
+                },
+                "detail": {
+                  "vi": "Precomputed candidate lists, bounded merge và current item filters.",
+                  "en": "Precomputed candidates, bounded merging and current item filters."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "model"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Browse cache / CDN",
+                  "en": "Browse cache / CDN"
+                },
+                "detail": {
+                  "vi": "Staleness budget, miss admission và cold-start protection.",
+                  "en": "Staleness budgets, miss admission and cold-start protection."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "events",
+                    "to": "recs",
+                    "description": {
+                      "vi": "Boundary events → recs: Precomputed candidate lists, bounded merge và current item filters.",
+                      "en": "Boundary events → recs: Precomputed candidates, bounded merging and current item filters."
+                    }
+                  },
+                  {
+                    "from": "recs",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Boundary recs → cache: Staleness budget, miss admission và cold-start protection.",
+                      "en": "Boundary recs → cache: Staleness budgets, miss admission and cold-start protection."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "recs",
+                    "description": {
+                      "vi": "Boundary api → recs: Precomputed candidate lists, bounded merge và current item filters.",
+                      "en": "Boundary api → recs: Precomputed candidates, bounded merging and current item filters."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "services",
+          "title": {
+            "vi": "Services theo domain và owner",
+            "en": "Services by domain and ownership"
+          },
+          "description": {
+            "vi": "Catalog, cart, inventory, orders và payment có consistency/failure policies khác nhau. API boundary cho phép mỗi owner đổi storage nhưng tăng network fan-out, deadlines và partial failures. Không đọc lén foreign tables; cũng không tách mọi function thành network service khi modular boundary đã đủ.",
+            "en": "Catalogs, carts, inventory, orders and payments need distinct consistency/failure policies. APIs permit storage independence but add fan-out, deadlines and partial failures. Avoid foreign-table dependencies and unnecessary network splits."
+          },
+          "problem": {
+            "vi": "Shared schema/release làm changes và incidents ảnh hưởng toàn store.",
+            "en": "Shared schemas/releases spread changes and incidents."
+          },
+          "decision": {
+            "vi": "Owned APIs/data, SLOs, contracts, local transactions và explicit workflows.",
+            "en": "Use owned APIs/data, SLOs, contracts, local transactions and explicit workflows."
+          },
+          "tradeoff": {
+            "vi": "Observability, schema evolution và semantic coordination tốn hơn monolith.",
+            "en": "Observability, evolution and semantic coordination add cost."
+          },
+          "nextPressure": {
+            "vi": "Cart nên degrade/merge khác strict stock decisions.",
+            "en": "Cart merges and degradation differ from strict stock decisions."
+          },
+          "exitCriteria": {
+            "vi": "Một dependency lỗi không làm mọi page/order retry amplify.",
+            "en": "A failed dependency does not amplify all page/order retries."
+          },
+          "diagram": {
+            "id": "checkout-stage-services",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Catalog authority",
+                  "en": "Catalog authority"
+                },
+                "detail": {
+                  "vi": "Offer/price/eligibility versions; browse cache không là payment quote.",
+                  "en": "Offer, price and eligibility versions; browse caches are not binding quotes."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cart",
+                "label": {
+                  "vi": "Cart service",
+                  "en": "Cart service"
+                },
+                "detail": {
+                  "vi": "Version/causal context, merge semantics và durable accepted changes.",
+                  "en": "Versions/causal context, merge semantics and durable accepted changes."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "inventory",
+                "label": {
+                  "vi": "Inventory authority",
+                  "en": "Inventory authority"
+                },
+                "detail": {
+                  "vi": "Available/hold/committed conservation và terminal state ownership.",
+                  "en": "Available/held/committed conservation and terminal-state ownership."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "workflow",
+                "label": {
+                  "vi": "Order workflow",
+                  "en": "Order workflow"
+                },
+                "detail": {
+                  "vi": "Durable state/intent/results, retries và compensation progress.",
+                  "en": "Durable state, intent/results, retries and compensation progress."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "pay",
+                "label": {
+                  "vi": "Payment boundary",
+                  "en": "Payment boundary"
+                },
+                "detail": {
+                  "vi": "Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                  "en": "Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Boundary api → catalog: Offer/price/eligibility versions; browse cache không là payment quote.",
+                      "en": "Boundary api → catalog: Offer, price and eligibility versions; browse caches are not binding quotes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "cart",
+                    "description": {
+                      "vi": "Boundary api → cart: Version/causal context, merge semantics và durable accepted changes.",
+                      "en": "Boundary api → cart: Versions/causal context, merge semantics and durable accepted changes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "workflow",
+                    "description": {
+                      "vi": "Boundary api → workflow: Durable state/intent/results, retries và compensation progress.",
+                      "en": "Boundary api → workflow: Durable state, intent/results, retries and compensation progress."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "inventory",
+                    "description": {
+                      "vi": "Boundary workflow → inventory: Available/hold/committed conservation và terminal state ownership.",
+                      "en": "Boundary workflow → inventory: Available/held/committed conservation and terminal-state ownership."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary workflow → pay: Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                      "en": "Boundary workflow → pay: Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "cart",
+          "title": {
+            "vi": "Cart ưu tiên availability nhưng có merge contract",
+            "en": "Carts favor availability under merge contracts"
+          },
+          "description": {
+            "vi": "Cart replicas có thể giữ concurrent versions và causal context. Union có thể resurrect removed items; LWW whole-document có thể mất independent adds. Observed-remove/add-wins là một option với tombstone/offline horizon. Không store nào luôn writable nếu không còn reachable durable capacity; ACK semantics vẫn phải nói rõ.",
+            "en": "Cart replicas may preserve concurrent versions and causal context. Union resurrects removals; whole-document LWW loses independent additions. Observed-remove is one option with retention requirements. No store is always writable without reachable durable capacity; acknowledgement semantics still matter."
+          },
+          "problem": {
+            "vi": "Shopper thao tác nhiều devices hoặc vùng mạng partition.",
+            "en": "Shoppers use multiple devices and partitioned networks."
+          },
+          "decision": {
+            "vi": "Choose per-item membership/quantity semantics và durable accepted intent.",
+            "en": "Choose membership/quantity semantics and durable accepted intent."
+          },
+          "tradeoff": {
+            "vi": "Conflicts, removed metadata retention và offline resync làm logic phức tạp.",
+            "en": "Conflicts, removal retention and offline resynchronization add complexity."
+          },
+          "nextPressure": {
+            "vi": "Checkout phải chốt price/quantity/stock tại authorities.",
+            "en": "Checkout must finalize price, quantities and stock at authorities."
+          },
+          "exitCriteria": {
+            "vi": "Concurrent add/remove và stale replica không silently overwrite accepted edits ngoài contract.",
+            "en": "Concurrent and stale changes honor declared merge semantics."
+          },
+          "diagram": {
+            "id": "checkout-stage-cart",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Shopper",
+                  "en": "Shopper"
+                },
+                "detail": {
+                  "vi": "Giữ checkout request identity, hiển thị pending và quote đã xác nhận.",
+                  "en": "Retains checkout identities, pending state and acknowledged quotes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "cart",
+                "label": {
+                  "vi": "Cart service",
+                  "en": "Cart service"
+                },
+                "detail": {
+                  "vi": "Version/causal context, merge semantics và durable accepted changes.",
+                  "en": "Versions/causal context, merge semantics and durable accepted changes."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cartdb",
+                "label": {
+                  "vi": "Cart replicas",
+                  "en": "Cart replicas"
+                },
+                "detail": {
+                  "vi": "Conflict metadata, repair và offline/retention horizon.",
+                  "en": "Conflict metadata, repair and offline/retention horizons."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary client → api: Auth, cart snapshot, validated quote, order identity và deadline.",
+                      "en": "Boundary client → api: Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "cart",
+                    "description": {
+                      "vi": "Boundary api → cart: Version/causal context, merge semantics và durable accepted changes.",
+                      "en": "Boundary api → cart: Versions/causal context, merge semantics and durable accepted changes."
+                    }
+                  },
+                  {
+                    "from": "cart",
+                    "to": "cartdb",
+                    "description": {
+                      "vi": "Boundary cart → cartdb: Conflict metadata, repair và offline/retention horizon.",
+                      "en": "Boundary cart → cartdb: Conflict metadata, repair and offline/retention horizons."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "inventory",
+          "title": {
+            "vi": "Atomic admission và expiring holds",
+            "en": "Atomic admission and expiring holds"
+          },
+          "description": {
+            "vi": "Conditional stock decrement, unique hold/result và durable expiry state phải trong cùng transaction/equivalent protocol. Expiry/release/commit là competing terminal transitions, check state/generation và server time tại authority. TTL cleanup không giải race; cancelled/deleted row không được mất evidence chống duplicate release.",
+            "en": "Atomically retain stock decrements, unique holds/results and expiry state. Expiry, release and commit compete under state/generation and server-time checks. Cleanup TTL does not solve races; retain evidence against duplicate release."
+          },
+          "problem": {
+            "vi": "Many buyers mua cùng last unit; abandoned checkout khóa stock.",
+            "en": "Buyers race for last units while abandoned checkouts retain stock."
+          },
+          "decision": {
+            "vi": "Inventory conservation và owner-specific hold state, bounded leases.",
+            "en": "Enforce stock conservation, hold ownership and bounded leases."
+          },
+          "tradeoff": {
+            "vi": "TTL ngắn làm checkout fail; TTL dài tăng unavailable stock; abuse/admission cần riêng.",
+            "en": "Short leases hurt conversion; long leases lock stock; abuse/admission require separate controls."
+          },
+          "nextPressure": {
+            "vi": "Order cần coordinate inventory và external payment.",
+            "en": "Orders must coordinate inventory and external payments."
+          },
+          "exitCriteria": {
+            "vi": "Expire/commit/retry interleavings giữ stock và đúng owner; late payment có reconcile path.",
+            "en": "Interleavings preserve inventory/ownership and reconcile late payment results."
+          },
+          "diagram": {
+            "id": "checkout-stage-inventory",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "inventory",
+                "label": {
+                  "vi": "Inventory authority",
+                  "en": "Inventory authority"
+                },
+                "detail": {
+                  "vi": "Available/hold/committed conservation và terminal state ownership.",
+                  "en": "Available/held/committed conservation and terminal-state ownership."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Local commerce DB",
+                  "en": "Local commerce DB"
+                },
+                "detail": {
+                  "vi": "Orders, inventory, holds và outbox có local transaction boundary.",
+                  "en": "Orders, inventory, holds and outbox share local transaction boundaries."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "workflow",
+                "label": {
+                  "vi": "Order workflow",
+                  "en": "Order workflow"
+                },
+                "detail": {
+                  "vi": "Durable state/intent/results, retries và compensation progress.",
+                  "en": "Durable state, intent/results, retries and compensation progress."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "inventory",
+                    "description": {
+                      "vi": "Boundary api → inventory: Available/hold/committed conservation và terminal state ownership.",
+                      "en": "Boundary api → inventory: Available/held/committed conservation and terminal-state ownership."
+                    }
+                  },
+                  {
+                    "from": "inventory",
+                    "to": "db",
+                    "description": {
+                      "vi": "Boundary inventory → db: Orders, inventory, holds và outbox có local transaction boundary.",
+                      "en": "Boundary inventory → db: Orders, inventory, holds and outbox share local transaction boundaries."
+                    }
+                  },
+                  {
+                    "from": "inventory",
+                    "to": "workflow",
+                    "description": {
+                      "vi": "Boundary inventory → workflow: Durable state/intent/results, retries và compensation progress.",
+                      "en": "Boundary inventory → workflow: Durable state, intent/results, retries and compensation progress."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "saga",
+          "title": {
+            "vi": "Durable order workflow và compensations",
+            "en": "Durable workflows and compensations"
+          },
+          "description": {
+            "vi": "Workflow ghi step intent trước dispatch, dùng stable command ID tại participant, rồi persist observed result. Crash giữa external effect và result record luôn cần query/retry identity. Compensation là business action có retries/failures, không rollback thời gian. Unknown payment giữ pending và recovery; không catch mọi exception rồi release như decline.",
+            "en": "Persist step intent before dispatch, retain participant identities and record results. Effect/result crash gaps require query/retry recovery. Compensation is a fallible business action, not time reversal. Unknown payments remain pending rather than being treated as declines."
+          },
+          "problem": {
+            "vi": "Không có local transaction bao phủ tất cả owners/providers.",
+            "en": "No local transaction covers all owners/providers."
+          },
+          "decision": {
+            "vi": "Explicit state machine, durable intents/results và idempotent participant contracts.",
+            "en": "Use state machines, durable intent/results and idempotent participant contracts."
+          },
+          "tradeoff": {
+            "vi": "Intermediate states, isolation anomalies và delayed compensation cần UX/on-call.",
+            "en": "Intermediate states, isolation anomalies and compensation delays need UX and operations."
+          },
+          "nextPressure": {
+            "vi": "Shipping/capture timing và partial fulfillment cần identities nhỏ hơn order.",
+            "en": "Shipping/capture timing and partial fulfillment need finer identities."
+          },
+          "exitCriteria": {
+            "vi": "Crash mỗi boundary không duplicate reserve/authorize/ship hoặc bỏ missing intent.",
+            "en": "Boundary crashes preserve reservation, payment, shipping and recovery identities."
+          },
+          "diagram": {
+            "id": "checkout-stage-saga",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "workflow",
+                "label": {
+                  "vi": "Order workflow",
+                  "en": "Order workflow"
+                },
+                "detail": {
+                  "vi": "Durable state/intent/results, retries và compensation progress.",
+                  "en": "Durable state, intent/results, retries and compensation progress."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "orders",
+                "label": {
+                  "vi": "Order state store",
+                  "en": "Order state store"
+                },
+                "detail": {
+                  "vi": "Current quote, state version, receipt identity và outbox.",
+                  "en": "Current quotes, state versions, receipt identities and outbox."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "inventory",
+                "label": {
+                  "vi": "Inventory authority",
+                  "en": "Inventory authority"
+                },
+                "detail": {
+                  "vi": "Available/hold/committed conservation và terminal state ownership.",
+                  "en": "Available/held/committed conservation and terminal-state ownership."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "pay",
+                "label": {
+                  "vi": "Payment boundary",
+                  "en": "Payment boundary"
+                },
+                "detail": {
+                  "vi": "Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                  "en": "Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Committed event log",
+                  "en": "Committed event log"
+                },
+                "detail": {
+                  "vi": "Stable event IDs, replay/checkpoints và deletion/retention policies.",
+                  "en": "Stable identities, replay/checkpoints and deletion/retention policies."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "workflow",
+                    "description": {
+                      "vi": "Boundary api → workflow: Durable state/intent/results, retries và compensation progress.",
+                      "en": "Boundary api → workflow: Durable state, intent/results, retries and compensation progress."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "orders",
+                    "description": {
+                      "vi": "Boundary workflow → orders: Current quote, state version, receipt identity và outbox.",
+                      "en": "Boundary workflow → orders: Current quotes, state versions, receipt identities and outbox."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "inventory",
+                    "description": {
+                      "vi": "Boundary workflow → inventory: Available/hold/committed conservation và terminal state ownership.",
+                      "en": "Boundary workflow → inventory: Available/held/committed conservation and terminal-state ownership."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary workflow → pay: Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                      "en": "Boundary workflow → pay: Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                    }
+                  },
+                  {
+                    "from": "orders",
+                    "to": "events",
+                    "description": {
+                      "vi": "Boundary orders → events: Stable event IDs, replay/checkpoints và deletion/retention policies.",
+                      "en": "Boundary orders → events: Stable identities, replay/checkpoints and deletion/retention policies."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "payment",
+          "title": {
+            "vi": "Authorize, capture và shipment identity",
+            "en": "Authorization, capture and shipment identity"
+          },
+          "description": {
+            "vi": "Một payment method có thể authorize lúc order và capture lúc dispatch; đây là policy được chọn, không universal cho mọi method/country. Authorization có expiry và capture rules; split shipment dùng stable shipment/capture IDs, cumulative amount cap và reconciliation. Failed capture trước dispatch có explicit stop/pending policy.",
+            "en": "A chosen policy may authorize at ordering and capture at dispatch, but methods/jurisdictions vary. Authorizations expire; split shipments require stable capture identities, aggregate caps and reconciliation. Failed captures need an explicit dispatch policy."
+          },
+          "problem": {
+            "vi": "Charge sai thời điểm hoặc retry với new key tạo refunds/duplicate charges.",
+            "en": "Bad timing or new retry identities cause refunds/duplicates."
+          },
+          "decision": {
+            "vi": "Separate authorize/capture/void/refund operations và amount/owner invariants.",
+            "en": "Separate money operations and enforce amount/ownership invariants."
+          },
+          "tradeoff": {
+            "vi": "Reauthorization, partial captures và external ambiguity tăng states.",
+            "en": "Reauthorization, partial capture and uncertainty add states."
+          },
+          "nextPressure": {
+            "vi": "Shared fleet/dependency vẫn có global failure blast radius.",
+            "en": "Shared fleets/dependencies retain broad failure impact."
+          },
+          "exitCriteria": {
+            "vi": "Ship/capture retries không charge twice; capture total không vượt contract.",
+            "en": "Shipping/capture retries preserve identity and cumulative limits."
+          },
+          "diagram": {
+            "id": "checkout-stage-payment",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "workflow",
+                "label": {
+                  "vi": "Order workflow",
+                  "en": "Order workflow"
+                },
+                "detail": {
+                  "vi": "Durable state/intent/results, retries và compensation progress.",
+                  "en": "Durable state, intent/results, retries and compensation progress."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "pay",
+                "label": {
+                  "vi": "Payment boundary",
+                  "en": "Payment boundary"
+                },
+                "detail": {
+                  "vi": "Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                  "en": "Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "fulfill",
+                "label": {
+                  "vi": "Fulfillment",
+                  "en": "Fulfillment"
+                },
+                "detail": {
+                  "vi": "Warehouse allocation, package/shipment identity và proof of dispatch.",
+                  "en": "Warehouse allocation, shipment identities and dispatch evidence."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "orders",
+                "label": {
+                  "vi": "Order state store",
+                  "en": "Order state store"
+                },
+                "detail": {
+                  "vi": "Current quote, state version, receipt identity và outbox.",
+                  "en": "Current quotes, state versions, receipt identities and outbox."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "workflow",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary workflow → pay: Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                      "en": "Boundary workflow → pay: Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "orders",
+                    "description": {
+                      "vi": "Boundary workflow → orders: Current quote, state version, receipt identity và outbox.",
+                      "en": "Boundary workflow → orders: Current quotes, state versions, receipt identities and outbox."
+                    }
+                  },
+                  {
+                    "from": "orders",
+                    "to": "fulfill",
+                    "description": {
+                      "vi": "Boundary orders → fulfill: Warehouse allocation, package/shipment identity và proof of dispatch.",
+                      "en": "Boundary orders → fulfill: Warehouse allocation, shipment identities and dispatch evidence."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "fulfill",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary fulfill → pay: Authorization/capture/void/refund identity và unknown-result reconciliation.",
+                      "en": "Boundary fulfill → pay: Authorization, capture, void/refund identities and uncertain-result reconciliation."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "cells",
+          "title": {
+            "vi": "Cells, shuffle subsets và shared dependencies",
+            "en": "Cells, shuffle subsets and shared dependencies"
+          },
+          "description": {
+            "vi": "Cells là bounded independently operable slices với data ownership, capacity và controlled deployment. Shuffle sharding chọn small worker subsets để giảm overlap trong một fleet; không đồng nghĩa copy toàn stack mỗi tenant. Partial overlap vẫn gây errors nếu retry/admission không đúng; shared auth/router/database có thể phá isolation.",
+            "en": "Cells are independently operable slices with owned data/capacity and controlled rollout. Shuffle sharding reduces fleet overlap rather than copying a stack per tenant. Partial overlap still causes failures under limited retries, and shared dependencies can break isolation."
+          },
+          "problem": {
+            "vi": "Noisy tenant, poison request hoặc bad deploy lan quá rộng.",
+            "en": "Noisy tenants, poison requests and deployments spread too widely."
+          },
+          "decision": {
+            "vi": "Stable placement, per-slice quotas và independently bounded dependencies.",
+            "en": "Use stable placement, slice quotas and bounded dependencies."
+          },
+          "tradeoff": {
+            "vi": "Headroom/operations/router criticality và retry cost tăng.",
+            "en": "Headroom, operations, router criticality and retry cost grow."
+          },
+          "nextPressure": {
+            "vi": "Planned peak còn cần preparation và hot-key admission.",
+            "en": "Planned peaks still require preparation and hot-key admission."
+          },
+          "exitCriteria": {
+            "vi": "Fail one cell/worker subset; measure actual cohort errors và surviving capacity.",
+            "en": "Fail cells/subsets and measure cohort errors and surviving capacity."
+          },
+          "diagram": {
+            "id": "checkout-stage-cells",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Shopper",
+                  "en": "Shopper"
+                },
+                "detail": {
+                  "vi": "Giữ checkout request identity, hiển thị pending và quote đã xác nhận.",
+                  "en": "Retains checkout identities, pending state and acknowledged quotes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "router",
+                "label": {
+                  "vi": "Stable cell router",
+                  "en": "Stable cell router"
+                },
+                "detail": {
+                  "vi": "Placement epoch, admission và simple routing; không fallback writes tùy tiện.",
+                  "en": "Placement epochs, admission and simple routing without arbitrary write fallback."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "cellA",
+                "label": {
+                  "vi": "Commerce cell A",
+                  "en": "Commerce cell A"
+                },
+                "detail": {
+                  "vi": "Independent capacity, data ownership và deployment cohort.",
+                  "en": "Independent capacity, data ownership and deployment cohorts."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cellB",
+                "label": {
+                  "vi": "Commerce cell B",
+                  "en": "Commerce cell B"
+                },
+                "detail": {
+                  "vi": "Bound failure domain và declared shared dependencies.",
+                  "en": "Bounded failure domains and declared shared dependencies."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "router",
+                    "description": {
+                      "vi": "Boundary client → router: Placement epoch, admission và simple routing; không fallback writes tùy tiện.",
+                      "en": "Boundary client → router: Placement epochs, admission and simple routing without arbitrary write fallback."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "cellA",
+                    "description": {
+                      "vi": "Boundary router → cellA: Independent capacity, data ownership và deployment cohort.",
+                      "en": "Boundary router → cellA: Independent capacity, data ownership and deployment cohorts."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "cellB",
+                    "description": {
+                      "vi": "Boundary router → cellB: Bound failure domain và declared shared dependencies.",
+                      "en": "Boundary router → cellB: Bounded failure domains and declared shared dependencies."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "peak",
+          "title": {
+            "vi": "Planned peak: pre-scale, shed, bound queues",
+            "en": "Planned peaks: pre-scale, shed and bound queues"
+          },
+          "description": {
+            "vi": "Load test từng dependency lẫn end-to-end tail, warm capacity/caches và pre-scale trước known spike. Gate hot SKU attempts bằng bounded queue/tokens, fairness và bot controls; queue receipt không là stock reservation. Shed optional discovery trước khi critical paths saturate, nhưng fraud/security không tự optional.",
+            "en": "Test dependencies and end-to-end tails, warm caches/capacity and pre-scale. Bound hot-SKU queues/tokens with fairness and abuse controls; queue receipts do not reserve stock. Degrade optional discovery before critical paths saturate without treating security as optional."
+          },
+          "problem": {
+            "vi": "Flash crowd tập trung một key và đến nhanh hơn autoscaling.",
+            "en": "Flash crowds concentrate on keys faster than scaling reacts."
+          },
+          "decision": {
+            "vi": "Admission theo actual downstream capacity, bounded wait/deadline và retry advice.",
+            "en": "Admit by downstream capacity with bounded waits, deadlines and retry advice."
+          },
+          "tradeoff": {
+            "vi": "Queue UX/fairness, rejected demand và token abuse cần chính sách.",
+            "en": "Queue fairness, rejected demand and token abuse need policy."
+          },
+          "nextPressure": {
+            "vi": "Delivery promise cần capacity-aware stock/transport state.",
+            "en": "Delivery promises need capacity-aware inventory and transport."
+          },
+          "exitCriteria": {
+            "vi": "Overload giữ goodput, backlog có bound và retries không amplify.",
+            "en": "Overload preserves useful throughput with bounded backlogs and retries."
+          },
+          "diagram": {
+            "id": "checkout-stage-peak",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Shopper",
+                  "en": "Shopper"
+                },
+                "detail": {
+                  "vi": "Giữ checkout request identity, hiển thị pending và quote đã xác nhận.",
+                  "en": "Retains checkout identities, pending state and acknowledged quotes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Bounded admission queue",
+                  "en": "Bounded admission queue"
+                },
+                "detail": {
+                  "vi": "Signed queue token, fairness/expiry và safe drain capacity.",
+                  "en": "Scoped queue tokens, fairness, expiry and safe draining capacity."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "workflow",
+                "label": {
+                  "vi": "Order workflow",
+                  "en": "Order workflow"
+                },
+                "detail": {
+                  "vi": "Durable state/intent/results, retries và compensation progress.",
+                  "en": "Durable state, intent/results, retries and compensation progress."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "inventory",
+                "label": {
+                  "vi": "Inventory authority",
+                  "en": "Inventory authority"
+                },
+                "detail": {
+                  "vi": "Available/hold/committed conservation và terminal state ownership.",
+                  "en": "Available/held/committed conservation and terminal-state ownership."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary client → api: Auth, cart snapshot, validated quote, order identity và deadline.",
+                      "en": "Boundary client → api: Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary api → queue: Signed queue token, fairness/expiry và safe drain capacity.",
+                      "en": "Boundary api → queue: Scoped queue tokens, fairness, expiry and safe draining capacity."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "queue",
+                    "to": "workflow",
+                    "description": {
+                      "vi": "Boundary queue → workflow: Durable state/intent/results, retries và compensation progress.",
+                      "en": "Boundary queue → workflow: Durable state, intent/results, retries and compensation progress."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "inventory",
+                    "description": {
+                      "vi": "Boundary workflow → inventory: Available/hold/committed conservation và terminal state ownership.",
+                      "en": "Boundary workflow → inventory: Available/held/committed conservation and terminal-state ownership."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "promise",
+          "title": {
+            "vi": "Delivery promise là offer có validity",
+            "en": "Delivery promises are validity-bound offers"
+          },
+          "description": {
+            "vi": "Estimate dựa warehouse stock, processing capacity, cutoff/calendar, carrier routes, address/service level và uncertainty. Browse promise có snapshot/expiry; checkout recheck và xác nhận changed promise. Allocation/dispatch phải giữ promised contract hoặc báo revised estimate, không dùng cached arrival date như durable shipment capacity.",
+            "en": "Estimate from warehouse stock, capacity, cutoffs/calendars, routes, addresses and uncertainty. Browsing promises have snapshots/expiry; checkout revalidates and confirms changes. Allocation/dispatch must honor or explicitly revise the promise rather than treat cached dates as reserved capacity."
+          },
+          "problem": {
+            "vi": "In stock không nói bao giờ giao tới địa chỉ của shopper.",
+            "en": "In-stock status does not establish arrival at a shopper address."
+          },
+          "decision": {
+            "vi": "Promise snapshot + allocation/fulfillment protocol và exception handling.",
+            "en": "Use promise snapshots with allocation/fulfillment protocols and exception handling."
+          },
+          "tradeoff": {
+            "vi": "Freshness/cost, capacity uncertainty và operational exceptions trade off.",
+            "en": "Freshness, compute cost and operational uncertainty trade off."
+          },
+          "nextPressure": {
+            "vi": "Tiếp tục theo cost/reliability/customer outcomes; kiến trúc không dừng ở date label.",
+            "en": "Continue by cost, reliability and customer outcomes rather than a final date label."
+          },
+          "exitCriteria": {
+            "vi": "Recheck cutoff/warehouse loss, split shipments và timezone/DST boundaries.",
+            "en": "Test cutoffs, warehouse losses, split shipments and timezone/DST boundaries."
+          },
+          "diagram": {
+            "id": "checkout-stage-promise",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Branches mô tả các responsibilities; không phải mọi calls cần chạy nối tiếp.",
+              "en": "Branches describe responsibilities; calls are not necessarily sequential."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Checkout API",
+                  "en": "Checkout API"
+                },
+                "detail": {
+                  "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+                  "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "promise",
+                "label": {
+                  "vi": "Promise service",
+                  "en": "Promise service"
+                },
+                "detail": {
+                  "vi": "Stock/location/cutoff/capacity snapshot và quote validity.",
+                  "en": "Stock, locations, cutoffs, capacity snapshots and quote validity."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "inventory",
+                "label": {
+                  "vi": "Inventory authority",
+                  "en": "Inventory authority"
+                },
+                "detail": {
+                  "vi": "Available/hold/committed conservation và terminal state ownership.",
+                  "en": "Available/held/committed conservation and terminal-state ownership."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "plan",
+                "label": {
+                  "vi": "Network plan",
+                  "en": "Network plan"
+                },
+                "detail": {
+                  "vi": "Warehouse/carrier calendars, processing capacity và exception updates.",
+                  "en": "Warehouse/carrier calendars, processing capacity and exception updates."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "workflow",
+                "label": {
+                  "vi": "Order workflow",
+                  "en": "Order workflow"
+                },
+                "detail": {
+                  "vi": "Durable state/intent/results, retries và compensation progress.",
+                  "en": "Durable state, intent/results, retries and compensation progress."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "fulfill",
+                "label": {
+                  "vi": "Fulfillment",
+                  "en": "Fulfillment"
+                },
+                "detail": {
+                  "vi": "Warehouse allocation, package/shipment identity và proof of dispatch.",
+                  "en": "Warehouse allocation, shipment identities and dispatch evidence."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "promise",
+                    "description": {
+                      "vi": "Boundary api → promise: Stock/location/cutoff/capacity snapshot và quote validity.",
+                      "en": "Boundary api → promise: Stock, locations, cutoffs, capacity snapshots and quote validity."
+                    }
+                  },
+                  {
+                    "from": "promise",
+                    "to": "inventory",
+                    "description": {
+                      "vi": "Boundary promise → inventory: Available/hold/committed conservation và terminal state ownership.",
+                      "en": "Boundary promise → inventory: Available/held/committed conservation and terminal-state ownership."
+                    }
+                  },
+                  {
+                    "from": "promise",
+                    "to": "plan",
+                    "description": {
+                      "vi": "Boundary promise → plan: Warehouse/carrier calendars, processing capacity và exception updates.",
+                      "en": "Boundary promise → plan: Warehouse/carrier calendars, processing capacity and exception updates."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "workflow",
+                    "description": {
+                      "vi": "Boundary api → workflow: Durable state/intent/results, retries và compensation progress.",
+                      "en": "Boundary api → workflow: Durable state, intent/results, retries and compensation progress."
+                    }
+                  },
+                  {
+                    "from": "workflow",
+                    "to": "fulfill",
+                    "description": {
+                      "vi": "Boundary workflow → fulfill: Warehouse allocation, package/shipment identity và proof of dispatch.",
+                      "en": "Boundary workflow → fulfill: Warehouse allocation, shipment identities and dispatch evidence."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "4. Peak checkout khác hot-key contention",
+        "en": "4. Peak checkout differs from hot-key contention"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ synthetic: 600K checkout requests trong15 phút; browse80pages/checkout; một deal có5000units và240Kattempts trong30giây. Không dùng các số này làm Amazon metrics. Retry, multi-item/multi-warehouse, fulfillment events và duplicates làm operations lớn hơn customer orders.",
+          "en": "Assume synthetic traffic of600K checkout requests in fifteen minutes, eighty browse pages per checkout, and a five-thousand-unit deal with240K attempts in thirty seconds. These are not Amazon metrics. Retries, multi-item/warehouse work and events exceed customer order counts."
+        },
+        {
+          "vi": "Scale total storage khác serialize một contested quantity. Có thể chia stock thành disjoint escrow buckets nếu sum budgets giữ đúng và transfers/rebalancing atomic; không clone “available=5000” vào mọi bucket. Admission giảm wasted attempts nhưng inventory authority vẫn quyết winners.",
+          "en": "Total storage scaling differs from serializing contested quantities. Disjoint escrow buckets can spread work if total budgets and transfers remain correct; cloning full stock into each bucket oversells. Admission reduces wasted attempts while inventory still decides winners."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Metric",
+            "en": "Metric"
+          },
+          {
+            "vi": "Calculation",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Interpretation",
+            "en": "Interpretation"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Checkout requests",
+              "en": "Checkout requests"
+            },
+            {
+              "vi": "600K /900s ≈667/s",
+              "en": "600K /900s ≈667/s"
+            },
+            {
+              "vi": "Chưa attempts từ retry/workflow.",
+              "en": "Excludes retry/workflow attempts."
+            }
+          ],
+          [
+            {
+              "vi": "Browse reads",
+              "en": "Browse reads"
+            },
+            {
+              "vi": "667×80≈53,333/s",
+              "en": "667×80≈53,333/s"
+            },
+            {
+              "vi": "Cache/miss paths cần capacity riêng.",
+              "en": "Caches/misses need separate capacity."
+            }
+          ],
+          [
+            {
+              "vi": "Deal attempts",
+              "en": "Deal attempts"
+            },
+            {
+              "vi": "240K/30s =8000/s",
+              "en": "240K/30s =8000/s"
+            },
+            {
+              "vi": "Một SKU/hot allocation domain.",
+              "en": "One SKU/hot allocation domain."
+            }
+          ],
+          [
+            {
+              "vi": "Attempt / unit",
+              "en": "Attempt / unit"
+            },
+            {
+              "vi": "240K/5000 =48",
+              "en": "240K/5000 =48"
+            },
+            {
+              "vi": "Ít nhất nhiều losers dù correctness đúng.",
+              "en": "Many requests cannot win even with correct allocation."
+            }
+          ],
+          [
+            {
+              "vi": "Workflow WIP",
+              "en": "Workflow WIP"
+            },
+            {
+              "vi": "667/s ×2s ≈1334",
+              "en": "667/s ×2s ≈1334"
+            },
+            {
+              "vi": "Little’s law cho stable matching boundary; pending external lâu hơn tăng WIP.",
+              "en": "Little’s law for a stable boundary; long pending outcomes increase WIP."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Theo dõi một order và hai failure paths",
+        "en": "5. Trace an order and two failure paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chạy từng trace để tách quote, local commit và external calls. Step result lưu sau call không đóng crash window; participant cần stable operation identity và recovery evidence. Bảng state là authority cho UX/support, không suy từ frontend spinner hoặc một notification đã gửi.",
+          "en": "Step through quotes, commits and external calls. Recording results after calls does not close crash windows; participants need stable operation identities and evidence. Durable order state drives UX/support rather than spinners or notifications."
+        }
+      ],
+      "diagram": {
+        "id": "checkout-journey",
+        "title": {
+          "vi": "Một order qua quote, hold, payment và shipment",
+          "en": "One order through quotes, holds, payments and shipments"
+        },
+        "caption": {
+          "vi": "Pending là trạng thái thật; confirmation cần durable evidence và outbox, không dựa vào việc request trước đã timeout.",
+          "en": "Pending is a real state; confirmation requires durable evidence and intent rather than assumptions about timed-out calls."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Shopper",
+              "en": "Shopper"
+            },
+            "detail": {
+              "vi": "Giữ checkout request identity, hiển thị pending và quote đã xác nhận.",
+              "en": "Retains checkout identities, pending state and acknowledged quotes."
+            },
+            "x": 130,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Checkout API",
+              "en": "Checkout API"
+            },
+            "detail": {
+              "vi": "Auth, cart snapshot, validated quote, order identity và deadline.",
+              "en": "Authentication, cart snapshots, validated quotes, order identities and deadlines."
+            },
+            "x": 440,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "cart",
+            "label": {
+              "vi": "Cart service",
+              "en": "Cart service"
+            },
+            "detail": {
+              "vi": "Version/causal context, merge semantics và durable accepted changes.",
+              "en": "Versions/causal context, merge semantics and durable accepted changes."
+            },
+            "x": 760,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "catalog",
+            "label": {
+              "vi": "Catalog authority",
+              "en": "Catalog authority"
+            },
+            "detail": {
+              "vi": "Offer/price/eligibility versions; browse cache không là payment quote.",
+              "en": "Offer, price and eligibility versions; browse caches are not binding quotes."
+            },
+            "x": 1060,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "workflow",
+            "label": {
+              "vi": "Order workflow",
+              "en": "Order workflow"
+            },
+            "detail": {
+              "vi": "Durable state/intent/results, retries và compensation progress.",
+              "en": "Durable state, intent/results, retries and compensation progress."
+            },
+            "x": 130,
+            "y": 380,
+            "kind": "worker"
+          },
+          {
+            "id": "orders",
+            "label": {
+              "vi": "Order state store",
+              "en": "Order state store"
+            },
+            "detail": {
+              "vi": "Current quote, state version, receipt identity và outbox.",
+              "en": "Current quotes, state versions, receipt identities and outbox."
+            },
+            "x": 440,
+            "y": 380,
+            "kind": "store"
+          },
+          {
+            "id": "inventory",
+            "label": {
+              "vi": "Inventory authority",
+              "en": "Inventory authority"
+            },
+            "detail": {
+              "vi": "Available/hold/committed conservation và terminal state ownership.",
+              "en": "Available/held/committed conservation and terminal-state ownership."
+            },
+            "x": 760,
+            "y": 380,
+            "kind": "service"
+          },
+          {
+            "id": "pay",
+            "label": {
+              "vi": "Payment boundary",
+              "en": "Payment boundary"
+            },
+            "detail": {
+              "vi": "Authorization/capture/void/refund identity và unknown-result reconciliation.",
+              "en": "Authorization, capture, void/refund identities and uncertain-result reconciliation."
+            },
+            "x": 1060,
+            "y": 380,
+            "kind": "service"
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Committed event log",
+              "en": "Committed event log"
+            },
+            "detail": {
+              "vi": "Stable event IDs, replay/checkpoints và deletion/retention policies.",
+              "en": "Stable identities, replay/checkpoints and deletion/retention policies."
+            },
+            "x": 130,
+            "y": 680,
+            "kind": "queue"
+          },
+          {
+            "id": "fulfill",
+            "label": {
+              "vi": "Fulfillment",
+              "en": "Fulfillment"
+            },
+            "detail": {
+              "vi": "Warehouse allocation, package/shipment identity và proof of dispatch.",
+              "en": "Warehouse allocation, shipment identities and dispatch evidence."
+            },
+            "x": 440,
+            "y": 680,
+            "kind": "worker"
+          },
+          {
+            "id": "promise",
+            "label": {
+              "vi": "Promise service",
+              "en": "Promise service"
+            },
+            "detail": {
+              "vi": "Stock/location/cutoff/capacity snapshot và quote validity.",
+              "en": "Stock, locations, cutoffs, capacity snapshots and quote validity."
+            },
+            "x": 760,
+            "y": 680,
+            "kind": "service"
+          },
+          {
+            "id": "plan",
+            "label": {
+              "vi": "Network plan",
+              "en": "Network plan"
+            },
+            "detail": {
+              "vi": "Warehouse/carrier calendars, processing capacity và exception updates.",
+              "en": "Warehouse/carrier calendars, processing capacity and exception updates."
+            },
+            "x": 1060,
+            "y": 680,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "quote",
+            "label": {
+              "vi": "Snapshot cart và validate quote",
+              "en": "Snapshot carts and validate quotes"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Send cart version, address và stable checkout ID.",
+                  "en": "Send cart versions, addresses and stable checkout identities."
+                }
+              },
+              {
+                "from": "api",
+                "to": "cart",
+                "description": {
+                  "vi": "Read immutable checkout snapshot thay live mutable cart.",
+                  "en": "Read an immutable checkout snapshot rather than a changing cart."
+                }
+              },
+              {
+                "from": "api",
+                "to": "catalog",
+                "description": {
+                  "vi": "Revalidate offers, tax/discount/currency scope và shopper consent.",
+                  "en": "Revalidate offers, totals/currency and shopper consent."
+                }
+              },
+              {
+                "from": "api",
+                "to": "promise",
+                "description": {
+                  "vi": "Validate promise window/current capacity assumptions.",
+                  "en": "Validate promise windows and capacity assumptions."
+                }
+              },
+              {
+                "from": "promise",
+                "to": "plan",
+                "description": {
+                  "vi": "Use cutoff/calendar/service-level snapshot.",
+                  "en": "Use cutoff, calendar and service-level snapshots."
+                }
+              },
+              {
+                "from": "api",
+                "to": "workflow",
+                "description": {
+                  "vi": "Start retained order identity với immutable quote.",
+                  "en": "Start retained order identities with immutable quotes."
+                }
+              }
+            ]
+          },
+          {
+            "id": "place",
+            "label": {
+              "vi": "Reserve và authorize",
+              "en": "Reserve and authorize"
+            },
+            "steps": [
+              {
+                "from": "workflow",
+                "to": "orders",
+                "description": {
+                  "vi": "Persist reserve/auth intent trước dispatch, với command IDs.",
+                  "en": "Persist reservation/payment intent before dispatch with command identities."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "inventory",
+                "description": {
+                  "vi": "Atomically reserve quantities và retain hold result/expiry/generation.",
+                  "en": "Atomically reserve quantities and retain hold results, expiry and generations."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "pay",
+                "description": {
+                  "vi": "Authorize bằng stable operation identity, không order-wide key cho mọi operations.",
+                  "en": "Authorize with stable operation identities rather than reusing one key across different operations."
+                }
+              },
+              {
+                "from": "pay",
+                "to": "workflow",
+                "description": {
+                  "vi": "Return accepted/declined/unknown evidence; lost reply cần recovery.",
+                  "en": "Return acceptance, decline or unknown evidence; lost replies require recovery."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "inventory",
+                "description": {
+                  "vi": "Convert current valid hold hoặc run explicit late-result policy.",
+                  "en": "Convert valid current holds or execute explicit late-result policy."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "orders",
+                "description": {
+                  "vi": "Persist PLACED/CONFIRMED state và fulfillment/receipt outbox.",
+                  "en": "Persist confirmed order state and fulfillment/receipt intent."
+                }
+              }
+            ]
+          },
+          {
+            "id": "unknown",
+            "label": {
+              "vi": "Unknown payment không là decline",
+              "en": "Unknown payments are not declines"
+            },
+            "steps": [
+              {
+                "from": "pay",
+                "to": "workflow",
+                "description": {
+                  "vi": "Timeout không chứng minh provider chưa authorize.",
+                  "en": "Timeouts do not prove authorization did not occur."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "orders",
+                "description": {
+                  "vi": "Retain PENDING_PAYMENT và next recovery action.",
+                  "en": "Retain PENDING_PAYMENT and the next recovery action."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "pay",
+                "description": {
+                  "vi": "Query/retry same operation theo provider contract, reconcile results.",
+                  "en": "Query/retry the same operation under provider contracts and reconcile."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "inventory",
+                "description": {
+                  "vi": "Nếu hold hết hạn, không commit như còn ownership; release/void policy riêng.",
+                  "en": "Expired holds no longer authorize allocation; apply explicit release/void policy."
+                }
+              }
+            ]
+          },
+          {
+            "id": "ship",
+            "label": {
+              "vi": "Fulfillment và capture theo shipment",
+              "en": "Fulfillment and capture by shipment"
+            },
+            "steps": [
+              {
+                "from": "orders",
+                "to": "events",
+                "description": {
+                  "vi": "Publish durable committed fulfillment intent.",
+                  "en": "Publish committed fulfillment intent durably."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "fulfill",
+                "description": {
+                  "vi": "Dedupe order/allocation/shipment command và recover uncertain dispatch.",
+                  "en": "Deduplicate allocation/shipment commands and recover uncertain dispatch."
+                },
+                "async": true
+              },
+              {
+                "from": "fulfill",
+                "to": "pay",
+                "description": {
+                  "vi": "Capture operation bound shipment/amount; enforce aggregate remaining amount.",
+                  "en": "Capture by shipment/amount while enforcing aggregate remaining authorization."
+                }
+              },
+              {
+                "from": "fulfill",
+                "to": "orders",
+                "description": {
+                  "vi": "Record shipment evidence và partial status, không overwrite cancellations.",
+                  "en": "Record shipment evidence and partial state without overwriting cancellations."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Compensate có retry và reconciliation",
+              "en": "Compensate with retries and reconciliation"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Cancel có identity và expected order version.",
+                  "en": "Cancel with identity and expected order version."
+                }
+              },
+              {
+                "from": "api",
+                "to": "workflow",
+                "description": {
+                  "vi": "Evaluate shipped/authorized/captured state trước chọn actions.",
+                  "en": "Evaluate shipping/payment state before selecting actions."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "inventory",
+                "description": {
+                  "vi": "Release exact hold nếu terminal transition còn hợp lệ.",
+                  "en": "Release exact holds under valid terminal transitions."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "pay",
+                "description": {
+                  "vi": "Void authorization hoặc refund captured operation theo state/evidence.",
+                  "en": "Void authorizations or refund captures under state/evidence."
+                }
+              },
+              {
+                "from": "workflow",
+                "to": "orders",
+                "description": {
+                  "vi": "Retain compensation progress, unresolved outcome và support visibility.",
+                  "en": "Retain compensation progress, unresolved outcomes and support visibility."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "6. API giữ quote, order và operation identities",
+        "en": "6. APIs retain quote, order and operation identities"
+      },
+      "paragraphs": [
+        {
+          "vi": "Không dùng một key chung cho authorize/capture/refund vì chúng là operations khác. Idempotency scope bind merchant/account, operation, currency/amount/payload và retention policy. Uniqueness constraints giữ result cùng transition; cache response đơn thuần không thay durable result record.",
+          "en": "Authorization, capture and refund need distinct operation identities. Scope keys to accounts/merchants, operations, currency, amounts and payloads with explicit retention. Retain results with transitions; response caching alone does not provide durable identity."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/checkout-quotes",
+          "description": {
+            "vi": "Validate cart snapshot và authoritative totals/promise.",
+            "en": "Validate cart snapshots, totals and promises."
+          },
+          "request": "{cartVersion, items, addressId, deliveryOption, currency}",
+          "response": "201 {quoteId, quoteVersion, totalMinor, currency, expiresAt, promiseVersion}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/orders",
+          "description": {
+            "vi": "Start/replay cùng order cho stable checkout identity.",
+            "en": "Start/replay one order under stable checkout identity."
+          },
+          "request": "Idempotency-Key: checkout-42\n{quoteId, quoteVersion, shopperConsent, paymentMethodRef}",
+          "response": "202 {orderId, state:\"PENDING_PAYMENT\", statusUrl}",
+          "notes": [
+            {
+              "vi": "202 không hứa đã authorize hoặc capture; conflict payload trả409.",
+              "en": "202 does not promise authorization/capture; conflicting payloads return409."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/internal/inventory/holds",
+          "description": {
+            "vi": "Atomic quantity reservation với retained result.",
+            "en": "Atomically reserve quantities and retain results."
+          },
+          "request": "{holdCommandId, orderId, skuWarehouse, quantity, expiresAtPolicy}",
+          "response": "{holdId, generation, state:\"ACTIVE\", serverExpiresAt}"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/orders/{orderId}/shipments/{shipmentId}/capture",
+          "description": {
+            "vi": "Capture bound to shipment và cumulative remaining authorization.",
+            "en": "Capture against shipments and remaining authorization."
+          },
+          "request": "{captureOperationId, authorizationRef, amountMinor, currency, expectedStateVersion}",
+          "response": "{captureState:\"SUCCEEDED|DECLINED|UNKNOWN\", operationRef}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/orders/{orderId}/cancellations",
+          "description": {
+            "vi": "Start durable cancellation, có thể pending compensation.",
+            "en": "Start durable cancellation with possible pending compensation."
+          },
+          "request": "Idempotency-Key: cancel-42\n{expectedOrderVersion, reason}",
+          "response": "202 {state:\"CANCEL_PENDING\", cancellationId}"
+        }
+      ]
+    },
+    {
+      "id": "cart",
+      "title": {
+        "vi": "7. Cart conflicts: additions, removals và quantities",
+        "en": "7. Cart conflicts: additions, removals and quantities"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cart nên giữ user intent qua offline edits nếu đó là product contract. Một membership merge có thể là observed-remove set: mỗi add có tag riêng, remove ghi tags đã quan sát. Concurrent fresh add có thể giữ item theo add-wins; user đã remove-all trên mọi devices là semantics mạnh hơn và cần design khác. Union không biết deletion; whole-document LWW làm independent edit biến mất khi wall clocks lệch.",
+          "en": "Preserve offline intent under a chosen product contract. Observed-remove membership assigns add tags and records observed removals. Fresh concurrent additions may survive under add-wins; remove-all requires stronger semantics. Union forgets deletions, and document LWW loses independent edits under skew."
+        },
+        {
+          "vi": "Lab chỉ membership, không giải quantity. Quantity có set-to-X, increment/decrement hoặc per-device contributions với business caps; chọn semantics trước CRDT. Tombstone/tag GC cần causal stability, bounded offline horizon hoặc forced epoch resync. Cart accepted ACK chỉ hứa mức durability của selected replicas, không “always succeeds” dưới mọi failure. Checkout luôn revalidate strict authorities.",
+          "en": "The lab covers membership, not quantity. Quantities may use assignments, deltas or device contributions with caps; choose semantics before data structures. Garbage collection needs causal stability, bounded offline history or forced epoch resync. Acknowledgements depend on reachable durable capacity, and checkout revalidates authorities."
+        }
+      ],
+      "experiment": "checkout-cart"
+    },
+    {
+      "id": "inventory",
+      "title": {
+        "vi": "8. Inventory hold là một state machine atomic",
+        "en": "8. Inventory holds are atomic state machines"
+      },
+      "paragraphs": [
+        {
+          "vi": "Conservation cho hard stock: available + active held + committed allocated = allocatable total, cộng các explicit adjustment/return states nếu có. Atomic decrement và INSERT hold/result phải commit cùng boundary; nếu decrement thành công rồi INSERT crash thì hàng mất ownership. Release/expire chỉ đổi ACTIVE→RELEASED/EXPIRED một lần và increment trong cùng commit.",
+          "en": "For hard stock, available plus active holds plus committed allocation equals total, extended by explicit adjustments/returns. Commit decrements, hold records and results together; otherwise crashes lose ownership. Terminal release/expiry increments stock atomically and only once."
+        },
+        {
+          "vi": "Commit hold cần current owner/order/generation, expected state và server expiry policy tại serialization point. TTL sweeper có thể trễ; read/commit checks vẫn phải reject expired ownership. TTL dài hơn payment p99 chỉ giảm frequency, không chứng minh race hết xảy ra. Late authorization sau release cần void/reconcile, còn capture rồi mới phát hiện không có hàng cần refund/fulfillment exception.",
+          "en": "Commit under current order ownership, generation, state and server expiry at the serialization point. Sweepers may lag; expired holds still cannot commit. Long TTLs reduce frequency without eliminating races. Late authorizations need void/reconciliation; captured money without stock needs refund/exception handling."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "-- Conceptual local transaction, with command-result identity.\nBEGIN;\n-- Lock/check the hold and stock in a consistent lock order.\nUPDATE holds SET state = 'EXPIRED', version = version + 1\n WHERE hold_id = :hold AND state = 'ACTIVE'\n   AND expires_at <= :authoritative_now\n RETURNING sku, quantity;\n-- Only if that transition returned a row, increment the same stock once.\n-- Persist release command/result and event intent before COMMIT.\nCOMMIT;",
+        "caption": {
+          "vi": "Đây là transition sketch, không SQL copy-run hoàn chỉnh. Conditional row count, consistent locking và result/outbox atomicity là phần bắt buộc; không chạy increment nếu không thắng transition.",
+          "en": "This is a transition sketch rather than copy-run SQL. Conditional row counts, consistent locking and atomic results/intent are required; never increment after losing the transition."
+        }
+      },
+      "experiment": "checkout-stock"
+    },
+    {
+      "id": "saga",
+      "title": {
+        "vi": "9. Workflow durability không xóa external crash window",
+        "en": "9. Workflow durability does not erase external crash windows"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi step có durable intent/command ID, participant result, retry policy và next state. Nếu authorize thành công nhưng workflow chưa ghi result thì replay phải query/retry same payment operation; “resume last completed step” không đủ nếu completed chưa recorded. Participant phải enforce identity cùng effect hoặc expose reliable recovery protocol. Event delivery at-least-once cần idempotent sinks, không chỉ consumer offset.",
+          "en": "Each step retains intent, command identity, participant results, retry policy and next state. If authorization succeeds before recording its result, replay queries/retries the same operation. Resuming the last recorded step alone is insufficient; participants must enforce identity or expose recovery."
+        },
+        {
+          "vi": "Saga không có isolation tự động: hai workflows cùng stock/cart/order cần authority checks/semantic locks để không contradictory transitions. Compensation có thể fail, không reverse emails/physical shipment hoặc guaranteed instant refund. Giữ COMPENSATION_PENDING, backoff/reconciliation và manual resolution path. 2PC có thể dùng khi participants thật sự support protocol, nhưng external providers thường không cùng transaction domain; NoSQL cũng có thể hỗ trợ transactions trong scope cụ thể.",
+          "en": "Sagas do not automatically isolate concurrent workflows. Authorities or semantic locks must guard contradictory transitions. Compensation can fail and cannot reverse notifications or dispatched goods. Retain pending repair/manual resolution. Cooperating participants may use2PC; external providers usually do not share that domain, and NoSQL products may support scoped transactions."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Before effect",
+            "en": "Before effect"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Persist intent + stable identity; define timeout/unknown recovery.",
+              "en": "Persist intent/identity and define uncertain-result recovery."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "After effect",
+            "en": "After effect"
+          },
+          "icon": "inspect",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Record observed result + state transition + next intent atomically khi local.",
+              "en": "Atomically retain local results, transitions and next intent."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "On failure",
+            "en": "On failure"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Distinguish definitive decline, transient failure và unknown outcome.",
+              "en": "Distinguish definitive decline, transient failure and unknown outcomes."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "payment",
+      "title": {
+        "vi": "10. Authorization, partial shipment và money reconciliation",
+        "en": "10. Authorization, partial shipments and reconciliation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Authorize-at-order/capture-at-dispatch là selected method policy, không universal legal rule. Authorization có expiry/amount/partial-capture constraints; payment method có thể immediate charge hoặc asynchronous approval. Shipping pipeline cần commit policy khi capture fails/unknown, reauthorization consent nếu cần và unique external capture per shipment.",
+          "en": "Order-time authorization and dispatch-time capture are selected policy, not universal law. Methods have expiry, amount and capture rules or asynchronous approval. Dispatch must define behavior for failed/unknown capture, reauthorization consent and unique shipment capture identities."
+        },
+        {
+          "vi": "Order-level total cap không thay per-shipment idempotency; idempotency không ngăn cumulative overcapture nếu distinct operation IDs đều valid. Refund/void là different actions theo settled state; webhook stale status không overwrite terminal result. Reconcile order→provider→settlement/ledger bằng references, amounts và currency. Balanced accounting chưa chứng minh đầy đủ mọi legitimate order event.",
+          "en": "Order caps and shipment idempotency solve different problems. Distinct valid operation IDs can still overcapture without aggregate limits. Void/refund depend on state, and stale events cannot overwrite results. Reconcile order, provider and settlement evidence by identity, amount and currency."
+        }
+      ]
+    },
+    {
+      "id": "cells",
+      "title": {
+        "vi": "11. Cells khác shuffle sharding, overlap khác outage",
+        "en": "11. Cells differ from shuffle sharding; overlap differs from outage"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cell là independently bounded slice của serving/data/ownership; router nhỏ có stable placement/epoch và không randomly reroute writes sang owner khác. Shared control/auth/catalog/payment dependencies cần failure budgets/fallbacks riêng; shared database toàn fleet làm cell isolation giảm. Deployment cell-by-cell với health gates giảm correlated bad rollout.",
+          "en": "Cells bound serving, data and ownership. Stable routers must not randomly redirect writes across owners. Shared authentication, catalog or payment dependencies need independent controls; shared databases weaken isolation. Gated cell-by-cell deployment limits correlated rollout failures."
+        },
+        {
+          "vi": "Shuffle subset chọn một số workers cho tenant/job để ít shared fate hơn plain partition. Với8workers, subsets2workers có28combinations; fault ở2workers làm1subset không có healthy target. Nhưng partial overlap vẫn gây first-attempt failure; retry phải distinct, idempotent, bounded bởi deadline/capacity. Không biến1/28 exact-overlap thành generic availability SLO.",
+          "en": "Shuffle subsets reduce shared fate. Two-worker subsets from eight workers yield twenty-eight combinations; two failed workers fully disable one subset. Partial overlaps still fail initial attempts. Distinct bounded idempotent retries depend on deadlines/capacity, so exact-overlap probability is not a generic availability SLO."
+        }
+      ],
+      "experiment": "checkout-cells"
+    },
+    {
+      "id": "peak",
+      "title": {
+        "vi": "12. Peak day: goodput, fairness và bounded waiting",
+        "en": "12. Peak days: goodput, fairness and bounded waiting"
+      },
+      "paragraphs": [
+        {
+          "vi": "Pre-scale capacity/database connections, warm cache and test target workload including degraded dependencies. Concurrency limits theo useful downstream work tốt hơn chỉ LB open connections. Queue có max length/wait, cancellation, signed principal-bound tokens và explicit queue-position semantics; token không bypass stock authority. Dedupe refresh/retry, chống bot/captcha/rate abuse theo product fairness.",
+          "en": "Pre-scale capacity/connections, warm caches and test degraded dependencies. Limit useful downstream concurrency rather than only open connections. Bound queues and waiting, cancellation and scoped tokens; queued admission never bypasses inventory. Deduplicate retries and apply abuse/fairness policy."
+        },
+        {
+          "vi": "Shed optional reviews/recommendations trước strict order/payment, nhưng security/fraud/compliance checks không bị bỏ chỉ vì “không kiếm tiền ngay”. Timeout/retry budgets end-to-end ngăn upstream retry storm. Escrow stock buckets cần disjoint budgets, ownership và safe rebalance; capacity gate hiển thị approximate remaining khác authoritative units available. Measure successful confirmed orders, tail/wait/drop và fairness cohorts.",
+          "en": "Degrade optional discovery before critical ordering, while retaining required security checks. End-to-end budgets prevent retry storms. Escrow buckets need disjoint budgets and safe rebalancing; approximate displayed counts do not authorize units. Measure useful orders, tails, waiting, drops and fairness."
+        }
+      ]
+    },
+    {
+      "id": "promise",
+      "title": {
+        "vi": "13. Delivery promise, recommendation và lifecycle after checkout",
+        "en": "13. Promises, recommendations and post-checkout lifecycle"
+      },
+      "paragraphs": [
+        {
+          "vi": "Promise combines warehouse stock, pick/pack queues, transport calendars/cutoffs, service class và address region. Cache key phải gồm dimensions ảnh hưởng output và time-bucket validity; invalidation khi capacity/stock changes. Checkout revalidates và retains accepted promise version. Multi-package order có từng ETA/amount, chưa thể dùng fastest warehouse date cho cả giỏ hàng.",
+          "en": "Promises combine warehouse stock, processing queues, calendars, cutoffs, service class and regions. Cache keys need relevant dimensions and validity; stock/capacity changes invalidate them. Checkout retains accepted versions. Multiple packages have separate dates/amounts rather than one fastest-warehouse estimate."
+        },
+        {
+          "vi": "Fulfillment giữ allocation/shipment IDs, scan/dispatch evidence, retries và exception routing. Inventory physical damage/returns/restocking tạo explicit adjustments, không chỉ update available từ cached order count. Cancel sau dispatch có return/refund workflow khác cancel trước allocation. Audit/history giúp customer support giải thích order partial/pending thay một boolean “paid”.",
+          "en": "Fulfillment retains allocation/shipment identities, dispatch evidence and exception handling. Damage and returns create explicit adjustments rather than cached-count updates. Post-dispatch cancellation needs return/refund workflows. Retained history explains partial/pending orders better than one paid boolean."
+        },
+        {
+          "vi": "Recommendations có offline build + bounded online seeds/merge; item-item similarity không đồng nghĩa every pair có materialized row. Filter prohibited/unavailable/current audience, version data/model và provide cold-start fallback. Recommendations có thể eventual nhưng không là source cho price, tax, inventory hay delivery commitment.",
+          "en": "Recommendations combine offline builds with bounded online seed merging; item similarity does not require unrestricted pair materialization. Filter eligibility and version data/models with cold-start fallback. Recommendations never authorize prices, inventory or delivery commitments."
+        }
+      ]
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "14. Failure matrix: customer outcome và recovery evidence",
+        "en": "14. Failure matrix: outcomes and recovery evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nối checkout/order/hold/payment/shipment IDs trong traces; không log card secrets hoặc toàn address tùy tiện. Dashboard cho unknown money, expired holds, stuck workflows, duplicate releases, compensation age và queue fairness. Tách customer order conversion khỏi infrastructure request success.",
+          "en": "Correlate checkout, order, hold, payment and shipment identities without logging secrets or unnecessary addresses. Monitor unknown money, expired holds, stuck workflows, repeated releases, compensation age and queue fairness. Infrastructure success does not establish customer conversion."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Required behavior",
+            "en": "Required behavior"
+          },
+          {
+            "vi": "Proof / drill",
+            "en": "Proof / drill"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Lost Place order reply",
+              "en": "Lost Place order reply"
+            },
+            {
+              "vi": "Replay same order/quote-bound result.",
+              "en": "Replay the same quote-bound order/result."
+            },
+            {
+              "vi": "Commit rồi disconnect; retry changed cart nhận conflict.",
+              "en": "Disconnect after commit; altered payload retries conflict."
+            }
+          ],
+          [
+            {
+              "vi": "Atomic decrement/hold split",
+              "en": "Atomic decrement/hold split"
+            },
+            {
+              "vi": "Không lost ownership hoặc orphan reservation.",
+              "en": "No lost ownership or orphan reservations."
+            },
+            {
+              "vi": "Crash giữa statement phải rollback cùng transaction.",
+              "en": "Crashes between statements roll back one transaction."
+            }
+          ],
+          [
+            {
+              "vi": "Duplicate expiry",
+              "en": "Duplicate expiry"
+            },
+            {
+              "vi": "Terminal state + increment chỉ một lần.",
+              "en": "Terminal state and increment apply once."
+            },
+            {
+              "vi": "Expiry worker retry sau lost reply, concurrent commit.",
+              "en": "Retry expiry after lost replies alongside commit."
+            }
+          ],
+          [
+            {
+              "vi": "Late auth after resale",
+              "en": "Late auth after resale"
+            },
+            {
+              "vi": "Không allocate released stock; void/reconcile pending.",
+              "en": "Do not allocate released stock; retain void/reconciliation."
+            },
+            {
+              "vi": "Auth accepted nhưng response delay tới sau TTL+resale.",
+              "en": "Delay accepted authorization beyond expiry and resale."
+            }
+          ],
+          [
+            {
+              "vi": "Saga crash/replay",
+              "en": "Saga crash/replay"
+            },
+            {
+              "vi": "Participant IDs giữ identity xuyên restart.",
+              "en": "Participant identities survive restarts."
+            },
+            {
+              "vi": "Crash trước/after provider effect và result record.",
+              "en": "Crash around provider effects and result recording."
+            }
+          ],
+          [
+            {
+              "vi": "Partial shipment retry",
+              "en": "Partial shipment retry"
+            },
+            {
+              "vi": "No duplicate capture, enforce total remaining amount.",
+              "en": "No duplicate capture; enforce cumulative limits."
+            },
+            {
+              "vi": "Same shipment duplicate + distinct shipments race.",
+              "en": "Duplicate shipments and concurrent distinct shipments."
+            }
+          ],
+          [
+            {
+              "vi": "Cell failure/shared DB",
+              "en": "Cell failure/shared DB"
+            },
+            {
+              "vi": "Measure actual blast radius và conditional fallback.",
+              "en": "Measure real impact and safe fallback."
+            },
+            {
+              "vi": "Fail one subset rồi required shared authority.",
+              "en": "Fail a subset, then a required shared authority."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Worked interview: kiểm assumptions trước tối ưu",
+        "en": "15. Worked interview: test assumptions before optimization"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giải thích một cart→quote→hold→authorize→confirm trước, rồi chọn hot key, workflow hoặc isolation làm deep dive. Với mỗi lựa chọn, nêu authority, lost reply, pending state và retry identity. Các đáp án dưới không bắt mọi store phải dùng eventual carts hay saga.",
+          "en": "Trace carts, quotes, holds, authorization and confirmation before choosing hot keys, workflows or isolation for a deep dive. Explain authority, lost replies, pending states and retry identities without prescribing eventual carts or sagas universally."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Atomic decrement riêng có đủ cho reservation?",
+            "en": "Is a standalone atomic decrement enough for reservations?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Stock giảm phải đi cùng hold owner/quantity/expiry/generation, unique result và intent trong transaction/equivalent protocol. Nếu INSERThold crash sau decrement thì conservation counters có thể đẹp nhưng ownership mất.",
+              "en": "No. Retain ownership, quantities, expiry, generations, results and intent with the stock transition. A crash after decrement can lose ownership even when counters appear plausible."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hold hết hạn rồi payment authorize thành công thì sao?",
+            "en": "What if authorization succeeds after hold expiry?"
+          },
+          "answer": [
+            {
+              "vi": "Recheck current hold/state/expiry/generation tại authority. Không commit stock đã release hoặc bán lại. Retain pending void/reconciliation; captured money cần refund/exception policy khác. Timeout không chứng minh decline.",
+              "en": "Revalidate current ownership/state, expiry and generation. Do not commit released/resold units. Retain void/reconciliation; captured money needs a different refund/exception policy. Timeouts do not establish declines."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Mọi saga step có undo là đủ ACID không?",
+            "en": "Does an undo action for every saga step provide ACID?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Saga không tự isolation, undo có thể fail hoặc không reverse physical effect. Guard concurrent transitions, retain compensation progress và manual repair; participant idempotency xử lý effect/result crash gap.",
+              "en": "No. Sagas do not automatically isolate, and undo may fail or not reverse physical effects. Guard concurrency, retain repair progress and preserve participant identities across crash gaps."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao cart item quay lại chưa chắc là bug?",
+            "en": "Why is a returning cart item not always a bug?"
+          },
+          "answer": [
+            {
+              "vi": "Observed-remove/add-wins có thể giữ fresh concurrent add b2 dù b1 bị remove. Old tag b1 quay lại sau lost tombstone là issue khác. Contract remove-all/quantity phải explicit, không suy từ merge-name.",
+              "en": "Observed-remove/add-wins may preserve a fresh concurrent b2 while removing b1. Resurrection of old b1 after losing tombstones is different. Define removal and quantity semantics explicitly."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một million attempts một SKU thì chỉ thêm shards?",
+            "en": "Do more shards solve a hot SKU with a million attempts?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu cùng allocation key. Bound admission/queue và authoritative conditional claims. Có thể disjoint escrow budgets để parallelize nhưng cần total conservation và safe transfers; cache/token không thay stock authority.",
+              "en": "Not when allocation remains one key. Bound admission and authoritative claims. Disjoint escrow budgets can parallelize under conservation and safe transfers; caches/tokens do not replace stock authority."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Shuffle 2-of8 có nghĩa chỉ1/28 requests lỗi?",
+            "en": "Does two-of-eight shuffle sharding imply only1/28 failed requests?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ dưới assumptions phù hợp:2badworkers, uniform subsets và thử cả2distincttargets. Một random attempt vẫn25%fail; sharedrequireddependencyfault làm100%. Overlap combinatorics không tự là availability SLO.",
+              "en": "Only with two failed workers, uniform subsets and both distinct attempts. One random attempt still fails25percent; shared required failure disables all. Combinatorics alone do not establish an SLO."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Authorize/capture dùng cùng orderID làm key mọi nơi?",
+            "en": "Should authorization and capture reuse one order ID everywhere?"
+          },
+          "answer": [
+            {
+              "vi": "Không: scope theo operation/merchant/method và payload; split shipments cần capture IDs riêng cùng aggregate cap. Same-operation retries giữ key; new operations không giả reuse để dedup nhau. Query/reconcile ambiguous outcomes theo provider contract.",
+              "en": "Scope identities to operations, merchants/methods and payloads. Split shipments need distinct captures plus aggregate limits. Preserve same-operation retries and reconcile uncertainty rather than reuse identities across different operations."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Promise trên product page có thể dùng nguyên ở checkout?",
+            "en": "Can a product-page delivery promise be reused unchanged at checkout?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động. Check validity/cutoff, item/address/service dimensions, current allocation/capacity và accepted quote. Changed date cần policy/consent; multi-package promise khác fastest single item. Cache freshness không là reserved shipping capacity.",
+              "en": "Revalidate expiry, cutoffs, dimensions and capacity/allocation against the accepted quote. Handle changes explicitly; multiple packages differ from one fastest item. Fresh caches do not reserve shipping capacity."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

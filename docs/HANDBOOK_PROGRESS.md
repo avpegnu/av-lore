@@ -1,22 +1,22 @@
 # Tiến độ System Design & AI
 
-Cập nhật ngày 22/10/2026. Checkpoint 41 (Netflix/BuildTimeline) đã commit/push; Stripe, Uber, Community Chat và Photo Platform được triển khai tiếp ở local; tiếp tục tự triển khai các bài sau theo từng đợt, không dừng sau mỗi mục. Không coi phạm vi 73 bài/công cụ đã hoàn tất.
+Cập nhật22/10/2026. Chủ sở hữu yêu cầu commit/push các mốc đã kiểm tra rồi tiếp tục triển khai nhiều bài liên tiếp, không dừng xin xác nhận sau mỗi mục. Phạm vi73 bài/công cụ chưa hoàn tất.
 
-## Tình trạng hiện tại
+## Trạng thái hiện tại
 
-- **45/73 bài đã biên soạn Việt–Anh**, gồm đủ bản mở rộng cho **26 Case Studies**.
-- Tất cả 45 bài giữ `status: review`; **0 bài complete**. Số section, unit tests hoặc build thành công không thay vòng review độ phủ/kỹ thuật/English cuối.
-- **28 mục chưa biên soạn**: 6 Build Stories, 14 AI Systems, 3 Practice và 5 Interview tools.
-- Main preview: `http://127.0.0.1:4322/av-lore/`, snapshot 45 bài đã qua kiểm tra và publish local.
-- Giữ nguyên 198 chương/15 lộ trình, 31 topic Notes & Interview, ID và dữ liệu học tập hiện có.
+- **48/73 bài đã biên soạn Việt–Anh**, gồm4 Foundations,8 Building Blocks,26 Case Studies,9 Build Stories và1 AI Systems.
+- Tất cả48 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
+- **25 mục chưa biên soạn**:3 Build Stories (`ep-whatsapp`, `ep-figma`, `ep-youtube`),14 AI Systems,3 Practice và5 Interview tools.
+- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local48. Các bài `/episodes/ep-amazon/`, `/episodes/ep-spotify/`, `/episodes/ep-airbnb/` có bản `/en/` tương ứng.
+- Giữ198 chương/15 lộ trình,31 Notes & Interview topics, stable IDs, localStorage keys và9 themes. Không portfolio.
 
-| Nhóm | Số bài | Canonical IDs |
-| --- | --- | --- |
-| Nền tảng | 4 | estimation, framework, networking, scaling |
-| Building Blocks | 8 | caching, consistency, databases, load-balancing, messaging, rate-limiting, reliability, unique-ids |
-| Case Studies | 26 | ad-clicks, autocomplete, chat, collaborative-editor, digital-wallet, email-service, exchange, file-sync, job-scheduler, key-value-store, leaderboard, llm-serving, maps-routing, message-queue, metrics-alerts, nearby-friends, news-feed, notifications, object-storage, payments, proximity, reservations, search-engine, url-shortener, video-platform, web-crawler |
-| Build Stories | 6 | ep-chatgpt, ep-netflix, ep-stripe, ep-uber, ep-discord, ep-instagram |
-| AI Systems | 1 | ai-inference |
+## Mốc đã push
+
+- Checkpoint33: AV Lore `3f3974547036498387b2bab2d6fcbe58aa581916`, IT Basic `996c995f1ec763944fe9d5bc53efc52d74861ef2`. Pages thành công39721870116.
+- Checkpoint40: AV Lore `243167f548a0a2a6add8a9adf6c98d9e263f8f4a`, IT Basic `4cd80c94c25287d217e12e5fb53c0a4cf50836af`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39740983441 . IT VPS39740981336 failed `ssh-keyscan`, vẫn failed sau1retry.
+- Checkpoint41: AV Lore `9c9eb33130ed313af9ae319c676130c4efef2058`, IT Basic `29492f5d7127605f5c870447dfc6f03db5a57b18`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39745514081 ; IT VPS39745517763 failed.
+- Checkpoint45: AV Lore `aa559d70ba76ff29edf090b35e7772bd6c34102a`, IT Basic `8357d80c9bfcb89e93f3f08d9fafb1018175ee72`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39752592201 . IT VPS https://github.com/avpegnu/it-basic/actions/runs/39752592483 failed trong Setup SSH key tại `ssh-keyscan`; đã đọc failed log22/10. Source hai repo push thành công; không đổi workflow/settings/secrets.
+- Local48 gồm Checkout/Audio/Booking bên dưới; đã được chủ sở hữu cho phép commit/push. Ghi commit hashes/result thực tế khi hoàn tất, không đoán trước deploy status.
 
 ## Các bài bổ sung trong checkpoint 40
 
@@ -44,55 +44,43 @@ Cập nhật ngày 22/10/2026. Checkpoint 41 (Netflix/BuildTimeline) đã commit
 
 Preview: `http://127.0.0.1:4322/av-lore/episodes/ep-netflix/` và `/av-lore/en/episodes/ep-netflix/`.
 
-## Bổ sung local sau checkpoint 41
+## Bổ sung sau checkpoint41
 
-- Stripe: 17 phần, 12 stages, 5 main traces, 3 labs, 8 câu có lời giải. Processor ambiguity/cross-provider routing, verified inbox/business guards và versioned store cutover. Phân biệt authorization/capture/settlement, provider evidence với stale NOT_FOUND.
-- Uber: 15 phần, 12 stages, 5 main traces, 3 labs, 8 câu. Geo epoch/seq/TTL, matching theo total/fairness/batch delay và trip-driver/current-offer invariants.
-- Community Chat: 15 phần, 12 stages, 5 main traces, 3 labs, 8 câu. Scope/cursor/version-safe query coalescing, active audience/relay backpressure và snapshot/live/deletion replay.
-- Photo Platform: 15 phần, 12 stages, 5 main traces, 3 labs, 8 câu. ID capacity/clock/ownership/exact serialization, publication/outbox/generation races và Story eligibility/viewed-state holes.
-- Canonical English được biên tập cùng nội dung Việt, runtime strings có manual dictionary. Các mô hình offline ghi rõ assumptions/limits; không gọi payment providers, production storage hoặc social APIs.
-- Đã đối chiếu full chapter/stage/demo theo learning purposes khi biên soạn; vòng review độc lập cuối vẫn chưa hoàn tất. Không nâng status bằng số lượng blocks hoặc tests.
+| Bài | Nội dung gốc Việt–Anh | Mô phỏng / giới hạn chính |
+| --- | --- | --- |
+| Stripe (`ep-stripe`) |17sections/12stages/5maintraces/3labs/8worked questions|Processor ambiguity, verified inbox/business guards, migration cutover; auth không capture/settlement, stale NOT_FOUND không proof|
+| Uber (`ep-uber`)|15sections/12stages/5traces/3labs/8questions|Geo epoch/seq/TTL, matching total/fairness/delay, trip+driver/current-offer invariants|
+| Community Chat (`ep-discord`)|15sections/12stages/5traces/3labs/8questions|Scope/cursor/version-safe reads, active audience/relay gaps, snapshot/live/deletion recovery|
+| Photo Platform (`ep-instagram`)|15sections/12stages/5traces/3labs/8questions|ID clock/capacity/ownership/precision, publish/delete races, Stories expiry/seen holes|
+| Checkout (`ep-amazon`)|15sections/11stages/5traces/5APIs/3labs/8questions|Atomic hold/expiry/late auth, observed cart membership, retry-aware shuffle subsets/shared dependency|
+| Audio Platform (`ep-spotify`)|14sections/11stages/5traces/5APIs/3labs/8questions|Startup critical path/rights gates, offline entry anchors/replay, semantic play/report corrections|
+| Booking Marketplace (`ep-airbnb`)|15sections/11stages/5traces/5APIs/3labs/8questions|Local-date horizon/rules, quote expiry/consent, CDC regression versus missing changes|
 
-## Snapshot đã kiểm tra cuối
+Bốn bài đầu thuộc checkpoint45; ba bài cuối thuộc local48. Mỗi stage có diagram và problem/decision/tradeoff/nextPressure/exitCriteria. Traces có step playback; prose dùng cards/flows/tables theo nghĩa. Không copy code/prose bên ngoài; không thêm acknowledgements/references UI/README. English được biên tập cùng canonical pairs và manual runtime dictionary, build offline.
 
-- `npm run check`: **234 files, 0 errors/warnings/hints**. `npm test`: **124 tests đạt**.
-- `npm run build` + `npm run verify`: **600 pages, 260682 links/assets**, 198 chương, 31 topics và 26 cases.
-- Cả bốn bài mới đều qua dedicated browser VI/EN, 12 stages, keyboard, boundary scenarios, desktop/mobile và 9 theme accessibility; generic 6 routes Stripe/Uber/Community và 2 routes Photo Platform đạt. Đã xem screenshots desktop/mobile, gồm diagrams, results và publication/Story states. Uber đã chạy lại sau chỉnh label FREE trên mobile.
-- IT Basic: **45 bài / 92 HTML files, 1072 internal links** đạt. Browser 8 static pages VI/EN của bốn bài mới kiểm canonical sections/stages/headings/tables/diagrams, mobile và language.
-- Runtime dictionary không thiếu key trên built snapshot; English build offline. Main preview4322 đã publish local45; staging4323 dừng sau kiểm tra.
-- Full IT Basic scan baseline còn49 broken links cũ ở AI indexes/JS chapter8, ngoài diff; không sửa `Test/Python/test.py`. Courses giữ baseline792 viewport checks/30 contrast checks, lượt này không đổi courses.
-- Logs/research nằm bền trong `.cache/handbook-expansion/`, screenshots/reports trong `artifacts/`; đều ignored local, không dùng `/tmp`. Browser scripts và canonical sources được track.
+## Kiểm tra snapshot48
 
-## Điểm tiếp tục
+- Source:246files,0errors/warnings/hints;133unit tests đạt.
+- Build+verify: **606pages,265084links/assets**,198courses,31topics,26cases. Localization thiếu0keys, không gọi online dịch.
+- Checkout,Audio,Booking đều có dedicated VI/EN,11stages,keyboard,boundary cases,desktop/mobile và9theme accessibility pass. Generic mỗi bài2routes pass. Checkout regression chạy lại trên snapshot47 sau tăng readability mobile. Đã xem screenshots và chỉnh label/output spacing, balanced worker grid, calendar14nights vừa desktop và quote status gọn; sau chỉnh chạy lại dedicated suites tương ứng.
+- Static IT Basic: **48bài/98HTML,1150internal links** pass. Browser6staticpagesVIEN của ba bài mới kiểm canonical headings/sections/stage transcripts/tables/diagrams/mobile/language; React labs chỉ AV Lore.
+- Baseline full IT Basic còn49brokenlinks cũ ởAIindexes/JSchapter8, source giốngHEAD và ngoài diff. Không chạm `Test/Python/test.py`. Courses giữ baseline792viewport/30contrastchecks; lượt này không sửa courses.
+- Logs `.cache/handbook-expansion/{checkout,audio,stay}-*` và `batch{46,47,48}-legacy-*`; reports/screenshots `artifacts/`. Persistent local trong repo, ignored, không `/tmp`. Staging đã dừng sau verified snapshot; main4322 tiếp tục phục vụ48.
 
-1. Tiếp tục **`ep-amazon`**, sau đó `ep-spotify`, `ep-airbnb`, `ep-whatsapp`, `ep-figma`, `ep-youtube`. Amazon đã đọc full chapter/11 stages/inventory model/demo; primary docs conditional updates/saga/load shedding đã mở. Cần đọc body cells/shuffle sharding/Dynamo và chốt 3 mô hình gốc trước authoring. Không copy pseudo-SQL tách decrement/hold hoặc sweeper thiếu conditional terminal transition; external payment timeout/late auth không được coi như decline. Không hứa always-writable hoặc saga rollback/isolation tuyệt đối.
-2. Hoàn thiện14 AI Systems, bắt đầu `ai-kv-cache`, rồi8 Practice/Interview tools.
-3. Review độc lập độ phủ, dễ hiểu, kỹ thuật/formulas/units, English và visual/interaction purposes cho toàn bộ73. Framework còn cần product prompt/query mismatch review; Exchange có thể bổ sung regional DR/RPO.
+## Tiếp theo
 
-## Source và cách làm tiếp
+1. **`ep-whatsapp`**: đã đọc full chapter12stages/fanout model/demo. Research/3mô hình dự kiến lưu `whatsapp-research.json`. Official encryption PDF lấy được bằng curl sau web redirect lỗi; local PDF/TXT tại `.cache/handbook-expansion/whatsapp-primary-whitepaper.*`,Version9Feb25,2026. Đã đọc Group Messages và2021Meta multi-device/backup articles; đọc relevant initiation/media/device consistency trước author nếu claim chi tiết. Chưa thêm source models/component/canonical. Proposed labs: per-device durable ACK/replay, active-sender/group-epoch fan-out arithmetic, membership/key-holder boundary (không real crypto).
+2. `ep-figma`, `ep-youtube`; sau đó14 AI entries bắt đầu`ai-kv-cache`, rồi8 Practice/Interview tools. `npm run content:audit` là danh sách chính xác.
+3. Independent final review từng bài theo coverage/purpose, diễn giải tự nhiên Việt/English, formulas/units và failure/security assumptions. Không nâng complete bằng đếm blocks/tests. Framework còn cần product prompt/query mismatch review; Exchange có thể thêm regional DR/RPO.
 
-`src/content/handbook/*.json` là source chuẩn với cặp `vi/en`; schema ở `src/lib/handbook-schema.ts`, renderer ở `src/components/HandbookLesson.astro`, danh mục 73 mục ở `src/lib/handbook-catalog.json`. Mô hình mới ở `src/lib/{email,log,wallet,scheduler,search,netflix}-models.ts`, React labs và browser checks có tên tương ứng.
+## Source và cách tiếp tục
 
-Không rerun các one-time author helpers trong `.cache/handbook-expansion/authoring/` để overwrite bài đã sửa; sửa trực tiếp canonical JSON. Plan/coverage/research local ở `.cache/handbook-expansion/`. Không chạy lại migration. Patch Chat trong `docs/work-in-progress/chat.patch` đã áp dụng ngày 22/10, không apply lần nữa. Không chạm thay đổi ngoài phạm vi ở `IT Basic/Test/Python/test.py`.
+Canonical `src/content/handbook/*.json` là chuẩn; schema `src/lib/handbook-schema.ts`, catalog73 `src/lib/handbook-catalog.json`, renderer `src/components/HandbookLesson.astro`. Không rerun one-time creation helpers trong `.cache/handbook-expansion/authoring/` để overwrite bài đã chỉnh. Đặc biệt canonical Uber đã thêm technology table, Airbnb đã polish interview answers sau helper. Sửa trực tiếp JSON và giữ IDs.
 
-Shared prose/flows/cards/tables/API và diagram transcripts đồng bộ qua `IT Basic/tools/sync-handbook.py`; React labs chỉ ở AV Lore. Giữ branding/deploy/dependencies riêng. Đọc git status cả hai repo trước sửa tiếp.
+Trước sửa tiếp đọc git status cả hai repo; giữ unrelated IT Basic/Test/Python/test.py. Không migrate, không tạo Astro trong IT Basic. Shared prose/flows/cards/table/API/diagram/stage transcripts sync bằng `python3 tools/sync-handbook.py` tại IT Basic; không fake React labs trong HTML.
 
-Main preview phục vụ `dist/`. Dùng staging `.cache/handbook-preview/` trên port 4323, build/verify xong mới start preview và đợi HTTP200 trước browser. Không mutate staging khi suite đang chạy. Sau pass, copy `_astro` trước rồi toàn bộ `dist` và localization report sang main; không `--delete` assets cũ. Dừng bằng `npx astro preview stop` tại đúng staging cwd để không tắt main. Staging đã dừng sau snapshot cuối; main4322 vẫn chạy.
+AV Lore source/content cần check,test,build,verify và browser khi behavior/language/navigation đổi. Browser generic hỗ trợ `HANDBOOK_IDS`, `HANDBOOK_CONTENT_DIR`, `PREVIEW_URL`; range helper theo min/step; await island-ready và language-ready. Source model fixtures không là benchmark/production/security implementation.
 
-Browser generic hỗ trợ `HANDBOOK_IDS` và `HANDBOOK_CONTENT_DIR` để kiểm phần đổi trên validated snapshot. Chạy dedicated checks cho new behavior; range helper phải tôn trọng min/step và hướng ở max. Giữ key dữ liệu học tập hiện có và 9 themes đã chốt.
+Main4322 phục vụ `dist/`. Build ở `.cache/handbook-preview/`, chỉ rsync source lúc staging đã dừng và không test/build đang chạy. Đợi build+verify exit0 rồi start4323, đợi server ready/HTTP200 trước browser. Sau browser/screenshots pass, copy `_astro` trước rồi toàn dist + localization report về main; không `--delete` old assets. Dừng bằng `npx astro preview stop` tại stagingcwd, không main. Không mutate staging khi browser chạy.
 
-`npm run content:audit -- --require-complete` hiện cố ý chưa đạt vì mới authored45/reviewed0 trên scope73. Build/verify chạy độc lập, không cần repo IT Basic hoặc dịch online.
-
-## Checkpoint đã push
-
-Ngày 22/10, mốc 33 bài: AV Lore `3f3974547036498387b2bab2d6fcbe58aa581916`, IT Basic `996c995f1ec763944fe9d5bc53efc52d74861ef2`. Pages workflow thành công: https://github.com/avpegnu/av-lore/actions/runs/39721870116 . Bảy bài trong bảng trên được triển khai sau mốc 33 và thuộc checkpoint 40 được chủ sở hữu yêu cầu commit/push ở lượt hiện tại. Các bài bổ sung sau checkpoint 40 sẽ được theo dõi riêng.
-
-Checkpoint trước ngày 21/10: AV Lore `12e9038bff6f5c51bb39059aa8c6427713362e36`, IT Basic `5aa8f07`. Giữ lịch sử commit, không reset/rewrite.
-
-## Checkpoint 40 đã push theo yêu cầu mới
-
-AV Lore `243167f548a0a2a6add8a9adf6c98d9e263f8f4a`, IT Basic `4cd80c94c25287d217e12e5fb53c0a4cf50836af`. Pages đã thành công: https://github.com/avpegnu/av-lore/actions/runs/39740983441 . Workflow VPS của IT Basic dừng ở `ssh-keyscan` trong Setup SSH key, vẫn lỗi sau một lần retry: https://github.com/avpegnu/it-basic/actions/runs/39740981336 . Không sửa workflows/secrets để đoán khắc phục; source đã push thành công. Công việc Build Stories tiếp theo được giữ local.
-
-## Checkpoint 41 đã push
-
-AV Lore `9c9eb33130ed313af9ae319c676130c4efef2058`, IT Basic `29492f5d7127605f5c870447dfc6f03db5a57b18`. Pages thành công: https://github.com/avpegnu/av-lore/actions/runs/39745514081 . Workflow VPS IT Basic thất bại: https://github.com/avpegnu/it-basic/actions/runs/39745517763 . Không sửa workflows/settings/secrets. Bốn bài mới phía trên được kiểm tra trong checkpoint 45; chủ sở hữu đã cho phép commit/push và tiếp tục triển khai.
+Không auto Settings/secrets/workflows/PR; user hiện cho phép commit/push checkpoint và tiếp tục nhiều mục. Đừng final là hoàn tất khi73scope/review chưa xong. Progress local `plan.json`, `coverage.json` cùng folderignored; tracked handoff là file này.

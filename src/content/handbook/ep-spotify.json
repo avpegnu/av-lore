@@ -1,0 +1,2965 @@
+{
+  "id": "ep-spotify",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Audio Platform: instant Play, offline intent và trusted reports",
+    "en": "Building an Audio Platform: instant playback, offline intent and trusted reports"
+  },
+  "summary": {
+    "vi": "11 giai đoạn kiến trúc và ba lab: startup critical path, playlist anchors/replay và qualified-play reporting; giữ media, rights và evidence đúng authority.",
+    "en": "Eleven architecture stages and three labs explore startup critical paths, playlist anchors/replay and qualified-play reports under separate media, rights and evidence authority."
+  },
+  "prerequisites": [
+    "video-platform",
+    "collaborative-editor",
+    "ad-clicks",
+    "message-queue"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "cache",
+    "messaging",
+    "storage-search"
+  ],
+  "takeaways": [
+    {
+      "vi": "Startup là critical path; valid rights và bytes đều phải ready trước output.",
+      "en": "Startup follows dependencies; rights and bytes must both be ready."
+    },
+    {
+      "vi": "Offline capability có bounded revocation/check-in window; encryption không là authorization.",
+      "en": "Offline rights have bounded check-ins/revocation; encryption is not authorization."
+    },
+    {
+      "vi": "Playlist log không tự merge intent; entries/anchors/context và ownership cần protocol.",
+      "en": "Logs do not merge intent automatically; identities, contexts and ownership need protocols."
+    },
+    {
+      "vi": "Event dedup khác qualified play và payout evidence; closed reports cần adjustments.",
+      "en": "Transport deduplication differs from qualified plays and payment evidence; closed reports need corrections."
+    },
+    {
+      "vi": "Reuse delivery paths, nhưng giữ policies/content types và operational ownership rõ.",
+      "en": "Reuse delivery while preserving content policies and operational ownership."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Nghe nhanh, sync đúng, đếm có evidence",
+      "en": "Start quickly, synchronize correctly and count with evidence"
+    },
+    "caption": {
+      "vi": "Media/control/report paths có guarantees riêng.",
+      "en": "Media, control and reporting have distinct guarantees."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Play",
+          "en": "Play"
+        },
+        "detail": {
+          "vi": "Resolve + rights + buffered compatible media.",
+          "en": "Resolve, authorize and buffer compatible media."
+        },
+        "icon": "gauge"
+      },
+      {
+        "title": {
+          "vi": "Sync",
+          "en": "Sync"
+        },
+        "detail": {
+          "vi": "Stable edit identities và retained anchor context.",
+          "en": "Stable edit identities and retained contexts."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Count",
+          "en": "Count"
+        },
+        "detail": {
+          "vi": "Accepted evidence → qualified play → versioned report.",
+          "en": "Accepted evidence → qualified plays → versioned reports."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Evolve",
+          "en": "Evolve"
+        },
+        "detail": {
+          "vi": "Discovery, long-form, search và platform ownership.",
+          "en": "Discovery, long-form, search and platform ownership."
+        },
+        "icon": "decision"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Audio platform: cảm giác instant và evidence đáng tin",
+        "en": "1. Audio platforms: instant experience and trustworthy evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài này thiết kế platform kiểu Spotify: music playback, offline downloads, playlist sync, events, discovery, long-form audio và hybrid search. 11 stages dùng public learning themes nhưng là teaching architecture, không inventory production hiện tại. Mục tiêu là hiểu vì sao bytes, rights, user intent và financial/report evidence phải tách authority.",
+          "en": "This Spotify-style platform covers music, downloads, playlists, events, discovery, long-form audio and hybrid search. Eleven teaching stages explore public architectural themes rather than a current deployment inventory, separating media, rights, intent and evidence."
+        },
+        {
+          "vi": "Historical hybrid client-server/P2P cho desktop cho thấy delivery sources có thể đổi mà product loop vẫn giống nhau. Một measurement cũ gồm cache hits không trở thành SLA hiện tại cho mobile random jumps. Dưới đây mọi số trong labs đều synthetic; rights và reporting policies được đặt rõ, không mô phỏng Spotify DRM hoặc royalty engine.",
+          "en": "Historical desktop hybrid delivery shows that sources can change while the product loop remains. Old cached measurements do not establish mobile SLAs. Labs use synthetic values and explicit policies rather than implementing Spotify DRM or royalty rules."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Media / rights",
+            "en": "Media / rights"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Bytes immutable, license scoped; cache hit không bypass entitlement.",
+              "en": "Immutable bytes and scoped rights; cache hits never bypass entitlement."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "User intent",
+            "en": "User intent"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Entry/op identity, versions, offline context và device/session ownership.",
+              "en": "Entry/operation identity, versions, offline context and session ownership."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Evidence / reports",
+            "en": "Evidence / reports"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Accepted transport khác genuine play, qualification và payable report.",
+              "en": "Accepted transport differs from genuine plays, qualification and payable reports."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "boundaries",
+      "title": {
+        "vi": "2. Một Play có nhiều clocks và ACKs",
+        "en": "2. Playback has multiple clocks and acknowledgements"
+      },
+      "paragraphs": [
+        {
+          "vi": "Track/content ID, file generation, playlist revision, playback session/owner epoch, event ID và report rule version không thay thế nhau. Chọn generation trước fetch, recheck rights theo capability contract, giữ pending edits/events tới durable ACK. Một stream bytes trả200 không chứng minh đã nghe, còn event ACK không chứng minh event qualify hay payout.",
+          "en": "Content, file generations, list revisions, session epochs, event identities and rule versions are distinct. Resolve generations, validate rights and retain pending intent until durable acknowledgement. A successful byte response does not prove listening, and event acceptance does not establish qualification/payment."
+        },
+        {
+          "vi": "Playback control multi-device cần current active-session ownership với version/lease. Command stale từ phone cũ không nên pause/seek speaker mới sau handoff; command IDs và expected owner epoch giúp reject. Resume position không luôn max: explicit seek backward/restart khác stale progress update. Define current session authority, sequence/version và reconnect behavior.",
+          "en": "Multi-device controls need versioned session ownership. Stale phone commands must not control a newly handed-off speaker. Retain command identity/expected epoch and distinguish deliberate backward seeks from stale progress rather than blindly taking maximum position."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Resolve → authorize → bytes → output",
+          "en": "Resolve → authorize → bytes → output"
+        },
+        "caption": {
+          "vi": "Các dependencies quyết critical path; các ACK quyết recovery.",
+          "en": "Dependencies determine critical paths; acknowledgements determine recovery."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Resolve",
+              "en": "Resolve"
+            },
+            "detail": {
+              "vi": "Content tới compatible file generation.",
+              "en": "Resolve compatible file generations."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Authorize",
+              "en": "Authorize"
+            },
+            "detail": {
+              "vi": "Current rights hoặc valid bounded offline capability.",
+              "en": "Current rights or bounded valid offline capabilities."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Buffer",
+              "en": "Buffer"
+            },
+            "detail": {
+              "vi": "Validate encrypted bytes và fill startup buffer.",
+              "en": "Verify bytes and fill startup buffers."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Observe",
+              "en": "Observe"
+            },
+            "detail": {
+              "vi": "Report QoE và accepted intent bằng identities riêng.",
+              "en": "Report QoE and accepted intent with separate identities."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 11 stages: delivery, correctness và ownership",
+        "en": "3. Eleven stages: delivery, correctness and ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi giai đoạn có problem, decision, trade-off, next trigger và exit criteria. Chọn cải tiến dựa evidence: playback tail, event completeness, sync correctness hoặc team operations. Reuse playlist/media primitives khi contract phù hợp, không ép new content types vào cũ nếu entitlement/ordering khác.",
+          "en": "Each stage states pressure, decisions, costs, triggers and exit criteria. Follow evidence from playback, reporting, synchronization and operations. Reuse primitives when contracts fit without forcing new content into unsuitable entitlement/ordering rules."
+        }
+      ],
+      "stages": [
+        {
+          "id": "hybrid",
+          "title": {
+            "vi": "Bắt đầu playback, rồi tối ưu delivery",
+            "en": "Start playback before optimizing delivery"
+          },
+          "description": {
+            "vi": "Thiết kế đầu có native client, catalog, server delivery và optional peer/cache sources. P2P từng là một cách giảm origin bandwidth trên desktop; server cung cấp fast prefix/fallback. Không suy historical measurement thành hiện trạng: mobile constraints, NAT/privacy, upload cost và CDN economics có thể đổi quyết định.",
+            "en": "An initial native client resolves catalogs and uses server delivery with optional peers/caches. Desktop P2P historically reduced origin traffic while servers supplied startup/fallback. Do not treat historical measurements as current architecture; devices, privacy and delivery economics change decisions."
+          },
+          "problem": {
+            "vi": "Music phải play nhanh nhưng bandwidth và unreliable sources có cost.",
+            "en": "Playback must start quickly despite costly bandwidth and unreliable sources."
+          },
+          "decision": {
+            "vi": "Separate control metadata khỏi delivery source; verify chunks và keep fallback.",
+            "en": "Separate control metadata from delivery sources; verify chunks and retain fallback."
+          },
+          "tradeoff": {
+            "vi": "Peer discovery/NAT, resource consent và protocol complexity tăng.",
+            "en": "Peer discovery, NAT, resource consent and protocol complexity add cost."
+          },
+          "nextPressure": {
+            "vi": "Skip khiến startup delay quan trọng hơn full download throughput.",
+            "en": "Skipping makes startup delay more important than total download throughput."
+          },
+          "exitCriteria": {
+            "vi": "Start/fallback measured theo cold/warm/device/network cohorts.",
+            "en": "Measure startup/fallback by connection, device and network cohorts."
+          },
+          "diagram": {
+            "id": "audio-stage-hybrid",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Audio catalog",
+                  "en": "Audio catalog"
+                },
+                "detail": {
+                  "vi": "Track/content ID tới file generations/codecs/territory và availability versions.",
+                  "en": "Content IDs resolve to file generations, codecs, territories and availability versions."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Audio origin",
+                  "en": "Audio origin"
+                },
+                "detail": {
+                  "vi": "Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                  "en": "Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "peers",
+                "label": {
+                  "vi": "Historical peers",
+                  "en": "Historical peers"
+                },
+                "detail": {
+                  "vi": "Optional desktop delivery peers; integrity, authorization và fallback vẫn cần.",
+                  "en": "Optional desktop peers still need integrity, authorization and fallback."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "edge"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Boundary gateway → catalog: Track/content ID tới file generations/codecs/territory và availability versions.",
+                      "en": "Boundary gateway → catalog: Content IDs resolve to file generations, codecs, territories and availability versions."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Boundary client → origin: Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                      "en": "Boundary client → origin: Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "peers",
+                    "description": {
+                      "vi": "Boundary client → peers: Optional desktop delivery peers; integrity, authorization và fallback vẫn cần.",
+                      "en": "Boundary client → peers: Optional desktop peers still need integrity, authorization and fallback."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "startup",
+          "title": {
+            "vi": "Client cache, warm connection và prefetch budget",
+            "en": "Client caches, warm connections and prefetch budgets"
+          },
+          "description": {
+            "vi": "Reuse connection, cache valid metadata và prefetch likely next prefix. Tính critical path từ dependencies: license/key và encrypted bytes có thể overlap sau resolve; decode phải chờ cả hai. Prefetch sai lãng phí data/battery và không loại entitlement check. QoE budget xét tails và cold random jumps, không chỉ median cache hits.",
+            "en": "Reuse connections, cache valid metadata and prefetch likely prefixes. Follow dependencies: licensing and bytes may overlap after resolution, while decoding waits for both. Wrong predictions waste resources without replacing authorization. Budget tails and random jumps rather than only cached medians."
+          },
+          "problem": {
+            "vi": "Nhiều small round trips làm từng skip chậm dù server CPU thấp.",
+            "en": "Small round trips delay skips despite low server CPU."
+          },
+          "decision": {
+            "vi": "Bounded client caches/prefetch, dependency-aware concurrency và QoE instrumentation.",
+            "en": "Use bounded caching/prefetch, dependency-aware concurrency and QoE instrumentation."
+          },
+          "tradeoff": {
+            "vi": "Stale metadata/keys, wrong predictions và device constraints tăng variants.",
+            "en": "Stale state, bad predictions and device constraints add variants."
+          },
+          "nextPressure": {
+            "vi": "Offline/mobile cần license và encrypted-download lifecycle rõ.",
+            "en": "Offline/mobile playback needs explicit license/download lifecycle."
+          },
+          "exitCriteria": {
+            "vi": "Cache hit không bypass revoked/expired authorization theo selected contract.",
+            "en": "Cache hits respect selected expiry/revocation contracts."
+          },
+          "diagram": {
+            "id": "audio-stage-startup",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Local media cache",
+                  "en": "Local media cache"
+                },
+                "detail": {
+                  "vi": "Bound size, integrity và valid generation; bytes không đồng nghĩa rights.",
+                  "en": "Bounds size, integrity and generation; bytes do not establish rights."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Audio catalog",
+                  "en": "Audio catalog"
+                },
+                "detail": {
+                  "vi": "Track/content ID tới file generations/codecs/territory và availability versions.",
+                  "en": "Content IDs resolve to file generations, codecs, territories and availability versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "license",
+                "label": {
+                  "vi": "Rights / license",
+                  "en": "Rights / license"
+                },
+                "detail": {
+                  "vi": "Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                  "en": "Current scoped entitlement or bounded device-bound offline capabilities."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Audio origin",
+                  "en": "Audio origin"
+                },
+                "detail": {
+                  "vi": "Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                  "en": "Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Boundary client → cache: Bound size, integrity và valid generation; bytes không đồng nghĩa rights.",
+                      "en": "Boundary client → cache: Bounds size, integrity and generation; bytes do not establish rights."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Boundary gateway → catalog: Track/content ID tới file generations/codecs/territory và availability versions.",
+                      "en": "Boundary gateway → catalog: Content IDs resolve to file generations, codecs, territories and availability versions."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "license",
+                    "description": {
+                      "vi": "Boundary gateway → license: Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                      "en": "Boundary gateway → license: Current scoped entitlement or bounded device-bound offline capabilities."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Boundary client → origin: Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                      "en": "Boundary client → origin: Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "offline",
+          "title": {
+            "vi": "Offline bytes và bounded rights capability",
+            "en": "Offline bytes and bounded rights capabilities"
+          },
+          "description": {
+            "vi": "Download encrypted media cùng manifest/checksums; cấp license/device capability có scope, expiry và check-in policy. Offline client không thể biết instant remote revocation khi không có network; product chấp nhận bounded staleness hoặc yêu cầu reconnect. Hardware/secure storage và clock rollback controls là implementation/security design riêng.",
+            "en": "Download encrypted media with manifests/integrity and scoped device capabilities with expiry/check-in policy. Disconnected clients cannot learn instant revocation; accept bounded staleness or require reconnect. Secure storage and rollback defenses need separate design."
+          },
+          "problem": {
+            "vi": "Users mất mạng nhưng vẫn muốn nghe nội dung đã được cấp phép.",
+            "en": "Users lose networks while needing authorized downloads."
+          },
+          "decision": {
+            "vi": "Separate bytes/license state, explicit offline UX và device quotas.",
+            "en": "Separate media/license state with explicit offline UX and device quotas."
+          },
+          "tradeoff": {
+            "vi": "Expired rights, lost device, clock tampering và incomplete downloads cần xử lý.",
+            "en": "Handle expiry, lost devices, tampered clocks and incomplete downloads."
+          },
+          "nextPressure": {
+            "vi": "Nhiều devices cần sync playlist intent và resume state.",
+            "en": "Multiple devices need synchronized playlists and resume state."
+          },
+          "exitCriteria": {
+            "vi": "Offline capability invalid không tự refresh được bằng cached ciphertext.",
+            "en": "Invalid offline capabilities cannot refresh through cached ciphertext."
+          },
+          "diagram": {
+            "id": "audio-stage-offline",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "license",
+                "label": {
+                  "vi": "Rights / license",
+                  "en": "Rights / license"
+                },
+                "detail": {
+                  "vi": "Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                  "en": "Current scoped entitlement or bounded device-bound offline capabilities."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Local media cache",
+                  "en": "Local media cache"
+                },
+                "detail": {
+                  "vi": "Bound size, integrity và valid generation; bytes không đồng nghĩa rights.",
+                  "en": "Bounds size, integrity and generation; bytes do not establish rights."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Audio origin",
+                  "en": "Audio origin"
+                },
+                "detail": {
+                  "vi": "Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                  "en": "Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "license",
+                    "description": {
+                      "vi": "Boundary gateway → license: Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                      "en": "Boundary gateway → license: Current scoped entitlement or bounded device-bound offline capabilities."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Boundary client → origin: Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                      "en": "Boundary client → origin: Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Boundary client → cache: Bound size, integrity và valid generation; bytes không đồng nghĩa rights.",
+                      "en": "Boundary client → cache: Bounds size, integrity and generation; bytes do not establish rights."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "playlists",
+          "title": {
+            "vi": "Playlist operations, snapshots và stable anchors",
+            "en": "Playlist operations, snapshots and stable anchors"
+          },
+          "description": {
+            "vi": "Một entry có identity riêng dù track lặp. Device gửi op ID, base version và anchors; authority validate quyền, dedup và rebase/conflict theo protocol. Log chỉ lưu order, không tự hiểu intent. Snapshot/compaction giữ accepted results và tombstone/context tới offline horizon; missing context cần resync.",
+            "en": "Entries have distinct identities even when tracks repeat. Devices send operation identities, base versions and anchors; authority authorizes, deduplicates and rebases/conflicts. Logs alone do not understand intent. Snapshots retain results/context or require resynchronization."
+          },
+          "problem": {
+            "vi": "Offline concurrent inserts/moves/removes dễ làm mutable array mất edits.",
+            "en": "Offline inserts, moves and removals can lose edits in mutable arrays."
+          },
+          "decision": {
+            "vi": "Stable entries/anchors và versioned authority log hoặc full sequence CRDT/OT.",
+            "en": "Use stable entries/anchors with an authority log or complete sequence CRDT/OT."
+          },
+          "tradeoff": {
+            "vi": "Conflict semantics, compaction và ACL changes có user-visible cost.",
+            "en": "Conflicts, compaction and permission changes are visible costs."
+          },
+          "nextPressure": {
+            "vi": "Delivery sources thay đổi nhưng playlist/control API nên ổn định.",
+            "en": "Delivery sources change while control contracts should remain stable."
+          },
+          "exitCriteria": {
+            "vi": "Lost reply replay không duplicate entry; stale index không silently move intent.",
+            "en": "Retries preserve entries and stale indexes do not silently change intent."
+          },
+          "diagram": {
+            "id": "audio-stage-playlists",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "playlist",
+                "label": {
+                  "vi": "Playlist authority",
+                  "en": "Playlist authority"
+                },
+                "detail": {
+                  "vi": "Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                  "en": "Stable entry/operation identities, versions, snapshots and rebase rules."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "liststore",
+                "label": {
+                  "vi": "Playlist log / snapshot",
+                  "en": "Playlist log / snapshot"
+                },
+                "detail": {
+                  "vi": "Durable accepted operations và retained anchor/tombstone horizon.",
+                  "en": "Durable operations with retained anchor/tombstone horizons."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "playlist",
+                    "description": {
+                      "vi": "Boundary gateway → playlist: Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                      "en": "Boundary gateway → playlist: Stable entry/operation identities, versions, snapshots and rebase rules."
+                    }
+                  },
+                  {
+                    "from": "playlist",
+                    "to": "liststore",
+                    "description": {
+                      "vi": "Boundary playlist → liststore: Durable accepted operations và retained anchor/tombstone horizon.",
+                      "en": "Boundary playlist → liststore: Durable operations with retained anchor/tombstone horizons."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "cdn",
+          "title": {
+            "vi": "Đơn giản hóa delivery bằng CDN/origin",
+            "en": "Simplify delivery through CDNs/origins"
+          },
+          "description": {
+            "vi": "Khi peer path không còn đáng complexity, hợp nhất delivery qua edge caches/origin. Retain client cache/prefetch và encrypted-generation integrity. Rights/key path vẫn có scope/expiry; encryption không chứng minh có quyền phân phối mọi bytes ở mọi nơi. Cache TTL/path/query/auth policy phải được kiểm theo license và privacy contract.",
+            "en": "Retire peer complexity when measured benefits no longer justify it, retaining client caches and integrity. Licensing remains scoped; encryption does not authorize unrestricted distribution. Check cache policies against licensing and privacy contracts."
+          },
+          "problem": {
+            "vi": "Multiple delivery stacks làm mobile/desktop operations khó hơn lợi ích tiết kiệm.",
+            "en": "Multiple stacks add more operations than savings justify."
+          },
+          "decision": {
+            "vi": "Versioned origin assets, CDN steering/shielding và safe rollout per cohort.",
+            "en": "Use versioned assets, CDN steering/shielding and cohort rollouts."
+          },
+          "tradeoff": {
+            "vi": "Origin egress, misses và concentration/vendor dependency tăng.",
+            "en": "Origin egress, misses and vendor concentration grow."
+          },
+          "nextPressure": {
+            "vi": "Events/analytics scale độc lập audio bytes.",
+            "en": "Events and analytics scale separately from media bytes."
+          },
+          "exitCriteria": {
+            "vi": "Fail edge/origin giữ QoE/fallback bounds; rollout không expose wrong generation.",
+            "en": "Failures preserve bounded QoE/fallback and correct generations."
+          },
+          "diagram": {
+            "id": "audio-stage-cdn",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Audio catalog",
+                  "en": "Audio catalog"
+                },
+                "detail": {
+                  "vi": "Track/content ID tới file generations/codecs/territory và availability versions.",
+                  "en": "Content IDs resolve to file generations, codecs, territories and availability versions."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "license",
+                "label": {
+                  "vi": "Rights / license",
+                  "en": "Rights / license"
+                },
+                "detail": {
+                  "vi": "Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                  "en": "Current scoped entitlement or bounded device-bound offline capabilities."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Audio CDN",
+                  "en": "Audio CDN"
+                },
+                "detail": {
+                  "vi": "Authorized encrypted media generations, origin shielding và cache policy.",
+                  "en": "Encrypted media generations under access, shielding and cache policies."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Audio origin",
+                  "en": "Audio origin"
+                },
+                "detail": {
+                  "vi": "Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                  "en": "Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Boundary gateway → catalog: Track/content ID tới file generations/codecs/territory và availability versions.",
+                      "en": "Boundary gateway → catalog: Content IDs resolve to file generations, codecs, territories and availability versions."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "license",
+                    "description": {
+                      "vi": "Boundary gateway → license: Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                      "en": "Boundary gateway → license: Current scoped entitlement or bounded device-bound offline capabilities."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Boundary client → cdn: Authorized encrypted media generations, origin shielding và cache policy.",
+                      "en": "Boundary client → cdn: Encrypted media generations under access, shielding and cache policies."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Boundary cdn → origin: Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                      "en": "Boundary cdn → origin: Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "events",
+          "title": {
+            "vi": "Durable events và report semantics",
+            "en": "Durable events and reporting semantics"
+          },
+          "description": {
+            "vi": "Client buffer có identity/schema/version, bounded retries và admission evidence. Preserve client event time lẫn server receive time; validate skew/untrusted claims. Transport completeness từ accepted server ACK không chứng minh thu mọi event khi device chưa gửi. Reporting qualification cần play/session identity, fraud policy và closed-period corrections riêng.",
+            "en": "Client buffers retain identities, schemas and bounded retries. Preserve client and server times and validate claims. Server acceptance cannot prove completeness before submission. Qualification needs play/session identities, fraud policy and closed-period correction semantics."
+          },
+          "problem": {
+            "vi": "Events late, duplicate và reordered ảnh hưởng experiments/reporting.",
+            "en": "Late, duplicated and reordered events affect reports and experiments."
+          },
+          "decision": {
+            "vi": "Durable acceptance + stable IDs, idempotent sinks, versioned reports/adjustments.",
+            "en": "Use durable acceptance, stable identities, idempotent sinks and versioned adjustments."
+          },
+          "tradeoff": {
+            "vi": "Retention/privacy, replay costs và freshness/completeness trade off.",
+            "en": "Retention/privacy, replay cost and completeness/freshness trade off."
+          },
+          "nextPressure": {
+            "vi": "Discovery jobs có thể reuse playlist delivery.",
+            "en": "Discovery jobs can reuse playlist delivery."
+          },
+          "exitCriteria": {
+            "vi": "Replays giữ semantic counts; closed report không âm thầm đổi/payout lại.",
+            "en": "Replays preserve semantic counts and closed reports do not silently change or repay."
+          },
+          "diagram": {
+            "id": "audio-stage-events",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "ingest",
+                "label": {
+                  "vi": "Event admission",
+                  "en": "Event admission"
+                },
+                "detail": {
+                  "vi": "Auth/schema, stable event/play identities và server receipt evidence.",
+                  "en": "Authentication, schemas, event/play identities and receipt evidence."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "log",
+                "label": {
+                  "vi": "Durable event log",
+                  "en": "Durable event log"
+                },
+                "detail": {
+                  "vi": "Explicit accepted ACK, retention, redelivery và replay identities.",
+                  "en": "Explicit acceptance, retention, redelivery and replay identities."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              },
+              {
+                "id": "report",
+                "label": {
+                  "vi": "Versioned reports",
+                  "en": "Versioned reports"
+                },
+                "detail": {
+                  "vi": "Qualification rules, dedup, late adjustments và auditable report version.",
+                  "en": "Qualification, deduplication, late adjustments and auditable versions."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "ingest",
+                    "description": {
+                      "vi": "Boundary gateway → ingest: Auth/schema, stable event/play identities và server receipt evidence.",
+                      "en": "Boundary gateway → ingest: Authentication, schemas, event/play identities and receipt evidence."
+                    }
+                  },
+                  {
+                    "from": "ingest",
+                    "to": "log",
+                    "description": {
+                      "vi": "Boundary ingest → log: Explicit accepted ACK, retention, redelivery và replay identities.",
+                      "en": "Boundary ingest → log: Explicit acceptance, retention, redelivery and replay identities."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "log",
+                    "to": "report",
+                    "description": {
+                      "vi": "Boundary log → report: Qualification rules, dedup, late adjustments và auditable report version.",
+                      "en": "Boundary log → report: Qualification, deduplication, late adjustments and auditable versions."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "discovery",
+          "title": {
+            "vi": "Personal mixes đi qua playlist contracts",
+            "en": "Personal mixes use playlist contracts"
+          },
+          "description": {
+            "vi": "Batch/stream jobs chọn candidates, enforce eligibility và publish playlist generation nguyên vẹn. Không append vào user-editable playlist mà không ownership/version policy. Stagger scheduling, measure long-tail coverage/diversity và feature freshness; weekly refresh là product choice, không requirement của architecture.",
+            "en": "Jobs select eligible candidates and atomically publish playlist generations. Do not overwrite user edits without ownership/version policy. Stagger workloads and measure diversity, coverage and freshness; cadence is a product choice."
+          },
+          "problem": {
+            "vi": "Catalog lớn nhưng users khó tìm nội dung phù hợp.",
+            "en": "Large catalogs make discovery difficult."
+          },
+          "decision": {
+            "vi": "Reuse trusted list sync/offline path với distinct generated-list ownership.",
+            "en": "Reuse list synchronization/offline paths with distinct generated-list ownership."
+          },
+          "tradeoff": {
+            "vi": "Batch lag, personalization cost và feedback bias cần evaluation.",
+            "en": "Batch lag, cost and feedback bias require evaluation."
+          },
+          "nextPressure": {
+            "vi": "Data/compute operations đòi migration/platform strategy.",
+            "en": "Data and compute operations require a platform strategy."
+          },
+          "exitCriteria": {
+            "vi": "Partial job không expose half-built mix; refreshed version không lose saved user copy.",
+            "en": "Partial jobs do not expose incomplete mixes or erase saved copies."
+          },
+          "diagram": {
+            "id": "audio-stage-discovery",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "log",
+                "label": {
+                  "vi": "Durable event log",
+                  "en": "Durable event log"
+                },
+                "detail": {
+                  "vi": "Explicit accepted ACK, retention, redelivery và replay identities.",
+                  "en": "Explicit acceptance, retention, redelivery and replay identities."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "recs",
+                "label": {
+                  "vi": "Discovery jobs",
+                  "en": "Discovery jobs"
+                },
+                "detail": {
+                  "vi": "Candidate/model versions, eligibility filters và rollout cohorts.",
+                  "en": "Candidate/model versions, eligibility filters and rollout cohorts."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "model"
+              },
+              {
+                "id": "playlist",
+                "label": {
+                  "vi": "Playlist authority",
+                  "en": "Playlist authority"
+                },
+                "detail": {
+                  "vi": "Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                  "en": "Stable entry/operation identities, versions, snapshots and rebase rules."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "liststore",
+                "label": {
+                  "vi": "Playlist log / snapshot",
+                  "en": "Playlist log / snapshot"
+                },
+                "detail": {
+                  "vi": "Durable accepted operations và retained anchor/tombstone horizon.",
+                  "en": "Durable operations with retained anchor/tombstone horizons."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "log",
+                    "to": "recs",
+                    "description": {
+                      "vi": "Boundary log → recs: Candidate/model versions, eligibility filters và rollout cohorts.",
+                      "en": "Boundary log → recs: Candidate/model versions, eligibility filters and rollout cohorts."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "recs",
+                    "to": "playlist",
+                    "description": {
+                      "vi": "Boundary recs → playlist: Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                      "en": "Boundary recs → playlist: Stable entry/operation identities, versions, snapshots and rebase rules."
+                    }
+                  },
+                  {
+                    "from": "playlist",
+                    "to": "liststore",
+                    "description": {
+                      "vi": "Boundary playlist → liststore: Durable accepted operations và retained anchor/tombstone horizon.",
+                      "en": "Boundary playlist → liststore: Durable operations with retained anchor/tombstone horizons."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "playlist",
+                    "description": {
+                      "vi": "Boundary client → playlist: Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                      "en": "Boundary client → playlist: Stable entry/operation identities, versions, snapshots and rebase rules."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "cloud",
+          "title": {
+            "vi": "Migrate serving và data với verified checkpoints",
+            "en": "Migrate serving/data with verified checkpoints"
+          },
+          "description": {
+            "vi": "Managed cloud giảm một số infrastructure work, không chuyển trách nhiệm schemas, data correctness, quotas hoặc cost cho provider hoàn toàn. Dual-run endpoints/pipelines, compare accepted identities và output snapshots; mapping offsets/checkpoints khi đổi transport cần explicit protocol, không copy một numeric offset giữa systems.",
+            "en": "Managed cloud offloads some infrastructure, not schemas, correctness, quotas or costs. Dual-run and compare identities/output snapshots. Transport changes require explicit offset/checkpoint mapping rather than copying numeric offsets."
+          },
+          "problem": {
+            "vi": "Hardware và bespoke transport kéo team khỏi product work.",
+            "en": "Hardware and custom transport distract from product work."
+          },
+          "decision": {
+            "vi": "Cohort migration, source capture, verification, fence/cutover và rollback readiness.",
+            "en": "Use cohorts, capture, verification, fencing/cutover and rollback readiness."
+          },
+          "tradeoff": {
+            "vi": "Vendor dependence, egress, dual-running và adapter rewrites tốn chi phí.",
+            "en": "Vendors, egress, dual capacity and adapters add cost."
+          },
+          "nextPressure": {
+            "vi": "Nhiều teams/services cần discover ownership và common tooling.",
+            "en": "Many teams/services need discoverable ownership and common tooling."
+          },
+          "exitCriteria": {
+            "vi": "Backlog recovery không duplicate report effects hoặc mất source-accepted data.",
+            "en": "Backlog recovery preserves accepted data and idempotent report effects."
+          },
+          "diagram": {
+            "id": "audio-stage-cloud",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "cloud",
+                "label": {
+                  "vi": "Managed platform",
+                  "en": "Managed platform"
+                },
+                "detail": {
+                  "vi": "Compute/transport services có quota, customer schemas/checkpoints và cost ownership.",
+                  "en": "Managed services retain quotas, customer schemas/checkpoints and cost ownership."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "log",
+                "label": {
+                  "vi": "Durable event log",
+                  "en": "Durable event log"
+                },
+                "detail": {
+                  "vi": "Explicit accepted ACK, retention, redelivery và replay identities.",
+                  "en": "Explicit acceptance, retention, redelivery and replay identities."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "report",
+                "label": {
+                  "vi": "Versioned reports",
+                  "en": "Versioned reports"
+                },
+                "detail": {
+                  "vi": "Qualification rules, dedup, late adjustments và auditable report version.",
+                  "en": "Qualification, deduplication, late adjustments and auditable versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "playlist",
+                "label": {
+                  "vi": "Playlist authority",
+                  "en": "Playlist authority"
+                },
+                "detail": {
+                  "vi": "Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                  "en": "Stable entry/operation identities, versions, snapshots and rebase rules."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "gateway",
+                    "to": "cloud",
+                    "description": {
+                      "vi": "Boundary gateway → cloud: Compute/transport services có quota, customer schemas/checkpoints và cost ownership.",
+                      "en": "Boundary gateway → cloud: Managed services retain quotas, customer schemas/checkpoints and cost ownership."
+                    }
+                  },
+                  {
+                    "from": "cloud",
+                    "to": "log",
+                    "description": {
+                      "vi": "Boundary cloud → log: Explicit accepted ACK, retention, redelivery và replay identities.",
+                      "en": "Boundary cloud → log: Explicit acceptance, retention, redelivery and replay identities."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "log",
+                    "to": "report",
+                    "description": {
+                      "vi": "Boundary log → report: Qualification rules, dedup, late adjustments và auditable report version.",
+                      "en": "Boundary log → report: Qualification, deduplication, late adjustments and auditable versions."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "cloud",
+                    "to": "playlist",
+                    "description": {
+                      "vi": "Boundary cloud → playlist: Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                      "en": "Boundary cloud → playlist: Stable entry/operation identities, versions, snapshots and rebase rules."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "ownership",
+          "title": {
+            "vi": "Service catalog và paved paths",
+            "en": "Service catalogs and paved paths"
+          },
+          "description": {
+            "vi": "Team autonomy cần owner/SLO/on-call/API/dependency metadata cập nhật cùng code/deploy. Portal hỗ trợ tìm và tạo service theo templates, không tự là runtime dependency hoặc bảo đảm ownership đúng. Authorization, secrets và supply-chain policies cho plugins/templates vẫn cần. Đừng copy một historical team model thành universal organization recipe.",
+            "en": "Autonomy needs maintained ownership, SLOs, APIs and dependency metadata. Portals help discovery/templates without proving ownership or belonging on runtime paths. Secure plugins/templates and avoid universalizing historical organization models."
+          },
+          "problem": {
+            "vi": "Distributed teams khó tìm dependencies, docs và accountable owner.",
+            "en": "Distributed teams struggle to find dependencies and owners."
+          },
+          "decision": {
+            "vi": "Code-owned metadata, catalog ingestion, validated templates và platform support.",
+            "en": "Use code-owned metadata, ingestion, validated templates and support."
+          },
+          "tradeoff": {
+            "vi": "Stale catalogs, plugin trust và platform bottlenecks vẫn có thể xuất hiện.",
+            "en": "Stale data, plugin trust and platform bottlenecks remain."
+          },
+          "nextPressure": {
+            "vi": "Long-form content đem entitlement/resume contracts khác music.",
+            "en": "Long-form content introduces different rights/resume contracts."
+          },
+          "exitCriteria": {
+            "vi": "On-call có thể tìm owner/runbook và dependencies ngay khi catalog freshness bị test.",
+            "en": "Operations find owners/runbooks with tested catalog freshness."
+          },
+          "diagram": {
+            "id": "audio-stage-ownership",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "portal",
+                "label": {
+                  "vi": "Service catalog",
+                  "en": "Service catalog"
+                },
+                "detail": {
+                  "vi": "Owned metadata, APIs, docs, dependencies và on-call references.",
+                  "en": "Owned metadata, APIs, documentation, dependencies and on-call references."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "playlist",
+                "label": {
+                  "vi": "Playlist authority",
+                  "en": "Playlist authority"
+                },
+                "detail": {
+                  "vi": "Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                  "en": "Stable entry/operation identities, versions, snapshots and rebase rules."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "ingest",
+                "label": {
+                  "vi": "Event admission",
+                  "en": "Event admission"
+                },
+                "detail": {
+                  "vi": "Auth/schema, stable event/play identities và server receipt evidence.",
+                  "en": "Authentication, schemas, event/play identities and receipt evidence."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "portal",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary portal → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary portal → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "portal",
+                    "to": "playlist",
+                    "description": {
+                      "vi": "Boundary portal → playlist: Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+                      "en": "Boundary portal → playlist: Stable entry/operation identities, versions, snapshots and rebase rules."
+                    }
+                  },
+                  {
+                    "from": "portal",
+                    "to": "ingest",
+                    "description": {
+                      "vi": "Boundary portal → ingest: Auth/schema, stable event/play identities và server receipt evidence.",
+                      "en": "Boundary portal → ingest: Authentication, schemas, event/play identities and receipt evidence."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "long-form",
+          "title": {
+            "vi": "Podcasts và books reuse bytes, giữ policy riêng",
+            "en": "Podcasts/books reuse bytes with separate policies"
+          },
+          "description": {
+            "vi": "Reusable media delivery không đồng nghĩa cùng entitlement/revenue/progress rules. Episodes/books có chapter navigation, resume versions, ads/purchase/subscription/offline restrictions tùy contract. Progress merge không luôn max(position): user seek backward/restart là valid intent; session/device epochs và explicit reset semantics cần rõ.",
+            "en": "Shared delivery does not imply shared rights, revenue or progress. Long-form content has chapters, purchases/subscriptions and distinct restrictions. Progress is not always a maximum: backward seeks/restarts are valid and need explicit session/version semantics."
+          },
+          "problem": {
+            "vi": "Audio dài và nhiều content types khác short-track habits.",
+            "en": "Long-form media differs from short-track listening."
+          },
+          "decision": {
+            "vi": "Separate catalogs/policies, versioned resume và shared delivery primitives.",
+            "en": "Separate catalogs/policies and resume versions while reusing delivery primitives."
+          },
+          "tradeoff": {
+            "vi": "Policy fan-out/latency và mixed recommendations tăng variants.",
+            "en": "Policy fan-out, latency and mixed recommendations add variants."
+          },
+          "nextPressure": {
+            "vi": "Discovery cần lexical lẫn semantic retrieval.",
+            "en": "Discovery needs lexical and semantic retrieval."
+          },
+          "exitCriteria": {
+            "vi": "Wrong license/content type không được fallback thành public playback.",
+            "en": "Incorrect rights/content types never fall back to public playback."
+          },
+          "diagram": {
+            "id": "audio-stage-long-form",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "long",
+                "label": {
+                  "vi": "Long-form catalog",
+                  "en": "Long-form catalog"
+                },
+                "detail": {
+                  "vi": "Episodes/books, chapter/resume versions và content-specific entitlement.",
+                  "en": "Episodes/books, chapter/resume versions and content-specific entitlements."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "license",
+                "label": {
+                  "vi": "Rights / license",
+                  "en": "Rights / license"
+                },
+                "detail": {
+                  "vi": "Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                  "en": "Current scoped entitlement or bounded device-bound offline capabilities."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Audio CDN",
+                  "en": "Audio CDN"
+                },
+                "detail": {
+                  "vi": "Authorized encrypted media generations, origin shielding và cache policy.",
+                  "en": "Encrypted media generations under access, shielding and cache policies."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Audio origin",
+                  "en": "Audio origin"
+                },
+                "detail": {
+                  "vi": "Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                  "en": "Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "long",
+                    "description": {
+                      "vi": "Boundary gateway → long: Episodes/books, chapter/resume versions và content-specific entitlement.",
+                      "en": "Boundary gateway → long: Episodes/books, chapter/resume versions and content-specific entitlements."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "license",
+                    "description": {
+                      "vi": "Boundary gateway → license: Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+                      "en": "Boundary gateway → license: Current scoped entitlement or bounded device-bound offline capabilities."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Boundary client → cdn: Authorized encrypted media generations, origin shielding và cache policy.",
+                      "en": "Boundary client → cdn: Encrypted media generations under access, shielding and cache policies."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Boundary cdn → origin: Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+                      "en": "Boundary cdn → origin: Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "search",
+          "title": {
+            "vi": "Hybrid search với model/index version",
+            "en": "Hybrid search with model/index versions"
+          },
+          "description": {
+            "vi": "Lexical retrieval mạnh exact artist/show names; dense retrieval tìm paraphrases. Merge/rerank bounded candidates dưới current market/explicit-content/rights filters; query và document embeddings phải cùng compatible model space. CPU/GPU cost dựa batch/load/latency thực, không GPU luôn cheaper.",
+            "en": "Lexical retrieval preserves names while dense retrieval captures meaning. Merge bounded candidates under current eligibility with compatible query/document models. CPU/GPU economics depend on workload rather than universal superiority."
+          },
+          "problem": {
+            "vi": "Keyword-only bỏ lỡ natural queries; semantic-only bỏ exact names.",
+            "en": "Keyword-only misses natural queries and semantic-only can lose exact names."
+          },
+          "decision": {
+            "vi": "Hybrid candidates, bounded encoder deadline, versioned index và lexical fallback.",
+            "en": "Use hybrid retrieval, bounded encoder deadlines, versioned indexes and lexical fallback."
+          },
+          "tradeoff": {
+            "vi": "Embedding freshness, ANN recall, inference cost và tail latency cần measurement.",
+            "en": "Measure embedding freshness, recall, inference cost and tails."
+          },
+          "nextPressure": {
+            "vi": "Tiếp tục theo relevance/QoE/privacy/cost, không đuổi theo số components.",
+            "en": "Continue by relevance, QoE, privacy and cost rather than component counts."
+          },
+          "exitCriteria": {
+            "vi": "Model rollout có paired index version và fallback không bypass rights.",
+            "en": "Model rollouts pair compatible indexes and retain permission-safe fallbacks."
+          },
+          "diagram": {
+            "id": "audio-stage-search",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ responsibilities của giai đoạn; các branches không là một synchronous critical path.",
+              "en": "Stage responsibilities; branches are not one synchronous critical path."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Audio client",
+                  "en": "Audio client"
+                },
+                "detail": {
+                  "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+                  "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Playback gateway",
+                  "en": "Playback gateway"
+                },
+                "detail": {
+                  "vi": "Identity, deadlines, session routing và connection reuse.",
+                  "en": "Identity, deadlines, session routing and connection reuse."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "search",
+                "label": {
+                  "vi": "Hybrid search",
+                  "en": "Hybrid search"
+                },
+                "detail": {
+                  "vi": "Lexical + semantic candidates với model/index versions và current eligibility.",
+                  "en": "Lexical/semantic candidates with versioned models/indexes and current eligibility."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "encoder",
+                "label": {
+                  "vi": "Query encoder",
+                  "en": "Query encoder"
+                },
+                "detail": {
+                  "vi": "Bound latency/cost, vocabulary/model compatibility và fallback.",
+                  "en": "Bounds latency/cost, model compatibility and fallback."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "model"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Audio catalog",
+                  "en": "Audio catalog"
+                },
+                "detail": {
+                  "vi": "Track/content ID tới file generations/codecs/territory và availability versions.",
+                  "en": "Content IDs resolve to file generations, codecs, territories and availability versions."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary client → gateway: Identity, deadlines, session routing và connection reuse.",
+                      "en": "Boundary client → gateway: Identity, deadlines, session routing and connection reuse."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "search",
+                    "description": {
+                      "vi": "Boundary gateway → search: Lexical + semantic candidates với model/index versions và current eligibility.",
+                      "en": "Boundary gateway → search: Lexical/semantic candidates with versioned models/indexes and current eligibility."
+                    }
+                  },
+                  {
+                    "from": "search",
+                    "to": "encoder",
+                    "description": {
+                      "vi": "Boundary search → encoder: Bound latency/cost, vocabulary/model compatibility và fallback.",
+                      "en": "Boundary search → encoder: Bounds latency/cost, model compatibility and fallback."
+                    }
+                  },
+                  {
+                    "from": "catalog",
+                    "to": "search",
+                    "description": {
+                      "vi": "Boundary catalog → search: Lexical + semantic candidates với model/index versions và current eligibility.",
+                      "en": "Boundary catalog → search: Lexical/semantic candidates with versioned models/indexes and current eligibility."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "4. Tách plays, concurrent audio và events",
+        "en": "4. Separate plays, concurrent audio and events"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ40M DAU ×18plays/day,160kbps audio,3Mpeak concurrent listeners,8events/play. Đây là assumptions để học, không user/traffic Spotify công bố. Decimal units, không protocol overhead/replication, và average không là peak capacity.",
+          "en": "Assume forty million DAU, eighteen plays/day,160kbps, three million peak listeners and eight events/play. These are educational assumptions, not reported Spotify traffic. Decimal units omit protocol overhead/replication, and averages are not peak capacity."
+        },
+        {
+          "vi": "Audio bytes nhỏ trên một user nhưng aggregate lớn; nhiều events không có nghĩa mỗi event là một payable play. Prefetch/storage cost phải nhân actual prediction/waste, codec ladder và download cohorts. Offline event buffers có age/size limits; không hứa mọi event tồn tại vĩnh viễn bất chấp storage loss hoặc privacy deletion.",
+          "en": "Per-user media grows into substantial aggregate traffic, while many events do not imply many payable plays. Include prediction waste, ladders and download cohorts. Bound offline buffers and do not promise eternal evidence despite device loss or privacy deletion."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Metric",
+            "en": "Metric"
+          },
+          {
+            "vi": "Calculation",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Result / caveat",
+            "en": "Result / caveat"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Plays / day",
+              "en": "Plays / day"
+            },
+            {
+              "vi": "40M×18",
+              "en": "40M×18"
+            },
+            {
+              "vi": "720M plays; average≈8333/s.",
+              "en": "720M plays; average≈8333/s."
+            }
+          ],
+          [
+            {
+              "vi": "Peak media egress",
+              "en": "Peak media egress"
+            },
+            {
+              "vi": "3M×160kbps",
+              "en": "3M×160kbps"
+            },
+            {
+              "vi": "480Gbps payload, chưa overhead/retries.",
+              "en": "480Gbps payload before overhead/retries."
+            }
+          ],
+          [
+            {
+              "vi": "Events / day",
+              "en": "Events / day"
+            },
+            {
+              "vi": "720M×8",
+              "en": "720M×8"
+            },
+            {
+              "vi": "5.76B/day≈66,667/s average.",
+              "en": "5.76B/day≈66,667/s average."
+            }
+          ],
+          [
+            {
+              "vi": "210-second track",
+              "en": "210-second track"
+            },
+            {
+              "vi": "160kbps×210/8",
+              "en": "160kbps×210/8"
+            },
+            {
+              "vi": "4.2MB;100tracks≈420MB một rendition.",
+              "en": "4.2MB; one hundred tracks≈420MB for one rendition."
+            }
+          ],
+          [
+            {
+              "vi": "Two-second prefix",
+              "en": "Two-second prefix"
+            },
+            {
+              "vi": "160kbps×2/8",
+              "en": "160kbps×2/8"
+            },
+            {
+              "vi": "40KB;24kbps prefix=6KB.",
+              "en": "40KB;24kbps prefixes=6KB."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Theo dõi Play, edit và report",
+        "en": "5. Trace playback, edits and reports"
+      },
+      "paragraphs": [
+        {
+          "vi": "Select trace rồi step từng edge; observe authority và replay identity thay vì chỉ nhìn network boxes. Async events không được blocking audio decode nhưng buffering/drop policy phải explicit. Rights denial không được fallback sang cached unlicensed output.",
+          "en": "Step through authorities and replay identities rather than only network boxes. Events should not block decoding, but buffering/loss policy must be explicit. Rights denial cannot fall back to unlicensed cache output."
+        }
+      ],
+      "diagram": {
+        "id": "audio-play-journey",
+        "title": {
+          "vi": "Play, sync và report đi qua các authorities khác nhau",
+          "en": "Playback, synchronization and reporting cross distinct authorities"
+        },
+        "caption": {
+          "vi": "Media cache/bytes không grant rights; playlist accepted version và event/report version là các clocks khác nhau.",
+          "en": "Cached bytes do not grant rights; playlist versions and event/report versions are distinct clocks."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Audio client",
+              "en": "Audio client"
+            },
+            "detail": {
+              "vi": "Local bytes, playback buffer, pending edits và durable offline event queue có bounds.",
+              "en": "Local bytes, playback buffers, pending edits and bounded durable offline events."
+            },
+            "x": 130,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Playback gateway",
+              "en": "Playback gateway"
+            },
+            "detail": {
+              "vi": "Identity, deadlines, session routing và connection reuse.",
+              "en": "Identity, deadlines, session routing and connection reuse."
+            },
+            "x": 440,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "catalog",
+            "label": {
+              "vi": "Audio catalog",
+              "en": "Audio catalog"
+            },
+            "detail": {
+              "vi": "Track/content ID tới file generations/codecs/territory và availability versions.",
+              "en": "Content IDs resolve to file generations, codecs, territories and availability versions."
+            },
+            "x": 760,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "license",
+            "label": {
+              "vi": "Rights / license",
+              "en": "Rights / license"
+            },
+            "detail": {
+              "vi": "Current scoped entitlement hoặc bounded offline capability có device/expiry.",
+              "en": "Current scoped entitlement or bounded device-bound offline capabilities."
+            },
+            "x": 1060,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "cdn",
+            "label": {
+              "vi": "Audio CDN",
+              "en": "Audio CDN"
+            },
+            "detail": {
+              "vi": "Authorized encrypted media generations, origin shielding và cache policy.",
+              "en": "Encrypted media generations under access, shielding and cache policies."
+            },
+            "x": 130,
+            "y": 380,
+            "kind": "edge"
+          },
+          {
+            "id": "origin",
+            "label": {
+              "vi": "Audio origin",
+              "en": "Audio origin"
+            },
+            "detail": {
+              "vi": "Immutable encrypted chunks/segments, compatible manifests và lifecycle.",
+              "en": "Immutable encrypted chunks/segments, compatible manifests and lifecycle."
+            },
+            "x": 440,
+            "y": 380,
+            "kind": "store"
+          },
+          {
+            "id": "playlist",
+            "label": {
+              "vi": "Playlist authority",
+              "en": "Playlist authority"
+            },
+            "detail": {
+              "vi": "Stable entry/op IDs, ordered versions, snapshots và rebase/conflict rules.",
+              "en": "Stable entry/operation identities, versions, snapshots and rebase rules."
+            },
+            "x": 760,
+            "y": 380,
+            "kind": "service"
+          },
+          {
+            "id": "liststore",
+            "label": {
+              "vi": "Playlist log / snapshot",
+              "en": "Playlist log / snapshot"
+            },
+            "detail": {
+              "vi": "Durable accepted operations và retained anchor/tombstone horizon.",
+              "en": "Durable operations with retained anchor/tombstone horizons."
+            },
+            "x": 1060,
+            "y": 380,
+            "kind": "store"
+          },
+          {
+            "id": "ingest",
+            "label": {
+              "vi": "Event admission",
+              "en": "Event admission"
+            },
+            "detail": {
+              "vi": "Auth/schema, stable event/play identities và server receipt evidence.",
+              "en": "Authentication, schemas, event/play identities and receipt evidence."
+            },
+            "x": 130,
+            "y": 680,
+            "kind": "service"
+          },
+          {
+            "id": "log",
+            "label": {
+              "vi": "Durable event log",
+              "en": "Durable event log"
+            },
+            "detail": {
+              "vi": "Explicit accepted ACK, retention, redelivery và replay identities.",
+              "en": "Explicit acceptance, retention, redelivery and replay identities."
+            },
+            "x": 440,
+            "y": 680,
+            "kind": "queue"
+          },
+          {
+            "id": "report",
+            "label": {
+              "vi": "Versioned reports",
+              "en": "Versioned reports"
+            },
+            "detail": {
+              "vi": "Qualification rules, dedup, late adjustments và auditable report version.",
+              "en": "Qualification, deduplication, late adjustments and auditable versions."
+            },
+            "x": 760,
+            "y": 680,
+            "kind": "store"
+          },
+          {
+            "id": "recs",
+            "label": {
+              "vi": "Discovery jobs",
+              "en": "Discovery jobs"
+            },
+            "detail": {
+              "vi": "Candidate/model versions, eligibility filters và rollout cohorts.",
+              "en": "Candidate/model versions, eligibility filters and rollout cohorts."
+            },
+            "x": 1060,
+            "y": 680,
+            "kind": "model"
+          }
+        ],
+        "traces": [
+          {
+            "id": "resolve",
+            "label": {
+              "vi": "Resolve và scoped rights",
+              "en": "Resolve and scope rights"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "gateway",
+                "description": {
+                  "vi": "Send content/device/market context qua reused connection khi còn hợp lệ.",
+                  "en": "Send content, device and market context over valid reused connections."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "catalog",
+                "description": {
+                  "vi": "Resolve playable file generation/codecs và current content availability.",
+                  "en": "Resolve playable generations/codecs and current availability."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "license",
+                "description": {
+                  "vi": "Validate subscription/purchase/device/offline capability theo policy.",
+                  "en": "Validate subscription, purchases, devices and offline capabilities."
+                }
+              },
+              {
+                "from": "license",
+                "to": "client",
+                "description": {
+                  "vi": "Return scoped bounded license hoặc denied/pending; không expose unrestricted key.",
+                  "en": "Return scoped capabilities or denial/pending rather than unrestricted keys."
+                }
+              }
+            ]
+          },
+          {
+            "id": "stream",
+            "label": {
+              "vi": "Fetch bytes và decode",
+              "en": "Fetch bytes and decode"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "cdn",
+                "description": {
+                  "vi": "Fetch exact authorized encrypted prefix/generation; can overlap rights request khi policy cho phép.",
+                  "en": "Fetch permitted encrypted prefixes/generations, overlapping licensing only where allowed."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "origin",
+                "description": {
+                  "vi": "Miss fill có shielding/coalescing, identity và cache policy phù hợp.",
+                  "en": "Fill misses with shielding/coalescing under identity/cache policy."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "client",
+                "description": {
+                  "vi": "Validate integrity, buffer và wait valid license trước decode/output.",
+                  "en": "Verify integrity, buffer and await valid rights before decoding/output."
+                }
+              }
+            ]
+          },
+          {
+            "id": "playlist",
+            "label": {
+              "vi": "Offline edit và replay",
+              "en": "Offline edits and replay"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "gateway",
+                "description": {
+                  "vi": "Send op ID, playlist base version, stable entry anchors và principal.",
+                  "en": "Send operation identities, base versions, anchors and principals."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "playlist",
+                "description": {
+                  "vi": "Validate current editor rights, dedup và rebase/conflict theo contract.",
+                  "en": "Validate editing rights, deduplicate and rebase or conflict."
+                }
+              },
+              {
+                "from": "playlist",
+                "to": "liststore",
+                "description": {
+                  "vi": "Commit accepted op + retained result + new version atomically.",
+                  "en": "Atomically commit operations, retained results and new versions."
+                }
+              },
+              {
+                "from": "playlist",
+                "to": "client",
+                "description": {
+                  "vi": "Return accepted revision hoặc resync; local pending không là durable ACK.",
+                  "en": "Return accepted revisions or resynchronization; pending local state is not a durable ACK."
+                }
+              }
+            ]
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Qualified play reporting",
+              "en": "Qualified play reporting"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "ingest",
+                "description": {
+                  "vi": "Batch stable event/play IDs với client-time claims và bounded local retention.",
+                  "en": "Batch stable event/play identities with time claims and bounded local retention."
+                },
+                "async": true
+              },
+              {
+                "from": "ingest",
+                "to": "log",
+                "description": {
+                  "vi": "Validate admission, add server receipt time và ACK sau selected durability.",
+                  "en": "Validate admission, record receipt times and ACK selected durability."
+                },
+                "async": true
+              },
+              {
+                "from": "log",
+                "to": "report",
+                "description": {
+                  "vi": "Dedup event và semantic play, apply versioned qualification/time policy.",
+                  "en": "Deduplicate transport and semantic plays under versioned qualification/time policy."
+                },
+                "async": true
+              },
+              {
+                "from": "report",
+                "to": "recs",
+                "description": {
+                  "vi": "Expose governed derived views; discovery không được mutate closed report.",
+                  "en": "Expose governed derived views; discovery cannot mutate closed reports."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "mix",
+            "label": {
+              "vi": "Publish generated personal mix",
+              "en": "Publish generated personal mixes"
+            },
+            "steps": [
+              {
+                "from": "log",
+                "to": "recs",
+                "description": {
+                  "vi": "Read eligible histories với feature/model versions và consent/retention.",
+                  "en": "Read eligible histories under feature/model versions and retention/consent."
+                },
+                "async": true
+              },
+              {
+                "from": "recs",
+                "to": "playlist",
+                "description": {
+                  "vi": "Publish complete generated-list version qua owned API, không overwrite user edits.",
+                  "en": "Publish complete generated versions through owned APIs without overwriting user edits."
+                }
+              },
+              {
+                "from": "playlist",
+                "to": "liststore",
+                "description": {
+                  "vi": "Commit generation và sync delta/manifest identity.",
+                  "en": "Commit generations and synchronization identities."
+                }
+              },
+              {
+                "from": "client",
+                "to": "playlist",
+                "description": {
+                  "vi": "Sync ordinary list contract, then rights-check each playable item.",
+                  "en": "Synchronize ordinary list contracts, then authorize playable items."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "6. API bind context và retained results",
+        "en": "6. APIs bind context and retain results"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ là protocol contracts của thiết kế này, không endpoint Spotify. Capability/token cần cryptographic verification, audience/device/content/expiry binding và key handling phù hợp; return JSON field không thực hiện được security đó. Không đưa raw secrets vào telemetry.",
+          "en": "These are illustrative contracts, not Spotify endpoints. Capabilities need verified scope, audience, device/content/expiry bindings and secure key handling; JSON fields do not implement those guarantees. Keep secrets out of telemetry."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/playback-resolutions",
+          "description": {
+            "vi": "Resolve file generation và market/device context.",
+            "en": "Resolve generations and market/device context."
+          },
+          "request": "{contentId, deviceId, marketContext, acceptedCodecs}",
+          "response": "200 {generation, renditions, manifestRef, rightsContextVersion}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/playback-licenses",
+          "description": {
+            "vi": "Issue scoped capability hoặc explicit denied/pending.",
+            "en": "Issue scoped capabilities or denial/pending."
+          },
+          "request": "{sessionId, ownerEpoch, contentId, generation, deviceId, offlineRequested}",
+          "response": "{verdict, capabilityRef, expiresAt, checkInPolicy}",
+          "notes": [
+            {
+              "vi": "Offline expiry/revocation window phải là selected policy, không instant network knowledge.",
+              "en": "Offline expiry/revocation windows are explicit policy, not instant knowledge."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/playlists/{playlistId}/operations",
+          "description": {
+            "vi": "Validate/dedup/rebase op với stable entries.",
+            "en": "Validate/deduplicate/rebase stable-entry operations."
+          },
+          "request": "{operationId, baseRevision, type:\"insert\", entryId, trackId, afterEntryId}",
+          "response": "{state:\"ACCEPTED|CONFLICT|RESYNC_REQUIRED\", revision, retainedResult}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/client-event-batches",
+          "description": {
+            "vi": "Accept structured evidence với per-event status.",
+            "en": "Accept structured evidence with per-event status."
+          },
+          "request": "{batchId, events:[{eventId, playId, deviceSession, clientTime, payloadVersion, evidence}]}",
+          "response": "{acceptedEventIds, rejected, receiptRef, serverReceivedAt}",
+          "notes": [
+            {
+              "vi": "Client clear chỉ accepted identities; batch transport success không imply mọi record accepted.",
+              "en": "Clear accepted identities only; batch success does not accept every record."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/playback-sessions/{sessionId}/commands",
+          "description": {
+            "vi": "Reject stale owner/sequence sau handoff.",
+            "en": "Reject stale ownership/sequence after handoff."
+          },
+          "request": "{commandId, expectedOwnerEpoch, commandSequence, action, positionMs}",
+          "response": "{stateVersion, outcome:\"APPLIED|STALE|REPLAY\", currentOwnerEpoch}"
+        }
+      ]
+    },
+    {
+      "id": "startup",
+      "title": {
+        "vi": "7. Time to first sound là critical path",
+        "en": "7. Time to first sound is a critical path"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một naive sum có thể overestimate nếu rights và bytes chạy parallel; ngược lại assumed overlap có thể underestimate nếu key/file ID cần resolve trước. Draw dependency DAG và measure milestones trên client: tap, connection/metadata/license ready, first bytes, decoder ready, audible output. Network RTT, server queue, payload transfer và device decode không cùng một metric.",
+          "en": "Naive sums overestimate overlap while imaginary concurrency underestimates dependencies. Draw a DAG and instrument taps, connections, metadata/rights, bytes, decoder and output milestones. RTT, server queues, transfer and decoding are distinct measurements."
+        },
+        {
+          "vi": "Fixture default cold2RTT + metadata1RTT + max(license1RTT, chunkRTT+transfer) + decode. At100ms/5Mbps/160kbps, serial584ms và overlap484ms; đây là derived arithmetic, không benchmark. Prefetch đúng chỉ bỏ chunk wait; expired license vẫn fetch. Denied verdict không có first sound. Low-bitrate transition cần compatible decoder/manifest, không hứa listener không bao giờ nhận ra.",
+          "en": "The fixture uses cold setup, metadata, overlapped licensing/bytes and decode. At100ms RTT and5Mbps, serial is584ms versus484ms parallel: derived arithmetic, not a benchmark. Prefetch removes byte waits, not expired licensing. Denial has no first sound, and low-bitrate transitions require compatibility."
+        }
+      ],
+      "experiment": "audio-start"
+    },
+    {
+      "id": "rights-offline",
+      "title": {
+        "vi": "8. Cache bytes, license và offline clocks",
+        "en": "8. Cached bytes, licenses and offline clocks"
+      },
+      "paragraphs": [
+        {
+          "vi": "Media cache key cần immutable generation/codec/chunk và integrity; authorization response cache cần principal/device/content/policy/expiry scope khác. Publicly reachable ciphertext vẫn có licensing/privacy/distribution constraints. Encryption không tự là integrity hay erasure; DRM implementation, secure device storage và adversarial threat model nằm ngoài worksheet.",
+          "en": "Media caches need generation, codec, chunks and integrity; authorization caches have different principal/device/policy/expiry scopes. Ciphertext still has distribution/privacy constraints. Encryption alone establishes neither integrity nor erasure; production DRM/security is outside the worksheet."
+        },
+        {
+          "vi": "Offline capability đặt bounded check-in window và clock rollback handling. Device disconnected không thể nhận instant subscription revoke; chọn fail-closed khi expiry hoặc require reconnect, với UX phù hợp. Partial downloads, content removed, device deauthorization và storage cleanup cần state machines; deleting local index không chứng minh secure deletion mọi bytes/keys.",
+          "en": "Offline capabilities need bounded check-ins and rollback controls. Disconnected devices cannot instantly learn revocation; expiry may deny or require reconnect. Downloads, content removal, deauthorization and cleanup need explicit lifecycles without overstating secure erasure."
+        }
+      ]
+    },
+    {
+      "id": "playlists",
+      "title": {
+        "vi": "9. Playlist log chỉ là một phần của merge protocol",
+        "en": "9. Playlist logs are only part of a merge protocol"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lưu (playlist_id, entry_id, track_id, anchor/position, version), operation identity và accepted response. Track có thể lặp nên remove trackID không đủ xác định entry. Server authority có thể serialize/rebase pending ops; collaborative multi-writer cần đầy đủ CRDT/OT và ACL semantics. Một log ordered không tự giữ ý định nếu operations chỉ là stale array indices.",
+          "en": "Retain entries, tracks, anchors/positions, versions, operation identities and results. Repeated tracks require entry-specific edits. Authority may serialize/rebase; multi-writer collaboration needs a complete merge and permission protocol. Ordered logs do not preserve stale-index intent automatically."
+        },
+        {
+          "vi": "Lab baseA/B/C: deviceA prependX; deviceB insertY sau entryB theo index2 cũ. Index-only có thể đặt Y trướcB; stable anchor giữ vị trí sauB. Nếu Bremoved, tombstone/context giữ logical boundary; nếu context đã prune thì RESYNC_REQUIRED thay đoán. Production concurrent move/delete/cycle cases cần protocol riêng, không suy one-insert fixture thành full CRDT proof.",
+          "en": "The lab prependsX while an offline insertion uses old index2 afterB. Index-only can placeY beforeB; stable anchors preserve intent. Retained removal context preserves boundaries; pruned anchors require resynchronization. One insertion does not prove a complete move/delete/cycle protocol."
+        },
+        {
+          "vi": "Snapshot compaction giữ base revision, accepted op results và retained anchor/deletion horizon. Offline client quá cũ cần snapshot+rebase/conflict, không blindly replay vào new index. Revoke editor permission phải checked ở commit; pending offline edits không là quyền đã reserved vĩnh viễn.",
+          "en": "Snapshots retain revisions, results and anchor/deletion horizons. Old clients require snapshot/rebase/conflict handling rather than blind replay. Check current editing rights at commit; pending offline edits do not reserve permission forever."
+        }
+      ],
+      "experiment": "audio-playlist"
+    },
+    {
+      "id": "events",
+      "title": {
+        "vi": "10. Transport, qualification và financial reporting",
+        "en": "10. Transport, qualification and financial reporting"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giữ event_id cho transport retry, play/session identity cho semantic counting, raw client time claim và trusted server receipt time. Ingestion acceptance completeness bắt đầu tại defined server boundary; không hứa biết những events device chưa gửi. Client clock/skew/offline authenticity cần validate/flags, không chỉ đổi event-time field rồi tin. Event type/schema version và auth scope có quotas/deletion policy.",
+          "en": "Retain transport identities, play/session identities, claimed event times and trusted receipt times. Completeness starts at a defined server boundary, not unseen device events. Validate clock/offline authenticity and retain schemas, authorization, quotas and deletion policies."
+        },
+        {
+          "vi": "Progress30s và40s của cùng play có thể là hai distinct events nhưng một qualified play. Unique event ID không ngăn fake sessions hoặc qualification abuse. Rule version, content/territory eligibility, fraud review và report identity cần reproducible. “Raw events giữ vô hạn” không luôn hợp privacy; retain governed evidence đủ theo selected audit/retention contract.",
+          "en": "Distinct progress events can describe one qualified play. Event identity does not prevent fake sessions or qualification abuse. Reproduce rules, eligibility, fraud review and reports under governed retention rather than claiming unlimited raw-event storage."
+        },
+        {
+          "vi": "Live counts có thể update khi late data; closed financial report cần explicit versioned correction/adjustment và unique effect/result sink, không silently overwrite closed period hoặc pay full recomputation lần nữa. Lateness window không chứng minh future legitimate late events không bao giờ tới; quarantine/pending/correction channels phải declared. Royalty amount không được suy thành một fixed universal per-play fee từ lab counts.",
+          "en": "Live counts may change, but closed reports need versioned corrections and unique effects rather than silent overwrites or paying recomputations again. Lateness windows do not eliminate all future arrivals. Declare quarantine/review/corrections; lab counts do not establish universal per-play payments."
+        }
+      ],
+      "experiment": "audio-events"
+    },
+    {
+      "id": "discovery-search",
+      "title": {
+        "vi": "11. Discovery, search và long-form reuse",
+        "en": "11. Discovery, search and long-form reuse"
+      },
+      "paragraphs": [
+        {
+          "vi": "Generated personal mix dùng một immutable playlist generation từ candidate/model versions đã filter; publish whole list rồi switch pointer để không expose partial jobs. User saves/copies có ownership riêng. Batch schedules cần stagger/quota và deletion/consent propagation; feature lag và popularity feedback phải được đo bằng relevance/diversity/QoE, không chỉ click count.",
+          "en": "Publish complete immutable generated mixes from filtered versioned candidates/models, with separate ownership for saved copies. Stagger workloads and honor consent/deletion. Evaluate feature lag and popularity loops through relevance, diversity and QoE rather than only clicks."
+        },
+        {
+          "vi": "Hybrid search giữ lexical exact names cùng dense semantic candidates. Query/document models và index version phải tương thích; missing encoder có lexical fallback dưới current availability/rights. ANN approximation/recall và rerank costs trade off. Long-form catalog bổ sung chapters, resume/reset và per-title/purchase/hour-quota policies theo product contract; không hard-code music rules cho mọi item.",
+          "en": "Hybrid search retains exact names and semantic candidates with compatible model/index versions. Encoder failures may use authorized lexical fallback. Balance approximation and reranking costs. Long-form catalogs add chapters and distinct resume, purchase or quota policies rather than inheriting every music rule."
+        }
+      ]
+    },
+    {
+      "id": "migration-operations",
+      "title": {
+        "vi": "12. Cloud migration, service catalog và ownership",
+        "en": "12. Cloud migration, catalogs and ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Migrate transport/data cần accepted event identity/checkpoint mapping, parallel verification và output comparison ở semantic level. New broker offset không phải old broker offset; delivery guarantees/configuration và retention khác cần plan. Backfill không phát lại payout/notification như new traffic. Cloud quotas, regional failure, egress và consumer backlog recovery vẫn là engineering responsibility.",
+          "en": "Transport migration needs identity/checkpoint mapping and semantic output comparison. Offsets are not interchangeable; retention and guarantees differ. Backfills must not repeat financial/notification effects. Quotas, regional failures, egress and backlog recovery remain engineering responsibilities."
+        },
+        {
+          "vi": "Service catalog theo code-owned metadata giúp tìm owner, API, SLO, dependencies và runbooks. Catalog freshness phải được kiểm cùng deploy/ownership changes; template/plugin permissions và supply-chain checks cần controls. Portal thường không cần trên playback critical path. Org structures evolve; useful principle là accountability và safe paved paths, không copy toàn bộ named team model.",
+          "en": "Code-owned catalogs make owners, APIs, SLOs, dependencies and runbooks discoverable. Validate freshness and secure templates/plugins. Portals generally need not enter playback paths. Organization patterns evolve; accountability and safe tooling matter more than copying named structures."
+        }
+      ]
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "13. Failure matrix: audible output và trustworthy state",
+        "en": "13. Failure matrix: audible output and trustworthy state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Measure TTFS/start failure, rebuffer/skips, license denial reasons, cache/prefetch waste và device power/network cohorts. Tách playlist accepted lag, event server-to-sink latency, missing accepted records, semantic duplicate counts và closed report correction age. Logs giữ safe correlation IDs, không raw keys/tokens hoặc user listening history không giới hạn.",
+          "en": "Measure startup failures/tails, stalls, denials and prefetch costs by device/network. Separate list sync, accepted-event transport, missing records, semantic duplicates and correction age. Correlate safely without logging raw keys or unlimited histories."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Required behavior",
+            "en": "Required behavior"
+          },
+          {
+            "vi": "Drill",
+            "en": "Drill"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Prefetch hit, license expired",
+              "en": "Prefetch hit, expired license"
+            },
+            {
+              "vi": "Revalidate rights; no unauthorized output.",
+              "en": "Revalidate rights and deny unauthorized output."
+            },
+            {
+              "vi": "Warm bytes, cold/denied rights, offline expiry/clock rollback.",
+              "en": "Warm bytes with cold/denied rights and rollback/expiry."
+            }
+          ],
+          [
+            {
+              "vi": "Wrong predicted track",
+              "en": "Wrong predicted track"
+            },
+            {
+              "vi": "Charge waste to budget; normal random-jump path works.",
+              "en": "Account for waste and preserve random-jump playback."
+            },
+            {
+              "vi": "Change queue/device/network after prefetch.",
+              "en": "Change queues, devices and networks."
+            }
+          ],
+          [
+            {
+              "vi": "Lost playlist reply",
+              "en": "Lost playlist reply"
+            },
+            {
+              "vi": "Retained result, no duplicate entry.",
+              "en": "Retain results without duplicate entries."
+            },
+            {
+              "vi": "Commit insert then disconnect/retry same op.",
+              "en": "Commit then lose replies and retry."
+            }
+          ],
+          [
+            {
+              "vi": "Pruned offline anchor",
+              "en": "Pruned offline anchor"
+            },
+            {
+              "vi": "Resync/conflict rather than guessed position.",
+              "en": "Resynchronize/conflict rather than guess."
+            },
+            {
+              "vi": "Compact then reconnect old client.",
+              "en": "Compact before old-client reconnection."
+            }
+          ],
+          [
+            {
+              "vi": "Multiple events one play",
+              "en": "Multiple events for one play"
+            },
+            {
+              "vi": "Semantic count once under rule version.",
+              "en": "Count one semantic play under versioned rules."
+            },
+            {
+              "vi": "Duplicate IDs and fresh progress IDs.",
+              "en": "Replay duplicate and fresh progress IDs."
+            }
+          ],
+          [
+            {
+              "vi": "Late closed-period play",
+              "en": "Late closed-period play"
+            },
+            {
+              "vi": "Auditable adjustment or pending review; no silent drop.",
+              "en": "Auditable corrections/review rather than silent loss."
+            },
+            {
+              "vi": "After cutoff replay with same adjustment identity.",
+              "en": "Replay after cutoffs under stable correction identity."
+            }
+          ],
+          [
+            {
+              "vi": "Device handoff stale command",
+              "en": "Stale commands after handoff"
+            },
+            {
+              "vi": "Reject old owner epoch; preserve retained command result.",
+              "en": "Reject stale ownership and retain command results."
+            },
+            {
+              "vi": "Old phone seek/pause after new speaker activation.",
+              "en": "Delay old controls beyond new-speaker activation."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "14. Worked questions: rights, intent và evidence",
+        "en": "14. Worked questions: rights, intent and evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trình bày một Play end-to-end, một offline edit và một delayed event. Chọn latency, sync hoặc report correctness làm deep dive; không dùng generic “CDN+Kafka” làm bằng chứng đã giải requirements.",
+          "en": "Trace playback, offline edits and delayed events. Deep dive into latency, synchronization or reporting rather than treating product names as solved requirements."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao giảm server latency chưa chắc giảm TTFS nhiều?",
+            "en": "Why might faster servers barely improve startup?"
+          },
+          "answer": [
+            {
+              "vi": "Cold setup, network RTT, license dependencies, payload và device decode có thể dominate. Vẽ critical path và cohort metrics; overlap đúng dependency, cache/prefetch có scope và budget. Không dùng median cachehit che cold random jumps.",
+              "en": "Setup, RTT, licensing, transfer and decoding may dominate. Map dependencies/cohorts and optimize valid overlap/caches. Cached medians do not represent cold random jumps."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có prefetched encrypted chunk thì bỏ key service được không?",
+            "en": "Can prefetched encrypted chunks bypass licensing?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ dùng valid scoped capability còn hạn theo selected contract; bytes không grant rights. Expired/denied online verdict không được play nhờ cache. Offline revocation bounded theo check-in/expiry chứ không instant remote knowledge.",
+              "en": "Only valid scoped capabilities authorize playback. Cached bytes do not override expiry or denial. Offline revocation is bounded by check-ins/expiry rather than instant knowledge."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Versioned playlist log tự merge mọi offline move?",
+            "en": "Does a versioned log merge every offline move?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Need stable entry/op IDs, anchors/base context và rebase/conflict hoặc full CRDT/OT rules. Missing compacted anchor cần resync; same track lặp không cùng entry identity. Current editor ACL check tại commit.",
+              "en": "No. Retain entry/operation identities and contexts with rebase/conflict or full merge rules. Missing anchors need resynchronization, repeated tracks have distinct entries, and commit checks current permissions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dedup eventID đã đủ đúng stream counts chưa?",
+            "en": "Does event-ID deduplication establish correct play counts?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Hai fresh progress events có thể cùng play; fake evidence có thể IDs khác. Need qualified play identity, rule version, evidence/fraud review và atomic report sink. Lab rules30/45seconds synthetic, không universal payout policy.",
+              "en": "No. Fresh progress events may describe one play, and forged evidence can use fresh IDs. Qualify semantic plays with versioned rules and evidence. Synthetic thresholds do not establish payout policy."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Event-time field từ phone có thể tin hoàn toàn?",
+            "en": "Can phone event times be fully trusted?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Preserve server receipt time, validate skew/offline session/capability và quarantine suspicious data. Define transport SLO từ selected acceptance boundary; không biết event chưa gửi. Business event time khác arrival/report processing time.",
+              "en": "No. Preserve receipt times and validate claims/offline context. Define transport guarantees from acceptance without claiming knowledge of unsent events. Event, arrival and processing times differ."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Late valid play sau report close nên drop?",
+            "en": "Should valid plays arriving after report closure be dropped?"
+          },
+          "answer": [
+            {
+              "vi": "Không mặc định. Retain governed evidence, pending review hoặc explicit correction with report/rule/play identity. Avoid silent closed-period rewrite và duplicate payout khi rerun. Retention/privacy và payout policy được version riêng.",
+              "en": "Not by default. Govern evidence and use review or identified corrections. Avoid silent rewrites or repaying recomputation. Version retention and financial policy separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Resume audiobook chỉ cần max(position)?",
+            "en": "Can audiobook resume use maximum position only?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu user seek backward hoặc restart chapter. Separate deliberate commands và stale progress, current session/device epoch, ordered versions và reset semantics. Cross-device conflict policy là product contract.",
+              "en": "Not when users seek backward or restart. Distinguish commands from stale progress under session ownership, versions and reset semantics. Define cross-device conflict behavior."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Managed Pub/Sub hay cloud làm hết monitoring/ops chưa?",
+            "en": "Do managed transport/cloud remove operations responsibilities?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Provider xử lý selected infrastructure; app còn admission/durability settings, quotas, schemas, identity/dedup, checkpoint/replay, regional failure, privacy và cost. Verify accepted IDs và semantic outputs khi migration, không chỉ throughput.",
+              "en": "No. Applications retain configurations, quotas, schemas, identity/replay, regional resilience, privacy and costs. Validate identities and semantic output during migration rather than only throughput."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

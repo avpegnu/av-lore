@@ -1,0 +1,2907 @@
+{
+  "id": "ep-airbnb",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Booking Marketplace: dates, quotes và calendar authority",
+    "en": "Building a Booking Marketplace: dates, quotes and calendar authority"
+  },
+  "summary": {
+    "vi": "11 giai đoạn, search/hold/payment/CDC traces và ba lab cho horizon/rules, quote consent và projection versions; giữ no-overlap đúng scope.",
+    "en": "Eleven stages and search/hold/payment/CDC traces explore date coverage/rules, quote consent and projection versions under scoped no-overlap authority."
+  },
+  "prerequisites": [
+    "reservations",
+    "payments",
+    "search-engine",
+    "consistency"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "database",
+    "distributed",
+    "storage-search"
+  ],
+  "takeaways": [
+    {
+      "vi": "Search candidate không giữ nights; authority mới quyết booking.",
+      "en": "Search candidates do not hold nights; authority decides bookings."
+    },
+    {
+      "vi": "Dates half-open/local, blocking states và explicit expiry là domain rules.",
+      "en": "Half-open local dates, blocking states and explicit expiry are domain rules."
+    },
+    {
+      "vi": "Bitmap chỉ một filter có horizon, không encode mọi eligibility.",
+      "en": "Bitmaps are horizon-bound filters rather than all eligibility."
+    },
+    {
+      "vi": "Version guard không recover missing changes; CDC cần coverage và barriers.",
+      "en": "Version guards do not recover missing changes; CDC needs coverage and barriers."
+    },
+    {
+      "vi": "Quote consent, payment recovery và payout/cancellation states tách authority.",
+      "en": "Quote consent, payment recovery and payout/cancellation have distinct authority."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Tìm nhanh, giữ đúng, recover có evidence",
+      "en": "Find quickly, reserve correctly and recover with evidence"
+    },
+    "caption": {
+      "vi": "Mỗi bước giữ scope và accepted results xuyên retries.",
+      "en": "Preserve scope and accepted results across retries."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Discover",
+          "en": "Discover"
+        },
+        "detail": {
+          "vi": "Geo/date/rules candidates với observable coverage.",
+          "en": "Candidates with observable coverage."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Commit intent",
+          "en": "Commit intent"
+        },
+        "detail": {
+          "vi": "Scoped quote + atomic owned hold.",
+          "en": "Scoped quotes and atomic owned holds."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Confirm",
+          "en": "Confirm"
+        },
+        "detail": {
+          "vi": "Current ownership và resolved payment evidence.",
+          "en": "Current ownership and payment evidence."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Propagate / recover",
+          "en": "Propagate / recover"
+        },
+        "detail": {
+          "vi": "Versioned CDC, cancellation và money repair.",
+          "en": "Versioned capture, cancellation and money repair."
+        },
+        "icon": "route"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Marketplace bán một listing trong những đêm cụ thể",
+        "en": "1. A marketplace allocates listings for specific nights"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài này xây marketplace kiểu Airbnb: host quản lý listing/calendar/rules/price; guest tìm theo geo/dates rồi giữ/confirm một stay. Mỗi listing là single inventory trong lab; multi-room inventory cần capacity model khác. Các stages là teaching reconstruction theo problem/decision, không production inventory hiện tại.",
+          "en": "This Airbnb-style marketplace separates host listings/calendars/rules/prices from guest search and booking. Labs use single-inventory listings; multi-room inventory requires capacity semantics. Stages teach problem-driven design rather than a current deployment inventory."
+        },
+        {
+          "vi": "Search có thể dùng slightly stale projection với documented coverage; booking phải thắng ở authority. Price tip của model, cached estimate, scoped quote, stock hold và confirmed booking là objects khác nhau. Money pending/captured/refunded/paid-out cũng không là một boolean.",
+          "en": "Search may use bounded, observable projections while booking resolves at authority. Pricing suggestions, estimates, quotes, holds and confirmations are distinct, as are pending, captured, refunded and paid-out money."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Fast discovery",
+            "en": "Fast discovery"
+          },
+          "icon": "chart",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Geo/date/rule candidates và ranking có version/lag/coverage.",
+              "en": "Candidates and ranking expose versions, lag and coverage."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Booking authority",
+            "en": "Booking authority"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "No-overlap, current hold ownership, expiry và retained result.",
+              "en": "No-overlap, current ownership, expiry and retained results."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Business evidence",
+            "en": "Business evidence"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Quote consent, risk decision, payment outcome và cancellation/payout policy.",
+              "en": "Quote consent, risk decisions, money outcomes and cancellation/payout policy."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "domain",
+      "title": {
+        "vi": "2. Dates, rules và blocking states phải rõ",
+        "en": "2. Define dates, rules and blocking states"
+      },
+      "paragraphs": [
+        {
+          "vi": "Stay nights dùng local property calendar dates [check_in,check_out). Checkout ngày10 không block đêm bắt đầu ngày10; adjacent stays không overlap nếu turnover rules cho phép. Date range không NULL/empty/infinite ngoài policy. Không lấy UTC instant duration chia24h qua DST để thay local-night count. Hourly room booking là domain interval/timezone khác.",
+          "en": "Use half-open local-date stays: checkout dates do not block subsequent nights unless turnover rules do. Reject invalid intervals under policy. UTC durations divided by twenty-four hours do not replace local-date counting through DST; hourly inventory is a different domain."
+        },
+        {
+          "vi": "Calendar còn host blocks, booking holds, confirmed stays, cancellations và imported external calendars. Holds có server expiry/generation; expired state phải được transition authoritative trước khi bỏ blocking row. External sync có lag/conflicts và không có distributed uniqueness tự nhiên giữa independent booking platforms; phải nói rõ risk/fallback thay hứa mọi website luôn no-overlap.",
+          "en": "Calendars include host blocks, holds, confirmations, cancellations and external imports. Expiry changes authoritative state before removing blocks. External platforms have independent lag/conflicts; no automatic cross-platform uniqueness exists, so declare risks and policies."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Local nights tới booking commitment",
+          "en": "Local nights become booking commitments"
+        },
+        "caption": {
+          "vi": "Mọi dữ liệu giữ scope listing/dates/party và versions.",
+          "en": "Retain listing/date/party scope and versions throughout."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Search",
+              "en": "Search"
+            },
+            "detail": {
+              "vi": "Candidate dưới known horizon/rules.",
+              "en": "Candidates under known coverage/rules."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Quote",
+              "en": "Quote"
+            },
+            "detail": {
+              "vi": "Total/fees/taxes/currency và expiry/consent.",
+              "en": "Totals, fees, taxes, currency and consent."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Hold",
+              "en": "Hold"
+            },
+            "detail": {
+              "vi": "Atomic exclusive blocking range cho owner.",
+              "en": "Exclusive owned blocking intervals."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Confirm",
+              "en": "Confirm"
+            },
+            "detail": {
+              "vi": "Valid hold và payment evidence; recover unknown.",
+              "en": "Valid ownership and evidence; recover uncertainty."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 11 giai đoạn từ relational app tới platform",
+        "en": "3. Eleven stages from relational apps to platforms"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đọc problem, decision, trade-off, next trigger và exit criteria của từng stage. Risk, experiments và data pipelines có thể tạo giá trị trước khi cần hàng trăm services. Không biến historical engine/tool choice thành yêu cầu bắt buộc; giữ invariants và semantics làm tiêu chuẩn.",
+          "en": "Review pressures, choices, costs, triggers and exit criteria. Risk, experiments and pipelines can matter before large service fleets. Treat tools as choices while preserving invariants and semantics."
+        }
+      ],
+      "stages": [
+        {
+          "id": "mvp",
+          "title": {
+            "vi": "Listing, calendar và booking trong một authority",
+            "en": "Listings, calendars and bookings under one authority"
+          },
+          "description": {
+            "vi": "Một modular relational app đủ cho early marketplace nếu queries có indexes và booking invariants đúng. Listing dates là local calendar nights; không chia milliseconds cho86400000 để đếm mọi stay. External payment vẫn ngoài local transaction. Retain quote/booking identity và explicit pending UI từ đầu.",
+            "en": "A modular relational app fits early marketplaces with indexes and invariants. Nights are local dates rather than universal millisecond durations. Payments remain external; retain quote/booking identity and pending outcomes."
+          },
+          "problem": {
+            "vi": "Cần validate product và phục hồi accepted bookings.",
+            "en": "Validate the product and recover accepted bookings."
+          },
+          "decision": {
+            "vi": "Indexed search ban đầu, local calendar transactions và stable command results.",
+            "en": "Start with indexed queries, local calendar transactions and stable results."
+          },
+          "tradeoff": {
+            "vi": "Search load/release coupling tranh resources với booking.",
+            "en": "Search load and releases compete with booking."
+          },
+          "nextPressure": {
+            "vi": "Trust/risk problems tăng khi giao dịch giữa strangers.",
+            "en": "Transactions between strangers introduce trust/risk pressures."
+          },
+          "exitCriteria": {
+            "vi": "Concurrent overlap/lost reply/restore giữ selected booking contract.",
+            "en": "Overlap, lost-reply and restore tests preserve the booking contract."
+          },
+          "diagram": {
+            "id": "stay-stage-mvp",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "guest",
+                "label": {
+                  "vi": "Guest",
+                  "en": "Guest"
+                },
+                "detail": {
+                  "vi": "Search dates/party, approved quote và stable booking identity.",
+                  "en": "Dates/party, approved quotes and stable booking identities."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "host",
+                "label": {
+                  "vi": "Host",
+                  "en": "Host"
+                },
+                "detail": {
+                  "vi": "Listing/rule/price changes có current ownership và versions.",
+                  "en": "Owned versioned listing, rule and price changes."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Marketplace API",
+                  "en": "Marketplace API"
+                },
+                "detail": {
+                  "vi": "Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                  "en": "Identity, dates/timezones, deadlines and explicit outcomes."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "authority",
+                "label": {
+                  "vi": "Calendar authority",
+                  "en": "Calendar authority"
+                },
+                "detail": {
+                  "vi": "No-overlap cho blocking states, hold expiry transitions và retained results.",
+                  "en": "No-overlap across blocking states, expiry transitions and retained results."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "listing",
+                "label": {
+                  "vi": "Listing / quote",
+                  "en": "Listing / quote"
+                },
+                "detail": {
+                  "vi": "Current eligibility/rules và scoped complete quote versions.",
+                  "en": "Current eligibility/rules and scoped complete quote versions."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "guest",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary guest → api: Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                      "en": "Boundary guest → api: Identity, dates/timezones, deadlines and explicit outcomes."
+                    }
+                  },
+                  {
+                    "from": "host",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary host → api: Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                      "en": "Boundary host → api: Identity, dates/timezones, deadlines and explicit outcomes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "listing",
+                    "description": {
+                      "vi": "Boundary api → listing: Current eligibility/rules và scoped complete quote versions.",
+                      "en": "Boundary api → listing: Current eligibility/rules and scoped complete quote versions."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "authority",
+                    "description": {
+                      "vi": "Boundary api → authority: No-overlap cho blocking states, hold expiry transitions và retained results.",
+                      "en": "Boundary api → authority: No-overlap across blocking states, expiry transitions and retained results."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "risk",
+          "title": {
+            "vi": "Risk scoring đi cùng policy, không thay authority",
+            "en": "Risk scores inform policy rather than replace authority"
+          },
+          "description": {
+            "vi": "Serve versioned features/model dưới tight deadline; policy quyết allow/challenge/manual/deny theo risk và required checks. Không universal fail-open hoặc “always add friction”: safety và false-positive costs cần owner/guardrails. Delayed labels, adversarial drift và training-serving skew phải đo; log decision evidence tối thiểu theo privacy.",
+            "en": "Serve versioned features/models under deadlines and choose action policy by risk and required checks. No universal fail-open or challenge rule applies. Measure delayed labels, adversarial drift and feature skew while governing evidence."
+          },
+          "problem": {
+            "vi": "Fake accounts/card abuse và trust issues gây thiệt hại hai phía.",
+            "en": "Fraud and trust issues harm both sides."
+          },
+          "decision": {
+            "vi": "Separate model serving, decision policy và current booking/payment authority.",
+            "en": "Separate scoring, policy and transactional authority."
+          },
+          "tradeoff": {
+            "vi": "Latency, explainability, bias, label lag và fallback trade off.",
+            "en": "Latency, explainability, bias and delayed evidence trade off."
+          },
+          "nextPressure": {
+            "vi": "Nhiều product changes cần controlled experiments.",
+            "en": "Product changes need controlled experiments."
+          },
+          "exitCriteria": {
+            "vi": "Model outage có explicit risk-specific behavior; không bypass no-overlap/payment guards.",
+            "en": "Outages follow explicit policy without bypassing invariants."
+          },
+          "diagram": {
+            "id": "stay-stage-risk",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Marketplace API",
+                  "en": "Marketplace API"
+                },
+                "detail": {
+                  "vi": "Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                  "en": "Identity, dates/timezones, deadlines and explicit outcomes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "risk",
+                "label": {
+                  "vi": "Risk decision",
+                  "en": "Risk decision"
+                },
+                "detail": {
+                  "vi": "Versioned features/model, challenge/deny/allow policy và bounded fallback.",
+                  "en": "Versioned features/models, action policy and bounded fallback."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "model"
+              },
+              {
+                "id": "analytics",
+                "label": {
+                  "vi": "Governed datasets",
+                  "en": "Governed datasets"
+                },
+                "detail": {
+                  "vi": "Exposure/outcome evidence, lineage, delayed labels và retention.",
+                  "en": "Exposure/outcome evidence, lineage, delayed labels and retention."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "booking",
+                "label": {
+                  "vi": "Booking workflow",
+                  "en": "Booking workflow"
+                },
+                "detail": {
+                  "vi": "Current hold owner/state, quote consent, payment evidence và recovery.",
+                  "en": "Current ownership/state, consent, payment evidence and recovery."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "risk",
+                    "description": {
+                      "vi": "Boundary api → risk: Versioned features/model, challenge/deny/allow policy và bounded fallback.",
+                      "en": "Boundary api → risk: Versioned features/models, action policy and bounded fallback."
+                    }
+                  },
+                  {
+                    "from": "analytics",
+                    "to": "risk",
+                    "description": {
+                      "vi": "Boundary analytics → risk: Versioned features/model, challenge/deny/allow policy và bounded fallback.",
+                      "en": "Boundary analytics → risk: Versioned features/models, action policy and bounded fallback."
+                    }
+                  },
+                  {
+                    "from": "risk",
+                    "to": "booking",
+                    "description": {
+                      "vi": "Boundary risk → booking: Current hold owner/state, quote consent, payment evidence và recovery.",
+                      "en": "Boundary risk → booking: Current ownership/state, consent, payment evidence and recovery."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "experiments",
+          "title": {
+            "vi": "Experiments có exposure và interference",
+            "en": "Experiments track exposure and interference"
+          },
+          "description": {
+            "vi": "Stable assignment khác actual exposure. Log cả unit/variant/exposure time và versioned outcomes; predefine metrics/horizon/guardrails, check sample-ratio mismatch và avoid uncontrolled peeking. Shared supply làm treated guests ảnh hưởng control qua available inventory; randomization/analysis unit cần phù hợp interference.",
+            "en": "Assignment differs from actual exposure. Retain units, variants, exposures and outcomes with predefined metrics and diagnostics. Shared supply creates interference, requiring suitable randomization/analysis units rather than naive independent-user assumptions."
+          },
+          "problem": {
+            "vi": "Seasonality và selection bias làm before/after metrics dễ sai.",
+            "en": "Seasonality and selection bias distort comparisons."
+          },
+          "decision": {
+            "vi": "Experiment platform với trusted exposures, design review và two-sided guardrails.",
+            "en": "Use trusted exposure pipelines, reviewed designs and two-sided guardrails."
+          },
+          "tradeoff": {
+            "vi": "Traffic/power/time và market-wide side effects giới hạn rollout.",
+            "en": "Power, time and market effects constrain rollout."
+          },
+          "nextPressure": {
+            "vi": "Reports/models cần reproducible dependency pipelines.",
+            "en": "Reports and models need reproducible pipelines."
+          },
+          "exitCriteria": {
+            "vi": "A/A/assignment checks, clear estimand và rollout/rollback guards trước kết luận win.",
+            "en": "Validate assignment and estimands before declaring wins."
+          },
+          "diagram": {
+            "id": "stay-stage-experiments",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "guest",
+                "label": {
+                  "vi": "Guest",
+                  "en": "Guest"
+                },
+                "detail": {
+                  "vi": "Search dates/party, approved quote và stable booking identity.",
+                  "en": "Dates/party, approved quotes and stable booking identities."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Marketplace API",
+                  "en": "Marketplace API"
+                },
+                "detail": {
+                  "vi": "Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                  "en": "Identity, dates/timezones, deadlines and explicit outcomes."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "experiments",
+                "label": {
+                  "vi": "Experiment platform",
+                  "en": "Experiment platform"
+                },
+                "detail": {
+                  "vi": "Stable assignment/exposure, guardrails và marketplace interference design.",
+                  "en": "Stable assignment/exposure, guardrails and interference-aware design."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "analytics",
+                "label": {
+                  "vi": "Governed datasets",
+                  "en": "Governed datasets"
+                },
+                "detail": {
+                  "vi": "Exposure/outcome evidence, lineage, delayed labels và retention.",
+                  "en": "Exposure/outcome evidence, lineage, delayed labels and retention."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "guest",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary guest → api: Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                      "en": "Boundary guest → api: Identity, dates/timezones, deadlines and explicit outcomes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "experiments",
+                    "description": {
+                      "vi": "Boundary api → experiments: Stable assignment/exposure, guardrails và marketplace interference design.",
+                      "en": "Boundary api → experiments: Stable assignment/exposure, guardrails and interference-aware design."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "analytics",
+                    "description": {
+                      "vi": "Boundary api → analytics: Exposure/outcome evidence, lineage, delayed labels và retention.",
+                      "en": "Boundary api → analytics: Exposure/outcome evidence, lineage, delayed labels and retention."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "analytics",
+                    "to": "experiments",
+                    "description": {
+                      "vi": "Boundary analytics → experiments: Stable assignment/exposure, guardrails và marketplace interference design.",
+                      "en": "Boundary analytics → experiments: Stable assignment/exposure, guardrails and interference-aware design."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "pipelines",
+          "title": {
+            "vi": "Pipelines as code, task effects có identity",
+            "en": "Pipelines as code with identified effects"
+          },
+          "description": {
+            "vi": "Airflow-style DAG mô tả dependencies/data intervals/retries, không tự biến task thành idempotent transaction. Partition output bằng logical data interval/version và publish complete generation; backfill dùng snapshots/lineage, không re-trigger booking/payment notifications. Bound job concurrency để rebuild không starve live services.",
+            "en": "DAGs define dependencies, intervals and retries without making task effects transactional. Version outputs by logical intervals and publish complete generations. Backfills use lineage without replaying business effects; bound concurrency to protect serving."
+          },
+          "problem": {
+            "vi": "Cron chains thủ công không có visibility về data readiness và retry/backfill.",
+            "en": "Manual schedules obscure readiness, retries and backfills."
+          },
+          "decision": {
+            "vi": "Versioned DAG/tasks, data quality checks và atomic output publication.",
+            "en": "Use versioned tasks, quality checks and atomic publication."
+          },
+          "tradeoff": {
+            "vi": "Scheduler/control state và task-level correctness có operational cost.",
+            "en": "Schedulers and task correctness add operational cost."
+          },
+          "nextPressure": {
+            "vi": "Search cần derived index riêng để isolate query load.",
+            "en": "Search needs isolated derived indexes."
+          },
+          "exitCriteria": {
+            "vi": "Retry/backfill cùng interval không duplicate rows/effects; bad dataset không được publish.",
+            "en": "Retries/backfills preserve identities and reject bad publication."
+          },
+          "diagram": {
+            "id": "stay-stage-pipelines",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "scheduler",
+                "label": {
+                  "vi": "Batch orchestration",
+                  "en": "Batch orchestration"
+                },
+                "detail": {
+                  "vi": "Dependency/data intervals, retries/backfill, bounded workers và task idempotency.",
+                  "en": "Dependencies, data intervals, retries/backfills, bounded workers and task identity."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "analytics",
+                "label": {
+                  "vi": "Governed datasets",
+                  "en": "Governed datasets"
+                },
+                "detail": {
+                  "vi": "Exposure/outcome evidence, lineage, delayed labels và retention.",
+                  "en": "Exposure/outcome evidence, lineage, delayed labels and retention."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "builder",
+                "label": {
+                  "vi": "Index builder",
+                  "en": "Index builder"
+                },
+                "detail": {
+                  "vi": "Versioned snapshot, feature/rule compatibility và verified complete shards.",
+                  "en": "Versioned snapshots, feature/rule compatibility and verified complete shards."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "experiments",
+                "label": {
+                  "vi": "Experiment platform",
+                  "en": "Experiment platform"
+                },
+                "detail": {
+                  "vi": "Stable assignment/exposure, guardrails và marketplace interference design.",
+                  "en": "Stable assignment/exposure, guardrails and interference-aware design."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "scheduler",
+                    "to": "analytics",
+                    "description": {
+                      "vi": "Boundary scheduler → analytics: Exposure/outcome evidence, lineage, delayed labels và retention.",
+                      "en": "Boundary scheduler → analytics: Exposure/outcome evidence, lineage, delayed labels and retention."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "analytics",
+                    "to": "builder",
+                    "description": {
+                      "vi": "Boundary analytics → builder: Versioned snapshot, feature/rule compatibility và verified complete shards.",
+                      "en": "Boundary analytics → builder: Versioned snapshots, feature/rule compatibility and verified complete shards."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "analytics",
+                    "to": "experiments",
+                    "description": {
+                      "vi": "Boundary analytics → experiments: Stable assignment/exposure, guardrails và marketplace interference design.",
+                      "en": "Boundary analytics → experiments: Stable assignment/exposure, guardrails and interference-aware design."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "index",
+          "title": {
+            "vi": "Versioned index snapshot và live overlay",
+            "en": "Versioned snapshots and live overlays"
+          },
+          "description": {
+            "vi": "Build immutable index generation từ consistent snapshot, validate schema/features/checksums/coverage rồi rollout shards. Frequent calendar/rules/price updates qua incremental overlay có barrier/checkpoint mapping. Rollback snapshot không được rollback current deletion/availability overlay; live mutation versions phải survive rebuild.",
+            "en": "Build verified immutable generations from consistent snapshots. Incremental calendar/rule/price updates need barriers/checkpoints. Rolling back base snapshots must not discard current deletions or availability, and live versions must survive rebuilding."
+          },
+          "problem": {
+            "vi": "Search CPU/fan-out không nên cạnh tranh transaction primary.",
+            "en": "Search workloads should not compete with transaction primaries."
+          },
+          "decision": {
+            "vi": "Dedicated shards, complete generation manifest và versioned incremental updates.",
+            "en": "Use dedicated shards, complete manifests and versioned updates."
+          },
+          "tradeoff": {
+            "vi": "Rebuild cost, mixed versions và lag/coverage cần monitoring.",
+            "en": "Rebuild cost, mixed versions and lag need monitoring."
+          },
+          "nextPressure": {
+            "vi": "Dates availability cần representation/rules hiệu quả.",
+            "en": "Availability needs efficient representations and rules."
+          },
+          "exitCriteria": {
+            "vi": "Snapshot rollback/rebuild không resurrect unavailable/deleted listing state.",
+            "en": "Rollbacks/rebuilds preserve current blocking/deletion state."
+          },
+          "diagram": {
+            "id": "stay-stage-index",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "authority",
+                "label": {
+                  "vi": "Calendar authority",
+                  "en": "Calendar authority"
+                },
+                "detail": {
+                  "vi": "No-overlap cho blocking states, hold expiry transitions và retained results.",
+                  "en": "No-overlap across blocking states, expiry transitions and retained results."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "analytics",
+                "label": {
+                  "vi": "Governed datasets",
+                  "en": "Governed datasets"
+                },
+                "detail": {
+                  "vi": "Exposure/outcome evidence, lineage, delayed labels và retention.",
+                  "en": "Exposure/outcome evidence, lineage, delayed labels and retention."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "builder",
+                "label": {
+                  "vi": "Index builder",
+                  "en": "Index builder"
+                },
+                "detail": {
+                  "vi": "Versioned snapshot, feature/rule compatibility và verified complete shards.",
+                  "en": "Versioned snapshots, feature/rule compatibility and verified complete shards."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "index",
+                "label": {
+                  "vi": "Search projection",
+                  "en": "Search projection"
+                },
+                "detail": {
+                  "vi": "Geo/rules/availability coverage, per-listing versions và known lag.",
+                  "en": "Geo/rules/availability coverage, listing versions and known lag."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "search",
+                "label": {
+                  "vi": "Candidate retrieval",
+                  "en": "Candidate retrieval"
+                },
+                "detail": {
+                  "vi": "Conservative filters, ANN/lexical/geo sources và bounded query work.",
+                  "en": "Conservative filters, retrieval sources and bounded work."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "authority",
+                    "to": "analytics",
+                    "description": {
+                      "vi": "Boundary authority → analytics: Exposure/outcome evidence, lineage, delayed labels và retention.",
+                      "en": "Boundary authority → analytics: Exposure/outcome evidence, lineage, delayed labels and retention."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "analytics",
+                    "to": "builder",
+                    "description": {
+                      "vi": "Boundary analytics → builder: Versioned snapshot, feature/rule compatibility và verified complete shards.",
+                      "en": "Boundary analytics → builder: Versioned snapshots, feature/rule compatibility and verified complete shards."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "builder",
+                    "to": "index",
+                    "description": {
+                      "vi": "Boundary builder → index: Geo/rules/availability coverage, per-listing versions và known lag.",
+                      "en": "Boundary builder → index: Geo/rules/availability coverage, listing versions and known lag."
+                    }
+                  },
+                  {
+                    "from": "search",
+                    "to": "index",
+                    "description": {
+                      "vi": "Boundary search → index: Geo/rules/availability coverage, per-listing versions và known lag.",
+                      "en": "Boundary search → index: Geo/rules/availability coverage, listing versions and known lag."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "availability",
+          "title": {
+            "vi": "Availability bitmap là filter có horizon",
+            "en": "Availability bitmaps are horizon-bound filters"
+          },
+          "description": {
+            "vi": "Một bit/night biểu diễn blocked state trong bounded date horizon. Check requested range đủ coverage, rồi overlap bits và listing rules. Min/max stay, allowed check-in/out, occupancy, turnover gaps và price coverage không nằm tự nhiên trong một blocked bitmap. Wide intervals cần nhiều machine words; raw bits không đủ chứng minh whole system fit RAM.",
+            "en": "Blocked-night bits cover bounded horizons. Check coverage and overlap plus rules for stays, check-in/out, occupancy, gaps and prices. Wider ranges use multiple words; raw bits alone do not size the whole system."
+          },
+          "problem": {
+            "vi": "Search thường hỏi dates nhưng runtime joins/fan-out dễ đắt.",
+            "en": "Date queries can make runtime joins/fan-out expensive."
+          },
+          "decision": {
+            "vi": "Per-listing date-origin/version/horizon metadata và explicit unknown coverage.",
+            "en": "Retain date origins, versions, horizons and unknown coverage."
+          },
+          "tradeoff": {
+            "vi": "Lag, rolling horizon và business rules làm representation phức tạp.",
+            "en": "Lag, rolling horizons and rules add complexity."
+          },
+          "nextPressure": {
+            "vi": "Booking vẫn cần atomic authority không tin search alone.",
+            "en": "Booking still needs atomic authority."
+          },
+          "exitCriteria": {
+            "vi": "Beyond horizon không clamp thành free; rolling date origin không shift nhầm bits.",
+            "en": "Do not clamp unknown dates into availability or misalign rolling origins."
+          },
+          "diagram": {
+            "id": "stay-stage-availability",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "search",
+                "label": {
+                  "vi": "Candidate retrieval",
+                  "en": "Candidate retrieval"
+                },
+                "detail": {
+                  "vi": "Conservative filters, ANN/lexical/geo sources và bounded query work.",
+                  "en": "Conservative filters, retrieval sources and bounded work."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "index",
+                "label": {
+                  "vi": "Search projection",
+                  "en": "Search projection"
+                },
+                "detail": {
+                  "vi": "Geo/rules/availability coverage, per-listing versions và known lag.",
+                  "en": "Geo/rules/availability coverage, listing versions and known lag."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "cdc",
+                "label": {
+                  "vi": "Committed changes",
+                  "en": "Committed changes"
+                },
+                "detail": {
+                  "vi": "Capture checkpoints, snapshots/deletes và version-monotonic application.",
+                  "en": "Capture checkpoints, snapshots/deletions and monotonic application."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "authority",
+                "label": {
+                  "vi": "Calendar authority",
+                  "en": "Calendar authority"
+                },
+                "detail": {
+                  "vi": "No-overlap cho blocking states, hold expiry transitions và retained results.",
+                  "en": "No-overlap across blocking states, expiry transitions and retained results."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "search",
+                    "to": "index",
+                    "description": {
+                      "vi": "Boundary search → index: Geo/rules/availability coverage, per-listing versions và known lag.",
+                      "en": "Boundary search → index: Geo/rules/availability coverage, listing versions and known lag."
+                    }
+                  },
+                  {
+                    "from": "authority",
+                    "to": "cdc",
+                    "description": {
+                      "vi": "Boundary authority → cdc: Capture checkpoints, snapshots/deletes và version-monotonic application.",
+                      "en": "Boundary authority → cdc: Capture checkpoints, snapshots/deletions and monotonic application."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "cdc",
+                    "to": "index",
+                    "description": {
+                      "vi": "Boundary cdc → index: Geo/rules/availability coverage, per-listing versions và known lag.",
+                      "en": "Boundary cdc → index: Geo/rules/availability coverage, listing versions and known lag."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "booking",
+          "title": {
+            "vi": "No-overlap, blocking states và expiry transitions",
+            "en": "No-overlap, blocking states and expiry transitions"
+          },
+          "description": {
+            "vi": "Reserve [check_in,check_out) trên single-inventory listing bằng constraint/unique nights hoặc equivalent protocol. Partial exclusion chỉ xét HELD/CONFIRMED; expiry đổi state bằng transaction, không predicate now(). Confirm rechecks current hold owner/version/server expiry. Schema/failover scope phải đủ giữ invariant, không chỉ app-level “check free”.",
+            "en": "Reserve half-open stays with constraints/unique nights or equivalent protocols. Block held/confirmed states; expiry is an explicit transaction rather than a time-dependent index predicate. Confirmation checks current ownership, versions and expiry within durable authority."
+          },
+          "problem": {
+            "vi": "Hai guests có thể thấy cùng stale available result.",
+            "en": "Two guests may see the same stale availability."
+          },
+          "decision": {
+            "vi": "Atomic hold + retained result, selected no-overlap authority và payment recovery.",
+            "en": "Use atomic holds/results, no-overlap authority and payment recovery."
+          },
+          "tradeoff": {
+            "vi": "Abandoned holds, lock contention và late external outcomes cần UX/reconciliation.",
+            "en": "Abandoned holds, contention and late results need reconciliation."
+          },
+          "nextPressure": {
+            "vi": "Teams cần domain boundaries nhưng data authority không được duplicate.",
+            "en": "Teams need boundaries without duplicating authority."
+          },
+          "exitCriteria": {
+            "vi": "Expiry/confirm/race/lost reply giữ ownership; invalid dates/NULL/empty ranges bị reject.",
+            "en": "Races and failures preserve ownership while rejecting invalid intervals."
+          },
+          "diagram": {
+            "id": "stay-stage-booking",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "guest",
+                "label": {
+                  "vi": "Guest",
+                  "en": "Guest"
+                },
+                "detail": {
+                  "vi": "Search dates/party, approved quote và stable booking identity.",
+                  "en": "Dates/party, approved quotes and stable booking identities."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Marketplace API",
+                  "en": "Marketplace API"
+                },
+                "detail": {
+                  "vi": "Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                  "en": "Identity, dates/timezones, deadlines and explicit outcomes."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "booking",
+                "label": {
+                  "vi": "Booking workflow",
+                  "en": "Booking workflow"
+                },
+                "detail": {
+                  "vi": "Current hold owner/state, quote consent, payment evidence và recovery.",
+                  "en": "Current ownership/state, consent, payment evidence and recovery."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "authority",
+                "label": {
+                  "vi": "Calendar authority",
+                  "en": "Calendar authority"
+                },
+                "detail": {
+                  "vi": "No-overlap cho blocking states, hold expiry transitions và retained results.",
+                  "en": "No-overlap across blocking states, expiry transitions and retained results."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "pay",
+                "label": {
+                  "vi": "Payment boundary",
+                  "en": "Payment boundary"
+                },
+                "detail": {
+                  "vi": "Distinct authorize/capture/refund/payout identities và reconciliation.",
+                  "en": "Distinct money-operation identities and reconciliation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "guest",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary guest → api: Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                      "en": "Boundary guest → api: Identity, dates/timezones, deadlines and explicit outcomes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "booking",
+                    "description": {
+                      "vi": "Boundary api → booking: Current hold owner/state, quote consent, payment evidence và recovery.",
+                      "en": "Boundary api → booking: Current ownership/state, consent, payment evidence and recovery."
+                    }
+                  },
+                  {
+                    "from": "booking",
+                    "to": "authority",
+                    "description": {
+                      "vi": "Boundary booking → authority: No-overlap cho blocking states, hold expiry transitions và retained results.",
+                      "en": "Boundary booking → authority: No-overlap across blocking states, expiry transitions and retained results."
+                    }
+                  },
+                  {
+                    "from": "booking",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary booking → pay: Distinct authorize/capture/refund/payout identities và reconciliation.",
+                      "en": "Boundary booking → pay: Distinct money-operation identities and reconciliation."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "services",
+          "title": {
+            "vi": "Incremental services với one write owner",
+            "en": "Incremental services with one write owner"
+          },
+          "description": {
+            "vi": "Carve một owned API/path, compare shadow read outputs và ramp cohort. Shadow write phải sandbox/fenced không charge/book thật. Data cutover cần snapshot+capture+verify và ownership epoch/fencing; dual writes không atomic sẽ diverge. Delete old code sau contracts/rollback readiness, không count services thay measure traffic/invariants moved.",
+            "en": "Extract owned paths, compare shadow reads and ramp cohorts. Shadow writes must not create real bookings/charges. Cutovers need capture, verification and fencing rather than incoherent dual writes. Measure moved contracts/invariants rather than service counts."
+          },
+          "problem": {
+            "vi": "Shared releases/schema làm organization changes khó hơn.",
+            "en": "Shared releases/schemas increase coordination."
+          },
+          "decision": {
+            "vi": "Listing, booking, search và payments có contracts/ownership riêng.",
+            "en": "Give listings, booking, search and payments owned contracts."
+          },
+          "tradeoff": {
+            "vi": "Network latency, tracing và distributed recovery tăng costs.",
+            "en": "Network latency, tracing and recovery add cost."
+          },
+          "nextPressure": {
+            "vi": "Host pricing needs personalized suggestions và quote contract.",
+            "en": "Host pricing needs suggestions and quote contracts."
+          },
+          "exitCriteria": {
+            "vi": "Old callers không bypass authority; cutover không double book/charge.",
+            "en": "Old callers cannot bypass ownership or create duplicate effects."
+          },
+          "diagram": {
+            "id": "stay-stage-services",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Marketplace API",
+                  "en": "Marketplace API"
+                },
+                "detail": {
+                  "vi": "Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                  "en": "Identity, dates/timezones, deadlines and explicit outcomes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "listing",
+                "label": {
+                  "vi": "Listing / quote",
+                  "en": "Listing / quote"
+                },
+                "detail": {
+                  "vi": "Current eligibility/rules và scoped complete quote versions.",
+                  "en": "Current eligibility/rules and scoped complete quote versions."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "booking",
+                "label": {
+                  "vi": "Booking workflow",
+                  "en": "Booking workflow"
+                },
+                "detail": {
+                  "vi": "Current hold owner/state, quote consent, payment evidence và recovery.",
+                  "en": "Current ownership/state, consent, payment evidence and recovery."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "authority",
+                "label": {
+                  "vi": "Calendar authority",
+                  "en": "Calendar authority"
+                },
+                "detail": {
+                  "vi": "No-overlap cho blocking states, hold expiry transitions và retained results.",
+                  "en": "No-overlap across blocking states, expiry transitions and retained results."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "cdc",
+                "label": {
+                  "vi": "Committed changes",
+                  "en": "Committed changes"
+                },
+                "detail": {
+                  "vi": "Capture checkpoints, snapshots/deletes và version-monotonic application.",
+                  "en": "Capture checkpoints, snapshots/deletions and monotonic application."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              },
+              {
+                "id": "pay",
+                "label": {
+                  "vi": "Payment boundary",
+                  "en": "Payment boundary"
+                },
+                "detail": {
+                  "vi": "Distinct authorize/capture/refund/payout identities và reconciliation.",
+                  "en": "Distinct money-operation identities and reconciliation."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "api",
+                    "to": "listing",
+                    "description": {
+                      "vi": "Boundary api → listing: Current eligibility/rules và scoped complete quote versions.",
+                      "en": "Boundary api → listing: Current eligibility/rules and scoped complete quote versions."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "booking",
+                    "description": {
+                      "vi": "Boundary api → booking: Current hold owner/state, quote consent, payment evidence và recovery.",
+                      "en": "Boundary api → booking: Current ownership/state, consent, payment evidence and recovery."
+                    }
+                  },
+                  {
+                    "from": "booking",
+                    "to": "authority",
+                    "description": {
+                      "vi": "Boundary booking → authority: No-overlap cho blocking states, hold expiry transitions và retained results.",
+                      "en": "Boundary booking → authority: No-overlap across blocking states, expiry transitions and retained results."
+                    }
+                  },
+                  {
+                    "from": "authority",
+                    "to": "cdc",
+                    "description": {
+                      "vi": "Boundary authority → cdc: Capture checkpoints, snapshots/deletes và version-monotonic application.",
+                      "en": "Boundary authority → cdc: Capture checkpoints, snapshots/deletions and monotonic application."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "booking",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary booking → pay: Distinct authorize/capture/refund/payout identities và reconciliation.",
+                      "en": "Boundary booking → pay: Distinct money-operation identities and reconciliation."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "pricing",
+          "title": {
+            "vi": "Host pricing tips khác binding guest quote",
+            "en": "Host pricing tips differ from binding guest quotes"
+          },
+          "description": {
+            "vi": "Model gợi ý price/occupancy/revenue dưới host opt-in/min/max và demand uncertainty. Host-approved calendar pricing mới là source cho quote policy. Quote bind nights/party/currency/fees/taxes/rules/expiry và consent; selected price lock có validity rõ, còn estimate có thể requote. Model tip không tự silently change accepted guest total.",
+            "en": "Models suggest prices under host constraints and uncertainty. Approved prices feed quote policy. Quotes bind dates, party, currency, fees, taxes, rules, expiry and consent. Define price locks versus estimates; suggestions cannot silently change accepted totals."
+          },
+          "problem": {
+            "vi": "Unique listings/seasonality làm fixed pricing thiếu context.",
+            "en": "Unique properties and seasonality complicate pricing."
+          },
+          "decision": {
+            "vi": "Versioned demand/pricing models, host control và explicit quote lifecycle.",
+            "en": "Use versioned models, host control and quote lifecycles."
+          },
+          "tradeoff": {
+            "vi": "Training bias, fairness/income, price volatility và consent cost cần review.",
+            "en": "Bias, income effects, volatility and consent need review."
+          },
+          "nextPressure": {
+            "vi": "Candidate/ranking quality cần learned retrieval nhưng preserve hard filters.",
+            "en": "Learned retrieval must preserve hard eligibility."
+          },
+          "exitCriteria": {
+            "vi": "Expired/changing quote nhận requote; no automatic hidden price increase.",
+            "en": "Expired/changed quotes require explicit reevaluation and consent."
+          },
+          "diagram": {
+            "id": "stay-stage-pricing",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "host",
+                "label": {
+                  "vi": "Host",
+                  "en": "Host"
+                },
+                "detail": {
+                  "vi": "Listing/rule/price changes có current ownership và versions.",
+                  "en": "Owned versioned listing, rule and price changes."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Marketplace API",
+                  "en": "Marketplace API"
+                },
+                "detail": {
+                  "vi": "Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                  "en": "Identity, dates/timezones, deadlines and explicit outcomes."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "listing",
+                "label": {
+                  "vi": "Listing / quote",
+                  "en": "Listing / quote"
+                },
+                "detail": {
+                  "vi": "Current eligibility/rules và scoped complete quote versions.",
+                  "en": "Current eligibility/rules and scoped complete quote versions."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "pricing",
+                "label": {
+                  "vi": "Host pricing model",
+                  "en": "Host pricing model"
+                },
+                "detail": {
+                  "vi": "Suggestions/opt-in constraints và versioned approved prices.",
+                  "en": "Suggestions, opt-in constraints and approved price versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "model"
+              },
+              {
+                "id": "analytics",
+                "label": {
+                  "vi": "Governed datasets",
+                  "en": "Governed datasets"
+                },
+                "detail": {
+                  "vi": "Exposure/outcome evidence, lineage, delayed labels và retention.",
+                  "en": "Exposure/outcome evidence, lineage, delayed labels and retention."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "host",
+                    "to": "api",
+                    "description": {
+                      "vi": "Boundary host → api: Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+                      "en": "Boundary host → api: Identity, dates/timezones, deadlines and explicit outcomes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "listing",
+                    "description": {
+                      "vi": "Boundary api → listing: Current eligibility/rules và scoped complete quote versions.",
+                      "en": "Boundary api → listing: Current eligibility/rules and scoped complete quote versions."
+                    }
+                  },
+                  {
+                    "from": "analytics",
+                    "to": "pricing",
+                    "description": {
+                      "vi": "Boundary analytics → pricing: Suggestions/opt-in constraints và versioned approved prices.",
+                      "en": "Boundary analytics → pricing: Suggestions, opt-in constraints and approved price versions."
+                    }
+                  },
+                  {
+                    "from": "pricing",
+                    "to": "listing",
+                    "description": {
+                      "vi": "Boundary pricing → listing: Current eligibility/rules và scoped complete quote versions.",
+                      "en": "Boundary pricing → listing: Current eligibility/rules and scoped complete quote versions."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "retrieval",
+          "title": {
+            "vi": "Retrieve rồi rank, giữ eligibility và recall",
+            "en": "Retrieve then rank with eligibility and recall"
+          },
+          "description": {
+            "vi": "Geo/availability/rules xác định eligible universe, ANN/other sources giảm candidate pool trước expensive scorer. Filtered ANN có recall/performance trade-offs; widening/hybrid fallback phải bounded. Query/document model và index generation compatible; stale feature scores không override no-overlap. Offline labels chịu position/exposure/interference bias.",
+            "en": "Eligibility defines the universe while retrieval narrows candidates. Filtered ANN trades recall and cost; bound widening/fallbacks and pair models/indexes. Stale scores never override booking authority; training labels carry exposure/interference bias."
+          },
+          "problem": {
+            "vi": "Millions of listings không thể score full model mọi request.",
+            "en": "Scoring all listings per query is expensive."
+          },
+          "decision": {
+            "vi": "Bounded retrieval/ranking stages với model/feature/eligibility versions.",
+            "en": "Use bounded stages with compatible versions and eligibility."
+          },
+          "tradeoff": {
+            "vi": "Recall, diversity, host exposure và latency cần multi-sided evaluation.",
+            "en": "Recall, diversity, exposure and latency need multi-sided evaluation."
+          },
+          "nextPressure": {
+            "vi": "Money flows cần stable operation IDs xuyên services/providers.",
+            "en": "Money operations need stable identities across boundaries."
+          },
+          "exitCriteria": {
+            "vi": "Model rollout/rollback không return invalid/out-of-market/deleted candidates.",
+            "en": "Model changes preserve current eligibility and deletion."
+          },
+          "diagram": {
+            "id": "stay-stage-retrieval",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "guest",
+                "label": {
+                  "vi": "Guest",
+                  "en": "Guest"
+                },
+                "detail": {
+                  "vi": "Search dates/party, approved quote và stable booking identity.",
+                  "en": "Dates/party, approved quotes and stable booking identities."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "search",
+                "label": {
+                  "vi": "Candidate retrieval",
+                  "en": "Candidate retrieval"
+                },
+                "detail": {
+                  "vi": "Conservative filters, ANN/lexical/geo sources và bounded query work.",
+                  "en": "Conservative filters, retrieval sources and bounded work."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "index",
+                "label": {
+                  "vi": "Search projection",
+                  "en": "Search projection"
+                },
+                "detail": {
+                  "vi": "Geo/rules/availability coverage, per-listing versions và known lag.",
+                  "en": "Geo/rules/availability coverage, listing versions and known lag."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "ranker",
+                "label": {
+                  "vi": "Search ranker",
+                  "en": "Search ranker"
+                },
+                "detail": {
+                  "vi": "Bounded candidate scores, model/index version và current eligibility.",
+                  "en": "Bounded scores, compatible versions and current eligibility."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "model"
+              },
+              {
+                "id": "analytics",
+                "label": {
+                  "vi": "Governed datasets",
+                  "en": "Governed datasets"
+                },
+                "detail": {
+                  "vi": "Exposure/outcome evidence, lineage, delayed labels và retention.",
+                  "en": "Exposure/outcome evidence, lineage, delayed labels and retention."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "guest",
+                    "to": "search",
+                    "description": {
+                      "vi": "Boundary guest → search: Conservative filters, ANN/lexical/geo sources và bounded query work.",
+                      "en": "Boundary guest → search: Conservative filters, retrieval sources and bounded work."
+                    }
+                  },
+                  {
+                    "from": "search",
+                    "to": "index",
+                    "description": {
+                      "vi": "Boundary search → index: Geo/rules/availability coverage, per-listing versions và known lag.",
+                      "en": "Boundary search → index: Geo/rules/availability coverage, listing versions and known lag."
+                    }
+                  },
+                  {
+                    "from": "search",
+                    "to": "ranker",
+                    "description": {
+                      "vi": "Boundary search → ranker: Bounded candidate scores, model/index version và current eligibility.",
+                      "en": "Boundary search → ranker: Bounded scores, compatible versions and current eligibility."
+                    }
+                  },
+                  {
+                    "from": "analytics",
+                    "to": "ranker",
+                    "description": {
+                      "vi": "Boundary analytics → ranker: Bounded candidate scores, model/index version và current eligibility.",
+                      "en": "Boundary analytics → ranker: Bounded scores, compatible versions and current eligibility."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "payments",
+          "title": {
+            "vi": "Guest charge, host payout và uncertain outcomes",
+            "en": "Guest payments, host payouts and uncertainty"
+          },
+          "description": {
+            "vi": "Booking hold và payment authorization/capture có independent lifecycles. Stable operation ID scoped method/account/amount bảo vệ retries chỉ khi downstream contract/recovery support. Local pre-RPC/result lock không giải crash sau provider effect trước record. Unknown giữ pending/query/reconcile; hold expired không được confirm như còn ownership. Payout/refund giữ identities, ledger và evidence riêng.",
+            "en": "Holds and money operations have distinct lifecycles. Stable identities need downstream cooperation or recovery; local locks do not close provider effect/result gaps. Keep uncertainty pending and do not confirm expired ownership. Payouts/refunds need separate evidence and identities."
+          },
+          "problem": {
+            "vi": "Retries/timeouts và cancellation/payout timing có thể duplicate money effects.",
+            "en": "Retries and timing can duplicate money effects."
+          },
+          "decision": {
+            "vi": "Durable operation state, provider idempotence/outcome recovery và reconciliation.",
+            "en": "Retain operation state, provider recovery and reconciliation."
+          },
+          "tradeoff": {
+            "vi": "External uncertainty, FX/settlement/cancellation và support workflows tăng states.",
+            "en": "Uncertainty, settlement and support add state complexity."
+          },
+          "nextPressure": {
+            "vi": "Tiếp tục theo booked-stay correctness, trust, cost và user outcomes.",
+            "en": "Continue by correctness, trust, cost and outcomes."
+          },
+          "exitCriteria": {
+            "vi": "Crash every boundary giữ same charge/refund/payout identity và accepted booking evidence.",
+            "en": "Boundary failures preserve money identities and accepted booking evidence."
+          },
+          "diagram": {
+            "id": "stay-stage-payments",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và authority thay đổi theo pressure; branches không phải mọi calls nối tiếp.",
+              "en": "Responsibilities evolve by pressure; branches are not all sequential calls."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "booking",
+                "label": {
+                  "vi": "Booking workflow",
+                  "en": "Booking workflow"
+                },
+                "detail": {
+                  "vi": "Current hold owner/state, quote consent, payment evidence và recovery.",
+                  "en": "Current ownership/state, consent, payment evidence and recovery."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "authority",
+                "label": {
+                  "vi": "Calendar authority",
+                  "en": "Calendar authority"
+                },
+                "detail": {
+                  "vi": "No-overlap cho blocking states, hold expiry transitions và retained results.",
+                  "en": "No-overlap across blocking states, expiry transitions and retained results."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "pay",
+                "label": {
+                  "vi": "Payment boundary",
+                  "en": "Payment boundary"
+                },
+                "detail": {
+                  "vi": "Distinct authorize/capture/refund/payout identities và reconciliation.",
+                  "en": "Distinct money-operation identities and reconciliation."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cdc",
+                "label": {
+                  "vi": "Committed changes",
+                  "en": "Committed changes"
+                },
+                "detail": {
+                  "vi": "Capture checkpoints, snapshots/deletes và version-monotonic application.",
+                  "en": "Capture checkpoints, snapshots/deletions and monotonic application."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "booking",
+                    "to": "authority",
+                    "description": {
+                      "vi": "Boundary booking → authority: No-overlap cho blocking states, hold expiry transitions và retained results.",
+                      "en": "Boundary booking → authority: No-overlap across blocking states, expiry transitions and retained results."
+                    }
+                  },
+                  {
+                    "from": "booking",
+                    "to": "pay",
+                    "description": {
+                      "vi": "Boundary booking → pay: Distinct authorize/capture/refund/payout identities và reconciliation.",
+                      "en": "Boundary booking → pay: Distinct money-operation identities and reconciliation."
+                    }
+                  },
+                  {
+                    "from": "authority",
+                    "to": "cdc",
+                    "description": {
+                      "vi": "Boundary authority → cdc: Capture checkpoints, snapshots/deletes và version-monotonic application.",
+                      "en": "Boundary authority → cdc: Capture checkpoints, snapshots/deletions and monotonic application."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "4. Raw calendar bits chỉ là lower bound",
+        "en": "4. Raw calendar bits are only a lower bound"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định1M active listings,365nights mỗi listing,20M searches/day và200K booking attempts/day. Đây là toy workload, không Airbnb metrics. Raw bitmap không gồm rules, date origins, versions, index IDs, allocator/replicas, query CPU hoặc serving headroom. Low average booking rate không loại hot-listing races.",
+          "en": "Assume one million listings,365 nights, twenty million daily searches and two hundred thousand booking attempts. This toy workload excludes metadata, allocation, replication, CPU and headroom. Modest averages do not eliminate hot-listing races."
+        },
+        {
+          "vi": "365nights cần tối đa6words64bits mỗi listing, tùy range/alignment. Scan toàn bookings là baseline naive chứ SQL có suitable range/geo indexes không bắt buộc full scan. Candidate filters dùng geo/rules trước expensive ranking; exact cost dựa selected shards, selectivity, interval length và skew.",
+          "en": "A365-night bitmap uses six64-bit words before metadata. Naive scans are not the only SQL approach: range/geographical indexes can help. Cost depends on shards, selectivity, interval lengths and skew, not only raw memory."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Metric",
+            "en": "Metric"
+          },
+          {
+            "vi": "Calculation",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Meaning",
+            "en": "Meaning"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Raw blocked bitmap",
+              "en": "Raw blocked bitmap"
+            },
+            {
+              "vi": "1M×365/8",
+              "en": "1M×365/8"
+            },
+            {
+              "vi": "45.625MB decimal mỗi raw copy.",
+              "en": "45.625 decimal MB per raw copy."
+            }
+          ],
+          [
+            {
+              "vi": "Word-aligned bitmap",
+              "en": "Word-aligned bitmap"
+            },
+            {
+              "vi": "1M×6×8bytes",
+              "en": "1M×6×8bytes"
+            },
+            {
+              "vi": "48MB, chưa metadata/replicas.",
+              "en": "48MB before metadata/replicas."
+            }
+          ],
+          [
+            {
+              "vi": "Search rate",
+              "en": "Search rate"
+            },
+            {
+              "vi": "20M/86400",
+              "en": "20M/86400"
+            },
+            {
+              "vi": "≈231.5/s average; peak/cohort khác.",
+              "en": "≈231.5/s average; peaks/cohorts differ."
+            }
+          ],
+          [
+            {
+              "vi": "Booking attempt rate",
+              "en": "Booking attempt rate"
+            },
+            {
+              "vi": "200K/86400",
+              "en": "200K/86400"
+            },
+            {
+              "vi": "≈2.31/s average; retries/payment events lớn hơn.",
+              "en": "≈2.31/s average before retries/events."
+            }
+          ],
+          [
+            {
+              "vi": "Search / attempt",
+              "en": "Search / attempt"
+            },
+            {
+              "vi": "20M/200K",
+              "en": "20M/200K"
+            },
+            {
+              "vi": "100:1 trong fixture, không universal.",
+              "en": "100:1 in this fixture, not universal."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Search, hold, payment và CDC",
+        "en": "5. Search, holds, payments and CDC"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trace giữ authority của từng request thay chỉ xem component boxes. Search return candidate chưa reserve; payment success chưa confirm nếu hold đã mất. CDC tới index có lag/coverage và version contract, không async arrow nào tự là exactly-once hoặc seconds-at-worst guarantee.",
+          "en": "Traces show authority rather than only boxes. Candidates are not reservations and payment success cannot confirm lost ownership. CDC has lag/coverage/version contracts; asynchronous arrows do not imply exactly-once or a universal lag bound."
+        }
+      ],
+      "diagram": {
+        "id": "stay-marketplace-journey",
+        "title": {
+          "vi": "Search candidate khác quyền giữ và confirm nights",
+          "en": "Search candidates differ from held and confirmed nights"
+        },
+        "caption": {
+          "vi": "Search có bounded lag/coverage; booking authority giữ no-overlap. Quote/risk/payment có versions và outcomes riêng.",
+          "en": "Search has lag/coverage; booking authority enforces no-overlap. Quotes, risk and payments have distinct versions/outcomes."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "guest",
+            "label": {
+              "vi": "Guest",
+              "en": "Guest"
+            },
+            "detail": {
+              "vi": "Search dates/party, approved quote và stable booking identity.",
+              "en": "Dates/party, approved quotes and stable booking identities."
+            },
+            "x": 130,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Marketplace API",
+              "en": "Marketplace API"
+            },
+            "detail": {
+              "vi": "Identity, dates/timezone, deadlines và explicit pending/outcomes.",
+              "en": "Identity, dates/timezones, deadlines and explicit outcomes."
+            },
+            "x": 440,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "search",
+            "label": {
+              "vi": "Candidate retrieval",
+              "en": "Candidate retrieval"
+            },
+            "detail": {
+              "vi": "Conservative filters, ANN/lexical/geo sources và bounded query work.",
+              "en": "Conservative filters, retrieval sources and bounded work."
+            },
+            "x": 760,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "index",
+            "label": {
+              "vi": "Search projection",
+              "en": "Search projection"
+            },
+            "detail": {
+              "vi": "Geo/rules/availability coverage, per-listing versions và known lag.",
+              "en": "Geo/rules/availability coverage, listing versions and known lag."
+            },
+            "x": 1060,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "booking",
+            "label": {
+              "vi": "Booking workflow",
+              "en": "Booking workflow"
+            },
+            "detail": {
+              "vi": "Current hold owner/state, quote consent, payment evidence và recovery.",
+              "en": "Current ownership/state, consent, payment evidence and recovery."
+            },
+            "x": 130,
+            "y": 380,
+            "kind": "service"
+          },
+          {
+            "id": "authority",
+            "label": {
+              "vi": "Calendar authority",
+              "en": "Calendar authority"
+            },
+            "detail": {
+              "vi": "No-overlap cho blocking states, hold expiry transitions và retained results.",
+              "en": "No-overlap across blocking states, expiry transitions and retained results."
+            },
+            "x": 440,
+            "y": 380,
+            "kind": "store"
+          },
+          {
+            "id": "pay",
+            "label": {
+              "vi": "Payment boundary",
+              "en": "Payment boundary"
+            },
+            "detail": {
+              "vi": "Distinct authorize/capture/refund/payout identities và reconciliation.",
+              "en": "Distinct money-operation identities and reconciliation."
+            },
+            "x": 760,
+            "y": 380,
+            "kind": "service"
+          },
+          {
+            "id": "cdc",
+            "label": {
+              "vi": "Committed changes",
+              "en": "Committed changes"
+            },
+            "detail": {
+              "vi": "Capture checkpoints, snapshots/deletes và version-monotonic application.",
+              "en": "Capture checkpoints, snapshots/deletions and monotonic application."
+            },
+            "x": 1060,
+            "y": 380,
+            "kind": "queue"
+          },
+          {
+            "id": "listing",
+            "label": {
+              "vi": "Listing / quote",
+              "en": "Listing / quote"
+            },
+            "detail": {
+              "vi": "Current eligibility/rules và scoped complete quote versions.",
+              "en": "Current eligibility/rules and scoped complete quote versions."
+            },
+            "x": 130,
+            "y": 680,
+            "kind": "service"
+          },
+          {
+            "id": "risk",
+            "label": {
+              "vi": "Risk decision",
+              "en": "Risk decision"
+            },
+            "detail": {
+              "vi": "Versioned features/model, challenge/deny/allow policy và bounded fallback.",
+              "en": "Versioned features/models, action policy and bounded fallback."
+            },
+            "x": 440,
+            "y": 680,
+            "kind": "model"
+          },
+          {
+            "id": "ranker",
+            "label": {
+              "vi": "Search ranker",
+              "en": "Search ranker"
+            },
+            "detail": {
+              "vi": "Bounded candidate scores, model/index version và current eligibility.",
+              "en": "Bounded scores, compatible versions and current eligibility."
+            },
+            "x": 760,
+            "y": 680,
+            "kind": "model"
+          },
+          {
+            "id": "host",
+            "label": {
+              "vi": "Host",
+              "en": "Host"
+            },
+            "detail": {
+              "vi": "Listing/rule/price changes có current ownership và versions.",
+              "en": "Owned versioned listing, rule and price changes."
+            },
+            "x": 1060,
+            "y": 680,
+            "kind": "client"
+          }
+        ],
+        "traces": [
+          {
+            "id": "search",
+            "label": {
+              "vi": "Tìm listing cho dates",
+              "en": "Find listings for dates"
+            },
+            "steps": [
+              {
+                "from": "guest",
+                "to": "api",
+                "description": {
+                  "vi": "Validate dates theo listing/local calendar policy, party và geo scope.",
+                  "en": "Validate local-date policy, party and geography."
+                }
+              },
+              {
+                "from": "api",
+                "to": "search",
+                "description": {
+                  "vi": "Retrieve bounded candidates từ geo/semantic sources.",
+                  "en": "Retrieve bounded geographical/semantic candidates."
+                }
+              },
+              {
+                "from": "search",
+                "to": "index",
+                "description": {
+                  "vi": "Check coverage, blocked nights và current projected rule versions.",
+                  "en": "Check coverage, blocked nights and projected rules."
+                }
+              },
+              {
+                "from": "search",
+                "to": "ranker",
+                "description": {
+                  "vi": "Rank eligible candidates dưới model/index contract.",
+                  "en": "Rank eligible candidates under compatible model/index contracts."
+                }
+              },
+              {
+                "from": "search",
+                "to": "listing",
+                "description": {
+                  "vi": "Hydrate price/rules hoặc mark estimate; không cấp booking guarantee.",
+                  "en": "Hydrate current rules/prices or mark estimates without guaranteeing booking."
+                }
+              }
+            ]
+          },
+          {
+            "id": "hold",
+            "label": {
+              "vi": "Quote và hold authoritative",
+              "en": "Quote and hold at authority"
+            },
+            "steps": [
+              {
+                "from": "guest",
+                "to": "api",
+                "description": {
+                  "vi": "Stable booking identity bind dates/party/quote consent.",
+                  "en": "Bind stable booking identities to dates, parties and consent."
+                }
+              },
+              {
+                "from": "api",
+                "to": "listing",
+                "description": {
+                  "vi": "Validate quote scope, expiry, accepted total và rules.",
+                  "en": "Validate quote scope, expiry, totals and rules."
+                }
+              },
+              {
+                "from": "api",
+                "to": "risk",
+                "description": {
+                  "vi": "Score/decision theo bounded risk policy, không bypass constraints.",
+                  "en": "Apply bounded risk policy without bypassing invariants."
+                }
+              },
+              {
+                "from": "api",
+                "to": "booking",
+                "description": {
+                  "vi": "Start durable booking workflow với retained result.",
+                  "en": "Start durable booking workflows with retained results."
+                }
+              },
+              {
+                "from": "booking",
+                "to": "authority",
+                "description": {
+                  "vi": "Atomic HELD range + owner/expiry/generation + next intent dưới no-overlap.",
+                  "en": "Atomically hold ranges, ownership, expiry, versions and intent under no-overlap."
+                }
+              }
+            ]
+          },
+          {
+            "id": "payment",
+            "label": {
+              "vi": "Payment evidence và confirm",
+              "en": "Payment evidence and confirmation"
+            },
+            "steps": [
+              {
+                "from": "booking",
+                "to": "pay",
+                "description": {
+                  "vi": "Authorize/charge theo selected method policy bằng stable operation ID.",
+                  "en": "Authorize/charge under method policy and stable operation identity."
+                }
+              },
+              {
+                "from": "pay",
+                "to": "booking",
+                "description": {
+                  "vi": "Accepted/declined/unknown evidence; timeout giữ pending.",
+                  "en": "Return acceptance, decline or uncertainty; timeouts remain pending."
+                }
+              },
+              {
+                "from": "booking",
+                "to": "authority",
+                "description": {
+                  "vi": "Confirm chỉ current valid held ownership và acceptable payment evidence.",
+                  "en": "Confirm only valid current ownership and acceptable payment evidence."
+                }
+              },
+              {
+                "from": "pay",
+                "to": "host",
+                "description": {
+                  "vi": "Payout riêng theo policy/evidence; guest charge không đồng nghĩa host settled.",
+                  "en": "Payout follows separate policy/evidence; guest charging does not establish host settlement."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "cdc",
+            "label": {
+              "vi": "Committed state tới index",
+              "en": "Committed state reaches indexes"
+            },
+            "steps": [
+              {
+                "from": "authority",
+                "to": "cdc",
+                "description": {
+                  "vi": "Capture committed mutations với per-entity version, retention/checkpoints.",
+                  "en": "Capture committed versions with retained checkpoints."
+                },
+                "async": true
+              },
+              {
+                "from": "cdc",
+                "to": "index",
+                "description": {
+                  "vi": "Apply monotonic snapshots/tombstones; missing changes cần repair/catch-up.",
+                  "en": "Apply monotonic snapshots/tombstones and repair missing changes."
+                },
+                "async": true
+              },
+              {
+                "from": "index",
+                "to": "search",
+                "description": {
+                  "vi": "Expose projection version/horizon/lag; unknown không tự thành available.",
+                  "en": "Expose versions, horizons and lag without equating unknown with availability."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Cancel/expiry và late effects",
+              "en": "Cancellation/expiry and late effects"
+            },
+            "steps": [
+              {
+                "from": "guest",
+                "to": "api",
+                "description": {
+                  "vi": "Cancel bằng expected booking version và stable request.",
+                  "en": "Cancel with expected versions and stable identity."
+                }
+              },
+              {
+                "from": "api",
+                "to": "booking",
+                "description": {
+                  "vi": "Evaluate booking/payment/payout evidence trước chọn actions.",
+                  "en": "Evaluate booking, payment and payout evidence before acting."
+                }
+              },
+              {
+                "from": "booking",
+                "to": "authority",
+                "description": {
+                  "vi": "Conditional terminal transition release đúng range một lần.",
+                  "en": "Condition terminal releases on current ownership, once."
+                }
+              },
+              {
+                "from": "booking",
+                "to": "pay",
+                "description": {
+                  "vi": "Void/refund/recover theo outcome, không assume network timeout là failure.",
+                  "en": "Void, refund or recover by evidence rather than assuming timeout failure."
+                }
+              },
+              {
+                "from": "authority",
+                "to": "cdc",
+                "description": {
+                  "vi": "Emit terminal change để projections không resurrect old block/free state.",
+                  "en": "Emit terminal mutations without resurrecting stale state."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "6. Quote và booking APIs bind đúng scope",
+        "en": "6. Quote and booking APIs bind scope"
+      },
+      "paragraphs": [
+        {
+          "vi": "Examples thuộc thiết kế này, không Airbnb APIs. Validate guest/host ownership, listing, property timezone/local dates, party/occupancy, currency/fees/taxes, rule version và quote expiry. Same idempotency key với different dates/payload là conflict; stable retries replay retained result thay create new hold/payment.",
+          "en": "These illustrative APIs bind ownership, listings, local dates/timezones, party, currency, fees, rules and expiry. Changed payloads under the same identity conflict; stable retries replay results rather than create more holds/payments."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/v1/stays/search?area=...&checkIn=...&checkOut=...&guests=2",
+          "description": {
+            "vi": "Trả candidates cùng coverage/freshness metadata.",
+            "en": "Return candidates with coverage/freshness metadata."
+          },
+          "response": "200 {candidates, cursor, indexGeneration, calendarCoverage, freshnessStatus}",
+          "notes": [
+            {
+              "vi": "Missing shard/date horizon không được silently coi available.",
+              "en": "Missing shards or coverage cannot silently imply availability."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/stay-quotes",
+          "description": {
+            "vi": "Create complete scoped quote theo selected price-lock policy.",
+            "en": "Create complete quotes under chosen price-lock policy."
+          },
+          "request": "{listingId, localCheckIn, localCheckOut, guests, currency}",
+          "response": "201 {quoteId, quoteVersion, totalMinor, breakdown, expiresAt, policyVersions}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/stay-holds",
+          "description": {
+            "vi": "Atomically reserve night range tại authority.",
+            "en": "Reserve ranges atomically at authority."
+          },
+          "request": "Idempotency-Key: stay-hold-42\n{quoteId, expectedQuoteVersion, guestConsent}",
+          "response": "{holdId, generation, state:\"HELD\", serverExpiresAt}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/stay-bookings",
+          "description": {
+            "vi": "Start/recover confirmation bằng same hold/operation identity.",
+            "en": "Start/recover confirmation under stable identities."
+          },
+          "request": "Idempotency-Key: stay-book-42\n{holdId, holdGeneration, paymentMethodRef}",
+          "response": "202 {bookingId, state:\"PENDING_PAYMENT|CONFIRMED|REQUIRES_ACTION\", statusUrl}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/stay-bookings/{bookingId}/cancellations",
+          "description": {
+            "vi": "Retain terminal booking transition và money recovery progress.",
+            "en": "Retain terminal state and money recovery progress."
+          },
+          "request": "Idempotency-Key: stay-cancel-42\n{expectedBookingVersion, reason}",
+          "response": "202 {cancellationId, state:\"CANCEL_PENDING\", moneyStatus}"
+        }
+      ]
+    },
+    {
+      "id": "availability",
+      "title": {
+        "vi": "7. Bitmap filter, business rules và horizon",
+        "en": "7. Bitmap filters, business rules and horizons"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một AND chỉ trả lời requested nights có giao blocked nights trong known window không. Rolling horizon phải giữ date origin/version và atomic publish: không shift mask rồi giữ old date labels. Request vượt known horizon cần UNKNOWN/authoritative fallback, không truncate nights hoặc empty mask rồi kết luận free. Min stay, check-in/out rules, occupancy, turnover và price coverage cần additional filters.",
+          "en": "Bitmap overlap answers only covered blocked-night intersection. Rolling horizons need versioned origins and coherent publication. Requests outside coverage require unknown/fallback rather than truncated or empty masks. Apply stay, check-in/out, occupancy, gap and pricing rules separately."
+        },
+        {
+          "vi": "Lab có4listings/14nights và current rules; default range[4,7) có3rows không bit conflict nhưng chỉC đủ rules. Tắt rules hoặc clamp beyond horizon cho thấy false candidates. Booking authority vẫn rechecks dù index candidate đúng: host changes, concurrent hold và quote expiry có thể xảy ra sau search.",
+          "en": "The four-listing fixture has three bitmap-clear results for[4,7), but onlyC meets rules. Disabling filters or clamping unknown dates creates false candidates. Authority still rechecks because rules, holds and quotes can change after search."
+        }
+      ],
+      "experiment": "stay-calendar"
+    },
+    {
+      "id": "constraints",
+      "title": {
+        "vi": "8. No-overlap cần schema và authority scope đúng",
+        "en": "8. No-overlap requires schemas and authority scope"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với single-inventory stay, exclusion constraint hoặc unique per-night claims bảo vệ competing inserts dưới selected database authority. NOT NULL và check_in<check_out tránh unknown/empty interval bypass. Cancelled/expired rows phải bỏ blocking predicate; confirmed và active held ranges vẫn block. Timestamps/expiry không tự thay state khi thời gian trôi.",
+          "en": "Single-inventory exclusion or per-night uniqueness can guard competing writes at a chosen database authority. Reject null/invalid intervals and exclude cancelled/expired states from blocking. Time passing does not itself change row state."
+        },
+        {
+          "vi": "Không dùng now() trong partial index predicate: index functions/predicates cần immutable. Expiry worker/intake cleanup transaction đổi HELD→EXPIRED dưới current state/version và emits durable mutation. Confirm lock/check owner/generation/serverexpiry tại serialization point; expiry/confirm chỉ một transition thắng. Stale worker/replay không resurrect confirmed/released claim.",
+          "en": "Time-dependent predicates do not make expiring indexes. Change held state transactionally with guarded versions and intent. Confirmation checks ownership and expiry at serialization, and competing expiry/confirmation has one winner. Stale work cannot resurrect claims."
+        },
+        {
+          "vi": "Constraint không tự giải split-brain primary, accepted-data loss trong failover hoặc independent external channel inventory. Define write ownership/fencing/RPO và restore verification. Multi-room/hotel capacity thay no-overlap bằng capacity/room allocation đúng; không áp whole-home constraint vào mọi product.",
+          "en": "Constraints do not solve split-brain, failover loss or independent inventory channels. Define fencing, durability and restore verification. Multi-room capacity needs a different allocation invariant."
+        }
+      ],
+      "code": {
+        "language": "sql",
+        "content": "CREATE EXTENSION IF NOT EXISTS btree_gist;\nCREATE TABLE stay_claims (\n  booking_id uuid PRIMARY KEY,\n  listing_id bigint NOT NULL,\n  check_in date NOT NULL,\n  check_out date NOT NULL,\n  state text NOT NULL CHECK\n    (state IN ('HELD','CONFIRMED','EXPIRED','CANCELLED')),\n  expires_at timestamptz,\n  version bigint NOT NULL,\n  CHECK (check_in < check_out),\n  CHECK (state <> 'HELD' OR expires_at IS NOT NULL),\n  EXCLUDE USING gist (\n    listing_id WITH =,\n    (daterange(check_in, check_out, '[)')) WITH &&\n  ) WHERE (state IN ('HELD','CONFIRMED'))\n);\n-- Expiry changes HELD -> EXPIRED in an explicit transaction.\n-- Confirmation locks/checks current owner, state, version and server expiry.\n-- Retain idempotent command results and event intent atomically.\n-- Do not put expires_at > now() into an index predicate.",
+        "caption": {
+          "vi": "Schema minh họa cho single-inventory authority, không full migration/booking implementation. Cần retained command results, transaction protocol, permissions và failover contract riêng; EXPIRED state phải được cập nhật explicit.",
+          "en": "Illustrative single-inventory schema, not a full migration/booking engine. Results, transactions, permissions and failover need separate protocols; expiry requires explicit state updates."
+        }
+      }
+    },
+    {
+      "id": "quote",
+      "title": {
+        "vi": "9. Pricing tips, scoped quote và consent",
+        "en": "9. Pricing tips, scoped quotes and consent"
+      },
+      "paragraphs": [
+        {
+          "vi": "Host pricing model có thể suggest theo demand/seasonality nhưng host opt-in/min/max và published price policy giữ authority. Quote snapshot bind toàn itinerary, party, fees/taxes/currency, cancellation rules, listing/rate versions và expiry; selected price lock có thể honor old total tới expiry, estimate-only phải revalidate. Material change cần guest consent trước charge, không trust cached search price.",
+          "en": "Pricing models suggest under host controls and published policy. Quotes bind itinerary, party, total breakdown, rules, versions and expiry. Price locks may retain totals until expiry while estimates revalidate. Material changes require consent rather than cached-price trust."
+        },
+        {
+          "vi": "Lab v1 total$352 và host v2 total$418: lúc t=9 còn valid theo lock contract; t=10 strict expiry phải requote. Guest consent làm approved quote amount khác0 nhưng vẫn chưa reserve/charge. Binding giá khác giữ nights, and risk/availability decisions vẫn có authority riêng. Tax10% chỉ fixed arithmetic example, không real jurisdiction advice.",
+          "en": "The lab locks$352 before strict expiry and requotes$418 at the boundary. Consent approves a price, not a reservation or charge. Price commitments differ from night allocation, and the fixed tax rate is only arithmetic."
+        }
+      ],
+      "experiment": "stay-quote"
+    },
+    {
+      "id": "cdc",
+      "title": {
+        "vi": "10. Capture completeness, versions và snapshot barriers",
+        "en": "10. Capture completeness, versions and snapshot barriers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Committed CDC/outbox cần bao phủ mọi authoritative mutation, include deletes/cancellations/host blocks/rules, retention/checkpoints và per-entity version semantics. Out-of-order backfill không overwrite newer live changes; duplicate apply phải safe. Global ordered log offset khác listing version, và new source offset không copy trực tiếp từ old transport khi migration.",
+          "en": "Capture must cover all relevant mutations with retention, checkpoints and versions. Backfills cannot overwrite live changes, and replay must be safe. Global offsets differ from listing versions and cannot be transplanted across transports."
+        },
+        {
+          "vi": "Version guard chỉ tránh regression của những mutations đã nhận. Nếu lost cảlatest change và replay, highest seen version vẫn có thể stale. Lab giữ verified known floor4 để yêu cầu catch-up/fallback; production floor/coverage evidence có cost và semantics, không free oracle biết mọi future writes. Observe false candidates lẫn false negatives, lag/coverage theo shard/property/date cohort.",
+          "en": "Version guards do not recover lost changes. The fixture uses a verified floor to detect insufficient state; production evidence has cost and never predicts future writes. Measure stale positives, negatives and cohort lag/coverage."
+        },
+        {
+          "vi": "Snapshot index generation cần consistent snapshot+change barrier, versioned tombstones và compatibility với live overlay. Rollback old base không rollback current booking/deletion state. Capture gap/retention exhausted cần verified resnapshot/catch-up, không silently reset consumer checkpoint và declare fresh.",
+          "en": "Snapshots need consistent barriers, tombstones and compatible overlays. Old-base rollbacks preserve current booking/deletion state. Capture gaps need verified recovery rather than silently resetting checkpoints."
+        }
+      ],
+      "experiment": "stay-cdc"
+    },
+    {
+      "id": "money",
+      "title": {
+        "vi": "11. Payment, cancellation và host payout khác state",
+        "en": "11. Payments, cancellations and payouts have distinct state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Stable booking/payment operation identity cần provider-side idempotence hoặc reliable query/recovery contract. Local pre-call lock/result store không đóng crash window sau provider success trước local result; same key chỉ giúp khi selected scope/retention/semantics đúng. Unknown kết quả giữ pending và reconciliation; definitive decline khác timeout.",
+          "en": "Stable identities require provider cooperation or reliable recovery. Local result locks do not close external crash windows; keys help only under their scope/retention contract. Unknown outcomes remain pending rather than being treated as declines."
+        },
+        {
+          "vi": "Hold expired/released sau payment success không tự lấy lại nights đã cấp cho guest khác. Conditional confirm hoặc void/refund/exception policy phải rõ. Cancellation/rule window/payout scheduling là selected business contract; refund guest và reverse host payout có thể ở timelines khác. Ledger/report balance không chứng minh external completeness; reconcile booking, provider, settlement và payout references/currency.",
+          "en": "Successful payment cannot reclaim released nights. Define conditional confirmation or repair. Cancellation, refunds and payout recovery have distinct timelines and policies; balanced ledgers do not alone prove external completeness. Reconcile identities, amounts and currencies."
+        }
+      ]
+    },
+    {
+      "id": "risk-experiments-data",
+      "title": {
+        "vi": "12. Risk, experiments và data platforms cần evidence",
+        "en": "12. Risk, experiments and pipelines need evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Risk serving dùng versioned features/model và action policy có timeout/fallback phù hợp harm. Delayed fraud labels, model drift, false positives và fairness cần guardrails; universal fail-open hoặc always deny đều không là architecture proof. Experiment outcomes phải phân biệt assignment/exposure và effects trên shared supply/host income; avoid unplanned peeking/selection bias.",
+          "en": "Risk decisions need versioned evidence and harm-aware fallbacks with delayed-label, drift and fairness controls. Neither universal fail-open nor denial proves correctness. Experiments distinguish assignment/exposure and shared-supply effects while controlling selection and peeking."
+        },
+        {
+          "vi": "Airflow-style orchestration quản dependencies/data intervals/retries; tasks vẫn cần output identity, deterministic snapshots và safe publish. Backfill experiments/features không tạo new charges/payouts/notifications. Retention/deletion propagate tới governed datasets/model features theo policy; de-identified data không tự anonymous. Lineage phải nối source state, feature/rule/model/index và report version.",
+          "en": "Orchestration manages intervals and retries while tasks retain identities, snapshots and safe publication. Backfills must not create financial effects. Govern retention/deletion and lineage across source, features, models, indexes and reports without assuming de-identification guarantees anonymity."
+        }
+      ]
+    },
+    {
+      "id": "search-migration",
+      "title": {
+        "vi": "13. Retrieval, ranking và incremental service migration",
+        "en": "13. Retrieval, ranking and service migration"
+      },
+      "paragraphs": [
+        {
+          "vi": "Geo/date/rule eligibility tạo candidate universe; ANN/other retrieval giảm compute trước expensive ranking. Filtered ANN có selectivity/recall trade-off; widen/fallback có bound để không full-fanout khi một shard/model outage. Track recall, booked-stay outcomes, diversity, host exposure và cancel/regret metrics; score win không override hard eligibility hoặc availability authority.",
+          "en": "Eligibility bounds retrieval before ranking. Filtered ANN trades selectivity and recall; bound widening/fallback under outages. Evaluate outcomes, diversity and host exposure without letting scores override hard eligibility or authority."
+        },
+        {
+          "vi": "Monolith extraction giữ one write owner: owned API, shadow reads và cohort compare. Shadow effects phải sandbox/dry-run có proof, không double-book/charge trong comparison. Data migration dùng versioned capture/backfill/delete barrier, writer fence và explicit rollback after-target-writes; schema/service count không chứng minh data ownership đã chuyển an toàn.",
+          "en": "Extract services under one writer using safe shadow reads/cohorts. Shadow effects must not create real duplicates. Migrate data through versioned capture/barriers, fencing and explicit rollback; service counts do not prove safe ownership transfer."
+        }
+      ]
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "14. Failure matrix: coverage, commitments và money",
+        "en": "14. Failure matrix: coverage, commitments and money"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo search tail, stale availability rejection, unknown coverage, hold age/expiry race, confirm conflict, quote requote/consent, unknown payment và compensation/payout age. Cohorts gồm listing geo/date/rules/source sync; averages không che hot property. Keep safe IDs/versions để support/debug, không log sensitive addresses/payment credentials.",
+          "en": "Measure search tails, stale rejections, coverage, hold races, conflicts, quote consent and payment/repair age by property/date cohorts. Keep safe identities/versions without logging sensitive credentials or addresses."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Expected behavior",
+            "en": "Expected behavior"
+          },
+          {
+            "vi": "Drill",
+            "en": "Drill"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Request beyond calendar horizon",
+              "en": "Request beyond calendar horizon"
+            },
+            {
+              "vi": "UNKNOWN/fallback, không truncate thành free.",
+              "en": "Return unknown/fallback rather than truncate into availability."
+            },
+            {
+              "vi": "Entirely/partly outside rolling horizon, stale origin.",
+              "en": "Test outside windows and stale origins."
+            }
+          ],
+          [
+            {
+              "vi": "Overlap/adjacent nights",
+              "en": "Overlap/adjacent nights"
+            },
+            {
+              "vi": "Only overlap blocking intervals conflict theo local dates.",
+              "en": "Conflicts follow local-date blocking intervals."
+            },
+            {
+              "vi": "DST, checkout boundary, invalid/empty/NULL inputs.",
+              "en": "Test DST, boundaries and invalid inputs."
+            }
+          ],
+          [
+            {
+              "vi": "Expire vs confirm",
+              "en": "Expire versus confirm"
+            },
+            {
+              "vi": "One terminal transition, current owner/version/expiry.",
+              "en": "One valid terminal transition under ownership/expiry."
+            },
+            {
+              "vi": "Delayed PSP response sau release/resale.",
+              "en": "Delay payment beyond release/reallocation."
+            }
+          ],
+          [
+            {
+              "vi": "Old cancel/backfill after live booking",
+              "en": "Old cancel/backfill after live booking"
+            },
+            {
+              "vi": "Monotonic version không restore wrong free state.",
+              "en": "Versions reject stale availability restoration."
+            },
+            {
+              "vi": "Duplicate/reordered mutations và old snapshots.",
+              "en": "Replay duplicates, old mutations and snapshots."
+            }
+          ],
+          [
+            {
+              "vi": "CDC gap with version guard",
+              "en": "CDC gap with version guard"
+            },
+            {
+              "vi": "Coverage/barrier evidence detects insufficient state.",
+              "en": "Evidence exposes insufficient state."
+            },
+            {
+              "vi": "Drop latest plus all redelivery; exhaust retention.",
+              "en": "Lose latest/redelivery and exhaust retention."
+            }
+          ],
+          [
+            {
+              "vi": "Quote price changes",
+              "en": "Quote price changes"
+            },
+            {
+              "vi": "Selected lock validity và guest consent before amount change.",
+              "en": "Honor validity/consent before changing totals."
+            },
+            {
+              "vi": "now==expiry, new dates/guests/fees/currency.",
+              "en": "Test expiry equality and scope changes."
+            }
+          ],
+          [
+            {
+              "vi": "PSP success/local crash",
+              "en": "Provider success/local crash"
+            },
+            {
+              "vi": "Stable effect identity/query recovery và no assumed decline.",
+              "en": "Recover the same effect without assumed decline."
+            },
+            {
+              "vi": "Crash pre/post call/result, capture/refund/payout retries.",
+              "en": "Crash/retry around all effect/result boundaries."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Worked questions: bán time mà giữ đúng commitments",
+        "en": "15. Worked questions: allocate time and preserve commitments"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bắt đầu một search→quote→hold→payment→confirm và một failure trace. Phân biệt current authority, slightly stale projection và policy quyết acceptable loss/delay. Dùng answers để kiểm assumptions; không bắt mọi marketplace dùng cùng engine/tool.",
+          "en": "Trace search through confirmation and a failure, separating authority, projections and policy. These answers test assumptions rather than mandate one engine."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Một bitmap365bits có giải xong availability search?",
+            "en": "Does a365-bit bitmap solve availability search?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Bitmap chỉ biểu diễn các đêm bận trong một horizon đã biết. Vẫn cần date origin, version, các rule lưu trú, số khách, giá, metadata và độ tươi. Với nhiều machine words, phép kiểm tra không còn là một AND duy nhất. Booking vẫn phải kiểm lại tại authority.",
+              "en": "No. It covers blocked nights in a known horizon, alongside origins, rules, party, pricing, metadata and freshness. Wider operations cost more words and booking still revalidates authority."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dùng WHERE expires_at>now() cho active exclusion được không?",
+            "en": "Can active exclusion use WHERE expires_at>now()?"
+          },
+          "answer": [
+            {
+              "vi": "Không dùng thời gian hiện tại làm cơ chế tự hết hạn của partial index vì predicate phải immutable. Giữ blocking states HELD/CONFIRMED và chuyển expiry bằng transaction có kiểm state/version. Khi confirm, kiểm server expiry để việc sweeper chạy chậm không cấp quyền giữ phòng đã hết hạn.",
+              "en": "No. Time-dependent predicates do not implement indexed expiry. Use explicit blocking states and transactional expiry; confirmation validates current expiry/versions despite sweeper lag."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Constraint là bảo đảm mọi website không double book?",
+            "en": "Does a database constraint prevent double booking across every site?"
+          },
+          "answer": [
+            {
+              "vi": "Constraint chỉ bảo vệ trong phạm vi authority và durability đã chọn, với dữ liệu hợp lệ. Split-brain, failover làm mất dữ liệu hoặc lịch từ nền tảng độc lập cần protocol và recovery riêng. Nhiều phòng cùng loại cũng cần capacity model khác whole-home no-overlap.",
+              "en": "Only within its authority/durability scope with valid inputs. Split-brain, loss and independent calendars need explicit coordination/recovery; multi-room capacity differs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Version guard có sửa được lost CDC event?",
+            "en": "Can a version guard repair missing CDC events?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Guard chỉ từ chối mutation cũ đã quan sát; nó không tạo ra event mới bị mất. Cần capture completeness, retention, barriers, catch-up/resnapshot và evidence về coverage. Floor 4 trong lab được cung cấp từ verified barrier, không phải khả năng biết latest version miễn phí.",
+              "en": "No. Guards reject observed regressions without inventing missing state. Retain capture/barriers and recovery evidence; the fixture floor is a supplied verified barrier, not a free latest oracle."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "PSP thành công nhưng booking confirm fail thì cứ retry charge?",
+            "en": "Should payment be charged again after confirmation fails?"
+          },
+          "answer": [
+            {
+              "vi": "Không tạo thêm charge với economic identity mới. Phục hồi kết quả provider, rồi conditional confirm chỉ khi hold còn hợp lệ. Nếu ownership đã mất, dùng void/refund hoặc exception path; không lấy lại nights đã cấp cho người khác. Unknown và late outcomes cần reconciliation theo payment method.",
+              "en": "Do not create a new economic identity. Recover results and conditionally confirm current ownership; if lost, apply repair without stealing reallocated nights. Reconcile uncertainty under method contracts."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Price tip của model có thể đổi total guest đã accept?",
+            "en": "Can pricing suggestions change a guest’s accepted total?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động. Host policy và scoped quote quy định giá được giữ đến khi nào. Khi tổng thay đổi đáng kể, cần requote và guest consent trước charge. Quote chỉ cam kết phần giá theo policy, không giữ nights. Thuế cố định trong lab chỉ để minh họa phép tính.",
+              "en": "Not automatically. Host policy and scoped quote validity govern commitments; reapprove material changes before charging. Price commitments do not reserve nights."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "A/B perguest có luôn đo đúng ranking win không?",
+            "en": "Do guest-randomized tests always measure ranking wins correctly?"
+          },
+          "answer": [
+            {
+              "vi": "Không luôn đúng. Hai nhóm cùng tranh một nguồn phòng có thể gây interference; assignment khác exposure, còn peeking và selection cũng tạo bias. Cần xác định estimand, randomization unit, cách phân tích và guardrails cho cả guest/host. Conversion riêng chưa phản ánh thu nhập, fairness hoặc cancellation harm.",
+              "en": "No. Shared supply, exposure, peeking and selection can bias results. Define estimands, units and guardrails beyond conversion."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đổi monolith sangservices bằng dualwrite là đủ?",
+            "en": "Are dual writes enough to extract services?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Dual writes thiếu coherent capture, version barrier và writer fencing có thể lệch dữ liệu. Shadow effects còn có thể đặt hoặc charge thật hai lần. Cần owned contracts, verified backfill/CDC, semantic comparison, traffic cohorts và rollback protocol sau khi target đã nhận writes.",
+              "en": "Not without coherent capture, barriers and fenced ownership. Unsafe shadow effects duplicate bookings/charges. Migrate contracts, data and traffic with verified recovery."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
