@@ -1,0 +1,3872 @@
+{
+  "id": "ep-netflix",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Netflix: tiến hóa từ Play đến streaming toàn cầu",
+    "en": "Building Netflix: evolve from Play to global streaming"
+  },
+  "summary": {
+    "vi": "Đi qua 14 giai đoạn kiến trúc với sơ đồ có thể chạy, rate–quality candidates, CDN prefill và live join pressure; giải thích rõ authority, QoE và đánh đổi ở từng bước.",
+    "en": "Explore fourteen architectural stages with runnable diagrams, rate–quality candidates, CDN prefill and live join pressure, explaining authority, QoE and trade-offs at each step."
+  },
+  "prerequisites": [
+    "video-platform",
+    "caching",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "cache",
+    "observability",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Control plane cấp quyền/session; media plane phân phối bytes; feedback plane học và đo chất lượng.",
+      "en": "Control authorizes sessions, media delivers bytes and feedback measures quality and learns."
+    },
+    {
+      "vi": "Mỗi bước tiến hóa cần áp lực đo được, trade-off, owner và exit criteria; không thêm service chỉ để giống công ty lớn.",
+      "en": "Every evolution needs measured pressure, trade-offs, owners and exit criteria rather than imitation."
+    },
+    {
+      "vi": "Per-title dựa measured quality curves; prefill dựa demand và fill budget; hai thứ không miễn phí.",
+      "en": "Per-title relies on measured quality curves and prefill on demand/fill budgets; both have costs."
+    },
+    {
+      "vi": "Active-active không tự bảo đảm consistency hoặc survivor capacity; rights không fail open theo recommendation fallback.",
+      "en": "Active-active does not establish consistency or survivor capacity; recommendation fallback does not justify bypassing rights."
+    },
+    {
+      "vi": "Live vẫn share media qua CDN nhưng phải tính riêng join surge, cold-origin requests và latency/buffer trade-off.",
+      "en": "Live shares media through CDNs while requiring separate join, origin and latency/buffer budgets."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ một nút Play đến hệ thống học được từ failure",
+      "en": "From one Play button to a system that learns from failure"
+    },
+    "caption": {
+      "vi": "Đọc lý do thêm component, chạy luồng và thử assumptions trước khi chọn công nghệ.",
+      "en": "Understand why components are added, trace requests and test assumptions before choosing technology."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Play đúng",
+          "en": "Play correctly"
+        },
+        "detail": {
+          "vi": "Rights, session, manifest và license có authority rõ.",
+          "en": "Rights, sessions, manifests and licenses have explicit authority."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Phân phối hiệu quả",
+          "en": "Deliver efficiently"
+        },
+        "detail": {
+          "vi": "Encode evidence → placement/prefill → player QoE.",
+          "en": "Encoding evidence → placement/prefill → player QoE."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Chịu lỗi có bằng chứng",
+          "en": "Prove resilience"
+        },
+        "detail": {
+          "vi": "Bounded dependencies, region budgets và recovery drills.",
+          "en": "Bounded dependencies, regional budgets and recovery drills."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Mở rộng sản phẩm",
+          "en": "Extend the product"
+        },
+        "detail": {
+          "vi": "Governed learning, ads và live với contracts riêng.",
+          "en": "Governed learning, ads and live with distinct contracts."
+        },
+        "icon": "flag"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Xây một dịch vụ streaming qua các áp lực thật",
+        "en": "1. Build a streaming service through real pressures"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài này dùng Netflix làm ngữ cảnh sản phẩm để học tiến hóa kiến trúc: phát video theo yêu cầu (VOD), khám phá nội dung, nhiều thiết bị, nhiều vùng, quảng cáo và live. Các component, contracts, capacity và lab là thiết kế minh họa của AV Lore; không phải sơ đồ hệ thống nội bộ hiện tại. Đọc Video Platform trước để hiểu transcode DAG, segmented media, ABR và bandwidth; ở đây ta giải thích khi nào thêm mỗi lớp và phải trả giá gì.",
+          "en": "This build uses Netflix as a product context for architectural evolution: VOD, discovery, multiple devices and regions, advertising and live. Components, contracts, capacity and labs are AV Lore teaching designs rather than the company’s current internal system. First read Video Platform for transcoding DAGs, segmented media, ABR and bandwidth; this chapter explains why and when layers are added and what they cost."
+        },
+        {
+          "vi": "Các mốc công khai giúp định hướng: dịch vụ streaming ra mắt năm 2007; database corruption năm 2008 là một động lực cho cloud migration, được công bố hoàn tất năm 2016. Không suy từ sự cố DVD shipping sang khẳng định mọi video streaming ngừng ba ngày. Những giai đoạn dưới đây sắp theo câu hỏi thiết kế; các mảng trong thực tế có thể phát triển song song và không phải một checklist bắt buộc cho mọi startup.",
+          "en": "Public milestones provide orientation: streaming launched in 2007, a 2008 database corruption incident helped motivate a cloud migration publicly described as complete in 2016. A DVD-shipping disruption does not establish that all streaming stopped for three days. Stages below follow design questions; real initiatives overlap and are not a mandatory checklist for every startup."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Trải nghiệm thành công",
+            "en": "Successful experience"
+          },
+          "icon": "users",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Tìm được title hợp quyền; Play bắt đầu nhanh; phát liên tục, audio/subtitle đúng và resume hợp lý.",
+              "en": "Discover eligible titles, start promptly, play continuously with correct audio/subtitles and resume sensibly."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Giới hạn cần chốt",
+            "en": "Explicit boundaries"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Tách VOD/live và ad/no-ad; định nghĩa supported devices, territory, rights, target QoE và deadline.",
+              "en": "Separate VOD/live and ad/no-ad; define devices, territories, rights, QoE targets and deadlines."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Không tự thêm độ phức tạp",
+            "en": "Earn complexity"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Cloud, microservices, custom CDN hay active-active chỉ hữu ích khi giải quyết constraint đã đo.",
+              "en": "Cloud, microservices, a custom CDN or active-active are useful when they address measured constraints."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "journey",
+      "title": {
+        "vi": "2. Đọc hệ thống theo vòng đời của một title",
+        "en": "2. Read the system through one title’s lifecycle"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một title có ingestion identity và source version; validate video/audio/subtitles, encode các candidates, chọn ladder, package/encrypt, kiểm quality rồi publish generation. Manifest chỉ được trỏ tới objects đã sẵn sàng. Release hoặc rollback phải giữ client còn dùng generation cũ có thể hoàn tất; xóa asset theo retention/rights policy thay vì xóa ngay khi manifest mới xuất hiện.",
+          "en": "A title has an ingestion identity and source version. Validate video, audio and subtitles, encode candidates, choose a ladder, package/encrypt, quality-check and publish a generation. Manifests reference only ready objects. Rollouts and rollbacks preserve readable old generations under retention/rights policies rather than deleting assets immediately."
+        },
+        {
+          "vi": "Playback có hai đường: metadata/authorization nhỏ nhưng critical cho startup, media bytes rất lớn nhưng có thể chia sẻ qua CDN. Feedback events là đường thứ ba: history, QoE, experiments và learning. Một pipeline analytics chậm không nên chặn mỗi segment; ngược lại dữ liệu đủ nhanh cho ranking không có nghĩa đủ fresh để grant quyền xem.",
+          "en": "Playback has two paths: small metadata/authorization calls critical to startup, and large shareable CDN media traffic. Feedback is a third path for history, QoE, experiments and learning. Slow analytics should not block every segment, and data fresh enough for ranking is not automatically fresh enough for authorization."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Bốn vòng lặp, bốn loại failure",
+          "en": "Four loops with different failures"
+        },
+        "caption": {
+          "vi": "Dùng session ID, title generation, device và policy version để nối evidence giữa các plane.",
+          "en": "Correlate evidence using sessions, title generations, devices and policy versions."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Chuẩn bị",
+              "en": "Prepare"
+            },
+            "detail": {
+              "vi": "Master → validation → encodes → quality → publish.",
+              "en": "Master → validation → encodes → quality → publish."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Cho phép",
+              "en": "Authorize"
+            },
+            "detail": {
+              "vi": "Identity → rights/device checks → session/manifest/license.",
+              "en": "Identity → rights/device checks → session/manifest/license."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Phân phối",
+              "en": "Deliver"
+            },
+            "detail": {
+              "vi": "Steering → CDN → buffer/ABR → decrypt/decode.",
+              "en": "Steering → CDN → buffer/ABR → decrypt/decode."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Học và phục hồi",
+              "en": "Learn and recover"
+            },
+            "detail": {
+              "vi": "QoE/history → governed data → experiments/drills.",
+              "en": "QoE/history → governed data → experiments/drills."
+            },
+            "icon": "chart"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 14 giai đoạn: thêm kiến trúc khi có lý do",
+        "en": "3. 14 stages: add architecture for a reason"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn từng giai đoạn, bấm các component để xem trách nhiệm và chạy trace để theo dõi request. Bốn ô bên dưới tách áp lực, quyết định, đánh đổi và tín hiệu cần bước tiếp. Đọc exit criteria trước khi thêm component mới: một giải pháp chưa kiểm recovery có thể chỉ chuyển failure sang chỗ khó nhìn hơn.",
+          "en": "Select stages, inspect component responsibilities and run traces. Four panels distinguish pressures, decisions, trade-offs and reasons to move on. Read exit criteria before adding components: untested recovery may merely move failures somewhere harder to observe."
+        }
+      ],
+      "stages": [
+        {
+          "id": "mvp",
+          "title": {
+            "vi": "Bắt đầu bằng playback hoạt động",
+            "en": "Start with working playback"
+          },
+          "description": {
+            "vi": "MVP có một ứng dụng cho sign-in, catalog và quyền xem; media được encode thành một tập nhỏ renditions rồi đưa qua commercial CDN. Tách control plane khỏi media bytes ngay từ đầu: ứng dụng cấp phép một session, CDN phục vụ hàng triệu segment requests. Không cần chia mọi domain thành microservice để có sự tách biệt này.",
+            "en": "The MVP has one application for sign-in, catalog and viewing rights. A small rendition set is encoded and served through a commercial CDN. Separate control from media bytes immediately: the application authorizes a session while the CDN handles segment requests. This separation does not require splitting every domain into microservices."
+          },
+          "problem": {
+            "vi": "Người dùng cần bấm Play và xem liên tục trên một vài thiết bị; nhóm nhỏ cần debug được toàn bộ request.",
+            "en": "Users need Play to start reliably on a small device set; a small team must be able to debug the whole request."
+          },
+          "decision": {
+            "vi": "Giữ modular monolith, relational metadata store và managed CDN; publish assets trước manifest. Dùng session ID để nối startup errors, license errors và rebuffering.",
+            "en": "Use a modular monolith, relational metadata and managed CDN. Publish assets before manifests and correlate startup, license and rebuffering failures with session IDs."
+          },
+          "tradeoff": {
+            "vi": "Ít deployment units nhưng release hoặc database failure có thể ảnh hưởng nhiều chức năng; thương lượng CDN và instrument client vẫn là công việc thật.",
+            "en": "Few deployment units simplify delivery, but releases and database failures have wider impact. CDN integration and client instrumentation still require work."
+          },
+          "nextPressure": {
+            "vi": "Startup tail latency hoặc database/release coupling cản trở mục tiêu; đo trước khi tách service.",
+            "en": "Move on when measured startup tails or database/release coupling obstruct goals."
+          },
+          "exitCriteria": {
+            "vi": "Một title chạy end-to-end, quyền xem đúng, media không đi qua app server, rollback metadata/manifest được thử.",
+            "en": "Demonstrate end-to-end playback, correct rights, media bypassing app servers and tested metadata/manifest rollback."
+          },
+          "diagram": {
+            "id": "netflix-stage-mvp",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "MVP vẫn cần DRM, quyền và monitoring; đơn giản là số component vận hành ít hơn.",
+              "en": "The MVP still needs rights, DRM and monitoring; simplicity means fewer operated components."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "device",
+                "label": {
+                  "vi": "Player",
+                  "en": "Player"
+                },
+                "detail": {
+                  "vi": "Giữ buffer, chọn rendition và báo QoE có session ID.",
+                  "en": "Owns buffers, rendition selection and session-correlated QoE."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "app",
+                "label": {
+                  "vi": "Modular app",
+                  "en": "Modular app"
+                },
+                "detail": {
+                  "vi": "Catalog, account và session authorization có module boundaries.",
+                  "en": "Catalog, accounts and authorization have module boundaries."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Metadata SQL",
+                  "en": "Metadata SQL"
+                },
+                "detail": {
+                  "vi": "Transactions, backup và replication theo cấu hình được kiểm thử.",
+                  "en": "Transactions, backups and replication depend on tested configuration."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Commercial CDN",
+                  "en": "Commercial CDN"
+                },
+                "detail": {
+                  "vi": "Cache encrypted immutable segments theo version.",
+                  "en": "Caches encrypted immutable segments by version."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Chỉ lộ complete asset generation; không cần auth app proxy từng byte.",
+                  "en": "Exposes complete generations without app-proxying every byte."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "device",
+                    "to": "app",
+                    "description": {
+                      "vi": "Play gửi account/title/device context.",
+                      "en": "Play sends account/title/device context."
+                    }
+                  },
+                  {
+                    "from": "app",
+                    "to": "db",
+                    "description": {
+                      "vi": "Đọc quyền và playable generation; tạo session theo contract.",
+                      "en": "Read rights and a playable generation; create a session under its contract."
+                    }
+                  },
+                  {
+                    "from": "app",
+                    "to": "device",
+                    "description": {
+                      "vi": "Trả manifest reference và scoped authorization.",
+                      "en": "Return manifest references and scoped authorization."
+                    }
+                  },
+                  {
+                    "from": "device",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Player fetch encrypted media trực tiếp.",
+                      "en": "The player fetches encrypted media directly."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Miss fetch đúng published generation.",
+                      "en": "A miss fetches the published generation."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "recovery",
+          "title": {
+            "vi": "Đặt recovery trước mở rộng",
+            "en": "Make recovery explicit"
+          },
+          "description": {
+            "vi": "Một database quan trọng không được đồng nghĩa một bản dữ liệu không thể phục hồi. Tách failure domains, chuẩn bị replica/failover, backup bất biến và restore drill. Replication giúp availability nhưng có thể nhân bản corruption hoặc thao tác xóa; backup có retention và restore kiểm chứng là lớp khác.",
+            "en": "A critical database must not mean one unrecoverable copy. Separate failure domains and prepare replication, failover, immutable backups and restore drills. Replication improves availability but can replicate corruption or deletion; retained, verified backups provide a different recovery layer."
+          },
+          "problem": {
+            "vi": "Một sự cố data hoặc datacenter làm cả control plane mất khả dụng; không biết RPO/RTO thực tế.",
+            "en": "A data or datacenter failure can disable control while real RPO/RTO remain unknown."
+          },
+          "decision": {
+            "vi": "Định nghĩa authority, backup point và write fencing khi promote. Migrate từng domain bằng backfill + CDC + verification, có cutover/rollback checkpoint.",
+            "en": "Define authority, backup points and promotion fencing. Migrate domains with backfill, CDC, verification and explicit cutover/rollback checkpoints."
+          },
+          "tradeoff": {
+            "vi": "Dual writes tạo cửa sổ lệch trạng thái nếu không có outbox/transaction boundary; cloud không tự sửa schema coupling hoặc dữ liệu hỏng.",
+            "en": "Dual writes can diverge without an outbox or transaction boundary; cloud hosting does not repair schema coupling or corrupt data."
+          },
+          "nextPressure": {
+            "vi": "Recovery đã đo được nhưng teams vẫn chờ chung release hoặc query tải khác nhau tranh tài nguyên.",
+            "en": "Recovery is measured, but teams still share release bottlenecks or competing query workloads."
+          },
+          "exitCriteria": {
+            "vi": "Restore vào môi trường sạch, kiểm invariants, đo data loss và thời gian phục hồi; promotion cũ bị fence.",
+            "en": "Restore into a clean environment, validate invariants, measure loss and recovery time and fence the old writer."
+          },
+          "diagram": {
+            "id": "netflix-stage-recovery",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "SQL vẫn có HA; quyết định engine dựa access pattern và consistency, không dựa nhãn “web scale”.",
+              "en": "SQL supports HA; choose engines by access patterns and consistency rather than a scale label."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "app",
+                "label": {
+                  "vi": "Playback app",
+                  "en": "Playback app"
+                },
+                "detail": {
+                  "vi": "Timeout/fallback theo chức năng, không grant quyền khi store không trả lời.",
+                  "en": "Uses bounded timeouts and feature-specific fallbacks, never granting rights on store failure."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "primary",
+                "label": {
+                  "vi": "Primary store",
+                  "en": "Primary store"
+                },
+                "detail": {
+                  "vi": "Write authority có epoch/fence.",
+                  "en": "Write authority has an epoch/fence."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "replica",
+                "label": {
+                  "vi": "Replica",
+                  "en": "Replica"
+                },
+                "detail": {
+                  "vi": "Lag có thể khác zero; promotion là protocol.",
+                  "en": "Lag can be nonzero; promotion is a protocol."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "backup",
+                "label": {
+                  "vi": "Backup archive",
+                  "en": "Backup archive"
+                },
+                "detail": {
+                  "vi": "Versioned recovery points, retention và access control riêng.",
+                  "en": "Versioned recovery points with separate retention and access control."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "restore",
+                "label": {
+                  "vi": "Restore drill",
+                  "en": "Restore drill"
+                },
+                "detail": {
+                  "vi": "Restore + validation trước nhận traffic.",
+                  "en": "Restores and validates before receiving traffic."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "app",
+                    "to": "primary",
+                    "description": {
+                      "vi": "Write tới authority hiện tại.",
+                      "en": "Write to the current authority."
+                    }
+                  },
+                  {
+                    "from": "primary",
+                    "to": "replica",
+                    "description": {
+                      "vi": "Replicate theo durability/RPO contract.",
+                      "en": "Replicate under the durability/RPO contract."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "primary",
+                    "to": "backup",
+                    "description": {
+                      "vi": "Tạo consistent recovery points có retention.",
+                      "en": "Create consistent, retained recovery points."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "backup",
+                    "to": "restore",
+                    "description": {
+                      "vi": "Restore dữ liệu rồi validate domain invariants.",
+                      "en": "Restore and validate domain invariants."
+                    }
+                  },
+                  {
+                    "from": "restore",
+                    "to": "app",
+                    "description": {
+                      "vi": "Chỉ cutover sau fencing và readiness checks.",
+                      "en": "Cut over only after fencing and readiness checks."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "domains",
+          "title": {
+            "vi": "Chia service theo quyền sở hữu",
+            "en": "Split by domain ownership"
+          },
+          "description": {
+            "vi": "Tách catalog, accounts, recommendations và playback khi có lý do về scale, release hoặc failure isolation. Mỗi domain sở hữu contract và data; service discovery tìm endpoint khỏe nhưng không quyết định request có được retry an toàn hay không. Tránh biến cùng database thành dependency kín của hàng chục services.",
+            "en": "Split catalog, accounts, recommendations and playback when scale, releases or isolation justify it. Domains own contracts and data. Discovery locates healthy endpoints but does not establish retry safety. Avoid a hidden shared database dependency across dozens of services."
+          },
+          "problem": {
+            "vi": "Một schema/release chung buộc mọi nhóm phối hợp; workload recommendation không giống entitlement lookup.",
+            "en": "Shared schemas and releases couple teams; recommendation workloads differ from entitlement lookups."
+          },
+          "decision": {
+            "vi": "Tạo API boundary, service identity, discovery/health và bounded per-hop timeout; events truyền thay đổi mà không bắt mọi read join qua mạng.",
+            "en": "Establish APIs, service identity, discovery, health and per-hop timeouts; propagate changes with events instead of forcing every read through remote joins."
+          },
+          "tradeoff": {
+            "vi": "Distributed tracing, schema compatibility, eventual projections và on-call ownership tăng chi phí. Quá nhiều synchronous calls làm p99 xấu.",
+            "en": "Distributed tracing, schema compatibility, eventual projections and on-call ownership add cost. Excessive synchronous fan-out worsens p99."
+          },
+          "nextPressure": {
+            "vi": "Media delivery chiếm chi phí/quality lớn hơn app compute; cần placement gần networks của viewers.",
+            "en": "Delivery cost and quality dominate application compute, motivating placement near viewer networks."
+          },
+          "exitCriteria": {
+            "vi": "Mỗi service có owner, SLO, versioned contract, capacity limit và fallback được review; không có vòng call không giới hạn.",
+            "en": "Each service has an owner, SLO, versioned contract, capacity bound and reviewed fallback, with no unbounded call cycles."
+          },
+          "diagram": {
+            "id": "netflix-stage-domains",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Service boundaries hữu ích khi ownership và failure behavior rõ; discovery chỉ là một phần.",
+              "en": "Boundaries help when ownership and failure behavior are explicit; discovery is only one part."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "API edge",
+                  "en": "API edge"
+                },
+                "detail": {
+                  "vi": "Auth, admission và request deadline.",
+                  "en": "Authentication, admission and deadlines."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "play",
+                "label": {
+                  "vi": "Playback service",
+                  "en": "Playback service"
+                },
+                "detail": {
+                  "vi": "Orchestrate quyền/session, không proxy media.",
+                  "en": "Orchestrates rights/sessions without media proxying."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "rights",
+                "label": {
+                  "vi": "Rights / account",
+                  "en": "Rights / account"
+                },
+                "detail": {
+                  "vi": "Authority cho entitlement và policy version.",
+                  "en": "Entitlement authority and policy versions."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Catalog service",
+                  "en": "Catalog service"
+                },
+                "detail": {
+                  "vi": "Playable metadata và generation.",
+                  "en": "Playable metadata and generations."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "data",
+                "label": {
+                  "vi": "Domain stores",
+                  "en": "Domain stores"
+                },
+                "detail": {
+                  "vi": "Mỗi domain có ownership và consistency contract.",
+                  "en": "Domains own stores and consistency contracts."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "discovery",
+                "label": {
+                  "vi": "Discovery / health",
+                  "en": "Discovery / health"
+                },
+                "detail": {
+                  "vi": "Endpoint selection không thay auth hoặc correctness.",
+                  "en": "Endpoint selection does not replace authentication or correctness."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "edge",
+                    "to": "discovery",
+                    "description": {
+                      "vi": "Chọn endpoint khỏe có deployment version phù hợp.",
+                      "en": "Select healthy compatible endpoints."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "play",
+                    "description": {
+                      "vi": "Truyền identity và deadline còn lại.",
+                      "en": "Propagate identity and remaining deadlines."
+                    }
+                  },
+                  {
+                    "from": "play",
+                    "to": "rights",
+                    "description": {
+                      "vi": "Kiểm entitlement với bounded timeout.",
+                      "en": "Check entitlements within bounded time."
+                    }
+                  },
+                  {
+                    "from": "play",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Lấy playable generation theo policy context.",
+                      "en": "Obtain a playable generation for the policy context."
+                    }
+                  },
+                  {
+                    "from": "rights",
+                    "to": "data",
+                    "description": {
+                      "vi": "Read authority của domain, không đọc lén catalog tables.",
+                      "en": "Read domain authority rather than reaching into catalog tables."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "cdn",
+          "title": {
+            "vi": "Đưa media tới gần ISP",
+            "en": "Place media near ISPs"
+          },
+          "description": {
+            "vi": "Khi traffic đủ ổn định và có đối tác mạng, cân nhắc embedded caches hoặc IXP placements cùng commercial CDN. Open Connect là một ví dụ thực tế về dedicated delivery infrastructure, nhưng không có ngưỡng subscriber chung để mọi công ty phải tự xây CDN. Điều cần tối ưu là QoE và total cost theo geography/network, không chỉ cache hit tổng.",
+            "en": "At stable volume with network partners, consider embedded caches or IXP placement alongside commercial CDN. Dedicated delivery infrastructure is one option, but no universal subscriber threshold mandates building a CDN. Optimize QoE and total cost by geography/network rather than only aggregate hit rates."
+          },
+          "problem": {
+            "vi": "Transit distance/cost và peak link congestion làm playback tệ dù API nhanh.",
+            "en": "Transit distance, cost and peak congestion impair playback even when APIs are fast."
+          },
+          "decision": {
+            "vi": "Predict popularity theo vùng, prefill off-peak, publish complete assets; steering xét title availability, network locality, health và capacity.",
+            "en": "Forecast regional popularity, prefill off peak and publish complete assets; steering considers availability, locality, health and capacity."
+          },
+          "tradeoff": {
+            "vi": "Appliance procurement, ISP contracts, fill bandwidth, forecast errors và fallback capacity đều phải vận hành. Commercial CDN cũng có thể preposition.",
+            "en": "Hardware, ISP agreements, fill bandwidth, forecast error and fallback capacity need operations. Commercial CDNs may also preposition assets."
+          },
+          "nextPressure": {
+            "vi": "Hot title hoặc cache failure gây miss storm; dependency degradation cần containment.",
+            "en": "Hot titles or cache failures create miss storms; dependency degradation requires containment."
+          },
+          "exitCriteria": {
+            "vi": "Đo byte/request hit riêng, kiểm steering không chọn cache thiếu generation, thử cache loss và fill deadline.",
+            "en": "Measure byte and request hits separately, prevent steering to absent generations and test cache loss and fill deadlines."
+          },
+          "diagram": {
+            "id": "netflix-stage-cdn",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "CDN placement không chuyển entitlement authority vào media cache.",
+              "en": "CDN placement does not move entitlement authority into media caches."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "forecast",
+                "label": {
+                  "vi": "Popularity planner",
+                  "en": "Popularity planner"
+                },
+                "detail": {
+                  "vi": "Forecast theo vùng/title/rendition; có uncertainty.",
+                  "en": "Regional title/rendition forecasts carry uncertainty."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Origin objects",
+                  "en": "Origin objects"
+                },
+                "detail": {
+                  "vi": "Immutable versioned media.",
+                  "en": "Immutable versioned media."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "ISP / IXP caches",
+                  "en": "ISP / IXP caches"
+                },
+                "detail": {
+                  "vi": "Publish sau integrity/completeness check.",
+                  "en": "Publish after integrity and completeness checks."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "steer",
+                "label": {
+                  "vi": "Steering",
+                  "en": "Steering"
+                },
+                "detail": {
+                  "vi": "Availability, locality, load và failover.",
+                  "en": "Availability, locality, load and failover."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "player",
+                "label": {
+                  "vi": "Player",
+                  "en": "Player"
+                },
+                "detail": {
+                  "vi": "Fetch scoped objects và report QoE.",
+                  "en": "Fetches scoped objects and reports QoE."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "forecast",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Chọn complete assets trong storage/fill budget.",
+                      "en": "Select complete assets within storage/fill budgets."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "origin",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Off-peak fill rồi publish inventory khỏe.",
+                      "en": "Fill off peak and publish healthy inventory."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "player",
+                    "to": "steer",
+                    "description": {
+                      "vi": "Yêu cầu route tới playable generation.",
+                      "en": "Request routes to the playable generation."
+                    }
+                  },
+                  {
+                    "from": "steer",
+                    "to": "player",
+                    "description": {
+                      "vi": "Trả candidates có capacity/fallback.",
+                      "en": "Return candidates with capacity and fallback."
+                    }
+                  },
+                  {
+                    "from": "player",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Lấy encrypted segments gần mạng của mình.",
+                      "en": "Fetch encrypted segments near the access network."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "isolation",
+          "title": {
+            "vi": "Cô lập dependency failure",
+            "en": "Contain dependency failures"
+          },
+          "description": {
+            "vi": "Home page có thể dùng popular titles khi recommendation chậm, nhưng Play không được bỏ qua quyền hoặc cấp license vô điều kiện. Deadline, bounded retries có jitter, circuit breakers và bulkheads bảo vệ tài nguyên. Chaos chỉ có ích sau observability, hypotheses, abort thresholds và khả năng phục hồi.",
+            "en": "The home page may fall back to popular titles when recommendations are slow; Play cannot bypass rights or issue unrestricted licenses. Deadlines, bounded jittered retries, breakers and bulkheads protect resources. Chaos requires observability, hypotheses, abort thresholds and recovery capability."
+          },
+          "problem": {
+            "vi": "Một recommendation timeout giữ hết worker threads và kéo playback xuống theo.",
+            "en": "Recommendation timeouts exhaust workers and drag playback down."
+          },
+          "decision": {
+            "vi": "Tách concurrency pools cho optional và critical calls; truyền deadline; cache fallback vẫn lọc rights/maturity.",
+            "en": "Separate optional and critical concurrency pools, propagate deadlines and filter fallback content by rights/maturity."
+          },
+          "tradeoff": {
+            "vi": "Fallback giảm freshness/cá nhân hóa; breaker quá nhạy hoặc retry amplification gây sự cố mới. Isolation cần đo cả degraded UX.",
+            "en": "Fallbacks lose freshness/personalization; oversensitive breakers and retry amplification create failures. Measure degraded experience too."
+          },
+          "nextPressure": {
+            "vi": "Các thiết bị gọi nhiều API quá hoặc payload dư thừa; cần adapter nhưng không nhân bản quyền.",
+            "en": "Devices make too many calls or receive excessive payloads, motivating adapters without duplicating authorization."
+          },
+          "exitCriteria": {
+            "vi": "Inject dependency latency có giới hạn; playback resources còn đủ, optional requests bị shed và quyền không fail open.",
+            "en": "Boundedly inject latency; preserve playback resources, shed optional work and verify rights never fail open."
+          },
+          "diagram": {
+            "id": "netflix-stage-isolation",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Tự động degrade một chức năng không có nghĩa bỏ correctness cho chức năng khác.",
+              "en": "Degrading one feature does not waive another feature’s correctness."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "detail": {
+                  "vi": "Phân biệt degraded catalog với playback error.",
+                  "en": "Distinguishes degraded catalog from playback failure."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "bff",
+                "label": {
+                  "vi": "Device API",
+                  "en": "Device API"
+                },
+                "detail": {
+                  "vi": "Bằng deadline và concurrency budget.",
+                  "en": "Uses deadlines and concurrency budgets."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "reco",
+                "label": {
+                  "vi": "Recommendations",
+                  "en": "Recommendations"
+                },
+                "detail": {
+                  "vi": "Optional dependency với bounded resources.",
+                  "en": "Optional dependency with bounded resources."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "model"
+              },
+              {
+                "id": "fallback",
+                "label": {
+                  "vi": "Popular fallback",
+                  "en": "Popular fallback"
+                },
+                "detail": {
+                  "vi": "Vẫn kiểm rights, maturity, region.",
+                  "en": "Still respects rights, maturity and region."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "play",
+                "label": {
+                  "vi": "Critical playback",
+                  "en": "Critical playback"
+                },
+                "detail": {
+                  "vi": "Quyền/license giữ strict contract.",
+                  "en": "Rights/licenses retain strict contracts."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "bff",
+                    "description": {
+                      "vi": "Browse tới adapter với request deadline.",
+                      "en": "Browse reaches the adapter with a deadline."
+                    }
+                  },
+                  {
+                    "from": "bff",
+                    "to": "reco",
+                    "description": {
+                      "vi": "Call trong optional concurrency pool.",
+                      "en": "Call within an optional concurrency pool."
+                    }
+                  },
+                  {
+                    "from": "bff",
+                    "to": "fallback",
+                    "description": {
+                      "vi": "Timeout thì chọn fallback đã lọc hợp lệ.",
+                      "en": "On timeout select policy-filtered fallback."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "play",
+                    "description": {
+                      "vi": "Play dùng resource budget tách optional browse.",
+                      "en": "Play uses resources isolated from optional browsing."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "devices",
+          "title": {
+            "vi": "Thích nghi theo thiết bị",
+            "en": "Adapt by device"
+          },
+          "description": {
+            "vi": "TV, browser và mobile khác input, screen, memory, codec/DRM và cadence nâng cấp. Device API/BFF tổng hợp view-model tối thiểu nhưng domain services giữ business rules. Cùng title có thể có playable packages khác; cache identity phải chứa các dimensions ảnh hưởng response, không vô tình dùng personalized response chung cho mọi người.",
+            "en": "TVs, browsers and mobile clients differ in input, screens, memory, codec/DRM and upgrade cadence. Device APIs assemble compact view models while domain services retain business rules. Titles may have different playable packages; cache identities must include response-relevant dimensions without sharing personalized responses across users."
+          },
+          "problem": {
+            "vi": "Client quá nhiều round trips hoặc không hiểu metadata mới; old app tồn tại nhiều năm.",
+            "en": "Excessive round trips and new metadata break clients with long upgrade lifetimes."
+          },
+          "decision": {
+            "vi": "Capability negotiation, versioned contracts và server-driven layouts có bounded complexity; progressive rollout theo device cohorts.",
+            "en": "Use capability negotiation, versioned contracts and bounded server-driven layouts, progressively rolled out by device cohort."
+          },
+          "tradeoff": {
+            "vi": "BFF duplication và cache cardinality tăng; GraphQL hoặc aggregation không tự giới hạn fan-out.",
+            "en": "BFF duplication and cache cardinality grow; aggregation or GraphQL does not automatically bound fan-out."
+          },
+          "nextPressure": {
+            "vi": "Một region mất vẫn cần phục vụ devices mà không đổi semantics quyền/session.",
+            "en": "Regional loss must preserve device access and rights/session semantics."
+          },
+          "exitCriteria": {
+            "vi": "Test compatibility matrix, old client fallback và personalized cache isolation; theo dõi startup theo app/codec/DRM.",
+            "en": "Test the compatibility matrix, old-client fallbacks and personalized-cache isolation; observe startup by app, codec and DRM."
+          },
+          "diagram": {
+            "id": "netflix-stage-devices",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "UI có thể khác nhau trong khi rights domain vẫn thống nhất.",
+              "en": "Views may differ while rights remain one consistent domain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "tv",
+                "label": {
+                  "vi": "TV / mobile / web",
+                  "en": "TV / mobile / web"
+                },
+                "detail": {
+                  "vi": "Capabilities được validate, không là proof of identity.",
+                  "en": "Capabilities are validated but are not identity proof."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Device adapter",
+                  "en": "Device adapter"
+                },
+                "detail": {
+                  "vi": "Compact view-model, versioning và bounded aggregation.",
+                  "en": "Compact view models, versioning and bounded aggregation."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Catalog / artwork",
+                  "en": "Catalog / artwork"
+                },
+                "detail": {
+                  "vi": "Localized metadata và versioned assets.",
+                  "en": "Localized metadata and versioned assets."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "play",
+                "label": {
+                  "vi": "Playback domain",
+                  "en": "Playback domain"
+                },
+                "detail": {
+                  "vi": "Chọn packages tương thích và authorize theo policy.",
+                  "en": "Selects compatible packages and authorizes under policy."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Response cache",
+                  "en": "Response cache"
+                },
+                "detail": {
+                  "vi": "Public metadata tách personalized state.",
+                  "en": "Separates public metadata from personalized state."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "tv",
+                    "to": "api",
+                    "description": {
+                      "vi": "Khai báo app/capabilities với authenticated principal.",
+                      "en": "Declare app/capabilities with an authenticated principal."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Lookup chỉ trên cache scope/key hợp lệ.",
+                      "en": "Look up only valid cache scopes and keys."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Aggregate bounded metadata theo locale/device.",
+                      "en": "Aggregate bounded metadata by locale/device."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "play",
+                    "description": {
+                      "vi": "Play dùng authoritative policy, không tin UI filtering.",
+                      "en": "Play checks authoritative policy rather than trusting UI filtering."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "regions",
+          "title": {
+            "vi": "Thiết kế nhiều region",
+            "en": "Design multiple regions"
+          },
+          "description": {
+            "vi": "Nhiều region giúp chống regional failure nhưng không làm state tự nhất quán. Phân loại state: immutable media/catalog projections có thể replicate khác account restrictions hoặc concurrent-stream leases. Nêu authority khi network partition: từ chối thao tác, route về home region, hay dùng bounded-staleness policy đã chấp thuận.",
+            "en": "Multiple regions tolerate regional loss but do not make state automatically consistent. Classify state: immutable media and catalog projections differ from account restrictions or concurrent-stream leases. Define partition behavior: reject, route to a home region or use explicitly accepted bounded staleness."
+          },
+          "problem": {
+            "vi": "Một region không đáp ứng availability hoặc latency cho viewers toàn cầu.",
+            "en": "One region cannot meet global availability or latency goals."
+          },
+          "decision": {
+            "vi": "Route control traffic tới ready regions, replicate theo domain contract và kiểm survivable capacity; media routing tách app routing.",
+            "en": "Route control traffic to ready regions, replicate under domain contracts and verify survivor capacity; media routing remains separate."
+          },
+          "tradeoff": {
+            "vi": "Replication lag, egress, failover-induced cache misses và split-brain risks tăng. Active-passive vẫn hợp lý nếu warm, đủ capacity và được drill.",
+            "en": "Lag, egress, cold caches and split-brain risks increase. Warm, sufficiently provisioned and drilled active-passive designs can also work."
+          },
+          "nextPressure": {
+            "vi": "Dashboard xanh chưa chứng minh failover; phải thử chuyển traffic thật có kiểm soát.",
+            "en": "Healthy dashboards do not prove failover; exercise controlled real traffic transfers."
+          },
+          "exitCriteria": {
+            "vi": "Mất một region vẫn trong admitted load budget; rights/write authority không phân đôi và lag/RPO hiển thị.",
+            "en": "After losing a region, admitted load remains supportable, write/rights authority is unambiguous and lag/RPO are visible."
+          },
+          "diagram": {
+            "id": "netflix-stage-regions",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Số region không bằng mức chịu lỗi nếu các region còn lại hết capacity.",
+              "en": "Region count is not failure tolerance when survivors have no spare capacity."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "global",
+                "label": {
+                  "vi": "Global router",
+                  "en": "Global router"
+                },
+                "detail": {
+                  "vi": "Health/capacity, route TTL và connection draining.",
+                  "en": "Health, capacity, route TTL and connection draining."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "r1",
+                "label": {
+                  "vi": "Region A control",
+                  "en": "Region A control"
+                },
+                "detail": {
+                  "vi": "Phục vụ load đã admit với domain authority policy.",
+                  "en": "Serves admitted load under domain authority policies."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "r2",
+                "label": {
+                  "vi": "Region B control",
+                  "en": "Region B control"
+                },
+                "detail": {
+                  "vi": "Duy trì reserve capacity cho failover.",
+                  "en": "Maintains failover reserve capacity."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "s1",
+                "label": {
+                  "vi": "A domain state",
+                  "en": "A domain state"
+                },
+                "detail": {
+                  "vi": "Writes có ownership, replica policy và version.",
+                  "en": "Writes have ownership, replica policies and versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "s2",
+                "label": {
+                  "vi": "B domain state",
+                  "en": "B domain state"
+                },
+                "detail": {
+                  "vi": "Lag/lease semantics được quan sát.",
+                  "en": "Lag and lease semantics are observed."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "global",
+                    "to": "r1",
+                    "description": {
+                      "vi": "Route tới region healthy còn capacity.",
+                      "en": "Route to a healthy region with capacity."
+                    }
+                  },
+                  {
+                    "from": "r1",
+                    "to": "s1",
+                    "description": {
+                      "vi": "Write theo domain authority.",
+                      "en": "Write under domain authority."
+                    }
+                  },
+                  {
+                    "from": "s1",
+                    "to": "s2",
+                    "description": {
+                      "vi": "Replicate theo contract; không mặc định synchronous.",
+                      "en": "Replicate under the contract, not implicitly synchronously."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "global",
+                    "to": "r2",
+                    "description": {
+                      "vi": "Failover chỉ sau readiness/admission checks.",
+                      "en": "Fail over only after readiness/admission checks."
+                    }
+                  },
+                  {
+                    "from": "r2",
+                    "to": "s2",
+                    "description": {
+                      "vi": "Enforce freshness/ownership khi nhận control request.",
+                      "en": "Enforce freshness and ownership on control requests."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "drills",
+          "title": {
+            "vi": "Chứng minh bằng evacuation drill",
+            "en": "Prove evacuation with drills"
+          },
+          "description": {
+            "vi": "Tập chuyển một phần rồi toàn bộ traffic khỏi một region theo hypothesis rõ: surviving regions chịu được X requests/second và startup p99 vẫn dưới mục tiêu. Kiểm DNS/connection persistence, cache warmup, retries, queues và backlog recovery. Sơ đồ logic chỉ nêu intent; drill cho thấy các dependency thực bị quên.",
+            "en": "Gradually evacuate a region against a clear hypothesis: surviving regions sustain X requests/second within startup p99 targets. Test DNS, persistent connections, warmup, retries, queues and recovery backlog. Logical diagrams express intent; drills reveal overlooked dependencies."
+          },
+          "problem": {
+            "vi": "Failover procedure chỉ nằm trong runbook; không biết người trực hoặc automation có thực hiện đúng không.",
+            "en": "Failover exists only in a runbook; operator and automation effectiveness is unknown."
+          },
+          "decision": {
+            "vi": "Game day có load bounds, abort triggers, dry run, rollback owner và evidence theo client/region/ISP.",
+            "en": "Run game days with load bounds, abort triggers, dry runs, rollback owners and evidence by client, region and ISP."
+          },
+          "tradeoff": {
+            "vi": "Drill tiêu thụ reserve capacity và có risk thật; không bắt đầu bằng phá production ngẫu nhiên.",
+            "en": "Drills consume reserves and carry real risk; start with controlled hypotheses rather than random production destruction."
+          },
+          "nextPressure": {
+            "vi": "QoE events và hành vi users tăng nhanh; cần pipeline phục vụ learning nhưng tách control authority.",
+            "en": "Growing QoE and behavioral events need a learning pipeline separate from control authority."
+          },
+          "exitCriteria": {
+            "vi": "Có kết quả trước/trong/sau, thời gian route convergence, resource peaks, rollback và remediation đã kiểm chứng.",
+            "en": "Record before/during/after results, convergence, resource peaks, rollback and verified remediation."
+          },
+          "diagram": {
+            "id": "netflix-stage-drills",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Đo recovery và tail experience; tỷ lệ 200 OK phía server chưa đủ.",
+              "en": "Measure recovery and tail experience; server 200 rates are insufficient."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "operator",
+                "label": {
+                  "vi": "Drill controller",
+                  "en": "Drill controller"
+                },
+                "detail": {
+                  "vi": "Limits, abort và rollback ownership.",
+                  "en": "Limits, aborts and rollback ownership."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "router",
+                "label": {
+                  "vi": "Traffic router",
+                  "en": "Traffic router"
+                },
+                "detail": {
+                  "vi": "Giảm traffic dần, không giả định instant DNS.",
+                  "en": "Drains gradually without assuming instant DNS changes."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "survivors",
+                "label": {
+                  "vi": "Survivor regions",
+                  "en": "Survivor regions"
+                },
+                "detail": {
+                  "vi": "Admission, warmup và reserve.",
+                  "en": "Admission, warmup and reserve."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "signals",
+                "label": {
+                  "vi": "Client / server QoE",
+                  "en": "Client / server QoE"
+                },
+                "detail": {
+                  "vi": "Startup/rebuffer/error theo cohort.",
+                  "en": "Startup, rebuffering and errors by cohort."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "review",
+                "label": {
+                  "vi": "Recovery review",
+                  "en": "Recovery review"
+                },
+                "detail": {
+                  "vi": "Action items có test lại.",
+                  "en": "Action items require retesting."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "operator",
+                    "to": "router",
+                    "description": {
+                      "vi": "Bắt đầu bounded traffic shift theo hypothesis.",
+                      "en": "Start a bounded traffic shift under a hypothesis."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "survivors",
+                    "description": {
+                      "vi": "Drain connections và admit load có headroom.",
+                      "en": "Drain connections and admit load with headroom."
+                    }
+                  },
+                  {
+                    "from": "survivors",
+                    "to": "signals",
+                    "description": {
+                      "vi": "Collect saturation/QoE cả degraded clients.",
+                      "en": "Collect saturation and QoE, including degraded clients."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "signals",
+                    "to": "operator",
+                    "description": {
+                      "vi": "Vi phạm abort threshold thì rollback.",
+                      "en": "Roll back on abort thresholds."
+                    }
+                  },
+                  {
+                    "from": "signals",
+                    "to": "review",
+                    "description": {
+                      "vi": "Lưu evidence và kiểm remediation sau drill.",
+                      "en": "Retain evidence and retest remediation."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "events",
+          "title": {
+            "vi": "Tạo feedback pipeline",
+            "en": "Build the feedback pipeline"
+          },
+          "description": {
+            "vi": "Playback telemetry, search/click và viewing history có mục đích, retention và privacy khác nhau. Durable event log cho replay; processors dedup theo event/session sequence và handle event-time lateness. Analytics warehouse chứa projections để phân tích, không thay quyền xem hoặc billing authority.",
+            "en": "Playback telemetry, clicks and history have distinct purposes, retention and privacy. Durable logs enable replay; processors deduplicate by event/session sequence and handle event-time lateness. Warehouses provide analytical projections, not entitlement or billing authority."
+          },
+          "problem": {
+            "vi": "Số event vượt transactional request volume; team cần QoE, experiments và recommendation freshness.",
+            "en": "Events outgrow transactional traffic; teams need QoE, experiments and recommendation freshness."
+          },
+          "decision": {
+            "vi": "Version event schemas, minimize personal data, quản lý consent/deletion và replay-safe sinks; stream QoE nhanh tách batch analytics.",
+            "en": "Version schemas, minimize personal data, enforce consent/deletion and use replay-safe sinks; separate fast QoE streams from batch analytics."
+          },
+          "tradeoff": {
+            "vi": "At-least-once delivery cần dedup horizon; schema evolution, backfills và deletion propagation là việc liên tục.",
+            "en": "At-least-once delivery needs bounded deduplication; schema evolution, backfills and deletion propagation are ongoing work."
+          },
+          "nextPressure": {
+            "vi": "Mở quốc gia mới đòi rights, locale, time zones và device readiness ngoài bandwidth.",
+            "en": "New countries require rights, localization, time zones and device readiness as well as bandwidth."
+          },
+          "exitCriteria": {
+            "vi": "Drop/duplicate/late events không nhân đôi metrics; biết freshness của history và quyền truy cập từng dataset.",
+            "en": "Drops, duplicates and late events do not silently inflate metrics; history freshness and dataset permissions are explicit."
+          },
+          "diagram": {
+            "id": "netflix-stage-events",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Pipeline là feedback path, không dependency bắt buộc cho mọi media segment.",
+              "en": "The pipeline is feedback, not a mandatory dependency for every segment."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "player",
+                "label": {
+                  "vi": "Player events",
+                  "en": "Player events"
+                },
+                "detail": {
+                  "vi": "Session/event IDs, sequence và consent.",
+                  "en": "Session/event IDs, sequences and consent."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "ingest",
+                "label": {
+                  "vi": "Event intake",
+                  "en": "Event intake"
+                },
+                "detail": {
+                  "vi": "Auth, schema, quotas, durable ACK boundary.",
+                  "en": "Authentication, schemas, quotas and durable ACK boundary."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "log",
+                "label": {
+                  "vi": "Event log",
+                  "en": "Event log"
+                },
+                "detail": {
+                  "vi": "Retention và replay positions.",
+                  "en": "Retention and replay positions."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "stream",
+                "label": {
+                  "vi": "QoE / history jobs",
+                  "en": "QoE / history jobs"
+                },
+                "detail": {
+                  "vi": "Dedup, lateness và stateful recovery.",
+                  "en": "Deduplication, lateness and stateful recovery."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "warehouse",
+                "label": {
+                  "vi": "Analytics projections",
+                  "en": "Analytics projections"
+                },
+                "detail": {
+                  "vi": "Governed datasets, không entitlement authority.",
+                  "en": "Governed datasets, not entitlement authority."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "player",
+                    "to": "ingest",
+                    "description": {
+                      "vi": "Batch bounded telemetry với stable IDs.",
+                      "en": "Batch bounded telemetry with stable IDs."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "ingest",
+                    "to": "log",
+                    "description": {
+                      "vi": "ACK theo stated durability boundary.",
+                      "en": "ACK at the stated durability boundary."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "log",
+                    "to": "stream",
+                    "description": {
+                      "vi": "Replay giữ event identity; tính windows theo contract.",
+                      "en": "Replay preserves identity and uses specified windows."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "stream",
+                    "to": "warehouse",
+                    "description": {
+                      "vi": "Upsert/commit replay-safe projections, propagate deletions.",
+                      "en": "Commit replay-safe projections and propagate deletions."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "global",
+          "title": {
+            "vi": "Chuẩn bị phát hành toàn cầu",
+            "en": "Prepare global launches"
+          },
+          "description": {
+            "vi": "Một title hiện trên catalog không chứng minh người dùng ở mọi vùng được xem. Rights windows theo territory, maturity, account và thời gian có authority riêng; subtitles/audio/artwork có generation và quality checks. Launch readiness cần cả network capacity lẫn device/codec/DRM coverage và customer-support behavior.",
+            "en": "Catalog presence does not establish worldwide viewing rights. Territory windows, maturity, accounts and time need authoritative policy. Subtitles, audio and artwork need generations and quality checks. Launch readiness covers capacity, device/codec/DRM support and customer-facing failure behavior."
+          },
+          "problem": {
+            "vi": "Traffic mới có địa lý/ngôn ngữ khác và entitlement rules khác; clock/cache staleness gây grant sai.",
+            "en": "New traffic brings different geographies, languages and rights; clocks and stale caches can authorize incorrectly."
+          },
+          "decision": {
+            "vi": "Policy-versioned availability, localized manifests và rollout theo geography/device; cache TTL không dài hơn quyền cần enforce.",
+            "en": "Use policy-versioned availability, localized manifests and geographic/device rollouts; bound cached rights by enforcement requirements."
+          },
+          "tradeoff": {
+            "vi": "Rights invalidation và clock boundaries phức tạp; region preference không đủ suy ra legal territory và VPN detection không hoàn hảo.",
+            "en": "Rights invalidation and clock boundaries are difficult; preferred regions do not determine legal territory and VPN detection is imperfect."
+          },
+          "nextPressure": {
+            "vi": "Catalog lớn làm uniform encoding lãng phí ở nội dung đơn giản hoặc thiếu quality ở nội dung khó.",
+            "en": "A growing catalog makes uniform encoding wasteful for simple content or inadequate for difficult content."
+          },
+          "exitCriteria": {
+            "vi": "Test rights expiry, time-zone boundaries, audio/subtitle sync và device matrix; rollback một title không kéo toàn catalog.",
+            "en": "Test rights expiry, time boundaries, audio/subtitle synchronization and devices; roll back one title without taking down the catalog."
+          },
+          "diagram": {
+            "id": "netflix-stage-global",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Global rollout là compatibility và policy exercise, không chỉ nhân số instances.",
+              "en": "Global rollout is a compatibility and policy exercise, not just more instances."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Rights authority",
+                  "en": "Rights authority"
+                },
+                "detail": {
+                  "vi": "Territory/window/account/maturity rules.",
+                  "en": "Territory, window, account and maturity rules."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "catalog",
+                "label": {
+                  "vi": "Localized catalog",
+                  "en": "Localized catalog"
+                },
+                "detail": {
+                  "vi": "Metadata projections có policy version/freshness.",
+                  "en": "Metadata projections carry policy versions/freshness."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "manifest",
+                "label": {
+                  "vi": "Playable manifest",
+                  "en": "Playable manifest"
+                },
+                "detail": {
+                  "vi": "Audio/subtitle/codec/DRM compatibility.",
+                  "en": "Audio, subtitle, codec and DRM compatibility."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "device",
+                "label": {
+                  "vi": "Regional viewer",
+                  "en": "Regional viewer"
+                },
+                "detail": {
+                  "vi": "Không tin UI để enforce quyền.",
+                  "en": "UI filtering is not authorization."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              },
+              {
+                "id": "launch",
+                "label": {
+                  "vi": "Launch readiness",
+                  "en": "Launch readiness"
+                },
+                "detail": {
+                  "vi": "Capacity + rights + locale + devices.",
+                  "en": "Capacity, rights, localization and devices."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "worker"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "launch",
+                    "to": "catalog",
+                    "description": {
+                      "vi": "Chỉ publish metadata/locale đã kiểm readiness.",
+                      "en": "Publish only ready localized metadata."
+                    }
+                  },
+                  {
+                    "from": "device",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Authorize tại Play theo policy/version hiện hành.",
+                      "en": "Authorize Play under current policy/version."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "manifest",
+                    "description": {
+                      "vi": "Scope playable variants theo validated context.",
+                      "en": "Scope playable variants to validated context."
+                    }
+                  },
+                  {
+                    "from": "manifest",
+                    "to": "device",
+                    "description": {
+                      "vi": "Trả compatible generation và expiry behavior rõ.",
+                      "en": "Return compatible generations and explicit expiry behavior."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "encoding",
+          "title": {
+            "vi": "Tối ưu theo title và shot",
+            "en": "Optimize by title and shot"
+          },
+          "description": {
+            "vi": "Đo nhiều encoding candidates thay vì cố định bitrate theo resolution cho mọi phim. Một animation sạch có thể đạt target ở bitrate thấp, còn grain/action cần nhiều bits; 1080p bitrate thấp đôi khi tốt hơn 720p bitrate cao, nhưng phải đo trên nội dung/device cụ thể. Per-shot optimization thêm granularity và yêu cầu segment/keyframe alignment.",
+            "en": "Measure encoding candidates instead of assigning one bitrate per resolution to every film. Clean animation may reach targets with fewer bits while grain/action needs more. Low-rate 1080p can sometimes outperform higher-rate 720p, but this must be measured per content/device. Per-shot optimization adds granularity and segment/keyframe alignment requirements."
+          },
+          "problem": {
+            "vi": "Fixed ladders tốn delivery/storage mà vẫn không giữ quality đồng đều.",
+            "en": "Fixed ladders waste delivery/storage while producing uneven quality."
+          },
+          "decision": {
+            "vi": "Dùng rate–distortion evidence, device/codec constraints và ABR-compatible ladder; quality gates trên scenes khó trước publish.",
+            "en": "Use rate–distortion evidence, device/codec constraints and ABR-compatible ladders, with difficult-scene quality gates before publication."
+          },
+          "tradeoff": {
+            "vi": "Nhiều encodes/metrics/codec variants tốn compute và QA; metric không thay human review hoặc tương thích thiết bị.",
+            "en": "More encodes, metrics and codec variants cost compute and QA; metrics do not replace human review or device compatibility."
+          },
+          "nextPressure": {
+            "vi": "Delivery hiệu quả hơn nhưng discovery cần cá nhân hóa và experiments có guardrails.",
+            "en": "Efficient delivery still needs effective discovery and guarded experiments."
+          },
+          "exitCriteria": {
+            "vi": "So sánh cùng perceptual target và device cohort; validate segment boundaries, captions, DRM và rollback generation.",
+            "en": "Compare at declared perceptual targets by device cohort; validate segment boundaries, captions, DRM and rollback generations."
+          },
+          "diagram": {
+            "id": "netflix-stage-encoding",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Đường frontier chỉ có nghĩa trong codec, metric và nội dung đã đo.",
+              "en": "A frontier is meaningful only for the measured codec, metric and content."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "master",
+                "label": {
+                  "vi": "Mezzanine master",
+                  "en": "Mezzanine master"
+                },
+                "detail": {
+                  "vi": "Source version và audio/subtitle provenance.",
+                  "en": "Source versions and audio/subtitle provenance."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "encode",
+                "label": {
+                  "vi": "Candidate encodes",
+                  "en": "Candidate encodes"
+                },
+                "detail": {
+                  "vi": "Nhiều rate/resolution/codec points.",
+                  "en": "Multiple rate, resolution and codec points."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "quality",
+                "label": {
+                  "vi": "Quality analysis",
+                  "en": "Quality analysis"
+                },
+                "detail": {
+                  "vi": "Empirical curves + human/device checks.",
+                  "en": "Empirical curves plus human/device checks."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "ladder",
+                "label": {
+                  "vi": "Constrained ladder",
+                  "en": "Constrained ladder"
+                },
+                "detail": {
+                  "vi": "Target và device/ABR constraints.",
+                  "en": "Quality targets and device/ABR constraints."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "publish",
+                "label": {
+                  "vi": "Package / publish",
+                  "en": "Package / publish"
+                },
+                "detail": {
+                  "vi": "Atomic generation publication sau validation.",
+                  "en": "Publish a generation after validation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "master",
+                    "to": "encode",
+                    "description": {
+                      "vi": "Generate candidates theo title/shot.",
+                      "en": "Generate candidates per title/shot."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "encode",
+                    "to": "quality",
+                    "description": {
+                      "vi": "Measure rate/quality và test scenes khó.",
+                      "en": "Measure rate/quality and test difficult scenes."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "quality",
+                    "to": "ladder",
+                    "description": {
+                      "vi": "Chọn frontier phù hợp target và capabilities.",
+                      "en": "Choose a frontier under targets and capabilities."
+                    }
+                  },
+                  {
+                    "from": "ladder",
+                    "to": "publish",
+                    "description": {
+                      "vi": "Package aligned segments; publish manifest sau objects.",
+                      "en": "Package aligned segments and publish manifests after objects."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "personalization",
+          "title": {
+            "vi": "Học discovery qua experiments",
+            "en": "Learn discovery through experiments"
+          },
+          "description": {
+            "vi": "Ranking, artwork và row composition ảnh hưởng title nào được xem; experiment assignment cần ổn định theo unit đã chọn. Offline retrieval/ranking quality chưa chứng minh causal lift; online tests phải theo dõi startup, rebuffering, latency, diversity và guardrails ngoài engagement. Không claim một công thức riêng là thuật toán thực của Netflix.",
+            "en": "Ranking, artwork and row composition influence viewing. Experiment assignment must be stable for its unit. Offline ranking quality does not prove causal lift; online tests need startup, rebuffering, latency, diversity and other guardrails alongside engagement. No toy formula is the company’s real algorithm."
+          },
+          "problem": {
+            "vi": "Một catalog lớn khó khám phá; model tốt offline có thể quá chậm hoặc làm trải nghiệm hẹp hơn.",
+            "en": "Large catalogs are hard to discover; an offline-improved model may be too slow or narrow the experience."
+          },
+          "decision": {
+            "vi": "Offline feature/model pipeline + online bounded serving; filter eligible candidates trước response, assign experiment và log exposure thực.",
+            "en": "Combine offline pipelines with bounded online serving, filter eligible candidates, assign experiments and log actual exposure."
+          },
+          "tradeoff": {
+            "vi": "Feedback bias, leakage, missing exposure và multi-device assignment phá kết luận; fallback cũng cần experiment logging đúng.",
+            "en": "Feedback bias, leakage, missing exposure and cross-device assignment undermine conclusions; fallback needs accurate experiment logging too."
+          },
+          "nextPressure": {
+            "vi": "Ad-supported product thêm latency-sensitive decisions và measurement không được lẫn playback truth.",
+            "en": "Ads add latency-sensitive decisions and measurement that must not be confused with playback truth."
+          },
+          "exitCriteria": {
+            "vi": "Có holdout, guardrails, reproducible assignment/model versions và fallback vẫn hợp rights/maturity.",
+            "en": "Maintain holdouts, guardrails, reproducible assignment/model versions and policy-compliant fallbacks."
+          },
+          "diagram": {
+            "id": "netflix-stage-personalization",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Click hoặc request không đồng nghĩa exposure đã render hay causal improvement.",
+              "en": "A click or request alone is neither rendered exposure nor causal improvement."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "events",
+                "label": {
+                  "vi": "Governed features",
+                  "en": "Governed features"
+                },
+                "detail": {
+                  "vi": "Freshness, consent và leakage checks.",
+                  "en": "Freshness, consent and leakage checks."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "train",
+                "label": {
+                  "vi": "Offline training",
+                  "en": "Offline training"
+                },
+                "detail": {
+                  "vi": "Reproducible datasets/model versions.",
+                  "en": "Reproducible datasets and model versions."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "rank",
+                "label": {
+                  "vi": "Online ranker",
+                  "en": "Online ranker"
+                },
+                "detail": {
+                  "vi": "Bounded candidates/latency và fallback.",
+                  "en": "Bounded candidates/latency and fallback."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "model"
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Eligibility filters",
+                  "en": "Eligibility filters"
+                },
+                "detail": {
+                  "vi": "Rights, maturity và availability.",
+                  "en": "Rights, maturity and availability."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Assigned client",
+                  "en": "Assigned client"
+                },
+                "detail": {
+                  "vi": "Stable experiment unit; log rendered exposure.",
+                  "en": "Stable experiment unit with rendered-exposure logging."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "events",
+                    "to": "train",
+                    "description": {
+                      "vi": "Train/evaluate không trộn future labels.",
+                      "en": "Train/evaluate without future-label leakage."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "train",
+                    "to": "rank",
+                    "description": {
+                      "vi": "Canary version có rollback.",
+                      "en": "Canary a version with rollback."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "rank",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Filter candidates theo context hợp lệ.",
+                      "en": "Filter candidates under valid context."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "client",
+                    "description": {
+                      "vi": "Render assigned treatment và log exposure thực.",
+                      "en": "Render the assigned treatment and log real exposure."
+                    }
+                  },
+                  {
+                    "from": "client",
+                    "to": "events",
+                    "description": {
+                      "vi": "Feedback mang experiment/model identity và consent.",
+                      "en": "Feedback carries experiment/model identity and consent."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "ads",
+          "title": {
+            "vi": "Thêm quảng cáo có deadline",
+            "en": "Add deadline-bound advertising"
+          },
+          "description": {
+            "vi": "Ad tier cần consent, eligibility, frequency controls và decision deadline. Break planning/manifest stitching phải giữ timeline và quyền của media; client/server impression signals cần event identity, reconciliation và fraud checks. Decision thành công chưa chứng minh ad đã xem; timeout fallback phụ thuộc policy/contract, không mặc định skip mọi quảng cáo.",
+            "en": "An ad tier needs consent, eligibility, frequency controls and decision deadlines. Break planning and stitching preserve media timelines and rights. Impression signals need identities, reconciliation and fraud checks. A successful decision is not a viewed ad; timeout fallback depends on policy/contracts rather than always skipping ads."
+          },
+          "problem": {
+            "vi": "Ad calls hoặc creatives chậm không được tạo unbounded startup stall hay corrupt timeline.",
+            "en": "Slow ad calls or creatives must not create unbounded startup stalls or corrupt timelines."
+          },
+          "decision": {
+            "vi": "Budget ad decisions trong playback deadline, prevalidate creative compatibility và tách measurement pipeline khỏi segment serving.",
+            "en": "Budget decisions within playback deadlines, prevalidate creatives and separate measurement from segment serving."
+          },
+          "tradeoff": {
+            "vi": "Personalization giảm manifest cacheability; business/frequency state có consistency needs và privacy limits.",
+            "en": "Personalization reduces manifest cacheability; frequency/business state has consistency and privacy requirements."
+          },
+          "nextPressure": {
+            "vi": "Live tạo đồng thời join surge, new-segment misses và source failure mà VOD prefill không giải quyết hết.",
+            "en": "Live adds simultaneous joins, new-segment misses and source failures beyond what VOD prefill solves."
+          },
+          "exitCriteria": {
+            "vi": "Test no-fill/timeout, timeline continuity, consent và dedup impression; định nghĩa được paid/billable event authority.",
+            "en": "Test no-fill, timeouts, continuity, consent and impression deduplication; define billable-event authority."
+          },
+          "diagram": {
+            "id": "netflix-stage-ads",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Media delivery availability và measurement correctness là hai mục tiêu riêng.",
+              "en": "Delivery availability and measurement correctness are distinct goals."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "play",
+                "label": {
+                  "vi": "Playback session",
+                  "en": "Playback session"
+                },
+                "detail": {
+                  "vi": "Tier, consent và deadline context.",
+                  "en": "Tier, consent and deadline context."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "decision",
+                "label": {
+                  "vi": "Ad decision",
+                  "en": "Ad decision"
+                },
+                "detail": {
+                  "vi": "Bounded calls và contract-specific no-fill.",
+                  "en": "Bounded calls and contract-specific no-fill."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "stitch",
+                "label": {
+                  "vi": "Break / manifest",
+                  "en": "Break / manifest"
+                },
+                "detail": {
+                  "vi": "Compatible creative segments và timeline.",
+                  "en": "Compatible creatives and timelines."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "player",
+                "label": {
+                  "vi": "Player",
+                  "en": "Player"
+                },
+                "detail": {
+                  "vi": "Reports observation, không tự là billing authority.",
+                  "en": "Reports observations without being billing authority."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              },
+              {
+                "id": "measure",
+                "label": {
+                  "vi": "Measurement",
+                  "en": "Measurement"
+                },
+                "detail": {
+                  "vi": "Stable IDs, dedup và reconciliation.",
+                  "en": "Stable IDs, deduplication and reconciliation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "play",
+                    "to": "decision",
+                    "description": {
+                      "vi": "Request eligible ad plan trong bounded deadline.",
+                      "en": "Request an eligible plan within a bounded deadline."
+                    }
+                  },
+                  {
+                    "from": "decision",
+                    "to": "stitch",
+                    "description": {
+                      "vi": "Apply decision/no-fill theo policy.",
+                      "en": "Apply decisions/no-fill under policy."
+                    }
+                  },
+                  {
+                    "from": "stitch",
+                    "to": "player",
+                    "description": {
+                      "vi": "Publish timeline-compatible manifest.",
+                      "en": "Publish a timeline-compatible manifest."
+                    }
+                  },
+                  {
+                    "from": "player",
+                    "to": "measure",
+                    "description": {
+                      "vi": "Send identified impression/progress evidence.",
+                      "en": "Send identified impression/progress evidence."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "live",
+          "title": {
+            "vi": "Mở rộng sang live streaming",
+            "en": "Extend to live streaming"
+          },
+          "description": {
+            "vi": "Live vẫn tận dụng CDN vì cùng segment được nhiều viewers đọc, nhưng không thể prefill media chưa được tạo. Warm capacity và known init assets trước sự kiện; dùng origin shielding/coalescing khi segments mới xuất hiện. Redundant ingest/encoders cần aligned timelines, keyframes, codec configuration và discontinuity handling để failover không phá player.",
+            "en": "Live still benefits from CDN sharing, but future media cannot be prefilled. Prewarm capacity and known initialization assets; shield/coalesce origins when new segments appear. Redundant ingest and encoders require aligned timelines, keyframes, codec configuration and discontinuity handling for playable failover."
+          },
+          "problem": {
+            "vi": "Hàng triệu viewers vào cùng lúc, cùng cold segment và có nguồn live duy nhất có thể mất.",
+            "en": "Millions join together, request the same cold segment and depend on fallible live sources."
+          },
+          "decision": {
+            "vi": "Tách control join admission khỏi shared media fan-out; redundant contribution, encoders/origins và tested player recovery.",
+            "en": "Separate join admission from shared-media fan-out; use redundant contribution, encoders/origins and tested player recovery."
+          },
+          "tradeoff": {
+            "vi": "Buffer lớn tăng resilience nhưng tăng glass-to-glass latency; low-latency chunks tăng request pressure và giảm thời gian che outage.",
+            "en": "Larger buffers improve resilience but increase glass-to-glass latency; low-latency chunks raise request pressure and reduce outage coverage."
+          },
+          "nextPressure": {
+            "vi": "Tiếp tục đo trên rehearsals và real cohorts; không xem có hai encoders là xong reliability.",
+            "en": "Continue rehearsals and cohort measurement; two encoders alone do not establish reliability."
+          },
+          "exitCriteria": {
+            "vi": "Rehearse join peak, origin loss, source failover và recovery backlog; caption/audio/DRM continuity và fallback được kiểm trên thiết bị thật.",
+            "en": "Rehearse peak joins, origin loss, source failover and recovery backlog; test caption/audio/DRM continuity and fallback on real devices."
+          },
+          "diagram": {
+            "id": "netflix-stage-live",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Live segment sharing giảm origin work, không giảm số bytes phải tới viewers.",
+              "en": "Segment sharing reduces origin work, not bytes ultimately delivered to viewers."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "source",
+                "label": {
+                  "vi": "Redundant ingest",
+                  "en": "Redundant ingest"
+                },
+                "detail": {
+                  "vi": "Independent contribution paths, timestamp monitoring.",
+                  "en": "Independent contribution paths and timestamp monitoring."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "encode",
+                "label": {
+                  "vi": "Aligned encoders",
+                  "en": "Aligned encoders"
+                },
+                "detail": {
+                  "vi": "Codec/keyframes/timeline có failover contract.",
+                  "en": "Codec, keyframes and timelines have a failover contract."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Live origin",
+                  "en": "Live origin"
+                },
+                "detail": {
+                  "vi": "Publishes segments only when complete/ready.",
+                  "en": "Publishes only complete, ready segments."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "shield",
+                "label": {
+                  "vi": "Origin shield",
+                  "en": "Origin shield"
+                },
+                "detail": {
+                  "vi": "Coalesce identical shared keys, validate authorization/cache scope.",
+                  "en": "Coalesces identical shared keys under valid authorization/cache scope."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "pop",
+                "label": {
+                  "vi": "CDN POPs",
+                  "en": "CDN POPs"
+                },
+                "detail": {
+                  "vi": "Share media segments, not personalized licenses.",
+                  "en": "Share segments, not personalized licenses."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "player",
+                "label": {
+                  "vi": "Live player",
+                  "en": "Live player"
+                },
+                "detail": {
+                  "vi": "Buffer, live edge và continuity recovery.",
+                  "en": "Buffering, live edge and continuity recovery."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "source",
+                    "to": "encode",
+                    "description": {
+                      "vi": "Ingest redundant source, detect stalls/time drift.",
+                      "en": "Ingest redundant sources and detect stalls/time drift."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "encode",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Publish aligned playable segments.",
+                      "en": "Publish aligned playable segments."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "player",
+                    "to": "pop",
+                    "description": {
+                      "vi": "Shared segment requests hội tụ theo live edge.",
+                      "en": "Shared requests converge near the live edge."
+                    }
+                  },
+                  {
+                    "from": "pop",
+                    "to": "shield",
+                    "description": {
+                      "vi": "Cold misses được coalesce theo segment/generation.",
+                      "en": "Coalesce cold misses by segment/generation."
+                    }
+                  },
+                  {
+                    "from": "shield",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Fetch complete shared object và fan-out về caches.",
+                      "en": "Fetch the complete object and fan it out through caches."
+                    }
+                  },
+                  {
+                    "from": "pop",
+                    "to": "player",
+                    "description": {
+                      "vi": "Deliver media; player bám buffer/live-latency policy.",
+                      "en": "Deliver media under player buffer/live-latency policy."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "4. Ước lượng bốn ngân sách khác nhau",
+        "en": "4. Estimate four different budgets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định học tập: 20 triệu active users/ngày, 5% đang xem ở giờ peak, 5 Mbps video trung bình cho mỗi viewer. Một triệu concurrent viewers cần khoảng 5 Tbps video payload ở edge; audio, overhead, retries và geographic imbalance tính thêm. Không đưa 5 Tbps qua app server rồi nhân instance. Với session xem trung bình 30 phút và concurrency ổn định, arrival rate xấp xỉ 1.000.000 / 1.800 ≈ 556 starts/s. Đây là Little’s-law reasoning dưới giả định steady state, không đúng cho lúc live event đồng loạt bắt đầu.",
+          "en": "Assume twenty million daily active users, five percent concurrently watching at peak and five Mbps average video. A million concurrent viewers require roughly five Tbps of edge video payload, before audio, overhead, retries and geography. Do not proxy this through application servers. At steady concurrency with thirty-minute average sessions, arrivals are approximately 1,000,000 / 1,800 ≈ 556 starts/second. This steady-state reasoning does not describe synchronized live-event joins."
+        },
+        {
+          "vi": "Segments dài 4 giây tạo khoảng 250 nghìn video segment requests/s ở viewer edge cho một triệu viewers, chưa kể audio/subtitle/manifests. CDN miss ratio phải tách bytes và requests: với byte hit ratio 98%, 5 Tbps có khoảng 100 Gbps miss payload trước overhead, tiered caches hoặc coalescing. Không dùng request hit ratio thay thế byte ratio khi objects khác kích thước.",
+          "en": "Four-second segments produce about 250 thousand viewer-edge video requests/second for a million viewers, excluding audio, subtitles and manifests. Separate byte and request hits: at 98 percent byte hits, five Tbps implies around 100 Gbps of miss payload before overhead, tiering or coalescing. Request hits cannot substitute for byte hits when object sizes differ."
+        },
+        {
+          "vi": "Một giờ video ở 5 Mbps là 2,25 GB decimal payload. Lưu catalog cần cộng tất cả renditions/codecs/audio của mỗi title rồi nhân duration, replicas và retained generations. Delivery dùng rendition mà viewers thực chọn, không cộng cả ladder cho mỗi lượt xem. Tiền delivery, storage, encoding, caches, idle failover capacity và engineering cần cost model riêng theo hợp đồng, không chỉ đếm compute.",
+          "en": "One hour at five Mbps is 2.25 decimal GB. Catalog storage sums all renditions, codecs and audio, multiplied by durations, replication and retained generations. Delivery follows renditions viewers actually choose, not the entire ladder per view. Delivery, storage, encoding, caches, idle reserves and engineering need contract-specific cost models rather than compute counts alone."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Ngân sách",
+            "en": "Budget"
+          },
+          {
+            "vi": "Công thức / fixture",
+            "en": "Formula / fixture"
+          },
+          {
+            "vi": "Quyết định được soi sáng",
+            "en": "Decision informed"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Edge media",
+              "en": "Edge media"
+            },
+            {
+              "vi": "1M × 5 Mbps = 5 Tbps",
+              "en": "1M × 5 Mbps = 5 Tbps"
+            },
+            {
+              "vi": "CDN placement, interconnect và headroom theo ISP/region.",
+              "en": "CDN placement, interconnect and headroom by ISP/region."
+            }
+          ],
+          [
+            {
+              "vi": "Control startup",
+              "en": "Control startup"
+            },
+            {
+              "vi": "Steady starts ≈ concurrency / session duration",
+              "en": "Steady starts ≈ concurrency / session duration"
+            },
+            {
+              "vi": "Auth/license/session capacity; live join tính riêng.",
+              "en": "Auth, license and session capacity; size live joins separately."
+            }
+          ],
+          [
+            {
+              "vi": "Catalog storage",
+              "en": "Catalog storage"
+            },
+            {
+              "vi": "Σ(rendition bitrate × duration / 8) × retained copies",
+              "en": "Σ(rendition bitrate × duration / 8) × retained copies"
+            },
+            {
+              "vi": "Codec variants, retention, encode/storage/delivery trade-off.",
+              "en": "Codec variants, retention and encode/storage/delivery trade-offs."
+            }
+          ],
+          [
+            {
+              "vi": "Feedback",
+              "en": "Feedback"
+            },
+            {
+              "vi": "1M viewers × 1 progress event / 10 s = 100K events/s",
+              "en": "1M viewers × 1 progress event / 10 s = 100K events/s"
+            },
+            {
+              "vi": "Batching, durable intake, consent, dedup và retention.",
+              "en": "Batching, durable intake, consent, deduplication and retention."
+            }
+          ]
+        ]
+      },
+      "callout": {
+        "title": {
+          "vi": "Giả định không phải số liệu công ty",
+          "en": "Assumptions are not company statistics"
+        },
+        "body": {
+          "vi": "Mọi số trong sizing và labs là fixture. Validate peak, geography, payload distribution, client cohorts và dependencies trước khi dùng để chọn production capacity.",
+          "en": "All sizing and lab numbers are fixtures. Validate peaks, geography, payload distributions, client cohorts and dependencies before production capacity choices."
+        }
+      }
+    },
+    {
+      "id": "play-trace",
+      "title": {
+        "vi": "5. Theo dõi Play, license, media và feedback",
+        "en": "5. Trace Play, licenses, media and feedback"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn trace startup để thấy authorization không nằm trên đường media bytes. License request và media fetch có thể được client overlap trong giới hạn DRM/package; sơ đồ mô tả dependencies logic, không khẳng định mọi request phải chạy tuần tự. Segment đã cache không loại bỏ nhu cầu session/license hợp lệ; encrypted assets có thể share trong cache scope nhưng access tokens và logs vẫn cần bảo vệ.",
+          "en": "Startup traces distinguish authorization from media transport. Clients may overlap license and media work where DRM and packaging allow; the diagram shows logical dependencies, not a mandatory sequential schedule. Cached segments do not remove valid-session/license requirements. Encrypted assets can share cache scopes while tokens and logs still need protection."
+        },
+        {
+          "vi": "Chọn trace feedback để phân biệt acknowledged progress, durable intake và history projection đã apply. Nếu dùng at-least-once intake, stable event identity và bounded dedup contract cần nêu rõ. Với hai thiết bị cùng profile, “progress mới nhất” phải theo session/version policy, không mù quáng lấy số giây lớn nhất hoặc client timestamp lớn nhất.",
+          "en": "The feedback trace distinguishes acknowledged progress, durable intake and applied history. At-least-once intake needs stable identity and bounded deduplication contracts. Concurrent devices require session/version policies; choosing the largest playback position or client timestamp blindly is not sufficient."
+        }
+      ],
+      "diagram": {
+        "id": "netflix-playback-planes",
+        "title": {
+          "vi": "Một lần bấm Play đi qua những đâu?",
+          "en": "Where does one Play action go?"
+        },
+        "caption": {
+          "vi": "Control plane cấp quyền/session và chọn media; data plane phân phối encrypted segments. Các trace là thiết kế minh họa, không khẳng định private topology hiện tại.",
+          "en": "The control plane authorizes sessions and selects media; the data plane delivers encrypted segments. Traces are an educational design, not an assertion of current private topology."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "player",
+            "label": {
+              "vi": "Player / device",
+              "en": "Player / device"
+            },
+            "detail": {
+              "vi": "Capabilities, DRM module, buffer, ABR và QoE events; không tự quyết quyền bằng UI.",
+              "en": "Capabilities, DRM module, buffers, ABR and QoE events; UI filtering does not authorize playback."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "API edge / device API",
+              "en": "API edge / device API"
+            },
+            "detail": {
+              "vi": "Auth, bounded admission, app compatibility và end-to-end deadline; không proxy media bytes.",
+              "en": "Authentication, bounded admission, compatibility and end-to-end deadlines; does not proxy media bytes."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "play",
+            "label": {
+              "vi": "Playback control",
+              "en": "Playback control"
+            },
+            "detail": {
+              "vi": "Session authority, content generation, plan và stream-limit/rights policy.",
+              "en": "Session authority, content generations, plans and stream-limit/rights policy."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "rights",
+            "label": {
+              "vi": "Account / rights",
+              "en": "Account / rights"
+            },
+            "detail": {
+              "vi": "Entitlements, territory/window/maturity và account restrictions với freshness contract.",
+              "en": "Entitlements, territory/windows, maturity and account restrictions under freshness contracts."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "reco",
+            "label": {
+              "vi": "Catalog / discovery",
+              "en": "Catalog / discovery"
+            },
+            "detail": {
+              "vi": "Metadata/ranking có bounded fallback; candidate visibility không thay Play authorization.",
+              "en": "Metadata/ranking with bounded fallbacks; candidate visibility does not replace Play authorization."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "model"
+          },
+          {
+            "id": "license",
+            "label": {
+              "vi": "License service",
+              "en": "License service"
+            },
+            "detail": {
+              "vi": "Validate session/device challenge và rights; key handling theo DRM/security contract.",
+              "en": "Validates session/device challenges and rights; keys follow DRM/security contracts."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "steer",
+            "label": {
+              "vi": "Media steering",
+              "en": "Media steering"
+            },
+            "detail": {
+              "vi": "Chọn available inventory theo ISP/region/load/health, candidates và expiry rõ.",
+              "en": "Selects available inventory by ISP, region, load and health with candidates and expiry."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "origin",
+            "label": {
+              "vi": "Media origin",
+              "en": "Media origin"
+            },
+            "detail": {
+              "vi": "Versioned VOD assets hoặc live generation; origin shield/request coalescing.",
+              "en": "Versioned VOD assets or live generations with shielding/coalescing."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "Event ingest / log",
+              "en": "Event ingest / log"
+            },
+            "detail": {
+              "vi": "Stable event/session sequence, durable boundary, schema/consent và retention.",
+              "en": "Stable event/session sequences, durable boundaries, schemas, consent and retention."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "queue"
+          },
+          {
+            "id": "history",
+            "label": {
+              "vi": "QoE / history / data",
+              "en": "QoE / history / data"
+            },
+            "detail": {
+              "vi": "Replay-safe projections, event-time lateness và deletion; không entitlement authority.",
+              "en": "Replay-safe projections, event-time lateness and deletion; not entitlement authority."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "store"
+          },
+          {
+            "id": "cdn",
+            "label": {
+              "vi": "ISP / CDN edge",
+              "en": "ISP / CDN edge"
+            },
+            "detail": {
+              "vi": "Cached encrypted immutable segments, inventory/health và authorized cache policy.",
+              "en": "Cached encrypted immutable segments, inventory/health and authorized cache policy."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "edge"
+          },
+          {
+            "id": "encode",
+            "label": {
+              "vi": "Encode / live ingest",
+              "en": "Encode / live ingest"
+            },
+            "detail": {
+              "vi": "DAG validation, quality/codec/DRM packages và manifest-after-assets publication.",
+              "en": "DAG validation, quality/codec/DRM packages and manifest-after-assets publication."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "play",
+            "label": {
+              "vi": "Khởi tạo playback",
+              "en": "Start playback"
+            },
+            "steps": [
+              {
+                "from": "player",
+                "to": "edge",
+                "description": {
+                  "vi": "Play gửi title/profile/device capabilities và stable request ID.",
+                  "en": "Play sends title/profile/capabilities and a stable request ID."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "play",
+                "description": {
+                  "vi": "Auth/admit và truyền deadline; create session retry-safe theo contract.",
+                  "en": "Authenticate/admit and propagate deadlines; create a retry-safe session under its contract."
+                }
+              },
+              {
+                "from": "play",
+                "to": "rights",
+                "description": {
+                  "vi": "Validate entitlement, territory/window, maturity và stream-limit policy.",
+                  "en": "Validate entitlement, territory/windows, maturity and stream-limit policy."
+                }
+              },
+              {
+                "from": "play",
+                "to": "steer",
+                "description": {
+                  "vi": "Chọn media generation/device package và candidate CDNs khỏe có inventory.",
+                  "en": "Select a generation/device package and healthy CDN candidates with inventory."
+                }
+              },
+              {
+                "from": "play",
+                "to": "player",
+                "description": {
+                  "vi": "Trả session ID, manifest reference, license route và token expiry.",
+                  "en": "Return session IDs, manifests, license routes and token expiry."
+                }
+              }
+            ]
+          },
+          {
+            "id": "license",
+            "label": {
+              "vi": "License và media",
+              "en": "License and media"
+            },
+            "steps": [
+              {
+                "from": "player",
+                "to": "license",
+                "description": {
+                  "vi": "Gửi DRM challenge với scoped session; không log secrets vào telemetry.",
+                  "en": "Send a scoped DRM challenge without logging secrets into telemetry."
+                }
+              },
+              {
+                "from": "license",
+                "to": "rights",
+                "description": {
+                  "vi": "Revalidate theo contract và key policy; timeout không fail open.",
+                  "en": "Validate under rights/key policy; timeouts never fail open."
+                }
+              },
+              {
+                "from": "license",
+                "to": "player",
+                "description": {
+                  "vi": "Trả device/scheme-bound license theo policy; key nằm trong security boundary phù hợp.",
+                  "en": "Return licenses under device/scheme policy and appropriate key security boundaries."
+                }
+              },
+              {
+                "from": "player",
+                "to": "cdn",
+                "description": {
+                  "vi": "Fetch manifest/segments bằng scoped authorization và cache identity đúng.",
+                  "en": "Fetch manifests/segments with scoped authorization and correct cache identity."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "origin",
+                "description": {
+                  "vi": "Miss dùng shield/coalescing; không route qua account API cho mỗi media byte.",
+                  "en": "Misses use shielding/coalescing rather than routing every media byte through account APIs."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "player",
+                "description": {
+                  "vi": "Player decrypt/decode, chọn rendition theo throughput/buffer và report QoE.",
+                  "en": "The player decrypts/decodes, selects renditions from throughput/buffers and reports QoE."
+                }
+              }
+            ]
+          },
+          {
+            "id": "events",
+            "label": {
+              "vi": "History và learning",
+              "en": "History and learning"
+            },
+            "steps": [
+              {
+                "from": "player",
+                "to": "events",
+                "description": {
+                  "vi": "Gửi sequence/event-time và consent-bounded QoE/progress events.",
+                  "en": "Send sequenced event-time QoE/progress under consent bounds."
+                },
+                "async": true
+              },
+              {
+                "from": "events",
+                "to": "history",
+                "description": {
+                  "vi": "Dedup, xử lý late events, upsert progress theo session/version contract.",
+                  "en": "Deduplicate, handle lateness and upsert progress under session/version contracts."
+                },
+                "async": true
+              },
+              {
+                "from": "history",
+                "to": "reco",
+                "description": {
+                  "vi": "Cập nhật governed features/projections có freshness metadata.",
+                  "en": "Update governed features/projections with freshness metadata."
+                },
+                "async": true
+              },
+              {
+                "from": "reco",
+                "to": "edge",
+                "description": {
+                  "vi": "Trả catalog/ranking hợp policy với bounded fallback.",
+                  "en": "Return policy-compliant catalog/ranking with bounded fallback."
+                }
+              }
+            ]
+          },
+          {
+            "id": "publish",
+            "label": {
+              "vi": "Publish VOD và prefill",
+              "en": "Publish VOD and prefill"
+            },
+            "steps": [
+              {
+                "from": "encode",
+                "to": "origin",
+                "description": {
+                  "vi": "Complete encode/QA/package generation; publish assets trước manifest.",
+                  "en": "Complete encoding, QA and packaging; publish assets before manifests."
+                },
+                "async": true
+              },
+              {
+                "from": "origin",
+                "to": "cdn",
+                "description": {
+                  "vi": "Prefill selected complete assets off-peak; publish inventory sau validation.",
+                  "en": "Prefill selected complete assets off peak and publish inventory after validation."
+                },
+                "async": true
+              },
+              {
+                "from": "cdn",
+                "to": "steer",
+                "description": {
+                  "vi": "Report health, inventory và capacity; expired health không là proof còn media.",
+                  "en": "Report health, inventory and capacity; stale health is not proof of availability."
+                },
+                "async": true
+              },
+              {
+                "from": "steer",
+                "to": "play",
+                "description": {
+                  "vi": "Chỉ trả candidate phù hợp generation và device/rights context.",
+                  "en": "Return only candidates compatible with generation and device/rights context."
+                }
+              }
+            ]
+          },
+          {
+            "id": "live",
+            "label": {
+              "vi": "Live và degraded paths",
+              "en": "Live and degraded paths"
+            },
+            "steps": [
+              {
+                "from": "encode",
+                "to": "origin",
+                "description": {
+                  "vi": "Redundant live ingest tạo aligned segment generation; không prefill tương lai.",
+                  "en": "Redundant live ingest creates aligned generations without future prefill."
+                },
+                "async": true
+              },
+              {
+                "from": "player",
+                "to": "cdn",
+                "description": {
+                  "vi": "Nhiều viewers request cùng new segment; edge coalesces shared keys.",
+                  "en": "Many viewers request the same new segment; edges coalesce shared keys."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "origin",
+                "description": {
+                  "vi": "Shield gom miss; origin failure dùng tested alternate generation/continuity policy.",
+                  "en": "Shields collapse misses; failures use tested alternate-generation/continuity policies."
+                }
+              },
+              {
+                "from": "player",
+                "to": "steer",
+                "description": {
+                  "vi": "Khi candidate hỏng, bounded refresh/failover theo session/token expiry.",
+                  "en": "On candidate failure, bounded refresh/failover follows session/token expiry."
+                }
+              },
+              {
+                "from": "player",
+                "to": "events",
+                "description": {
+                  "vi": "Report startup/rebuffer/live latency để kiểm degraded UX, không chỉ server 200.",
+                  "en": "Report startup, rebuffering and live latency to observe degraded UX beyond server 200 rates."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "6. API và state: nhỏ, rõ, retry-safe",
+        "en": "6. APIs and state: small, explicit and retry-safe"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các endpoints sau là API minh họa. Request ID chỉ hữu ích khi server lưu result/ownership theo idempotency scope và retention; không tự biến POST thành exactly-once. Session có principal/profile, title generation, device/DRM capabilities, rights policy version, expiry và state. Một token hết hạn trong phim cần defined renewal behavior để tránh khiến mọi viewers refresh cùng lúc.",
+          "en": "These are illustrative APIs. Request IDs help only when servers retain results/ownership under scoped idempotency and retention; they do not make POST exactly-once. Sessions pin principals/profiles, title generations, device/DRM capabilities, policy versions, expiry and state. Define renewal behavior to avoid synchronized token refresh during playback."
+        },
+        {
+          "vi": "Không lưu raw license keys hoặc bearer tokens vào warehouse. Event payload minimize personal fields; TTL, access logs và deletion propagation phải bao gồm caches/projections/backups theo policy. Media URLs nên tránh exposing identity trong cache key hoặc log nếu không cần; cache authorization phải xác minh đúng scope để public encrypted bytes không bị đánh đồng với public entitlement.",
+          "en": "Do not place raw license keys or bearer tokens in warehouses. Minimize event personal fields; TTLs, access logs and deletion policies cover caches, projections and backups. Avoid unnecessary identity in media URLs and logs. Cache authorization must enforce scope; shareable encrypted bytes do not imply public entitlement."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/playback-sessions",
+          "description": {
+            "vi": "Authorize Play và trả contract cho client.",
+            "en": "Authorize Play and return a client contract."
+          },
+          "request": "{\"requestId\":\"p-781\",\"titleId\":\"t42\",\"profileId\":\"pr7\",\"device\":{\"codec\":[\"avc\"],\"drm\":\"supported-scheme\"}}",
+          "response": "201 { sessionId, titleGeneration, manifestUrl, licenseEndpoint, mediaCandidates, expiresAt, policyVersion }",
+          "notes": [
+            {
+              "vi": "Cùng requestId/principal và payload trả cùng result trong retention window; payload khác bị reject. Không reuse session của principal khác.",
+              "en": "Within retention, identical principal/request/payload returns the retained result; changed payload is rejected. Sessions are never reused across principals."
+            },
+            {
+              "vi": "403/region-rights-unavailable không retry bằng bypass quyền; 429/503 có bounded retry và Retry-After theo contract.",
+              "en": "Rights denials cannot be retried by bypassing policy; 429/503 use bounded retries and contract-defined Retry-After."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/drm/licenses",
+          "description": {
+            "vi": "Xử lý DRM challenge với session và device validation.",
+            "en": "Process DRM challenges with session/device validation."
+          },
+          "request": "{ sessionId, challenge, deviceAttestationIfRequired }",
+          "response": "200 <scheme-specific license> | explicit authorization / validation error",
+          "notes": [
+            {
+              "vi": "Không phải generic JSON key endpoint; DRM scheme/device security model quyết định license shape và lifecycle.",
+              "en": "This is not a generic JSON-key endpoint; the DRM/device security model defines license shape and lifecycle."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/media/{generation}/{package}/{rendition}/{segment}",
+          "description": {
+            "vi": "Lấy immutable encrypted segment theo scoped access/cache policy.",
+            "en": "Fetch immutable encrypted segments under scoped access/cache policies."
+          },
+          "response": "200 <segment bytes>; Content-Type, cache policy, integrity/version metadata",
+          "notes": [
+            {
+              "vi": "Signed URL/token expiry, cache key và origin authorization phải đồng bộ; đừng cache một access denial cho mọi users.",
+              "en": "Align signed-token expiry, cache keys and origin authorization; never share-cache one user’s denial across all users."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/playback-events",
+          "description": {
+            "vi": "Gửi batch có stable event identity, sequence, event-time và consent scope.",
+            "en": "Send batches with stable event identity, sequences, event time and consent scope."
+          },
+          "request": "{ sessionId, events: [{ eventId, seq, type, eventTime, positionMs }] }",
+          "response": "202 { acceptedEventIds, durabilityBoundary: \"durable-intake\" }",
+          "notes": [
+            {
+              "vi": "ACK này chưa chứng minh mọi history/experiment projection đã cập nhật; retry giữ event IDs.",
+              "en": "This ACK does not establish that all history/experiment projections have updated; retries retain event IDs."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "startup",
+      "title": {
+        "vi": "7. Startup budget và dependency isolation",
+        "en": "7. Startup budgets and dependency isolation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một mục tiêu startup cần định nghĩa từ thao tác Play đến first frame, và tách cold/warm app, DRM, geography và live/VOD cohorts. API p99 nhanh không bảo đảm first-frame nhanh: DNS/TLS, app startup, entitlement/session, manifest, DRM license, initial media buffer và decode đều đóng góp. Không cộng p99 từng hop rồi gọi là p99 toàn request; dùng distributed/client timing và traces để xem critical path và correlation.",
+          "en": "Define startup from Play to first frame, segmented by cold/warm app, DRM, geography and live/VOD. Fast API p99 does not guarantee first frames: DNS/TLS, app startup, authorization, manifests, licenses, buffers and decode all contribute. Summing hop p99s is not an end-to-end p99 estimate; use correlated client and distributed timings to find critical paths."
+        },
+        {
+          "vi": "Dùng parent deadline và remaining budget; bounded retries chỉ cho operation an toàn và nằm trong budget. Tách browse/recommendation pools khỏi Play/license pools. Nếu catalog decoration chậm, có thể trả layout đơn giản nhưng vẫn lọc eligibility. Nếu entitlement authority không đáp ứng freshness policy, trả error/degraded behavior theo contract, không tự grant. Cache hit stale cũng là một decision về quyền và revoked access.",
+          "en": "Propagate parent deadlines and remaining budgets. Retry only safe operations within bounded budgets. Isolate browse/recommendation resources from Play/license resources. Slow decorations may fall back to simple eligible layouts. An unavailable entitlement authority must follow freshness/error policy rather than grant access. Stale cached grants are also decisions about revocation."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Có thể degrade có kiểm soát",
+            "en": "Controlled degradation"
+          },
+          "icon": "check",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Artwork phụ, row ordering hoặc personalized rank → safe metadata/popular candidates đã lọc.",
+              "en": "Optional artwork, row ordering or ranking can fall back to filtered metadata/popular candidates."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Phải giữ invariant",
+            "en": "Preserve invariants"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Rights, maturity, account restrictions, license scope và payment plan không được bypass vì timeout.",
+              "en": "Rights, maturity, account restrictions, licenses and plans must not be bypassed on timeout."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Cần đo phía client",
+            "en": "Observe clients"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "First-frame time, rebuffer ratio/duration, bitrate switches, failures và live latency theo cohort.",
+              "en": "Measure first-frame time, rebuffer ratios/durations, switches, failures and live latency by cohort."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "quality",
+      "title": {
+        "vi": "8. Per-title encoding: chất lượng là evidence",
+        "en": "8. Per-title encoding: quality needs evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixed ladder gán cùng resolution/bitrate list cho mọi title dễ vận hành nhưng không thích nghi độ khó nén. Per-title chọn ladder theo measured rate–quality curves; per-shot chia scene/shot để cấp bits phù hợp hơn. Đây không phải chỉ nhân bitrate với một slider “complexity”. Khi đổi codec, quality metric, crop, grain treatment hoặc target device, curves cần đo/validate lại.",
+          "en": "A fixed resolution/bitrate ladder is simple but ignores content compressibility. Per-title ladders use measured rate–quality curves; per-shot processing allocates bits at finer granularity. This is not a complexity multiplier. Codec, metric, crop, grain treatment and device changes require renewed measurement and validation."
+        },
+        {
+          "vi": "Tập điểm không bị dominated là Pareto frontier: không có điểm khác vừa dùng bitrate thấp hơn hoặc bằng, vừa đạt quality cao hơn hoặc bằng, với ít nhất một điều tốt hơn. Convex-hull rate–distortion optimization và ladder selection thực có thêm constraints; lab chỉ hiển thị nondominated candidates và chọn điểm nhỏ nhất đạt target. Device cap được lọc trước frontier; nếu loại 1080p thì một 720p point trước đó bị trội có thể trở nên hữu ích.",
+          "en": "A Pareto frontier contains candidates not dominated by another with no greater bitrate and no lower quality, with at least one strict improvement. Real convex-hull and ladder optimization adds constraints; the lab only shows nondominated candidates and minimum-rate target choices. Apply device caps before computing frontiers: excluding 1080p can make a previously dominated 720p point useful."
+        },
+        {
+          "vi": "Giữ ABR switching-compatible segment boundaries/keyframes và representation metadata. Một codec mới giảm bytes cho một cohort nhưng phải tính encode compute, additional storage, device coverage, decode energy và lỗi rollout. Đừng xóa legacy codec chỉ vì metric offline tốt; route theo capabilities và retain rollback generation. So sánh tổng thể bằng quality/error/cost theo cohort, không một percentage tiết kiệm cho tất cả phim.",
+          "en": "Preserve switching-compatible segment boundaries, keyframes and representation metadata. A new codec may save bytes for a cohort while adding encoding, storage, compatibility, energy and rollout costs. Preserve supported legacy codecs and rollback generations. Compare quality, failures and cost by cohort instead of asserting one saving for every film."
+        }
+      ],
+      "experiment": "netflix-quality"
+    },
+    {
+      "id": "prefill",
+      "title": {
+        "vi": "9. CDN prefill, inventory và steering",
+        "en": "9. CDN prefill, inventory and steering"
+      },
+      "paragraphs": [
+        {
+          "vi": "Prefill biến một phần peak demand thành off-peak transfer; chỉ effective khi cache có đúng rendition/generation mà viewer sẽ cần. Forecast theo title alone chưa đủ khi vùng dùng codec, audio hoặc device khác nhau. Request hit ratio đo số requests; byte hit ratio đo tổng bytes. Một file hiếm nhưng rất lớn có thể làm hai tỷ lệ khác mạnh, và một title nhiều starts nhưng bỏ sớm không có bytes demand bằng số plays nhân full-file size.",
+          "en": "Prefill shifts some peak demand off peak when caches contain the correct renditions and generations. Title-level forecasts alone miss regional codec, audio and device variation. Request hits count requests while byte hits count bytes. Rare large objects and early abandonment can make these measures diverge; starts times full-file size is not universal demand."
+        },
+        {
+          "vi": "Trong lab, file A nhiều predicted plays nhất nhưng chiếm 6 GB; chọn A trước có thể bỏ lỡ B+C có tổng avoided bytes cao hơn trong 10 GB. Đây là 0/1 knapsack với hai resource bounds: storage và fill window. Mô hình giả định full-file views, complete-file availability và dự báo chính xác. Production thường chia chunks, có moving popularity, multiple cache tiers, disk/network constraints và partial fill; mục tiêu cũng có thể là QoE tail hoặc fairness thay vì bytes.",
+          "en": "In the lab, A has the most predicted plays but costs six GB. Choosing A first can displace B+C, whose avoided bytes are higher within ten GB. This is a 0/1 knapsack constrained by storage and fill windows. Full-file views, complete availability and accurate forecasts are assumptions. Production uses chunks, shifting demand, tiers and disk/network constraints; tail QoE or fairness may matter more than bytes."
+        },
+        {
+          "vi": "Steering cần inventory freshness, health, network locality và capacity; health xanh mà disk thiếu title không đủ. Return bounded candidates, token/session validity và failover behavior. Origin shields/coalescing giảm synchronized miss amplification nhưng không phải cho mọi personalized request. Cache eviction hoặc metadata invalidation phải giữ generation-consistent behavior. Appliance failure, stale inventory và new-title spike là ba test riêng.",
+          "en": "Steering combines inventory freshness, health, locality and capacity. A healthy server without a title is insufficient. Return bounded candidates with session/token and failover policies. Shields and coalescing reduce synchronized misses for shared objects, not every personalized request. Eviction and invalidation preserve generations. Test appliance failure, stale inventory and new-title spikes separately."
+        }
+      ],
+      "experiment": "netflix-fill"
+    },
+    {
+      "id": "regions",
+      "title": {
+        "vi": "10. Multi-region: capacity, state và drill",
+        "en": "10. Multi-region: capacity, state and drills"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả sử ba region đều đủ tối đa 100K control requests/s; tổng peak 180K được chia 60K mỗi region. Mất một region, hai region còn lại trung bình 90K; đã gần ceiling chưa tính retry/warmup. Nếu tổng peak là 240K thì sau mất region cần 120K mỗi region, vượt capacity dù dashboard trước đó chỉ 80%. Không dùng utilization hiện tại của một region để kết luận chịu được mất region.",
+          "en": "Assume three regions each sustain at most 100K control requests/second. A total peak of 180K gives 60K each; after one loss the survivors average 90K, close to ceilings before retries and warmup. At 240K total, survivors need 120K each, exceeding capacity despite pre-failure 80 percent utilization. Current single-region utilization does not establish evacuation readiness."
+        },
+        {
+          "vi": "Immutable media replicate/cache dễ hơn profile restrictions và concurrent-stream counters. State authority có thể dùng home region, globally consistent storage hoặc explicitly bounded stale policy; phải nêu behavior khi authority unreachable. Một eventual history update thường chấp nhận được nếu có session merge policy; revoked account được grant thêm có thể không chấp nhận được. Active-active là traffic topology, không một consistency guarantee.",
+          "en": "Immutable media are easier to replicate than restrictions and concurrent-stream counters. Choose home-region authority, globally consistent storage or an explicit bounded-stale policy, defining unreachable-authority behavior. Eventual history may be acceptable with merge rules while newly revoked access may not be. Active-active describes traffic topology, not consistency guarantees."
+        },
+        {
+          "vi": "Game day bắt đầu bằng hypothesis và bounded load shift. Theo dõi client startup/rebuffer, entitlement errors, queue backlog, dependency saturation, DNS/connection draining và retry volume; abort theo threshold đã chọn. Runbook nêu owner, automation, rollback và bước verify phục hồi. Sau failover còn catch-up/reconcile; quay traffic về quá nhanh có thể tạo cache miss/retry storm lần hai.",
+          "en": "Game days start with hypotheses and bounded shifts. Observe client startup/rebuffering, rights errors, queue lag, dependencies, DNS/connections and retries. Predefine abort thresholds, owners, automation, rollback and recovery checks. Catch-up and reconciliation continue after failover; returning traffic too quickly can create another miss/retry storm."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "State",
+            "en": "State"
+          },
+          {
+            "vi": "Ví dụ contract",
+            "en": "Example contract"
+          },
+          {
+            "vi": "Failure question",
+            "en": "Failure question"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Media generation",
+              "en": "Media generation"
+            },
+            {
+              "vi": "Immutable, publish-after-ready, retained readable versions.",
+              "en": "Immutable, publish-after-ready, retained readable versions."
+            },
+            {
+              "vi": "Alternate origin có cùng bytes/timeline chưa?",
+              "en": "Does the alternate origin have compatible bytes/timelines?"
+            }
+          ],
+          [
+            {
+              "vi": "Progress history",
+              "en": "Progress history"
+            },
+            {
+              "vi": "Eventual projection với session/version merge.",
+              "en": "Eventual projection with session/version merges."
+            },
+            {
+              "vi": "Late event có đẩy người dùng về progress cũ không?",
+              "en": "Can late events roll progress backwards incorrectly?"
+            }
+          ],
+          [
+            {
+              "vi": "Entitlement / restrictions",
+              "en": "Entitlement / restrictions"
+            },
+            {
+              "vi": "Authority + explicit freshness/revocation policy.",
+              "en": "Authority with explicit freshness/revocation policy."
+            },
+            {
+              "vi": "Partition sẽ deny, route home hay honor bounded grant?",
+              "en": "Does a partition deny, route home or honor a bounded grant?"
+            }
+          ],
+          [
+            {
+              "vi": "Stream-limit lease",
+              "en": "Stream-limit lease"
+            },
+            {
+              "vi": "Owner/lease/expiry theo consistency contract.",
+              "en": "Ownership, leases and expiry under a consistency contract."
+            },
+            {
+              "vi": "Split regions có vượt limit hoặc double-owner không?",
+              "en": "Can split regions exceed limits or admit duplicate owners?"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "discovery",
+      "title": {
+        "vi": "11. Discovery, artwork và feedback không được đo sai",
+        "en": "11. Measure discovery and feedback correctly"
+      },
+      "paragraphs": [
+        {
+          "vi": "Discovery pipeline có candidate retrieval, eligibility filters, ranking và page composition. Artworks/locales có asset versions; ranking features cần freshness và consent. Eligibility filtering ở Browse giúp UX, nhưng Play vẫn phải authorize lại theo policy. Recommendation dependency chậm có thể dùng popular/current catalog fallback đã lọc, với separate metrics cho degraded path.",
+          "en": "Discovery includes retrieval, eligibility, ranking and composition. Artwork and localization need asset versions; features need freshness and consent. Browse filtering improves experience while Play still authorizes current policy. Slow recommendation dependencies can use eligible popular/current catalog fallbacks with separate degraded-path metrics."
+        },
+        {
+          "vi": "Experiment cần stable assignment unit (profile/account/device tùy hypothesis), exposure khi treatment thực render, model/version IDs và guardrails. Log assignment mà không render không phải exposure. Offline NDCG/click prediction chưa chứng minh users hưởng lợi; experiments có novelty, selection bias, repeated measures và latency side effects. Chọn success criteria trước khi nhìn kết quả, kiểm segments và uncertainty thay vì tuyên bố lift từ một average.",
+          "en": "Experiments require stable assignment units, actual rendered exposure, model/version identities and guardrails. Assignment without rendering is not exposure. Offline ranking/click metrics do not prove user benefit; novelty, bias, repeated measures and latency matter. Prespecify success criteria, inspect segments and uncertainty and avoid declaring lift from one average."
+        },
+        {
+          "vi": "QoE events có event ID, session sequence, event time và schema version; handle clock skew/lateness, duplicate batches và offline devices. Retention/deletion phải đi qua features, projections và export policy. Streaming dashboard cho operational alerts và warehouse cho analysis có latency khác; so sánh chỉ số cần cùng denominator, time windows và definitions.",
+          "en": "QoE events need IDs, session sequences, event time and schema versions, handling skew, lateness, duplicates and offline clients. Retention/deletion policies cover features, projections and exports. Operational dashboards and analytical warehouses have different latency; compare metrics only under compatible denominators, windows and definitions."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Exposure",
+            "en": "Exposure"
+          },
+          "icon": "inspect",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Treatment thực sự được render cho unit; gắn assignment/model version và consent.",
+              "en": "The treatment is actually rendered to the unit with assignment/model versions and consent."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "QoE",
+            "en": "QoE"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "First-frame, rebuffering và device/network errors; không chỉ engagement tổng.",
+              "en": "First frames, rebuffering and device/network errors, not just aggregate engagement."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Privacy",
+            "en": "Privacy"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Minimize fields, access/retention/deletion và governed feature lineage.",
+              "en": "Minimize fields and govern access, retention, deletion and feature lineage."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ads",
+      "title": {
+        "vi": "12. Ads: deadline, timeline và measurement",
+        "en": "12. Ads: deadlines, timelines and measurement"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ad-supported playback thêm tier/consent/frequency context và ad decision services. Trả personalized manifest hoặc server-side stitched media phải giữ codec/audio/timeline/DRM continuity trên devices được hỗ trợ. Bounded decision deadline tránh giữ vô hạn critical startup; timeout/no-fill behavior là product/contract policy, có thể là fallback creative hoặc khác, không suy ra luôn skip ads.",
+          "en": "Ad-supported playback adds tier, consent, frequency context and decision services. Personalized manifests and stitched media preserve codec, audio, timeline and DRM continuity on supported devices. Bound decisions within startup deadlines. Timeout/no-fill behavior is a product/contract policy, potentially fallback creatives or another action, never an assumed universal skip."
+        },
+        {
+          "vi": "Separately define request, decision, impression, quartile/completion và billable event. Một HTTP 200 từ decision service không chứng minh creative được tải hay nhìn thấy. Stable IDs, client/server reconciliation, bounded dedup và fraud/privacy controls giữ measurement có nghĩa. Pipeline chậm nên buffer/retry theo policy nhưng không gắn synchronous warehouse write vào mỗi media segment.",
+          "en": "Define requests, decisions, impressions, progress and billable events separately. A decision-service 200 proves neither creative download nor visibility. Stable identities, reconciliation, bounded deduplication, fraud and privacy controls preserve meaning. Slow measurement can buffer/retry under policy without synchronous warehouse writes for each segment."
+        },
+        {
+          "vi": "Shared media segments vẫn cache được dù manifest personalized; cache key/scope và token validation phải phân biệt hai loại. Frequency caps giữa devices/regions có consistency/freshness trade-offs riêng. Dùng controlled cohort rollout, rehearsal cho no-fill/creative mismatch và giữ QoE guardrails theo ad tier/device.",
+          "en": "Shared segments can remain cacheable while manifests are personalized, with distinct keys, scopes and token validation. Cross-device/region frequency caps have separate consistency/freshness trade-offs. Roll out by cohort, rehearse no-fill and creative mismatch and retain tier/device QoE guardrails."
+        }
+      ]
+    },
+    {
+      "id": "live",
+      "title": {
+        "vi": "13. Live: join surge, origin pressure và buffer",
+        "en": "13. Live: join surges, origins and buffers"
+      },
+      "paragraphs": [
+        {
+          "vi": "VOD có thể preposition hầu hết media trước peak; live media chỉ xuất hiện sau ingest/encoding. Có thể warm infrastructure, capacity, connections và known init assets, nhưng không fill future frames. Những viewers ở cùng live edge thường request chung segment; CDN vẫn hữu ích. Edge coalescing giảm một fetch mỗi viewer thành một mỗi POP/variant; shared shield có thể giảm tiếp, dưới giả định key, timing, cacheability và generation phù hợp.",
+          "en": "VOD can preposition media before peaks; live media exists only after ingest/encoding. Prewarm infrastructure, capacity, connections and known initialization assets, but not future frames. Viewers near the same live edge share segments, so CDN remains useful. Edge coalescing can reduce per-viewer fetches to per-POP/variant fetches; shielding can reduce further under compatible key, timing, cacheability and generation assumptions."
+        },
+        {
+          "vi": "Control plane vẫn chịu auth/license/session startup. Ba triệu viewers đến trong 30 giây, hai control calls mỗi viewer, tạo khoảng 200K requests/s dù media cache hit hoàn hảo. Khả năng queue/admit, pre-established sessions, token renewal jitter và tested overload UX cần xem riêng; không coalesce licenses hoặc cache personalized grants theo segment key.",
+          "en": "The control plane still handles authentication, licenses and startup. Three million viewers joining in thirty seconds with two calls each create about 200K control requests/second even with perfect media hits. Admission, queues, established sessions, renewal jitter and overload UX need separate planning; licenses and grants cannot be coalesced by media keys."
+        },
+        {
+          "vi": "Redundant encoders tạo input paths có thể khác timestamp/keyframe/codec config; failover cần generation/sequence/discontinuity contract và device tests. Buffer che được outage ngắn nhưng tăng live latency. Low-latency protocols dùng partial segments/chunks thay đổi request pattern, availability và latency budget; lab dưới dùng full four-second segments để chỉ rõ trade-off, không dự báo chất lượng low-latency thực.",
+          "en": "Redundant encoders may differ in timestamps, keyframes and codec configuration. Failover needs generation, sequence and discontinuity contracts plus device tests. Buffers hide short outages at the cost of latency. Low-latency chunks change requests, availability and budgets; this lab uses full four-second segments to expose a trade-off, not predict low-latency performance."
+        }
+      ],
+      "experiment": "netflix-live"
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "14. Kiểm thử failure theo invariant",
+        "en": "14. Test failures against invariants"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn một trace, inject một fault rồi hỏi ACK có nghĩa gì, data authority nằm đâu, request có replay an toàn không và client nhìn thấy gì. Server availability, playback QoE, rights correctness và measurement integrity là bốn trục khác nhau. Dashboard cần phân rã theo ISP/device/region/content generation để một cohort nhỏ bị hỏng không chìm trong average toàn cầu.",
+          "en": "Choose a trace, inject a fault and ask what ACKs mean, where authority lives, whether replay is safe and what clients see. Availability, playback QoE, authorization and measurement integrity are distinct axes. Break dashboards down by ISP, device, region and content generation so small failing cohorts do not disappear in global averages."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Invariant / behavior",
+            "en": "Invariant / behavior"
+          },
+          {
+            "vi": "Evidence",
+            "en": "Evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Encode worker retry",
+              "en": "Encode worker retry"
+            },
+            {
+              "vi": "Output generation không trộn; manifest không trỏ partial assets.",
+              "en": "Do not mix output generations or reference partial assets."
+            },
+            {
+              "vi": "Replayed DAG task, asset hashes, publish log và player validation.",
+              "en": "Replayed tasks, hashes, publication logs and player validation."
+            }
+          ],
+          [
+            {
+              "vi": "Recommendation timeout",
+              "en": "Recommendation timeout"
+            },
+            {
+              "vi": "Bounded fallback, resources Play còn đủ và rights vẫn enforce.",
+              "en": "Bound fallback, preserve Play resources and enforce rights."
+            },
+            {
+              "vi": "Pool saturation, deadline traces, filtered fallback và client QoE.",
+              "en": "Pool saturation, deadlines, filtered fallback and client QoE."
+            }
+          ],
+          [
+            {
+              "vi": "Stale CDN inventory",
+              "en": "Stale CDN inventory"
+            },
+            {
+              "vi": "Candidate miss có bounded alternate; không retry loop.",
+              "en": "Misses have bounded alternatives rather than retry loops."
+            },
+            {
+              "vi": "Generation/health age, miss amplification và rebuffer tails.",
+              "en": "Generation/health age, miss amplification and rebuffer tails."
+            }
+          ],
+          [
+            {
+              "vi": "Region evacuation",
+              "en": "Region evacuation"
+            },
+            {
+              "vi": "Survivor capacity và state authority đủ, ACK/RPO đúng contract.",
+              "en": "Survivor capacity, authority and ACK/RPO match contracts."
+            },
+            {
+              "vi": "Client failures, routes, lag, queues, leases và restore drill.",
+              "en": "Client failures, routing, lag, queues, leases and restore drills."
+            }
+          ],
+          [
+            {
+              "vi": "Duplicate / late events",
+              "en": "Duplicate / late events"
+            },
+            {
+              "vi": "Không nhân đôi impression hoặc cho progress cũ thắng sai.",
+              "en": "Do not duplicate impressions or wrongly let old progress win."
+            },
+            {
+              "vi": "Replay fixtures, dedup horizon, event-time windows và projection versions.",
+              "en": "Replay fixtures, dedup horizons, event-time windows and versions."
+            }
+          ],
+          [
+            {
+              "vi": "Live source / origin failure",
+              "en": "Live source / origin failure"
+            },
+            {
+              "vi": "Playable continuity hoặc explicit recovery, không silent wrong timeline.",
+              "en": "Playable continuity or explicit recovery, not silent timeline corruption."
+            },
+            {
+              "vi": "Sequence/keyframe checks, real-device rehearsal, stall/live-latency tails.",
+              "en": "Sequence/keyframe checks, device rehearsals, stall and live-latency tails."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "decisions",
+      "title": {
+        "vi": "15. Ra quyết định theo constraint, không theo tên công nghệ",
+        "en": "15. Choose by constraints rather than technology names"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một câu trả lời tốt nêu requirement, giải pháp đơn giản đủ dùng, bottleneck buộc phải đổi và phương án bị loại có lý do. “Netflix dùng nên mình dùng” không chứng minh benefit cho startup. Modular monolith + managed CDN + relational metadata có thể đúng rất lâu nếu đáp ứng isolation, QoE và recovery. Ngược lại, active-active hoặc private delivery network chỉ đáng giá khi tổ chức thực sự vận hành được complexity tương ứng.",
+          "en": "A defensible answer states requirements, the simplest adequate design, the measured pressure to change and why alternatives were rejected. A famous company’s choice does not establish benefit for a startup. Modular applications, managed CDN and relational metadata may remain appropriate while meeting isolation, QoE and recovery goals. Active-active or private delivery requires matching operational capability."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lựa chọn",
+            "en": "Choice"
+          },
+          {
+            "vi": "Lý do có thể chọn",
+            "en": "When it may help"
+          },
+          {
+            "vi": "Đánh đổi / alternative",
+            "en": "Trade-off / alternative"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Domain services",
+              "en": "Domain services"
+            },
+            {
+              "vi": "Independent ownership, release và resource/failure isolation.",
+              "en": "Independent ownership, releases and resource/failure isolation."
+            },
+            {
+              "vi": "Remote calls/consistency/observability; giữ modular monolith khi đủ.",
+              "en": "Remote calls, consistency and observability; retain modularity when sufficient."
+            }
+          ],
+          [
+            {
+              "vi": "Dedicated ISP delivery",
+              "en": "Dedicated ISP delivery"
+            },
+            {
+              "vi": "Stable volume/locality và hợp đồng mạng hỗ trợ total QoE/cost.",
+              "en": "Stable locality/volume and network agreements improve total QoE/cost."
+            },
+            {
+              "vi": "Hardware/operations/fill/fallback; managed CDN có thể tốt hơn.",
+              "en": "Hardware, operations, fill and fallback; managed CDN may be better."
+            }
+          ],
+          [
+            {
+              "vi": "Per-title / per-shot",
+              "en": "Per-title / per-shot"
+            },
+            {
+              "vi": "Measured quality/cost wins ở supported cohorts.",
+              "en": "Measured quality/cost wins for supported cohorts."
+            },
+            {
+              "vi": "Compute/QA/storage và compatibility; không chỉ bitrate savings.",
+              "en": "Compute, QA, storage and compatibility beyond bitrate savings."
+            }
+          ],
+          [
+            {
+              "vi": "Multi-region active-active",
+              "en": "Multi-region active-active"
+            },
+            {
+              "vi": "Availability/latency và tested survivor capacity cần.",
+              "en": "Availability/latency goals with tested survivor capacity."
+            },
+            {
+              "vi": "State/routing/failover complexity; warm passive có thể phù hợp.",
+              "en": "State, routing and failover complexity; warm passive may fit."
+            }
+          ],
+          [
+            {
+              "vi": "Low-latency live",
+              "en": "Low-latency live"
+            },
+            {
+              "vi": "Product thật sự cần gần real time, có contribution/device capability.",
+              "en": "The product needs near-real-time behavior with capable sources/devices."
+            },
+            {
+              "vi": "Ít outage coverage, nhiều requests; buffered live đơn giản hơn.",
+              "en": "Less outage coverage and more requests; buffered live is simpler."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Luyện giải thích và phản biện",
+        "en": "16. Practice explanations and challenges"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trình bày theo scope → sizing → một Play trace → bottleneck → evolution → failure proof. Chọn hai deep dives thay vì đọc mọi component: ví dụ per-title evidence và live join surge, hoặc rights consistency và CDN placement. Câu trả lời mẫu dưới đây là reasoning theo assumptions của bài; thay đổi constraints có thể dẫn đến kiến trúc khác.",
+          "en": "Explain scope, sizing, one Play trace, bottlenecks, evolution and failure evidence. Choose two deep dives instead of listing components: for example per-title evidence and join surges, or rights consistency and placement. Answers below reason from this chapter’s assumptions; different constraints may justify different designs."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Vì sao API nhanh nhưng first frame vẫn chậm?",
+            "en": "Why can first frames be slow despite fast APIs?"
+          },
+          "answer": [
+            {
+              "vi": "API chỉ là một phần critical path. Kiểm cold app/DNS/TLS, entitlement, manifest, license, initial media buffer và decode theo client trace và cohort; tail delays có thể correlated. Không cộng p99 từng hop rồi khẳng định p99 tổng. Đặt startup definition từ Play đến first frame và kiểm ngoài server logs.",
+              "en": "APIs are only part of the path. Inspect cold app, DNS/TLS, rights, manifests, licenses, buffering and decode in client traces by cohort. Tail delays may correlate, so summed hop p99s are not end-to-end p99. Measure from Play to first frame beyond server logs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Encrypted media trong CDN có nghĩa ai cũng được xem?",
+            "en": "Does encrypted CDN media mean anyone may watch?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cacheable bytes và quyền nhận session/license là hai contract. Validate scoped access, device/DRM và rights freshness; token/logs cần bảo vệ. Ciphertext cache có metadata vận hành nên cũng không claim cache không có dữ liệu liên quan viewers.",
+              "en": "No. Cacheable bytes and rights to sessions/licenses are separate contracts. Validate scoped access, devices/DRM and fresh rights; protect tokens/logs. Operational metadata can still relate to viewers."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Per-title luôn tiết kiệm 50% mà giữ nguyên quality?",
+            "en": "Does per-title always save fifty percent at equal quality?"
+          },
+          "answer": [
+            {
+              "vi": "Không có phần trăm universal. Đo rate–quality theo content/codec/device và target, kiểm subjective/device quality, ABR alignment và tổng encode/storage/delivery cost. Lab dùng synthetic points; cùng vượt target chưa có nghĩa equal quality hoặc production BD-rate saving.",
+              "en": "There is no universal percentage. Measure curves by content/codec/device and target, validate quality and alignment and account for encoding, storage and delivery. Synthetic lab candidates above a common target are not identical quality or a production BD-rate result."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao chọn A nhiều plays nhất lại thua B+C khi prefill?",
+            "en": "Why can popular A lose to B+C in prefill?"
+          },
+          "answer": [
+            {
+              "vi": "A dùng 6/10 GB nên phần còn lại chỉ fit D+E, avoided bytes 770 GB trong fixture. B+C dùng đủ 10 GB và tránh 1.000 GB. Objective là bytes, constraint whole-file và fill window; nếu objective là starts, partial viewing, latency hay forecast khác, optimum cũng khác.",
+              "en": "A uses six of ten GB, leaving D+E and 770 avoided GB in the fixture. B+C uses ten GB and avoids 1,000 GB. The objective is bytes under whole-file and fill constraints; starts, partial viewing, latency or forecast changes alter the optimum."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Ba region có chịu được mất một region không?",
+            "en": "Can three regions tolerate losing one?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa đủ thông tin. Cần surviving capacity theo dependency, cache warmup/retry load, queue backlog, routing convergence và state authority. Ba region mỗi 100K/s, tổng 240K/s, mất một thì cần 120K/s mỗi survivor và overload. Kiểm drill theo QoE, không chỉ instance count.",
+              "en": "Region count is insufficient. Check survivor dependency capacity, caches, retries, queues, routing and authority. Three 100K/s regions at 240K total need 120K each after a loss and overload. Test client QoE in drills rather than counting instances."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Live không prefill tương lai, vậy CDN còn tác dụng không?",
+            "en": "If future live media cannot be prefilled, does CDN still help?"
+          },
+          "answer": [
+            {
+              "vi": "Có: nhiều viewers cùng đọc một segment sau khi publish; caches/coalescing/shields giảm repeated origin work và giữ locality. Prewarm capacity/known assets vẫn được. Auth/license/session joins là personalized control traffic cần capacity riêng; media sharing không làm bytes cuối cùng tới viewers biến mất.",
+              "en": "Yes. Viewers share published segments; caches, coalescing and shields reduce repeated origin work and improve locality. Prewarm capacity and known assets. Personalized startup traffic needs separate capacity and shared delivery still sends bytes to every viewer."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hai live encoders là failover không gián đoạn?",
+            "en": "Do two live encoders ensure seamless failover?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Timelines, timestamps, keyframes, codec config, segment sequence và discontinuities phải tương thích; contribution paths và origins cần tránh shared fate. Buffer lớn có thể che outage nhưng tăng live latency. Rehearse actual device behavior và source/origin faults.",
+              "en": "No. Timelines, timestamps, keyframes, codecs, sequences and discontinuities need compatibility; contribution paths and origins need independent failure domains. Buffers hide some outages but add latency. Rehearse device behavior and source/origin faults."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Ad decision trả 200 có thể tính impression luôn không?",
+            "en": "Does an ad-decision 200 establish an impression?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Định nghĩa decision, delivered media, rendered impression và billable event riêng. Stable IDs, dedup, client/server reconciliation, consent và fraud controls quyết định measurement. No-fill/timeout theo product/contract policy; không tự coi luôn skip là đúng.",
+              "en": "No. Distinguish decisions, delivered media, rendered impressions and billable events. Stable IDs, deduplication, reconciliation, consent and fraud controls define measurement. No-fill/timeout behavior follows contracts rather than an assumed skip."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
