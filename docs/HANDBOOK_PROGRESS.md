@@ -4,10 +4,10 @@ Cập nhật22/10/2026. Chủ sở hữu yêu cầu commit/push các mốc đã 
 
 ## Trạng thái hiện tại
 
-- **48/73 bài đã biên soạn Việt–Anh**, gồm4 Foundations,8 Building Blocks,26 Case Studies,9 Build Stories và1 AI Systems.
-- Tất cả48 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
-- **25 mục chưa biên soạn**:3 Build Stories (`ep-whatsapp`, `ep-figma`, `ep-youtube`),14 AI Systems,3 Practice và5 Interview tools.
-- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local48. Các bài `/episodes/ep-amazon/`, `/episodes/ep-spotify/`, `/episodes/ep-airbnb/` có bản `/en/` tương ứng.
+- **49/73 bài đã biên soạn Việt–Anh**, gồm4 Foundations,8 Building Blocks,26 Case Studies,10 Build Stories và1 AI Systems.
+- Tất cả49 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
+- **24 mục chưa biên soạn**:2 Build Stories (`ep-figma`, `ep-youtube`),14 AI Systems,3 Practice và5 Interview tools.
+- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local49. Các bài `/episodes/ep-amazon/`, `/episodes/ep-spotify/`, `/episodes/ep-airbnb/` có bản `/en/` tương ứng.
 - Giữ198 chương/15 lộ trình,31 Notes & Interview topics, stable IDs, localStorage keys và9 themes. Không portfolio.
 
 ## Mốc đã push
@@ -16,7 +16,7 @@ Cập nhật22/10/2026. Chủ sở hữu yêu cầu commit/push các mốc đã 
 - Checkpoint40: AV Lore `243167f548a0a2a6add8a9adf6c98d9e263f8f4a`, IT Basic `4cd80c94c25287d217e12e5fb53c0a4cf50836af`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39740983441 . IT VPS39740981336 failed `ssh-keyscan`, vẫn failed sau1retry.
 - Checkpoint41: AV Lore `9c9eb33130ed313af9ae319c676130c4efef2058`, IT Basic `29492f5d7127605f5c870447dfc6f03db5a57b18`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39745514081 ; IT VPS39745517763 failed.
 - Checkpoint45: AV Lore `aa559d70ba76ff29edf090b35e7772bd6c34102a`, IT Basic `8357d80c9bfcb89e93f3f08d9fafb1018175ee72`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39752592201 . IT VPS https://github.com/avpegnu/it-basic/actions/runs/39752592483 failed trong Setup SSH key tại `ssh-keyscan`; đã đọc failed log22/10. Source hai repo push thành công; không đổi workflow/settings/secrets.
-- Local48 gồm Checkout/Audio/Booking bên dưới; đã được chủ sở hữu cho phép commit/push. Ghi commit hashes/result thực tế khi hoàn tất, không đoán trước deploy status.
+- Checkpoint48 đã push: AV Lore `0aa78f454e48699205d7d7c4036a4df55a306b7b`, IT Basic `cc679068914e4d75e3616e469342965251825586`. Pages workflow thành công https://github.com/avpegnu/av-lore/actions/runs/39758156091; IT VPS39758157616 failed. Không suy deploy từ push.
 
 ## Các bài bổ sung trong checkpoint 40
 
@@ -56,7 +56,7 @@ Preview: `http://127.0.0.1:4322/av-lore/episodes/ep-netflix/` và `/av-lore/en/e
 | Audio Platform (`ep-spotify`)|14sections/11stages/5traces/5APIs/3labs/8questions|Startup critical path/rights gates, offline entry anchors/replay, semantic play/report corrections|
 | Booking Marketplace (`ep-airbnb`)|15sections/11stages/5traces/5APIs/3labs/8questions|Local-date horizon/rules, quote expiry/consent, CDC regression versus missing changes|
 
-Bốn bài đầu thuộc checkpoint45; ba bài cuối thuộc local48. Mỗi stage có diagram và problem/decision/tradeoff/nextPressure/exitCriteria. Traces có step playback; prose dùng cards/flows/tables theo nghĩa. Không copy code/prose bên ngoài; không thêm acknowledgements/references UI/README. English được biên tập cùng canonical pairs và manual runtime dictionary, build offline.
+Bốn bài đầu thuộc checkpoint45; ba bài cuối thuộc checkpoint48. Mỗi stage có diagram và problem/decision/tradeoff/nextPressure/exitCriteria. Traces có step playback; prose dùng cards/flows/tables theo nghĩa. Không copy code/prose bên ngoài; không thêm acknowledgements/references UI/README. English được biên tập cùng canonical pairs và manual runtime dictionary, build offline.
 
 ## Kiểm tra snapshot48
 
@@ -69,7 +69,7 @@ Bốn bài đầu thuộc checkpoint45; ba bài cuối thuộc local48. Mỗi st
 
 ## Tiếp theo
 
-1. **`ep-whatsapp`**: đã đọc full chapter12stages/fanout model/demo. Research/3mô hình dự kiến lưu `whatsapp-research.json`. Official encryption PDF lấy được bằng curl sau web redirect lỗi; local PDF/TXT tại `.cache/handbook-expansion/whatsapp-primary-whitepaper.*`,Version9Feb25,2026. Đã đọc Group Messages và2021Meta multi-device/backup articles; đọc relevant initiation/media/device consistency trước author nếu claim chi tiết. Chưa thêm source models/component/canonical. Proposed labs: per-device durable ACK/replay, active-sender/group-epoch fan-out arithmetic, membership/key-holder boundary (không real crypto).
+1. `ep-whatsapp` đã hoàn thành biên soạn/kiểm tra local49; tiếp tục Figma.
 2. `ep-figma`, `ep-youtube`; sau đó14 AI entries bắt đầu`ai-kv-cache`, rồi8 Practice/Interview tools. `npm run content:audit` là danh sách chính xác.
 3. Independent final review từng bài theo coverage/purpose, diễn giải tự nhiên Việt/English, formulas/units và failure/security assumptions. Không nâng complete bằng đếm blocks/tests. Framework còn cần product prompt/query mismatch review; Exchange có thể thêm regional DR/RPO.
 
@@ -84,3 +84,13 @@ AV Lore source/content cần check,test,build,verify và browser khi behavior/la
 Main4322 phục vụ `dist/`. Build ở `.cache/handbook-preview/`, chỉ rsync source lúc staging đã dừng và không test/build đang chạy. Đợi build+verify exit0 rồi start4323, đợi server ready/HTTP200 trước browser. Sau browser/screenshots pass, copy `_astro` trước rồi toàn dist + localization report về main; không `--delete` old assets. Dừng bằng `npx astro preview stop` tại stagingcwd, không main. Không mutate staging khi browser chạy.
 
 Không auto Settings/secrets/workflows/PR; user hiện cho phép commit/push checkpoint và tiếp tục nhiều mục. Đừng final là hoàn tất khi73scope/review chưa xong. Progress local `plan.json`, `coverage.json` cùng folderignored; tracked handoff là file này.
+
+## Checkpoint49: Private Messenger
+
+`ep-whatsapp.json`:16sections/12stages/5traces/6APIs/3labs/8worked questions, Việt–Anh, statusreview. Labs kiểm durable per-device ACK/replay, active-sender/group-epoch envelope arithmetic và membership/key-holder boundary. Rotation không xóa observed plaintext history; private signing key không distribute cho recipients. E2EE/HSM/companion assumptions tách rõ, không real crypto implementation.
+
+- Source250files0diagnostics;136tests đạt;608pages266562links/assets; localization0missing.
+- Dedicated12stages/3labs/boundary scenarios/VIEN/keyboard/mobile/9themes và generic2routes đạt. Đã xem screenshots desktop/mobile.
+- Static49bài/100HTML/1176links và2VIENbrowserpages đạt; không fake React labs.
+- Main4322đã publish49; stagingđã dừng. NewFigma models/tests đang viết, chưa canonical/build/browser/static; không tính vào49.
+- Figma research đã đọc full12stages và primarymultiplayer/journal/sharding/LiveGraph/plugin posts. Chú ý correction: Realms sandbox lịch sử đã đổi sang interpreter compiledtoWasm sau vulnerability; CDC có thể replay và không là globalorder acrossshards. Đừng ghi oldsourceoversimplifications thành guarantee.

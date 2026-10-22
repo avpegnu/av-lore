@@ -1,0 +1,3194 @@
+{
+  "id": "ep-whatsapp",
+  "group": "episode",
+  "status": "review",
+  "title": {
+    "vi": "Xây dựng Private Messenger: delivery, device trust và encrypted recovery",
+    "en": "Building a Private Messenger: delivery, device trust and encrypted recovery"
+  },
+  "summary": {
+    "vi": "12 giai đoạn, direct/group/media/restore traces và ba lab cho receipts, fan-out và membership epochs; phân biệt ciphertext custody với endpoint trust.",
+    "en": "Twelve stages and direct/group/media/restore traces explore receipts, fan-out and membership epochs while separating ciphertext custody from endpoint trust."
+  },
+  "prerequisites": [
+    "chat",
+    "message-queue",
+    "consistency",
+    "object-storage"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "messaging",
+    "security",
+    "network"
+  ],
+  "takeaways": [
+    {
+      "vi": "Server accepted, device persisted và user read là contracts khác nhau.",
+      "en": "Acceptance, device persistence and reading are distinct contracts."
+    },
+    {
+      "vi": "ACK và queueGC phải per-device với stable identities/durable recovery.",
+      "en": "Acknowledgements and retirement are device-specific with stable recovery."
+    },
+    {
+      "vi": "Sender Keys giảm sender payload work nhưng distribution/egress vẫn có cost.",
+      "en": "Sender Keys reduce payload work while retaining distribution/delivery costs."
+    },
+    {
+      "vi": "Fresh membership keys không thu hồi old plaintext history hoặc chữa mọi endpoint compromise.",
+      "en": "Fresh membership keys do not erase saved history or cure endpoint compromise."
+    },
+    {
+      "vi": "Key directories, encrypted media và backup vaults có trust/retention boundaries riêng.",
+      "en": "Directories, media and vaults have distinct trust/retention boundaries."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Custody, authority và trust tách riêng",
+      "en": "Separate custody, authority and trust"
+    },
+    "caption": {
+      "vi": "Một message đi qua nhiều devices và failure boundaries.",
+      "en": "Messages cross devices and failure boundaries."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Prepare",
+          "en": "Prepare"
+        },
+        "detail": {
+          "vi": "Approved endpoint protocol và stable identity.",
+          "en": "Approved protocol and stable identity."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Relay",
+          "en": "Relay"
+        },
+        "detail": {
+          "vi": "Durable device obligations với bounded retention.",
+          "en": "Durable bounded device obligations."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Receive",
+          "en": "Receive"
+        },
+        "detail": {
+          "vi": "Local persist/dedup, keys và explicit receipt.",
+          "en": "Local persistence, keys and receipts."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Recover",
+          "en": "Recover"
+        },
+        "detail": {
+          "vi": "Membership, history sync và protected restore theo scope.",
+          "en": "Scoped membership, history synchronization and restore."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Private messenger: relay, archive và endpoint trust",
+        "en": "1. Private messengers: relays, archives and endpoint trust"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài này xây private person-to-person messenger kiểu WhatsApp với direct/group messages, offline devices, attachments, companions và backups. Chọn store-and-forward server queues thay full server history archive là một design policy, không điều kiện bắt buộc của E2EE: server cũng có thể giữ encrypted history dưới retention/authorization contract khác. Các12stages là teaching architecture, không inventory production hiện tại.",
+          "en": "This WhatsApp-style messenger covers private direct/group messaging, devices, attachments and backups. Relay-only queues are a policy rather than an E2EE requirement; encrypted server archives are another design. Twelve stages teach architecture rather than describe a current deployment inventory."
+        },
+        {
+          "vi": "Approved endpoints có thể đọc/share/report nội dung; compromised endpoints và user-saved copies nằm ngoài lời hứa chỉ relay ciphertext. Business integrations, bots/AI hoặc reporting paths phải chỉ rõ plaintext endpoint/trust boundary riêng thay suy từ private human chat. Worksheet không generate keys, encrypt hay implement Signal; chỉ kiểm counts, histories và key-possession assumptions.",
+          "en": "Approved endpoints can read/share/report content. Compromised endpoints and saved copies require explicit boundaries. Integrations and reporting may have different plaintext endpoints. Worksheets model counts, histories and assumed possession, not cryptographic implementation."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Delivery",
+            "en": "Delivery"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Server accepted, device durable và user read có guarantees riêng.",
+              "en": "Acceptance, device durability and reading have distinct guarantees."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Content trust",
+            "en": "Content trust"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Approved identities/session protocol ở endpoints, metadata còn visible theo design.",
+              "en": "Approved endpoint identities/protocols protect content while metadata has separate controls."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Recovery",
+            "en": "Recovery"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Queue retention, history sync và backup keys/manifests có lifecycle khác nhau.",
+              "en": "Queues, history synchronization and backup material have different lifecycles."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "identities",
+      "title": {
+        "vi": "2. Một message có nhiều identities và ACKs",
+        "en": "2. One message has multiple identities and acknowledgements"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giữ logical message ID bind sender/conversation, immutable envelope identity cho recipient device/generation, membership epoch và accepted-result record. Retry prepared ciphertext dùng retained envelope; legitimate re-encryption có revision mới nhưng vẫn cùng logical intent khi phù hợp protocol. Không tự viết ratchet/state machine từ sơ đồ: outgoing protocol state và persisted envelopes cần audited implementation/recovery để tránh key reuse hoặc lost state.",
+          "en": "Retain logical intent, immutable device-envelope identities, membership context and results. Prepared retries retain envelopes; valid re-encryption retains logical intent under protocol. Use audited state/recovery rather than inventing ratchets that risk reuse or loss."
+        },
+        {
+          "vi": "Server ACK nghĩa selected durability đã nhận obligation; device ACK nghĩa selected local persisted acceptance; read receipt là explicit action/policy. Có thể persist ciphertext rồi chờ key/decrypt theo declared contract, nhưng không gọi nó user read. Server GC chỉ khi exact authenticated device obligation đã hoàn tất hoặc retention transition được ghi rõ.",
+          "en": "Server acceptance, device persistence and reading differ. Durable ciphertext may await keys under an explicit contract, without implying reading. Retire exact authenticated device obligations or record explicit retention expiry."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Accept → persist → deliver → observe",
+          "en": "Accept → persist → deliver → observe"
+        },
+        "caption": {
+          "vi": "Mỗi transition cần identity và recovery, không chỉ một TCP write thành công.",
+          "en": "Transitions require identity and recovery rather than successful socket writes."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Prepare",
+              "en": "Prepare"
+            },
+            "detail": {
+              "vi": "Audited endpoint protocol + stable envelope.",
+              "en": "Audited protocol and stable envelopes."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Accept",
+              "en": "Accept"
+            },
+            "detail": {
+              "vi": "Durable per-device obligation dưới retention/RPO.",
+              "en": "Durable obligations under retention/RPO."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Persist",
+              "en": "Persist"
+            },
+            "detail": {
+              "vi": "Recipient local state/dedup trước ACK.",
+              "en": "Recipient persistence/dedup before acknowledgement."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Observe",
+              "en": "Observe"
+            },
+            "detail": {
+              "vi": "Delivery khác explicit read signal.",
+              "en": "Delivery differs from explicit reading."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "evolution",
+      "title": {
+        "vi": "3. 12 giai đoạn: scope, scale và trust boundaries",
+        "en": "3. Twelve stages: scope, scale and trust boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đọc problem/decision/cost/next trigger/exit criteria. Erlang/lightweight processes là một option cho sockets, không thay admission/backpressure hoặc durability. Historical single-box connection records không là current production capacity/SLO. Privacy và recovery choices phải được giữ khi platform, ownership hoặc device model đổi.",
+          "en": "Follow pressures, choices, costs and exit criteria. Lightweight runtimes do not replace admission or durability, and historical socket records are not current SLAs. Preserve privacy/recovery contracts through platform and device changes."
+        }
+      ],
+      "stages": [
+        {
+          "id": "mvp",
+          "title": {
+            "vi": "Persistent messaging trên nền tảng có sẵn",
+            "en": "Persistent messaging on a proven foundation"
+          },
+          "description": {
+            "vi": "Bắt đầu một client/gateway/relay và durable device inbox contract. Có thể dùng existing messaging runtime/protocol thay viết mọi thứ từ đầu, nhưng auth, bounded payload/queues và stable message identity vẫn cần. Chọn server relay-only hay history archive rõ; MVP scope không xóa recovery responsibility.",
+            "en": "Begin with clients, gateways, relays and durable delivery contracts. Reuse proven runtimes while defining authentication, bounds and identities. Choose relay-only versus history explicitly; simple scope still needs recovery."
+          },
+          "problem": {
+            "vi": "Nhóm nhỏ cần delivery/reconnect đáng tin trước tối ưu fleet.",
+            "en": "A small team needs reliable delivery/reconnect before fleet optimization."
+          },
+          "decision": {
+            "vi": "Proven server primitives, explicit ACK states và local accepted-result identity.",
+            "en": "Use proven primitives with explicit acknowledgements and results."
+          },
+          "tradeoff": {
+            "vi": "Generic protocols/runtime có overhead và features không cần.",
+            "en": "Generic protocols add overhead and unnecessary features."
+          },
+          "nextPressure": {
+            "vi": "Số sockets/heartbeats làm memory và reconnect thành bottleneck.",
+            "en": "Sockets and heartbeats pressure memory and reconnection."
+          },
+          "exitCriteria": {
+            "vi": "Lost send reply không duplicate logical message; accepted obligation không biến mất khi socket fail.",
+            "en": "Lost replies preserve identities and obligations survive socket failures."
+          },
+          "diagram": {
+            "id": "secure-stage-mvp",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Connection gateway",
+                  "en": "Connection gateway"
+                },
+                "detail": {
+                  "vi": "Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                  "en": "Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "sender",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary sender → gateway: Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                      "en": "Boundary sender → gateway: Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "relay",
+                    "description": {
+                      "vi": "Boundary gateway → relay: Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                      "en": "Boundary gateway → relay: Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary relay → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary relay → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "relay",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary relay → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary relay → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "connections",
+          "title": {
+            "vi": "Đo per-connection budget, không chỉ messages/s",
+            "en": "Measure connection budgets, not only message rates"
+          },
+          "description": {
+            "vi": "Erlang/BEAM-style lightweight processes hoặc event loops giúp nhiều sockets nhưng không miễn memory/CPU/kernel buffers. Profile FD/TLS/buffer/heartbeat/scheduler queues, GC và mailbox growth. Per-process crash isolation không isolate shared dependency failure. Bound admission và reconnect jitter để một node restart không thành auth stampede.",
+            "en": "Lightweight processes or event loops support sockets without eliminating memory, CPU or kernel costs. Profile descriptors, TLS, buffers, scheduling and mailboxes; process isolation does not isolate shared failures. Bound admission and jitter reconnections."
+          },
+          "problem": {
+            "vi": "Idle sockets và sudden login bursts quyết capacity khác steady-state message rate.",
+            "en": "Idle sockets and login bursts scale differently from messages."
+          },
+          "decision": {
+            "vi": "Session ownership, measured per-device budgets và controlled drain/reconnect.",
+            "en": "Use explicit ownership, measured budgets and controlled reconnects."
+          },
+          "tradeoff": {
+            "vi": "Deep OS/runtime tuning tăng specialist cost và portability debt.",
+            "en": "Runtime/kernel specialization adds maintenance cost."
+          },
+          "nextPressure": {
+            "vi": "Offline recipients cần durable store-and-forward.",
+            "en": "Offline devices need durable delivery queues."
+          },
+          "exitCriteria": {
+            "vi": "Drain/restart/load tests giữ bounded memory, queue và recovery tail.",
+            "en": "Draining and load tests preserve bounded resources and recovery tails."
+          },
+          "diagram": {
+            "id": "secure-stage-connections",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Connection gateway",
+                  "en": "Connection gateway"
+                },
+                "detail": {
+                  "vi": "Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                  "en": "Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "route",
+                "label": {
+                  "vi": "Session directory",
+                  "en": "Session directory"
+                },
+                "detail": {
+                  "vi": "Device/session owner epoch; stale connection route không là durable truth.",
+                  "en": "Device/session ownership epochs; stale routes are not durable authority."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "sender",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary sender → gateway: Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                      "en": "Boundary sender → gateway: Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "route",
+                    "description": {
+                      "vi": "Boundary gateway → route: Device/session owner epoch; stale connection route không là durable truth.",
+                      "en": "Boundary gateway → route: Device/session ownership epochs; stale routes are not durable authority."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary gateway → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary gateway → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "delivery",
+          "title": {
+            "vi": "Per-device store-and-forward và durable ACK",
+            "en": "Per-device store-and-forward with durable receipts"
+          },
+          "description": {
+            "vi": "Server accepted nghĩa selected queue durability đã giữ obligation; device persisted nghĩa local state đã giữ data/identity; user read là signal khác. Device ACK chỉ giải obligation đúng device. Lost ACK được resend cùng identity; local dedup và ACK state cần coherent recovery. Retention hết mà device chưa nhận cần declared expired/failed state.",
+            "en": "Acceptance, device persistence and reading are distinct. Acknowledgements complete only their device obligation. Resend stable identities after lost acknowledgements and recover local dedup coherently. Retention expiry needs explicit failure semantics."
+          },
+          "problem": {
+            "vi": "Phones sleep, lose network và crash trước/after persistence.",
+            "en": "Devices sleep, disconnect and crash around persistence."
+          },
+          "decision": {
+            "vi": "Durable bounded device queues, authenticated bound ACKs và client-side dedup.",
+            "en": "Use durable bounded queues, bound acknowledgements and recipient dedup."
+          },
+          "tradeoff": {
+            "vi": "History restore/new devices thành protocol riêng nếu relay không archive.",
+            "en": "Restoring history needs a separate protocol without server archives."
+          },
+          "nextPressure": {
+            "vi": "Routing/member/device metadata cần low-latency owned store.",
+            "en": "Routing and membership need owned metadata."
+          },
+          "exitCriteria": {
+            "vi": "Crash-before-persist và aggregate ACK GC bị phát hiện; duplicate delivery không duplicate UI.",
+            "en": "Detect premature/aggregate acknowledgements and deduplicate presentation."
+          },
+          "diagram": {
+            "id": "secure-stage-delivery",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Connection gateway",
+                  "en": "Connection gateway"
+                },
+                "detail": {
+                  "vi": "Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                  "en": "Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "gateway",
+                    "to": "relay",
+                    "description": {
+                      "vi": "Boundary gateway → relay: Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                      "en": "Boundary gateway → relay: Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary relay → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary relay → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "queue",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary queue → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary queue → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  },
+                  {
+                    "from": "receiver",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary receiver → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary receiver → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "routing",
+          "title": {
+            "vi": "Hot routing state tách durable metadata",
+            "en": "Hot routing separates from durable metadata"
+          },
+          "description": {
+            "vi": "Session maps trả current gateway/device epoch; cache stale được redirect/retry chứ không mất accepted queue. In-memory/native store có thể hợp workload nhưng replication/disk/restore contract phải rõ. SQL/key-value/native runtime stores đều là options; disk-based primary không mặc định quá chậm nếu access pattern/locality đúng.",
+            "en": "Session maps resolve gateway/epochs while durable queues survive stale routing. Native/in-memory stores may fit but need replication and restore contracts. Engine choices depend on patterns/locality rather than categorical disk latency claims."
+          },
+          "problem": {
+            "vi": "Mỗi envelope chạm device/account/group lookups.",
+            "en": "Each envelope needs device/account/group lookups."
+          },
+          "decision": {
+            "vi": "Versioned ownership directory và durable configuration/approval authority.",
+            "en": "Separate versioned routing from durable approvals/configuration."
+          },
+          "tradeoff": {
+            "vi": "Cache invalidation, hotspots và repair cần bounded behavior.",
+            "en": "Invalidation, hotspots and repair need bounds."
+          },
+          "nextPressure": {
+            "vi": "Media lớn cần data plane riêng.",
+            "en": "Large media needs separate delivery capacity."
+          },
+          "exitCriteria": {
+            "vi": "Stale socket route không bypass current device approval hoặc drop queued envelope.",
+            "en": "Stale routes neither bypass approval nor lose obligations."
+          },
+          "diagram": {
+            "id": "secure-stage-routing",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "route",
+                "label": {
+                  "vi": "Session directory",
+                  "en": "Session directory"
+                },
+                "detail": {
+                  "vi": "Device/session owner epoch; stale connection route không là durable truth.",
+                  "en": "Device/session ownership epochs; stale routes are not durable authority."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "authority",
+                "label": {
+                  "vi": "Metadata authority",
+                  "en": "Metadata authority"
+                },
+                "detail": {
+                  "vi": "Device approval, membership versions, ownership/fencing và recoverable configuration.",
+                  "en": "Device approval, membership versions, fencing and recoverable configuration."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "relay",
+                    "to": "route",
+                    "description": {
+                      "vi": "Boundary relay → route: Device/session owner epoch; stale connection route không là durable truth.",
+                      "en": "Boundary relay → route: Device/session ownership epochs; stale routes are not durable authority."
+                    }
+                  },
+                  {
+                    "from": "route",
+                    "to": "authority",
+                    "description": {
+                      "vi": "Boundary route → authority: Device approval, membership versions, ownership/fencing và recoverable configuration.",
+                      "en": "Boundary route → authority: Device approval, membership versions, fencing and recoverable configuration."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary relay → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary relay → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "media",
+          "title": {
+            "vi": "Encrypted media tách socket control path",
+            "en": "Encrypted media separates from socket control"
+          },
+          "description": {
+            "vi": "Client hoàn tất encrypted blob upload rồi gửi protected descriptor chứa generation/hash/key context theo audited protocol. Recipient fetch blob, verify integrity/authenticated context rồi decrypt locally. Keys/thumbnails nhạy cảm nằm trong appropriate E2EE envelope, không URL/log plaintext tùy tiện. Queue/media expiry và partial upload cleanup cần contract riêng.",
+            "en": "Upload encrypted blobs before sending protected descriptors. Recipients verify integrity/context and decrypt locally. Protect sensitive keys/thumbnails rather than logging them. Define separate message/media lifetimes and incomplete-upload cleanup."
+          },
+          "problem": {
+            "vi": "Ảnh/video/voice payload có size/retention khác small envelopes.",
+            "en": "Media has different size and retention from small envelopes."
+          },
+          "decision": {
+            "vi": "Immutable encrypted blobs, scoped references và independent quotas/workers.",
+            "en": "Use immutable encrypted blobs, scoped references and separate quotas."
+          },
+          "tradeoff": {
+            "vi": "Missing/expired blobs, access metadata và bandwidth costs vẫn tồn tại.",
+            "en": "Missing assets, metadata exposure and bandwidth remain."
+          },
+          "nextPressure": {
+            "vi": "Partitions/failover cần preserve accepted metadata/queue state.",
+            "en": "Partition recovery must preserve accepted state."
+          },
+          "exitCriteria": {
+            "vi": "Descriptor không reference incomplete generation; corrupted/substituted blobs không output plaintext.",
+            "en": "Reject incomplete references and corrupted/substituted outputs."
+          },
+          "diagram": {
+            "id": "secure-stage-media",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Encrypted media",
+                  "en": "Encrypted media"
+                },
+                "detail": {
+                  "vi": "Immutable blobs, access/expiry, integrity references và separate capacity.",
+                  "en": "Immutable blobs, access/expiry, integrity references and separate capacity."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "sender",
+                    "to": "media",
+                    "description": {
+                      "vi": "Boundary sender → media: Immutable blobs, access/expiry, integrity references và separate capacity.",
+                      "en": "Boundary sender → media: Immutable blobs, access/expiry, integrity references and separate capacity."
+                    }
+                  },
+                  {
+                    "from": "sender",
+                    "to": "relay",
+                    "description": {
+                      "vi": "Boundary sender → relay: Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                      "en": "Boundary sender → relay: Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary relay → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary relay → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "queue",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary queue → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary queue → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  },
+                  {
+                    "from": "media",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary media → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary media → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "partitions",
+          "title": {
+            "vi": "Partition ownership, failover và fencing",
+            "en": "Partition ownership, failover and fencing"
+          },
+          "description": {
+            "vi": "Shard queue/config metadata theo chosen device/account/group domain; replicas có explicit durability/RPO. Primary-secondary pairs không tự ngăn split-brain: activation/quorum/witness/fencing hoặc equivalent protocol phải chứng minh one authority. Route hints không là fence. Capacity plan gồm replica promotion, queue catch-up và reconnect load.",
+            "en": "Shard state with explicit replication/RPO. Primary-secondary pairs need activation/fencing or equivalent coordination rather than automatic split-brain safety. Routing hints are not fences. Plan promotion, backlog and reconnect capacity."
+          },
+          "problem": {
+            "vi": "Một partition/node failure không được lan mọi conversations.",
+            "en": "Partition failures should not spread globally."
+          },
+          "decision": {
+            "vi": "Bounded owners/failure domains, recovery drills và durable accepted-result state.",
+            "en": "Bound ownership/failure domains and retain recovery evidence."
+          },
+          "tradeoff": {
+            "vi": "Standby capacity, lag và resharding/cutover tăng operational cost.",
+            "en": "Standbys, lag and reshards add operational cost."
+          },
+          "nextPressure": {
+            "vi": "Organizational/platform changes cần giữ protocol contracts.",
+            "en": "Platform changes must preserve protocols."
+          },
+          "exitCriteria": {
+            "vi": "Promote/restore không accept two owners hoặc erase ACKed obligations ngoài selected RPO.",
+            "en": "Recovery preserves exclusive ownership and declared durability."
+          },
+          "diagram": {
+            "id": "secure-stage-partitions",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "partition",
+                "label": {
+                  "vi": "Owned partitions",
+                  "en": "Owned partitions"
+                },
+                "detail": {
+                  "vi": "Exclusive writer activation, replication/RPO và bounded recovery capacity.",
+                  "en": "Exclusive writer activation, replication/RPO and bounded recovery capacity."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "route",
+                "label": {
+                  "vi": "Session directory",
+                  "en": "Session directory"
+                },
+                "detail": {
+                  "vi": "Device/session owner epoch; stale connection route không là durable truth.",
+                  "en": "Device/session ownership epochs; stale routes are not durable authority."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "relay",
+                    "to": "route",
+                    "description": {
+                      "vi": "Boundary relay → route: Device/session owner epoch; stale connection route không là durable truth.",
+                      "en": "Boundary relay → route: Device/session ownership epochs; stale routes are not durable authority."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "partition",
+                    "description": {
+                      "vi": "Boundary relay → partition: Exclusive writer activation, replication/RPO và bounded recovery capacity.",
+                      "en": "Boundary relay → partition: Exclusive writer activation, replication/RPO and bounded recovery capacity."
+                    }
+                  },
+                  {
+                    "from": "partition",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary partition → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary partition → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "continuity",
+          "title": {
+            "vi": "Giữ product contracts khi organization đổi",
+            "en": "Preserve contracts through organizational changes"
+          },
+          "description": {
+            "vi": "Không rewrite vì một new parent/platform vừa xuất hiện. Inventory dependencies, ownership, security boundaries và SLOs trước; separate product rollout khỏi infrastructure migration. Một protocol/message schema đã deployed tới devices cũ cần compatibility/deprecation plan, không simultaneous forced upgrade giả định mọi clients online.",
+            "en": "Avoid ownership-driven rewrites. Inventory dependencies, boundaries and SLOs before separating product and infrastructure rollout. Existing clients need compatibility/deprecation rather than assumed simultaneous upgrades."
+          },
+          "problem": {
+            "vi": "Fast growth và integration pressure dễ tạo risky rewrite.",
+            "en": "Growth and integration pressures invite risky rewrites."
+          },
+          "decision": {
+            "vi": "Stable wire/security contracts, gradual cohorts và staged data ownership.",
+            "en": "Retain wire/security contracts with staged ownership and cohorts."
+          },
+          "tradeoff": {
+            "vi": "Dual infrastructure/compatibility kéo dài nhưng giảm concentrated risk.",
+            "en": "Parallel environments add cost while spreading risk."
+          },
+          "nextPressure": {
+            "vi": "Private messaging cần authenticated end-to-end trust boundary.",
+            "en": "Private messaging needs authenticated endpoint trust."
+          },
+          "exitCriteria": {
+            "vi": "Old/new clients trao đổi đúng selected semantics xuyên rollout.",
+            "en": "Old/new clients preserve defined semantics through rollout."
+          },
+          "diagram": {
+            "id": "secure-stage-continuity",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "platform",
+                "label": {
+                  "vi": "Migration platform",
+                  "en": "Migration platform"
+                },
+                "detail": {
+                  "vi": "Parity cohorts, routing/queue barriers, telemetry và rollback after writes.",
+                  "en": "Parity cohorts, routing/queue barriers, telemetry and post-write rollback."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Connection gateway",
+                  "en": "Connection gateway"
+                },
+                "detail": {
+                  "vi": "Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                  "en": "Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "platform",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary platform → gateway: Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                      "en": "Boundary platform → gateway: Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                    }
+                  },
+                  {
+                    "from": "platform",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary platform → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary platform → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "sender",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary sender → gateway: Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                      "en": "Boundary sender → gateway: Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary gateway → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary gateway → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "private",
+          "title": {
+            "vi": "E2EE cần approved identities và audited protocol",
+            "en": "E2EE needs approved identities and audited protocols"
+          },
+          "description": {
+            "vi": "TLS bảo vệ client↔server nhưng E2EE đặt content keys tại approved endpoints. Key directory authenticity/device approval, session setup, key evolution và verification/consistency đều cần; không fetch public key một lần rồi tin vĩnh viễn. Use maintained audited protocols/libraries; no homemade primitives. Metadata/contact graph/timing vẫn cần privacy controls.",
+            "en": "TLS and E2EE protect different boundaries. Approvals, directory authenticity, session setup, evolution and verification all matter. Use audited protocols rather than custom primitives, while governing metadata separately."
+          },
+          "problem": {
+            "vi": "Operator/wire intermediaries không nên là plaintext authority cho private conversations.",
+            "en": "Private conversations should not trust intermediaries with plaintext."
+          },
+          "decision": {
+            "vi": "Per-device identities/session state và authenticated context giữ content end-to-end.",
+            "en": "Use device identities/session state and authenticated context."
+          },
+          "tradeoff": {
+            "vi": "Endpoint compromise, reporting/sharing và metadata nằm ngoài simple ciphertext-relay promise.",
+            "en": "Compromised endpoints, sharing/reporting and metadata require explicit boundaries."
+          },
+          "nextPressure": {
+            "vi": "Groups làm pairwise per-message fan-out đắt ở phone.",
+            "en": "Groups make per-message pairwise fan-out expensive."
+          },
+          "exitCriteria": {
+            "vi": "Identity/device changes có verification và recovery UX; relay không nhận plaintext keys.",
+            "en": "Identity changes retain verification/recovery without exposing keys to relays."
+          },
+          "diagram": {
+            "id": "secure-stage-private",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "keys",
+                "label": {
+                  "vi": "Public bundle directory",
+                  "en": "Public bundle directory"
+                },
+                "detail": {
+                  "vi": "Approved device identities/bundles, consistency và verification evidence.",
+                  "en": "Approved device identities/bundles, consistency and verification evidence."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "pairwise",
+                "label": {
+                  "vi": "End-device protocol state",
+                  "en": "End-device protocol state"
+                },
+                "detail": {
+                  "vi": "Audited client protocol giữ authenticated context và key evolution; không phải encryption service ở server.",
+                  "en": "Audited client protocols preserve authenticated context and key evolution; this is not server-side encryption."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "sender",
+                    "to": "keys",
+                    "description": {
+                      "vi": "Boundary sender → keys: Approved device identities/bundles, consistency và verification evidence.",
+                      "en": "Boundary sender → keys: Approved device identities/bundles, consistency and verification evidence."
+                    }
+                  },
+                  {
+                    "from": "sender",
+                    "to": "pairwise",
+                    "description": {
+                      "vi": "Boundary sender → pairwise: Audited client protocol giữ authenticated context và key evolution; không phải encryption service ở server.",
+                      "en": "Boundary sender → pairwise: Audited client protocols preserve authenticated context and key evolution; this is not server-side encryption."
+                    }
+                  },
+                  {
+                    "from": "pairwise",
+                    "to": "relay",
+                    "description": {
+                      "vi": "Boundary pairwise → relay: Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                      "en": "Boundary pairwise → relay: Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary relay → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary relay → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "sender-keys",
+          "title": {
+            "vi": "Sender Keys: setup, epoch và recipient fan-out",
+            "en": "Sender Keys: setup, epochs and recipient fan-out"
+          },
+          "description": {
+            "vi": "Một sender phân phối chain state/public verification key qua approved pairwise sessions, giữ private signing key ở sender. Sau setup, derive/erase message keys theo protocol, encrypt/sign payload một lần rồi relay copy. Membership leave clear sender states; distribution cần khi active sender gửi tiếp. Không một shared static group secret thay mọi sender/session.",
+            "en": "Distribute sender chain state/verification through approved sessions while retaining private signing keys. Then encrypt/sign one payload and fan out. Membership changes require fresh state/distribution; one static group secret is not equivalent."
+          },
+          "problem": {
+            "vi": "Phone upload/encryption cost tăng theo recipient devices.",
+            "en": "Phone work grows with recipient devices."
+          },
+          "decision": {
+            "vi": "Separate key distribution, payload work và actual recipient deliveries theo epoch.",
+            "en": "Count distribution, payload work and recipient deliveries separately."
+          },
+          "tradeoff": {
+            "vi": "Churn, compromised members và weaker recovery than fresh-secret pairwise updates cần review.",
+            "en": "Review churn, compromised members and recovery limits."
+          },
+          "nextPressure": {
+            "vi": "OS/network/platform migration vẫn phải preserve crypto/delivery state.",
+            "en": "Infrastructure moves must preserve crypto and delivery state."
+          },
+          "exitCriteria": {
+            "vi": "Revoked member không giữ future key theo selected authenticated membership contract.",
+            "en": "Fresh authenticated epochs exclude revoked recipients from future keys."
+          },
+          "diagram": {
+            "id": "secure-stage-sender-keys",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "group",
+                "label": {
+                  "vi": "Group membership authority",
+                  "en": "Group membership authority"
+                },
+                "detail": {
+                  "vi": "Authenticated current membership/device view và monotonic epochs.",
+                  "en": "Authenticated membership/device views and monotonic epochs."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "pairwise",
+                "label": {
+                  "vi": "End-device protocol state",
+                  "en": "End-device protocol state"
+                },
+                "detail": {
+                  "vi": "Audited client protocol giữ authenticated context và key evolution; không phải encryption service ở server.",
+                  "en": "Audited client protocols preserve authenticated context and key evolution; this is not server-side encryption."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "sender",
+                    "to": "group",
+                    "description": {
+                      "vi": "Boundary sender → group: Authenticated current membership/device view và monotonic epochs.",
+                      "en": "Boundary sender → group: Authenticated membership/device views and monotonic epochs."
+                    }
+                  },
+                  {
+                    "from": "sender",
+                    "to": "pairwise",
+                    "description": {
+                      "vi": "Boundary sender → pairwise: Audited client protocol giữ authenticated context và key evolution; không phải encryption service ở server.",
+                      "en": "Boundary sender → pairwise: Audited client protocols preserve authenticated context and key evolution; this is not server-side encryption."
+                    }
+                  },
+                  {
+                    "from": "pairwise",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary pairwise → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary pairwise → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  },
+                  {
+                    "from": "sender",
+                    "to": "relay",
+                    "description": {
+                      "vi": "Boundary sender → relay: Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                      "en": "Boundary sender → relay: Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary relay → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary relay → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "queue",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary queue → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary queue → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "platform",
+          "title": {
+            "vi": "Migrate runtime/network với parity và queue barriers",
+            "en": "Migrate platforms with parity and queue barriers"
+          },
+          "description": {
+            "vi": "Connection limits, schedulers, kernel/TLS behavior và storage semantics thay khi OS/hardware move. Cohort traffic/drains, preserve device/session identities và accepted queues; compare delivery tails/loss/duplicates, not just open-socket count. Data cutover cần change capture/barrier/version/fencing; rollback after target writes không đơn giản đổi endpoint.",
+            "en": "Platform moves change networking, scheduling and durability. Drain cohorts while preserving identities/queues and compare tails/loss, not only sockets. Cutover/rollback needs captured versions, barriers and fencing."
+          },
+          "problem": {
+            "vi": "Shared infrastructure có savings nhưng inherited assumptions dễ sai.",
+            "en": "Shared platforms offer savings but change assumptions."
+          },
+          "decision": {
+            "vi": "Parity drills và reversible cohorts tới verified ownership cutover.",
+            "en": "Use parity drills and cohorts before verified cutover."
+          },
+          "tradeoff": {
+            "vi": "Dual capacity và careful long-lived connection draining tốn thời gian.",
+            "en": "Dual capacity and long-lived draining take time."
+          },
+          "nextPressure": {
+            "vi": "Independent companion devices cần identities/queues/history riêng.",
+            "en": "Companions need independent identities, queues and history."
+          },
+          "exitCriteria": {
+            "vi": "Node/region drain không mất protocol state hoặc silently reset queue/ratchet generations.",
+            "en": "Draining preserves protocol state and generations."
+          },
+          "diagram": {
+            "id": "secure-stage-platform",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "platform",
+                "label": {
+                  "vi": "Migration platform",
+                  "en": "Migration platform"
+                },
+                "detail": {
+                  "vi": "Parity cohorts, routing/queue barriers, telemetry và rollback after writes.",
+                  "en": "Parity cohorts, routing/queue barriers, telemetry and post-write rollback."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Connection gateway",
+                  "en": "Connection gateway"
+                },
+                "detail": {
+                  "vi": "Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                  "en": "Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "route",
+                "label": {
+                  "vi": "Session directory",
+                  "en": "Session directory"
+                },
+                "detail": {
+                  "vi": "Device/session owner epoch; stale connection route không là durable truth.",
+                  "en": "Device/session ownership epochs; stale routes are not durable authority."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "partition",
+                "label": {
+                  "vi": "Owned partitions",
+                  "en": "Owned partitions"
+                },
+                "detail": {
+                  "vi": "Exclusive writer activation, replication/RPO và bounded recovery capacity.",
+                  "en": "Exclusive writer activation, replication/RPO and bounded recovery capacity."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "platform",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Boundary platform → gateway: Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+                      "en": "Boundary platform → gateway: Authenticated sockets, session routes, bounded buffers and reconnect controls."
+                    }
+                  },
+                  {
+                    "from": "platform",
+                    "to": "partition",
+                    "description": {
+                      "vi": "Boundary platform → partition: Exclusive writer activation, replication/RPO và bounded recovery capacity.",
+                      "en": "Boundary platform → partition: Exclusive writer activation, replication/RPO and bounded recovery capacity."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "route",
+                    "description": {
+                      "vi": "Boundary gateway → route: Device/session owner epoch; stale connection route không là durable truth.",
+                      "en": "Boundary gateway → route: Device/session ownership epochs; stale routes are not durable authority."
+                    }
+                  },
+                  {
+                    "from": "partition",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary partition → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary partition → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "multi-device",
+          "title": {
+            "vi": "Mỗi approved device có identity và delivery obligation",
+            "en": "Each approved device has identity and obligations"
+          },
+          "description": {
+            "vi": "Direct messages tạo appropriate encrypted envelopes tới recipient devices và sender companions. Directory mapping phải approved/verified để malicious hidden device không nhận keys. New device history transfer là authorized encrypted sync, không tự get plaintext archive; remove device cần future directory/session/key updates và pending-envelope policy.",
+            "en": "Direct messages fan out to approved recipient/sender devices. Verify directories against hidden-device substitution. History is authorized encrypted transfer; removals need future directory/session updates and pending-envelope policy."
+          },
+          "problem": {
+            "vi": "Companions không thể phụ thuộc phone luôn online.",
+            "en": "Companions cannot require a permanently online phone."
+          },
+          "decision": {
+            "vi": "Per-device identities/queues, consistency evidence và encrypted state sync.",
+            "en": "Use device identities/queues, consistency evidence and encrypted synchronization."
+          },
+          "tradeoff": {
+            "vi": "More envelopes, membership changes và state convergence cần capacity và UX.",
+            "en": "More envelopes, membership changes and convergence add cost."
+          },
+          "nextPressure": {
+            "vi": "Loss/restore cần backup trust boundary phù hợp.",
+            "en": "Device loss needs compatible recovery boundaries."
+          },
+          "exitCriteria": {
+            "vi": "ACK một device không xóa companion obligation; revoked/new devices theo history policy rõ.",
+            "en": "One acknowledgement cannot complete all devices; history policy is explicit."
+          },
+          "diagram": {
+            "id": "secure-stage-multi-device",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "keys",
+                "label": {
+                  "vi": "Public bundle directory",
+                  "en": "Public bundle directory"
+                },
+                "detail": {
+                  "vi": "Approved device identities/bundles, consistency và verification evidence.",
+                  "en": "Approved device identities/bundles, consistency and verification evidence."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "relay",
+                "label": {
+                  "vi": "Ciphertext relay",
+                  "en": "Ciphertext relay"
+                },
+                "detail": {
+                  "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                  "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Device delivery queues",
+                  "en": "Device delivery queues"
+                },
+                "detail": {
+                  "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+                  "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "queue"
+              },
+              {
+                "id": "receiver",
+                "label": {
+                  "vi": "Recipient devices",
+                  "en": "Recipient devices"
+                },
+                "detail": {
+                  "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                  "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              },
+              {
+                "id": "companion",
+                "label": {
+                  "vi": "Approved companion",
+                  "en": "Approved companion"
+                },
+                "detail": {
+                  "vi": "Distinct device identity, authorized history transfer và independent queue.",
+                  "en": "Distinct identity, authorized history transfer and independent queues."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "sender",
+                    "to": "keys",
+                    "description": {
+                      "vi": "Boundary sender → keys: Approved device identities/bundles, consistency và verification evidence.",
+                      "en": "Boundary sender → keys: Approved device identities/bundles, consistency and verification evidence."
+                    }
+                  },
+                  {
+                    "from": "sender",
+                    "to": "relay",
+                    "description": {
+                      "vi": "Boundary sender → relay: Route validated envelopes; recipient authorization không cấp plaintext keys.",
+                      "en": "Boundary sender → relay: Routes validated envelopes; recipient authorization does not provide plaintext keys."
+                    }
+                  },
+                  {
+                    "from": "relay",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Boundary relay → queue: Durable accepted obligations, device-specific ACK và retention/repair.",
+                      "en": "Boundary relay → queue: Durable obligations, device-specific acknowledgements and retention/repair."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "queue",
+                    "to": "receiver",
+                    "description": {
+                      "vi": "Boundary queue → receiver: Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+                      "en": "Boundary queue → receiver: Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+                    }
+                  },
+                  {
+                    "from": "queue",
+                    "to": "companion",
+                    "description": {
+                      "vi": "Boundary queue → companion: Distinct device identity, authorized history transfer và independent queue.",
+                      "en": "Boundary queue → companion: Distinct identity, authorized history transfer and independent queues."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "backups",
+          "title": {
+            "vi": "Encrypted backups và recovery trust boundary",
+            "en": "Encrypted backups and recovery trust"
+          },
+          "description": {
+            "vi": "Backup encrypt tại client, store versioned ciphertext/manifest/integrity ở selected cloud store. Key recovery có thể user-held secret hoặc protected HSM/password/device protocol. HSM vault có thể giữ key dưới controlled protocol; do đó không nói mọi key không bao giờ rời device. Attempt limits/anti-rollback/access control cần trust assumptions và audited implementation.",
+            "en": "Encrypt backups at clients and retain versioned ciphertext/manifests. Recovery may use user-held secrets or protected vault protocols. Vaults can hold keys, so not every key remains on a device. Limits and rollback protection depend on implementation/trust."
+          },
+          "problem": {
+            "vi": "Relay-only history khiến device loss cần separate recovery.",
+            "en": "Relay-only delivery needs separate history recovery."
+          },
+          "decision": {
+            "vi": "Separate backup keys/manifests, protected recovery và verified restore drills.",
+            "en": "Separate keys/manifests, protect recovery and test restores."
+          },
+          "tradeoff": {
+            "vi": "Losing recovery material, lockout, stale backups và recovery abuse cần selected policy.",
+            "en": "Recovery loss, lockout, staleness and abuse need explicit policy."
+          },
+          "nextPressure": {
+            "vi": "Mỗi new feature phải xác định ai là approved plaintext endpoint.",
+            "en": "Every feature must identify approved plaintext endpoints."
+          },
+          "exitCriteria": {
+            "vi": "Restore verified generation không bypass authentication hoặc resurrect revoked device authority.",
+            "en": "Restore verified data without bypassing identity or device approval."
+          },
+          "diagram": {
+            "id": "secure-stage-backups",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Responsibilities và trust boundaries; các branches không phải một synchronous call chain.",
+              "en": "Responsibilities and trust boundaries; branches are not one synchronous call chain."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "sender",
+                "label": {
+                  "vi": "Sender device",
+                  "en": "Sender device"
+                },
+                "detail": {
+                  "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+                  "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "backup",
+                "label": {
+                  "vi": "Encrypted backup store",
+                  "en": "Encrypted backup store"
+                },
+                "detail": {
+                  "vi": "Versioned ciphertext manifests, integrity, retention và recovery points.",
+                  "en": "Versioned ciphertext manifests, integrity, retention and recovery points."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "vault",
+                "label": {
+                  "vi": "Protected backup vault",
+                  "en": "Protected backup vault"
+                },
+                "detail": {
+                  "vi": "Selected HSM/key-recovery protocol, attempt limits và protected device channel.",
+                  "en": "Selected recovery protocols, attempt limits and protected device channels."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "companion",
+                "label": {
+                  "vi": "Approved companion",
+                  "en": "Approved companion"
+                },
+                "detail": {
+                  "vi": "Distinct device identity, authorized history transfer và independent queue.",
+                  "en": "Distinct identity, authorized history transfer and independent queues."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "sender",
+                    "to": "backup",
+                    "description": {
+                      "vi": "Boundary sender → backup: Versioned ciphertext manifests, integrity, retention và recovery points.",
+                      "en": "Boundary sender → backup: Versioned ciphertext manifests, integrity, retention and recovery points."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "sender",
+                    "to": "vault",
+                    "description": {
+                      "vi": "Boundary sender → vault: Selected HSM/key-recovery protocol, attempt limits và protected device channel.",
+                      "en": "Boundary sender → vault: Selected recovery protocols, attempt limits and protected device channels."
+                    }
+                  },
+                  {
+                    "from": "vault",
+                    "to": "companion",
+                    "description": {
+                      "vi": "Boundary vault → companion: Distinct device identity, authorized history transfer và independent queue.",
+                      "en": "Boundary vault → companion: Distinct identity, authorized history transfer and independent queues."
+                    }
+                  },
+                  {
+                    "from": "backup",
+                    "to": "companion",
+                    "description": {
+                      "vi": "Boundary backup → companion: Distinct device identity, authorized history transfer và independent queue.",
+                      "en": "Boundary backup → companion: Distinct identity, authorized history transfer and independent queues."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "4. Size sockets, envelopes, queues và media riêng",
+        "en": "4. Size sockets, envelopes, queues and media separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixture giả định20M concurrent devices,16KiB application state/device;30M DAU×40logical messages/day,mean3recipient-device deliveries/message;10Moffline devices×6queued messages×2KB;5%messages carry1MB media. Không phải WhatsApp metrics, không gồm kernel/TLS/index/replica/headroom.",
+          "en": "Assume twenty million concurrent devices,16KiB application state, thirty million DAU sending forty messages/day, three device deliveries/message and stated offline/media cohorts. These are not WhatsApp metrics and exclude kernel, replication and headroom."
+        },
+        {
+          "vi": "Concurrent sockets quyết memory/FD/heartbeats; encryption/envelope fan-out quyết client CPU/data và relay work; media bytes có cache/retention riêng. Node capacity phải đo trên workload/security/runtime config thực. Reconnect surge có thể nặng hơn normal sends; recovery state và key/device directories cũng phải chịu load.",
+          "en": "Sockets set memory/heartbeat budgets, fan-out sets endpoint/relay work and media has separate lifecycle. Measure capacity under real configuration, including reconnects and key-directory pressure."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Metric",
+            "en": "Metric"
+          },
+          {
+            "vi": "Calculation",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Meaning",
+            "en": "Meaning"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "App connection memory",
+              "en": "Application connection memory"
+            },
+            {
+              "vi": "20M×16KiB",
+              "en": "20M×16KiB"
+            },
+            {
+              "vi": "327.68GB raw app state; chưa kernel/TLS.",
+              "en": "327.68GB raw before kernel/TLS state."
+            }
+          ],
+          [
+            {
+              "vi": "Logical messages",
+              "en": "Logical messages"
+            },
+            {
+              "vi": "30M×40/86400",
+              "en": "30M×40/86400"
+            },
+            {
+              "vi": "≈13,889/s average.",
+              "en": "≈13,889/s average."
+            }
+          ],
+          [
+            {
+              "vi": "Device deliveries",
+              "en": "Device deliveries"
+            },
+            {
+              "vi": "1.2B×3/86400",
+              "en": "1.2B×3/86400"
+            },
+            {
+              "vi": "≈41,667/s, chưa retries/key distribution.",
+              "en": "≈41,667/s before retries/distribution."
+            }
+          ],
+          [
+            {
+              "vi": "Offline payload",
+              "en": "Offline payload"
+            },
+            {
+              "vi": "10M×6×2KB",
+              "en": "10M×6×2KB"
+            },
+            {
+              "vi": "120GB raw selected backlog.",
+              "en": "120GB raw selected backlog."
+            }
+          ],
+          [
+            {
+              "vi": "Media ingest",
+              "en": "Media ingest"
+            },
+            {
+              "vi": "1.2B×5%×1MB",
+              "en": "1.2B×5%×1MB"
+            },
+            {
+              "vi": "60TB/day trước replication/delivery.",
+              "en": "60TB/day before replication/delivery."
+            }
+          ],
+          [
+            {
+              "vi": "Mass reconnect",
+              "en": "Mass reconnect"
+            },
+            {
+              "vi": "20M/120s",
+              "en": "20M/120s"
+            },
+            {
+              "vi": "≈166,667logins/s trong2min fixture.",
+              "en": "≈166,667logins/s in the two-minute fixture."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Direct, receipts, media, group và restore",
+        "en": "5. Direct delivery, receipts, groups and restore"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các edges mô tả responsibilities/trust boundaries, không real crypto API. Key directory giữ public bundles/approval evidence nhưng client phải verify relevant identities. Backup vault có thể giữ protected secret material dưới protocol khác; không nói toàn backend chỉ có public keys trong mọi recovery mode.",
+          "en": "Edges describe responsibilities rather than crypto APIs. Verify device-directory identities. Backup vaults can hold protected recovery material under separate protocols, so not every backend component holds only public keys."
+        }
+      ],
+      "diagram": {
+        "id": "private-messenger-journey",
+        "title": {
+          "vi": "Ciphertext delivery, approved devices và recovery",
+          "en": "Ciphertext delivery, approved devices and recovery"
+        },
+        "caption": {
+          "vi": "Content crypto chạy ở approved endpoints; server relay/metadata/backup vault có boundaries riêng. Arrows không triển khai encryption hoặc attestation.",
+          "en": "Content cryptography runs at approved endpoints; relays, metadata and recovery have distinct boundaries. Arrows do not implement encryption or attestation."
+        },
+        "width": 1180,
+        "height": 840,
+        "nodes": [
+          {
+            "id": "sender",
+            "label": {
+              "vi": "Sender device",
+              "en": "Sender device"
+            },
+            "detail": {
+              "vi": "Approved identity, outgoing protocol state, stable logical/envelope IDs và local persistence.",
+              "en": "Approved identity, outgoing protocol state, stable logical/envelope identities and local persistence."
+            },
+            "x": 130,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Connection gateway",
+              "en": "Connection gateway"
+            },
+            "detail": {
+              "vi": "Authenticated sockets, current session route, bounded buffers và drain/reconnect controls.",
+              "en": "Authenticated sockets, session routes, bounded buffers and reconnect controls."
+            },
+            "x": 440,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "relay",
+            "label": {
+              "vi": "Ciphertext relay",
+              "en": "Ciphertext relay"
+            },
+            "detail": {
+              "vi": "Route validated envelopes; recipient authorization không cấp plaintext keys.",
+              "en": "Routes validated envelopes; recipient authorization does not provide plaintext keys."
+            },
+            "x": 760,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "queue",
+            "label": {
+              "vi": "Device delivery queues",
+              "en": "Device delivery queues"
+            },
+            "detail": {
+              "vi": "Durable accepted obligations, device-specific ACK và retention/repair.",
+              "en": "Durable obligations, device-specific acknowledgements and retention/repair."
+            },
+            "x": 1060,
+            "y": 100,
+            "kind": "queue"
+          },
+          {
+            "id": "receiver",
+            "label": {
+              "vi": "Recipient devices",
+              "en": "Recipient devices"
+            },
+            "detail": {
+              "vi": "Per-device keys/state, durable inbox, dedup, decryption và explicit read state.",
+              "en": "Per-device keys/state, durable inboxes, deduplication, decryption and read state."
+            },
+            "x": 130,
+            "y": 380,
+            "kind": "client"
+          },
+          {
+            "id": "keys",
+            "label": {
+              "vi": "Public bundle directory",
+              "en": "Public bundle directory"
+            },
+            "detail": {
+              "vi": "Approved device identities/bundles, consistency và verification evidence.",
+              "en": "Approved device identities/bundles, consistency and verification evidence."
+            },
+            "x": 440,
+            "y": 380,
+            "kind": "service"
+          },
+          {
+            "id": "media",
+            "label": {
+              "vi": "Encrypted media",
+              "en": "Encrypted media"
+            },
+            "detail": {
+              "vi": "Immutable blobs, access/expiry, integrity references và separate capacity.",
+              "en": "Immutable blobs, access/expiry, integrity references and separate capacity."
+            },
+            "x": 760,
+            "y": 380,
+            "kind": "store"
+          },
+          {
+            "id": "group",
+            "label": {
+              "vi": "Group membership authority",
+              "en": "Group membership authority"
+            },
+            "detail": {
+              "vi": "Authenticated current membership/device view và monotonic epochs.",
+              "en": "Authenticated membership/device views and monotonic epochs."
+            },
+            "x": 1060,
+            "y": 380,
+            "kind": "service"
+          },
+          {
+            "id": "partition",
+            "label": {
+              "vi": "Owned partitions",
+              "en": "Owned partitions"
+            },
+            "detail": {
+              "vi": "Exclusive writer activation, replication/RPO và bounded recovery capacity.",
+              "en": "Exclusive writer activation, replication/RPO and bounded recovery capacity."
+            },
+            "x": 130,
+            "y": 680,
+            "kind": "store"
+          },
+          {
+            "id": "companion",
+            "label": {
+              "vi": "Approved companion",
+              "en": "Approved companion"
+            },
+            "detail": {
+              "vi": "Distinct device identity, authorized history transfer và independent queue.",
+              "en": "Distinct identity, authorized history transfer and independent queues."
+            },
+            "x": 440,
+            "y": 680,
+            "kind": "client"
+          },
+          {
+            "id": "vault",
+            "label": {
+              "vi": "Protected backup vault",
+              "en": "Protected backup vault"
+            },
+            "detail": {
+              "vi": "Selected HSM/key-recovery protocol, attempt limits và protected device channel.",
+              "en": "Selected recovery protocols, attempt limits and protected device channels."
+            },
+            "x": 760,
+            "y": 680,
+            "kind": "service"
+          },
+          {
+            "id": "backup",
+            "label": {
+              "vi": "Encrypted backup store",
+              "en": "Encrypted backup store"
+            },
+            "detail": {
+              "vi": "Versioned ciphertext manifests, integrity, retention và recovery points.",
+              "en": "Versioned ciphertext manifests, integrity, retention and recovery points."
+            },
+            "x": 1060,
+            "y": 680,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "direct",
+            "label": {
+              "vi": "Direct message tới approved devices",
+              "en": "Direct messages reach approved devices"
+            },
+            "steps": [
+              {
+                "from": "sender",
+                "to": "keys",
+                "description": {
+                  "vi": "Obtain verified current device bundles/approval context, không blindly trust arbitrary list.",
+                  "en": "Obtain verified current bundles/approvals rather than arbitrary lists."
+                }
+              },
+              {
+                "from": "sender",
+                "to": "gateway",
+                "description": {
+                  "vi": "Prepare endpoint-encrypted envelopes với stable logical/device identities dưới audited protocol.",
+                  "en": "Prepare endpoint-encrypted envelopes with stable identities under an audited protocol."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "relay",
+                "description": {
+                  "vi": "Authenticate sender/device và validate scoped routing metadata.",
+                  "en": "Authenticate senders/devices and validate scoped routing."
+                }
+              },
+              {
+                "from": "relay",
+                "to": "queue",
+                "description": {
+                  "vi": "Durably retain each accepted recipient-device obligation.",
+                  "en": "Durably retain each device obligation."
+                },
+                "async": true
+              },
+              {
+                "from": "queue",
+                "to": "receiver",
+                "description": {
+                  "vi": "Deliver pending ciphertext trong retention với idempotent retries.",
+                  "en": "Deliver retained ciphertext with idempotent retries."
+                }
+              }
+            ]
+          },
+          {
+            "id": "receipts",
+            "label": {
+              "vi": "Persist, ACK và read receipts",
+              "en": "Persistence, acknowledgements and reading"
+            },
+            "steps": [
+              {
+                "from": "receiver",
+                "to": "queue",
+                "description": {
+                  "vi": "ACK exact device/envelope sau selected durable local acceptance.",
+                  "en": "Acknowledge exact devices/envelopes after durable local acceptance."
+                }
+              },
+              {
+                "from": "queue",
+                "to": "relay",
+                "description": {
+                  "vi": "Retire completed obligation; missing ACK permits redelivery.",
+                  "en": "Retire completed obligations; missing acknowledgements permit replay."
+                }
+              },
+              {
+                "from": "relay",
+                "to": "sender",
+                "description": {
+                  "vi": "Report selected delivery evidence, không tự suy user đã đọc.",
+                  "en": "Report delivery evidence without inferring reading."
+                }
+              },
+              {
+                "from": "receiver",
+                "to": "sender",
+                "description": {
+                  "vi": "Explicit read/user signal theo selected encrypted policy, distinct delivery.",
+                  "en": "Reading follows a separate explicit signal/policy."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "media",
+            "label": {
+              "vi": "Encrypted attachment",
+              "en": "Encrypted attachments"
+            },
+            "steps": [
+              {
+                "from": "sender",
+                "to": "media",
+                "description": {
+                  "vi": "Upload complete encrypted immutable generation với integrity context.",
+                  "en": "Upload complete immutable ciphertext with integrity context."
+                }
+              },
+              {
+                "from": "sender",
+                "to": "gateway",
+                "description": {
+                  "vi": "Send protected descriptor/key context bằng message protocol.",
+                  "en": "Send protected descriptors/key context through the message protocol."
+                }
+              },
+              {
+                "from": "relay",
+                "to": "queue",
+                "description": {
+                  "vi": "Retain small envelope obligations independently from media bytes.",
+                  "en": "Retain small envelopes separately from media bytes."
+                },
+                "async": true
+              },
+              {
+                "from": "media",
+                "to": "receiver",
+                "description": {
+                  "vi": "Fetch bytes, authenticate/verify descriptor và decrypt at endpoint.",
+                  "en": "Fetch bytes, verify protected descriptors and decrypt at endpoints."
+                }
+              }
+            ]
+          },
+          {
+            "id": "group",
+            "label": {
+              "vi": "Membership epoch và group fan-out",
+              "en": "Membership epochs and group fan-out"
+            },
+            "steps": [
+              {
+                "from": "sender",
+                "to": "group",
+                "description": {
+                  "vi": "Obtain authenticated current membership/device context.",
+                  "en": "Obtain authenticated membership/device context."
+                }
+              },
+              {
+                "from": "sender",
+                "to": "receiver",
+                "description": {
+                  "vi": "Distribute sender chain state/public verification via approved pairwise sessions.",
+                  "en": "Distribute chain state/verification through approved pairwise sessions."
+                }
+              },
+              {
+                "from": "sender",
+                "to": "relay",
+                "description": {
+                  "vi": "Send one signed group ciphertext bound to selected protocol/epoch.",
+                  "en": "Send one signed group ciphertext under protocol/epoch context."
+                }
+              },
+              {
+                "from": "relay",
+                "to": "queue",
+                "description": {
+                  "vi": "Copy to current recipient obligations; egress vẫn proportional recipients.",
+                  "en": "Create recipient obligations; egress still scales with recipients."
+                },
+                "async": true
+              },
+              {
+                "from": "queue",
+                "to": "companion",
+                "description": {
+                  "vi": "Companion cần đúng key/session, không inherit rights chỉ vì cùng account label.",
+                  "en": "Companions need valid keys/sessions, not just account labels."
+                }
+              }
+            ]
+          },
+          {
+            "id": "backup",
+            "label": {
+              "vi": "Protected backup và approved restore",
+              "en": "Protected backup and approved restore"
+            },
+            "steps": [
+              {
+                "from": "sender",
+                "to": "backup",
+                "description": {
+                  "vi": "Encrypt history locally rồi publish coherent ciphertext manifest/generation.",
+                  "en": "Encrypt locally and publish coherent ciphertext generations/manifests."
+                }
+              },
+              {
+                "from": "sender",
+                "to": "vault",
+                "description": {
+                  "vi": "Selected protected key/password/device recovery protocol, không plaintext-key logging.",
+                  "en": "Use protected recovery protocols without key logging."
+                }
+              },
+              {
+                "from": "vault",
+                "to": "companion",
+                "description": {
+                  "vi": "Release recovered material qua protected approved endpoint channel dưới policy.",
+                  "en": "Recover through protected approved endpoint channels."
+                }
+              },
+              {
+                "from": "backup",
+                "to": "companion",
+                "description": {
+                  "vi": "Fetch/verify/restore selected generation, không silently activate revoked identity.",
+                  "en": "Verify/restore generations without reviving revoked identities."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "6. API contracts bind device và operation identity",
+        "en": "6. API contracts bind devices and operation identity"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ thuộc thiết kế này, không WhatsApp APIs. Ciphertext/envelope fields không chứng minh confidentiality/integrity; audited protocols phải bind sender/device/conversation/version context. Same envelope identity với changed payload là conflict; server acceptance không override device approval hoặc group version policy.",
+          "en": "These are illustrative APIs, not WhatsApp endpoints. Fields do not establish cryptographic protection; protocols bind context. Changed payloads under one envelope identity conflict, and acceptance never overrides approvals or membership."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/v1/device-bundles/{accountId}",
+          "description": {
+            "vi": "Approved device bundle view có consistency/verification context.",
+            "en": "Approved bundles expose verification/consistency context."
+          },
+          "response": "{directoryEpoch, devices:[{deviceId, publicBundle, approvalEvidence}], consistencyProofRef}",
+          "notes": [
+            {
+              "vi": "Proof semantics và device verification cần protocol thật; JSON field không là attestation.",
+              "en": "Proofs need actual verification protocols; fields are not attestation."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/v1/device-envelopes",
+          "description": {
+            "vi": "Accept immutable recipient-device obligations.",
+            "en": "Accept immutable device obligations."
+          },
+          "request": "{envelopeId, logicalMessageId, senderDeviceId, recipientDeviceId, contextVersion, ciphertextRef, payloadHash}",
+          "response": "{state:\"ACCEPTED|REPLAY|CONFLICT|STALE_DEVICE\", receiptRef, retentionUntil}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/device-receipts",
+          "description": {
+            "vi": "Authenticated device confirms selected local durability.",
+            "en": "Devices acknowledge selected local durability."
+          },
+          "request": "{deviceId, envelopeId, receiptId, kind:\"PERSISTED\", localGeneration}",
+          "response": "{receiptOutcome:\"RECORDED|REPLAY\", remainingObligationState}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/media-uploads",
+          "description": {
+            "vi": "Scoped staging upload cho ciphertext, không content keys.",
+            "en": "Scope ciphertext staging uploads without content keys."
+          },
+          "request": "{mediaId, ciphertextByteLength, checksum, expiryPolicy}",
+          "response": "{uploadRef, immutableGeneration, publishState}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/group-membership-operations",
+          "description": {
+            "vi": "Conditional authorized membership transition.",
+            "en": "Condition authorized membership transitions."
+          },
+          "request": "{operationId, groupId, expectedMembershipEpoch, changes, authorizationContext}",
+          "response": "{membershipEpoch, deviceView, rekeyRequired, retainedResult}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/backup-manifests",
+          "description": {
+            "vi": "Publish coherent encrypted backup generation.",
+            "en": "Publish coherent encrypted backup generations."
+          },
+          "request": "{backupId, generation, expectedPreviousGeneration, encryptedManifestRef, recoveryProtocolVersion}",
+          "response": "{state:\"PUBLISHED|CONFLICT\", generation}",
+          "notes": [
+            {
+              "vi": "Backup data publication khác device approval/key recovery.",
+              "en": "Backup publication differs from device approval/key recovery."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "delivery",
+      "title": {
+        "vi": "7. Durable per-device receipts và local dedup",
+        "en": "7. Durable device receipts and local deduplication"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lab một message choD1/D2: ACKD1 không cho phép xóaD2offline queue. NếuD1ACK khi chỉ volatile rồi crash, server đã GC và không còn replay path. NếuD2persist nhưng ACKlost, redelivery cùng logical identity phải không thêm duplicate local message. Recipient state/result/receipt cần coherent crash recovery; unique ID alone không serialize effects.",
+          "en": "The fixture distinguishes device obligations, premature acknowledgements and idempotent replay. Persist before acknowledgement and recover recipient state coherently; identity alone does not serialize effects."
+        },
+        {
+          "vi": "Per-device queue giữ accepted ciphertext theo retention, storage durability và auth/epoch contracts. Device nhận thiếu key/context có thể giữ durable pending-decrypt và repair request theo protocol; đừng gọi chưa decrypt là read. Queue TTL hết hạn cần expired/failed outcome, push notification chỉ wake hint chứ không durable delivery.",
+          "en": "Queues retain ciphertext under explicit durability, expiry and identity. Pending decryption may be durable but is not reading. Expiry needs explicit failure and push notifications are wake hints rather than durable delivery."
+        }
+      ],
+      "experiment": "secure-delivery"
+    },
+    {
+      "id": "keys",
+      "title": {
+        "vi": "8. Approved identities, metadata và endpoint threat model",
+        "en": "8. Approved identities, metadata and endpoint threat models"
+      },
+      "paragraphs": [
+        {
+          "vi": "E2EE khác TLS: wire tới service được bảo vệ không đồng nghĩa operator không đọc content. Approved endpoint key ownership, authenticated session setup, per-message evolution, replay/out-of-order bounds và device verification cùng tạo contract. Một malicious directory có thể try introduce device; approvals/consistency/security-code verification cần semantics cụ thể. Không treat public-key fetch là trust proof.",
+          "en": "TLS alone does not hide content from its endpoint. E2EE needs approved identities, authenticated setup, evolution and replay/device controls. Directory retrieval is not identity proof; approvals and verification need explicit semantics."
+        },
+        {
+          "vi": "Metadata vẫn có routing, device/account/group membership, time/size/media access theo design. Encryption không tự anonymous, không chặn authorized recipient share/report hoặc endpoint malware. Cryptographic forward secrecy dưới erased-key assumptions không xóa plaintext history đã lưu ở devices. Private communications, business integrations và backups phải state rõ ai là authorized plaintext endpoint.",
+          "en": "Routing and timing metadata remain separate privacy concerns. Encryption does not prevent recipient sharing or compromised endpoints. Erased-key secrecy does not erase saved plaintext. Define plaintext endpoints for private messages, integrations and backups."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Protect content",
+            "en": "Protect content"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Use audited protocols/implementations; bind current approved identities/context.",
+              "en": "Use audited protocols with approved identities and context."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Bound metadata",
+            "en": "Bound metadata"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Minimize retained routing/log data và govern access/purpose.",
+              "en": "Minimize and govern routing/log data."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "State exclusions",
+            "en": "State exclusions"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Saved plaintext, compromised endpoints và authorized reporting không tự biến mất.",
+              "en": "Saved plaintext, endpoint compromise and authorized reporting remain explicit boundaries."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "groups",
+      "title": {
+        "vi": "9. Sender Keys tối ưu sender, không xóa recipients",
+        "en": "9. Sender Keys optimize senders, not recipient delivery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sender phân phối chain state + public signing verification key qua approved pairwise sessions; private signing key không được phát cho group. Payload tiếp theo dùng protocol message-key evolution/erasure và signing rồi relay fan-out. Membership leave cần clear/start fresh theo selected scheme; inactive sender có thể chưa gửi new distribution tới khi next send. Churn và device changes cần per-sender/per-group generations.",
+          "en": "Distribute chain state and public verification while retaining private signing keys. Payloads evolve/erase keys and remain signed. Membership changes require fresh sender state; distribution may await the next active send. Track sender/group/device generations."
+        },
+        {
+          "vi": "Cost lab giữA surviving active senders, mỗi senderMmessages mỗi epoch và chỉ non-senders rời group. Ởepochk cóRk=(N−k)×D−1recipient devices, gồm companions của sender trừ originating device. Pairwise data envelopes=A×M×ΣRk; SenderKey distribution=A×ΣRk, shared payloads=A×M×epochs. Server data deliveries của cả hai vẫn=A×M×ΣRk. Đây là logical counts, không equal-cost crypto benchmark.",
+          "en": "The lab fixes surviving active senders and per-epoch messages. Recipient counts include companions except origins. Compare pairwise data, sender-key distribution and shared payload counts separately; recipient deliveries remain. Counts are not equivalent cryptographic costs or benchmarks."
+        },
+        {
+          "vi": "Short/churny conversations có thể chưa amortize setup. Batching packets, ciphertext sizes, key/session establishment, signatures, retries và actual CPU/battery cần measured costs riêng. Full group key-management alternatives có security/scale properties khác; không suy một shared static key là tương đương Sender Keys hoặc mọi group protocol.",
+          "en": "Short/churny workloads may not amortize setup. Actual packets, sizes, setup, signatures, retries and device costs need measurement. Static shared secrets and other group protocols are not interchangeable."
+        }
+      ],
+      "experiment": "secure-fanout"
+    },
+    {
+      "id": "membership",
+      "title": {
+        "vi": "10. Membership revoke khác thu hồi old knowledge",
+        "en": "10. Revocation differs from retracting old knowledge"
+      },
+      "paragraphs": [
+        {
+          "vi": "LabA/B/C đã đọc và lưu m0; sauBleave,Djoin,currentepoch2. Fresh sender key được phân phối tới current recipients theo approved sessions. Bkhông nên có future key, nhưng m0saved không biến mất. Dchưa cóoldhistory theo selected no-history-sharing policy; explicit authorized history sync có thể là operation khác.",
+          "en": "The fixture givesA/B/C saved m0, then removesB and addsD. Fresh approved distribution excludesB from future keys without erasing saved history. The selected policy withholds history fromD; authorized history sharing is separate."
+        },
+        {
+          "vi": "Nếu sender vẫn dùng old key, server chỉ bỏBkhỏi fan-out chưa bảo vệ cryptographic access nếuBnhận được ciphertext ở nơi khác. Epoch admission giúp reject honest stale-context sends, nhưng metadata label không chứng minh actual cipher dùng đúng key; full protocol/context verification và endpoint assumptions vẫn cần. Dmissing key có thể cần pending-decrypt/key repair. Compromised current endpoint vẫn được cấpfreshkey không được chữa chỉ bằng rotation.",
+          "en": "Removing relay recipients alone does not protect ciphertext accessible elsewhere when old keys remain. Epoch guards reject honest stale context but labels do not attest actual encryption. Retain protocol verification and repair missing keys; rotation does not cure a still-authorized compromised endpoint."
+        }
+      ],
+      "experiment": "secure-membership"
+    },
+    {
+      "id": "media",
+      "title": {
+        "vi": "11. Attachment lifetime và control-plane isolation",
+        "en": "11. Attachment lifetime and control-plane isolation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Upload ciphertext vào immutable generation, finalize complete blob rồi gửi protected descriptor bound generation/integrity/context. Receiver verify trước output, xử lý missing/expired media qua explicit UI/retry policy. Media URL/access logs không nên lộ content keys; encrypted payload vẫn có size/timing/storage/quota concerns. Thumbnail nếu nhạy cảm cũng phải qua proper protection.",
+          "en": "Publish complete immutable ciphertext before protected descriptors. Verify before output and handle missing media explicitly. Keep keys out of URLs/logs while governing size/timing and thumbnails."
+        },
+        {
+          "vi": "Message retained/delivered không bảo đảm media còn tồn tại mãi. Choose message/media retention, deletion/tombstone propagation và orphan cleanup independently; fullsize downloads không đi qua latency-sensitive socket relay. Client-side dedup/hash cũng không tự anonymous hoặc proof content safe; integrity claim dựa authenticated descriptor.",
+          "en": "Message delivery does not promise eternal media. Define independent retention, deletion and cleanup while separating large transfers. Hashes need authenticated context and do not establish anonymity or general content safety."
+        }
+      ]
+    },
+    {
+      "id": "devices",
+      "title": {
+        "vi": "12. Multi-device identity, history và convergence",
+        "en": "12. Device identities, history and convergence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Approved companion không phải alias cùng socket. Mỗi device có own identity/session state, own durable inbox/receipt và relevant outgoing encrypted copies. Directory approval/consistency chống unauthorized additions trong threat model; revoke cần invalidatefuturecontexts/session/bundle view và định nghĩa queued old-envelope handling. Không giả instant erase keys/history trên device đã nhận.",
+          "en": "Companions have distinct identities, state, inboxes and receipts. Approvals govern additions; revocation updates future contexts and queued-envelope policy without pretending to erase received history."
+        },
+        {
+          "vi": "History transfer tới new approved device phải authorized, E2EE và coherent snapshot/delta boundary. History/chats/settings đọc/xóa state có different merge policies; stable event IDs/versions và tombstones chống resurrect deleted state. Local search indexing chạy endpoint hoặc privacy-preserving design có threat model riêng; server không được silently decrypt private archive để làm search.",
+          "en": "Authorize coherent encrypted history synchronization and define per-state merge/deletion semantics. Preserve identities/versions against resurrection. Endpoint search or privacy-preserving alternatives need explicit models rather than silent server decryption."
+        }
+      ]
+    },
+    {
+      "id": "backup",
+      "title": {
+        "vi": "13. Backup keys và HSM recovery không là magic",
+        "en": "13. Backup keys and vault recovery are not magic"
+      },
+      "paragraphs": [
+        {
+          "vi": "Encrypted backup gồm ciphertext generations/manifests/integrity và selected recovery material. Có thể user-held secret hoặc protected vault/device/password flow; một HSM-based vault có thể giữ secret dưới authenticated protected channel và attempt controls. Vì vậy “mọi key không rời device” hoặc “brute force impossible với mọi operator” là claims quá rộng. State HSM/trusted-code/anti-rollback/limit assumptions và recovery policy.",
+          "en": "Backups combine versioned data and recovery material. Secrets may be user-held or protected by vault protocols, so universal device-only and brute-force-impossibility claims are too broad. Define hardware/code, rollback and attempt-limit assumptions."
+        },
+        {
+          "vi": "Restore verify generation/coherence/integrity, authenticate approved recipient device và avoid replay/rollback to revoked authority. Forgotten material/lockout/reset có product-specific recovery rules; đừng suy no-helpdesk guarantee cho mọi mode. Backup retention/erasure khác relay queueGC và user-visible deletion. Test restore underpartial/lost device/cloud failure, không chỉ backup upload success.",
+          "en": "Restore verified generations into authenticated devices while preventing rollback/revived approval. Recovery/lockout rules depend on mode. Backup retention differs from queue garbage collection and visible deletion; test restores, not only uploads."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "14. Partition recovery, privacy và capacity",
+        "en": "14. Partition recovery, privacy and capacity"
+      },
+      "paragraphs": [
+        {
+          "vi": "Partition owners/session routes cần epochs/fencing/equivalent coordination tại actual write sink. Primary/secondary replication không tự solve split-brain hoặc accepted-data RPO. Backpressure giữ socket mailboxes/queues bounded; per-user/device/group quotas và reconnect jitter tránh shared auth/key-directory overload. Measure availability của accepted delivery nghĩa gì, không chỉ connections up.",
+          "en": "Fence actual ownership rather than only routing. Replication alone does not solve split-brain/RPO. Bound buffers and coordinate quotas/reconnection across authentication and directories. Measure defined delivery availability rather than sockets alone."
+        },
+        {
+          "vi": "Migration preserve accepted envelope/result, metadata versions, protocol state và recovery identities. Shadow compares không send real duplicate recipients hoặc expose keys. Logs tối thiểu safe IDs/versions/reasons, không plaintext/private keys/raw sensitive member histories. Group fan-out, key-distribution backlog và missing-key decrypt failures là separate metrics.",
+          "en": "Migrations preserve accepted identity/state without duplicate real effects or key exposure. Log minimally and separate recipient fan-out, distribution backlog and decryption failures."
+        }
+      ]
+    },
+    {
+      "id": "failures",
+      "title": {
+        "vi": "15. Failure matrix: data custody và key boundaries",
+        "en": "15. Failure matrix: custody and key boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Alerts theo accepted-queue age, retentionexpiry, device receipt/replay, offline cohorts, drain/reconnect, directory consistency, missing keys và restore verification. “Blue tick” UX không thay durable delivery proof. Mọi sensitive operation có accountable owner và retention/repair policy.",
+          "en": "Monitor obligation age/expiry, replay, offline devices, directories, keys and restores. Read indicators do not replace durability evidence; retain ownership and repair policy."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Required behavior",
+            "en": "Required behavior"
+          },
+          {
+            "vi": "Drill",
+            "en": "Drill"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Lost send/ACK reply",
+              "en": "Lost send/ACK reply"
+            },
+            {
+              "vi": "Stable logical/device identity, idempotent replay.",
+              "en": "Stable device/intent identity and replay."
+            },
+            {
+              "vi": "Disconnect trước/after queue/local commit.",
+              "en": "Disconnect around queue/local commits."
+            }
+          ],
+          [
+            {
+              "vi": "One account ACK for all devices",
+              "en": "One acknowledgement for all devices"
+            },
+            {
+              "vi": "Offline companion obligation còn tồn tại.",
+              "en": "Preserve offline companion obligations."
+            },
+            {
+              "vi": "ACKphone khi laptop offline.",
+              "en": "Acknowledge a phone while a laptop is offline."
+            }
+          ],
+          [
+            {
+              "vi": "Device ACK before persistence",
+              "en": "Premature device acknowledgement"
+            },
+            {
+              "vi": "No irreversible GC before selected local durability.",
+              "en": "Retire only after selected durability."
+            },
+            {
+              "vi": "Crash ngay sau ACK, không durable copy.",
+              "en": "Crash after acknowledgement without persistence."
+            }
+          ],
+          [
+            {
+              "vi": "Member leave/key missing",
+              "en": "Membership leave/missing keys"
+            },
+            {
+              "vi": "Fresh approved sender state, pending key repair và explicit history policy.",
+              "en": "Fresh state, key repair and history policy."
+            },
+            {
+              "vi": "Stale key, old ciphertext, new device missing distribution.",
+              "en": "Mix stale keys, old data and missing distribution."
+            }
+          ],
+          [
+            {
+              "vi": "Directory hidden device",
+              "en": "Hidden directory device"
+            },
+            {
+              "vi": "Approved/verified identities, consistency/alert/recovery.",
+              "en": "Verify approvals and consistency."
+            },
+            {
+              "vi": "Unexpected device/bundle substitution theo threat model.",
+              "en": "Test unexpected device/bundle substitution."
+            }
+          ],
+          [
+            {
+              "vi": "Blob expired/corrupt",
+              "en": "Expired/corrupt media"
+            },
+            {
+              "vi": "No unauthenticated plaintext output; explicit failure UX.",
+              "en": "Reject invalid output and expose failure."
+            },
+            {
+              "vi": "Descriptor generation mismatch hoặc missing blob.",
+              "en": "Mismatch descriptors/generations or remove blobs."
+            }
+          ],
+          [
+            {
+              "vi": "Restore stale/unauthorized generation",
+              "en": "Unauthorized/stale restore"
+            },
+            {
+              "vi": "Verify coherence/identity và no revoked-device resurrection.",
+              "en": "Verify coherence/identity without reviving revoked devices."
+            },
+            {
+              "vi": "Partial manifests, lost secrets, stale backup/rollback attempts.",
+              "en": "Test partial data, lost material and rollback."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "16. Worked questions: delivery, encryption và recovery",
+        "en": "16. Worked questions: delivery, encryption and recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trace một offline direct message, một group epoch change và một restore trước khi chọn deep dive. Các answers là design reasoning với scope đã nêu, không security proof hoặc product guarantees ngoài threat model.",
+          "en": "Trace offline delivery, membership changes and restore before choosing depth. Answers reason under declared scope rather than prove cryptographic security."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Server ACK và recipient read có giống nhau?",
+            "en": "Are server acceptance and recipient reading equivalent?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Server ACK hứa selected queue durability; device ACK hứa selected local acceptance; read là explicit signal/policy. Cần bind receipts theo đúng device/envelope. Một companion offline vẫn còn obligation sau phone ACK.",
+              "en": "No. Server durability, device acceptance and reading are distinct, device-bound evidence. Phone acknowledgement does not complete an offline companion."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "One ciphertext có nghĩa group cost O(1) hết?",
+            "en": "Does one ciphertext make all group work constant?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ giảm selected sender payload work sau setup. Pairwise distribution và epoch churn vẫn tốn; server deliveries/egress tăng theo recipient devices. Logical envelope counts không là equal-cost crypto/CPU benchmark.",
+              "en": "It reduces selected sender work after setup; distribution and recipient deliveries remain. Envelope counts do not establish equivalent compute costs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Khi B rời group, chỉ bỏ B khỏi server fan-out đã đủ chưa?",
+            "en": "Does removing B from server fan-out suffice?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu future payload vẫn dùng key B biết và B có thể lấy ciphertext. Cần fresh authenticated sender state và distribution theo protocol. Không thể thu hồi m0 B đã đọc/lưu; rekey cũng không chữa một current endpoint vẫn đang bị compromise.",
+              "en": "Not if B retains future keys and can obtain ciphertext. Refresh authenticated state while recognizing old saved history and current endpoint compromise remain."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sender Keys phát private signing key cho recipients?",
+            "en": "Do Sender Keys distribute private signing keys?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Recipients nhận chain state và public verification material qua approved pairwise sessions; private signing key ở sender. Full protocol còn message-key evolution/erasure, context và replay rules. Không tự implement từ một toy lab.",
+              "en": "No. Recipients receive chain state and public verification while private signing remains at the sender, under a complete audited protocol."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "E2EE có xóa hết metadata và mọi endpoint risk không?",
+            "en": "Does E2EE eliminate metadata and endpoint risk?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Routing, thời gian, kích thước, device và membership metadata cần controls riêng. Approved recipients có thể share/report; compromised endpoint có thể lộ plaintext. Cần nói rõ directory verification, endpoint trust và backup mode. Có ciphertext không chứng minh anonymous.",
+              "en": "No. Govern metadata and endpoint trust separately; approved sharing and compromised devices remain. Verify directories and define backup boundaries."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "UUID có tự bảo đảm redelivery không tạo duplicate UI không?",
+            "en": "Does a UUID alone provide exactly-once presentation?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Device phải persist dedup/state cùng effect/result và phục hồi coherent trước selected ACK. Logical identity cần bind sender/conversation và recipient-device envelope. Retry đổi payload cần conflict hoặc revision policy; một UUID riêng lẻ không serialize các effects.",
+              "en": "No. Persist identities with state/effects and recover before acknowledgements. Bind logical/device context and handle changed payloads explicitly."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Encrypted backups có nghĩa key không bao giờ rời device?",
+            "en": "Do encrypted backups imply keys never leave devices?"
+          },
+          "answer": [
+            {
+              "vi": "Không với mọi mode. Protected HSM vault có thể giữ recovery secret qua protocol không cho ordinary frontend đọc. Cần state trust/attempt/anti-rollback và recovery policy; không nói hardware làm mọi attack impossible.",
+              "en": "Not universally: protected vaults may hold recovery material. Define trust, limits and rollback controls rather than assuming hardware eliminates attacks."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Primary-secondary pair có tự đủ để chỉ có một writer không?",
+            "en": "Does a primary-secondary pair ensure exclusive writers?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Partition hoặc promotion cần activation, fencing, quorum hoặc equivalent protocol ở actual write sink. Route cache không phải fence. Recovery cũng cần giữ accepted envelope/results theo selected RPO, không chỉ khởi động replacement node.",
+              "en": "No. Promotion needs actual ownership coordination/fencing and retained accepted state under explicit RPO, not merely new routing."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
