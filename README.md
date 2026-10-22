@@ -10,11 +10,11 @@ AV Lore là website học tập và tra cứu kiến thức công nghệ: từ n
 
 - **Lộ trình học:** 15 lộ trình với 198 chương, điều hướng theo chủ đề và chương học.
 - **Notes & Interview:** 31 topic, 147 notes và 387 câu hỏi chính cùng các câu hỏi đào sâu; câu hỏi liên kết với phần kiến thức tương ứng.
-- **Case Studies:** thư viện riêng với 26 bài System Design với requirements, capacity estimation, API, data model, sơ đồ luồng, failure mode và trade-off.
-- **Học trực quan:** sơ đồ minh họa, tóm tắt ghi nhớ và 31 bài thử tương tác để quan sát hành vi của hệ thống.
+- **System Design & AI:** nền tảng thiết kế hệ thống, Building Blocks, 26 Case Studies, cùng các bài Build Stories và AI Systems đang được mở rộng. Bài học kết hợp requirements, capacity estimation, API, data model, sơ đồ nhiều luồng, failure modes và trade-offs.
+- **Học trực quan:** sơ đồ có trace theo từng bước, tóm tắt ghi nhớ, bài thử theo topic và mô phỏng chuyên sâu để quan sát hành vi của hệ thống.
 - **Luyện tập:** lọc câu hỏi theo vai trò, xem gợi ý trả lời và đánh dấu nội dung cần ôn.
 - **Tra cứu:** tìm kiếm toàn văn với chỉ mục riêng cho từng ngôn ngữ, mục lục trong bài và breadcrumb.
-- **Cá nhân hóa:** năm theme sáng/tối (mặc định Tối xanh xám), bookmark, tiến độ chương và nhập/xuất dữ liệu học tập bằng JSON.
+- **Cá nhân hóa:** chín theme sáng/tối (mặc định GitHub Dark), bookmark, tiến độ chương và nhập/xuất dữ liệu học tập bằng JSON.
 - **Hai ngôn ngữ:** chuyển Việt/English ngay tại bài đang đọc, giữ đường dẫn và vị trí mục.
 
 Nội dung đọc được xuất sẵn thành HTML. Các lab, tìm kiếm và công cụ học tập dùng JavaScript. Dữ liệu học tập lưu trên trình duyệt; có thể xuất JSON để sao lưu hoặc chuyển sang thiết bị khác.
@@ -76,9 +76,10 @@ src/
   content/
     courses/           Nội dung chương học
     topics/            Notes và câu hỏi Interview
+    handbook/          Nội dung chuyên sâu với cặp Việt–Anh đã biên soạn
   i18n/                Từ điển English và các bản dịch chỉnh thủ công
   layouts/             Bố cục chung, navbar, sidebar và mục lục
-  lib/                 Nội dung case study, mô phỏng và logic học tập
+  lib/                 Schema, danh mục, mô hình mô phỏng và logic học tập
   pages/               Các trang và routes
   styles/              Style chung và bảng màu theme
 public/
@@ -92,11 +93,11 @@ AGENTS.md              Quy ước làm việc dành cho AI
 
 ## Nội dung và bản dịch
 
-Notes và Interview dùng chung dữ liệu trong `src/content/topics/`; các bài luyện tập đọc trực tiếp từ ngân hàng câu hỏi này. Case study nằm trong `src/lib/cases.ts`. ID nội dung cần được giữ ổn định để bookmark và tiến độ tiếp tục hoạt động.
+Notes và Interview dùng chung dữ liệu trong `src/content/topics/`; các bài luyện tập đọc trực tiếp từ ngân hàng câu hỏi này. Bài chuyên sâu nằm trong `src/content/handbook/`, dùng schema tại `src/lib/handbook-schema.ts` và danh mục phạm vi tại `src/lib/handbook-catalog.json`. ID nội dung cần được giữ ổn định để bookmark và tiến độ tiếp tục hoạt động.
 
-Nội dung ưu tiên giải thích dễ hiểu bằng tiếng Việt và giữ các thuật ngữ chuyên ngành bằng English. Mỗi topic hoặc case study có nguồn kỹ thuật để đọc thêm và đối chiếu; số liệu giả định cần đi kèm bối cảnh và đơn vị.
+Nội dung ưu tiên giải thích dễ hiểu bằng tiếng Việt và giữ các thuật ngữ chuyên ngành bằng English. Các số liệu và mô phỏng có giả định, bối cảnh, đơn vị và giới hạn áp dụng rõ.
 
-Bản English dùng dịch máy với nhãn giao diện và thuật ngữ được chỉnh riêng; chưa được rà soát thủ công toàn bộ. Từ điển nằm trong `src/i18n/en.json`; các chỉnh sửa trong `src/i18n/en-overrides.json` được ưu tiên. Build sử dụng từ điển đã lưu, không gọi dịch vụ dịch online, và báo lỗi nếu thiếu bản dịch.
+Các bài chuyên sâu lưu cặp `vi/en` cho nội dung, sơ đồ và lời giải; chúng vẫn cần vòng review tổng thể trước khi đánh dấu hoàn tất. Các chương học và Notes & Interview dùng từ điển English với nhãn giao diện/thuật ngữ được chỉnh riêng; chưa được rà soát thủ công toàn bộ. Từ điển nằm trong `src/i18n/en.json`; các chỉnh sửa trong `src/i18n/en-overrides.json` được ưu tiên. Build sử dụng từ điển đã lưu, không gọi dịch vụ dịch online, và báo lỗi nếu thiếu bản dịch.
 
 Sau khi cập nhật nội dung, kiểm tra bản dịch tương ứng rồi chạy:
 
@@ -117,3 +118,5 @@ Website được deploy bằng workflow [GitHub Pages](.github/workflows/pages.y
 | `PUBLIC_BASE_PATH` | `/av-lore`                  |
 
 Trong CI, hai giá trị này được lấy từ owner và tên repository. Khi dùng domain hoặc base path khác, đặt cùng cấu hình cho cả build và verify.
+
+`npm run content:audit` báo các bài đã biên soạn, đang chờ review và còn thiếu trong danh mục. Báo cáo độ phủ và hướng tiếp tục nằm trong [docs/HANDBOOK_PROGRESS.md](docs/HANDBOOK_PROGRESS.md).

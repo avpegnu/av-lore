@@ -1,0 +1,1324 @@
+{
+  "id": "digital-wallet",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Digital Wallet: ledger, available funds và recovery",
+    "en": "Designing a Digital Wallet: ledgers, available funds and recovery"
+  },
+  "summary": {
+    "vi": "Tách intent, posted/held/available, transit và commit decisions; so ACID ledger với deterministic engine, thử snapshot thiếu dedup, cross-owner timeout và concurrent holds.",
+    "en": "Separate intent, posted/held/available balances, transit and decisions; compare ACID ledgers with deterministic engines and test incomplete snapshots, uncertain transfers and concurrent holds."
+  },
+  "prerequisites": [
+    "payments",
+    "consistency",
+    "message-queue"
+  ],
+  "relatedTopics": [
+    "database",
+    "distributed",
+    "auth",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Balanced totals không chứng minh đúng intent, đúng recipient hoặc no overspend.",
+      "en": "Balanced totals do not prove intent, recipients or spending bounds."
+    },
+    {
+      "vi": "Result/dedup, holds và pending decisions phải recover cùng monetary state.",
+      "en": "Results, reservations and pending decisions recover with monetary state."
+    },
+    {
+      "vi": "Timeout là uncertainty, không quyền refund trái với late credit.",
+      "en": "Timeouts indicate uncertainty rather than authorize contradictory refunds."
+    },
+    {
+      "vi": "Posted, held và available có semantics khác nhau; check-and-reserve cần atomicity.",
+      "en": "Posted, held and available differ; reservation admission needs atomicity."
+    },
+    {
+      "vi": "Start ACID, scale bằng measurements; event sourcing không loại mọi coordination.",
+      "en": "Start with ACID and measured scaling; event sourcing does not eliminate coordination."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Theo một monetary intent tới kết quả có thể giải thích",
+      "en": "Follow monetary intent to explainable outcomes"
+    },
+    "caption": {
+      "vi": "Không để tiền, identity hoặc pending responsibility mất giữa các bước.",
+      "en": "Preserve value, identity and pending responsibility between steps."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Identify / authorize",
+          "en": "Identify and authorize"
+        },
+        "detail": {
+          "vi": "Stable intent, exact amount, current rights.",
+          "en": "Stable intents, exact amounts and current rights."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Reserve / commit",
+          "en": "Reserve and commit"
+        },
+        "detail": {
+          "vi": "Available checks, balanced entries và durable results.",
+          "en": "Availability, balanced entries and durable results."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Resolve / project",
+          "en": "Resolve and project"
+        },
+        "detail": {
+          "vi": "Transit decisions và versioned read models.",
+          "en": "Transit decisions and versioned views."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Recover / reconcile",
+          "en": "Recover and reconcile"
+        },
+        "detail": {
+          "vi": "Complete snapshots, replay và independent evidence.",
+          "en": "Complete snapshots, replay and independent evidence."
+        },
+        "icon": "compare"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Wallet balance transfer khác card payment",
+        "en": "1. Wallet transfers differ from card payments"
+      },
+      "paragraphs": [
+        {
+          "vi": "Digital wallet quản lý stored value: người dùng nạp tiền, giữ số dư, chuyển cho nhau và rút ra. Bài Payments tập trung external charge/provider uncertainty; bài này tập trung internal ledger, available funds, pending transfers và recovery. Baseline một currency cho internal transfer, có balance/history và full change trail. Currency conversion, credit products và fraud-model implementation là scope riêng; nạp/rút vẫn cần adapter và reconciliation được giải thích bên dưới.",
+          "en": "A wallet manages stored value through funding, balances, internal transfers and withdrawals. Payments covers external charges and uncertain provider outcomes; this lesson focuses on the internal ledger, availability, pending transfers and recovery. The baseline uses a single currency with history/audit trails; FX, credit products and fraud-model implementation are separate, while funding/withdrawal boundaries remain explicit."
+        },
+        {
+          "vi": "Chốt response semantics trước: accepted command, funds reserved, transfer in flight, completed và rejected khác nhau. API202 chỉ nói workflow đã được nhận theo declared boundary. API completed cần chứng minh monetary effects đã đạt chosen commit protocol, không chỉ command nằm trong queue hoặc một sender debit đã ghi. Display balance có thể lag; spend authorization phải dùng authority có concurrency guarantees phù hợp.",
+          "en": "Distinguish accepted commands, reservations, in-flight transfers, completion and rejection. Acceptance proves only its declared boundary; completion requires the monetary commit protocol rather than a queued command or isolated debit. Display balances may lag, but spending uses an authoritative concurrency-safe state."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "User intent",
+            "en": "User intent"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Persist transfer identity trước submit; timeout không tạo intent mới.",
+              "en": "Persist identities before submitting; timeouts do not create new intents."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Money authority",
+            "en": "Money authority"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Available check và monetary mutation cùng atomic/serialized authority.",
+              "en": "Availability checks and monetary mutations share safe authority."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Visible progress",
+            "en": "Visible progress"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Show pending/held/completed cùng as-of version, không dùng success mơ hồ.",
+              "en": "Expose pending/held/completed states and versions rather than vague success."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "invariants",
+      "title": {
+        "vi": "2. Bảo toàn tiền là cần nhưng chưa đủ",
+        "en": "2. Conservation is necessary but insufficient"
+      },
+      "paragraphs": [
+        {
+          "vi": "Internal movement một currency cần balanced journal entries theo chart of accounts; từ góc nhìn operator, user balances thường là liabilities, bank cash là assets. Debit/credit tăng hay giảm phụ thuộc account type, không đồng nhất “debit luôn trừ, credit luôn cộng”. Trong labs, A/B/transit là simplified holdings để nhìn dòng value, không thay một accounting schema hoàn chỉnh. Nạp/rút/fees thêm counterpart accounts; sum user balances không phải hằng số khi có external flows.",
+          "en": "Balance journals within a currency under an explicit chart of accounts. Operator user balances are generally liabilities and bank cash assets; debit/credit direction depends on account type. The labs show simplified holdings rather than a complete accounting schema. Funding, withdrawals and fees need counterpart accounts, so user totals need not remain constant across external flows."
+        },
+        {
+          "vi": "Các invariants khác gồm no overspend theo product policy, đúng currency/source/destination, mỗi authorized intent chỉ có một supported effect, holds resolve đúng một lần, completed transfer có đủ postings, identity/result không mất khi recovery và stale owner không commit. Duplicate transfer30 vẫn giữ total 100 nhưng Alice trả hai lần. Hai pending holds60 trên posted 100 cũng giữ posted total nhưng available=-20. Vì vậy kiểm “sum không đổi” không thay authorization, uniqueness và balance bounds.",
+          "en": "Also enforce spending bounds, correct parties/currencies, identified effects, single reservation resolution, complete postings, recoverable results and fenced owners. Duplicate transfers can conserve totals while charging twice; excessive holds can preserve posted totals while making availability negative. Conservation does not prove authorization, uniqueness or bounds."
+        },
+        {
+          "vi": "Dùng exact integer/decimal representation có scale/currency metadata và overflow checks. Minor units không luôn là cents và không phải currency nào cũng có hai chữ số thập phân. JSON API dùng decimal string khi vượt safe integer range; DB dùng integer/decimal phù hợp. Rounding/fees phải thành explicit postings theo policy; không để floating point tự sinh một residual rồi bỏ qua.",
+          "en": "Use exact integers/decimals with asset scale and overflow checks. Minor units are not universally cents or two decimals. Encode large amounts as strings and use appropriate database types. Rounding/fees create explicit postings rather than ignored floating-point residuals."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Invariant",
+            "en": "Invariant"
+          },
+          {
+            "vi": "Counterexample",
+            "en": "Counterexample"
+          },
+          {
+            "vi": "Guard",
+            "en": "Guard"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Conservation",
+              "en": "Conservation"
+            },
+            {
+              "vi": "Thiếu counterpart khi nạp/rút.",
+              "en": "Missing counterparts on external flows."
+            },
+            {
+              "vi": "Balanced entries theo currency/account classes.",
+              "en": "Balanced per-currency/account-class entries."
+            }
+          ],
+          [
+            {
+              "vi": "One intent / effect",
+              "en": "One intent / effect"
+            },
+            {
+              "vi": "Retry debit+credit lần hai, total vẫn đúng.",
+              "en": "Duplicate balanced payment."
+            },
+            {
+              "vi": "Scoped identity + fingerprint + persisted result.",
+              "en": "Scoped identities, fingerprints and results."
+            }
+          ],
+          [
+            {
+              "vi": "No overspend",
+              "en": "No overspend"
+            },
+            {
+              "vi": "Hai holds cùng stale balance.",
+              "en": "Concurrent stale reservations."
+            },
+            {
+              "vi": "Atomic check-and-reserve.",
+              "en": "Atomic check-and-reserve."
+            }
+          ],
+          [
+            {
+              "vi": "Recovery equivalence",
+              "en": "Recovery equivalence"
+            },
+            {
+              "vi": "Snapshot có balances nhưng thiếu pending/dedup.",
+              "en": "Incomplete snapshot state."
+            },
+            {
+              "vi": "Exact cut + complete state + compatible tail.",
+              "en": "Exact cuts, complete state and compatible tails."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "3. Đặt throughput target mà không bỏ qua coordination",
+        "en": "3. Size throughput without ignoring coordination"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định peak một triệu internal transfers/giây; mỗi completed transfer có ít nhất hai journal postings. Nếu dùng illustrative100-byte event/transfer, logical event rate100 MB/s; nếu sustained cả ngày thì 8,64 TB/day, RF3 thành25,92 TB/day trước indexes/metadata. Peak không mặc định sustained daily average. Real event có identities, result/fingerprint, amounts, versions và often nhiều workflow facts nên100 bytes là arithmetic input, không production payload estimate.",
+          "en": "Assume a peak million transfers/second with at least two postings per completed transfer. At an illustrative 100-byte event, logical rate is 100 MB/s, or 8.64 TB/day only if sustained; RF three gives 25.92 TB/day before overhead. Peak is not the daily average, and real identities/results/workflow facts often exceed this assumed payload."
+        },
+        {
+          "vi": "Capacity phải đo local vs cross-owner ratio, hot accounts, keys retained cho idempotency, snapshot size/replay rate và projection backlog. Nếu mỗi persisted result giả định100 bytes, một triệu commands/giây sustained trong 24 h tạo86,4 tỷ results, raw8,64 TB; dedup state không thể là unbounded in-memory set mặc định. Durable transfer registry, scoped epochs/time windows có enforceable policy và archival lookup là design choices cần explicit semantics.",
+          "en": "Measure local/cross-owner ratios, hot accounts, retained identities, snapshots/replay and projection backlogs. A hypothetical 100-byte retained result per command at a sustained million/second creates 86.4 billion daily results or 8.64 TB raw. Deduplication cannot default to an unbounded RAM set; durable registries and enforceable scopes/archival policies need explicit semantics."
+        },
+        {
+          "vi": "Partition count lấy measured safe throughput và recovery bounds, không chỉ RPS target chia arbitrary constant. Single hot sender vẫn serialize nếu no-overdraft decision cần cùng authority; thêm machines không tự chia constraint đó. Projected balance cache giảm display reads, không cho phép stale spending. Đặt ACK p99, pending-transfer age và rebuild time alongside RPS; throughput cao mà recovery nhiều ngày chưa chắc đáp ứng SLO.",
+          "en": "Choose partitions from measured throughput and recovery bounds. A hot sender can remain serialized by its spending constraint despite extra machines. Display caching does not authorize stale spending. Evaluate latency, pending age and rebuild time alongside throughput."
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "4. Transfer API có identity, result và freshness",
+        "en": "4. Transfer APIs expose identity, results and freshness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Client persist intent ID trước request để browser/app restart vẫn retry cùng operation. Scope key theo tenant/principal/action; canonical fingerprint gồm source, destination, amount, currency và relevant semantics. Cùng key/body trả existing result; key khác body là conflict, không chuyển tiền thêm. Concurrent same-key requests cần unique/serialized claim cùng authority, không check Redis rồi ghi database một cách rời rạc. Transport validation errors và persisted business rejections có retry semantics riêng được định nghĩa.",
+          "en": "Persist intent IDs before requests so restarts retain retry identity. Scope keys and fingerprint all meaningful fields. Identical retries return existing results; changed bodies conflict. Concurrent claims need atomic authority rather than disconnected cache/database checks. Define retry semantics separately for transport validation and persisted business rejection."
+        },
+        {
+          "vi": "GET status cần authorized transfer identity và strong/consistent source của terminal decision. Balance/history trả currency, posted/held/available và asOfVersion; optional minVersion giúp read-your-write bằng bounded wait hoặc authoritative fallback. Cross-partition operation có vector/cut token thích hợp thay một global sequence giả định. Pagination dùng stable cursor/order; expose pending riêng, không fake completed từ projection missing row.",
+          "en": "Status reads require authorized authoritative decisions. Balance/history expose amounts and versions, with bounded read-your-write waiting/fallback. Cross-partition cuts may need vectors rather than fictional global sequences. Use stable pagination and explicit pending states."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/transfers",
+          "description": {
+            "vi": "Idempotency-Key scoped; completed chỉ sau monetary commit, pending có status URL.",
+            "en": "Scoped idempotency; completion follows monetary commit, while pending includes status lookup."
+          },
+          "request": "Idempotency-Key: intent-7\n{ \"from\":\"wallet-A\", \"to\":\"wallet-B\", \"amountMinor\":\"3000\", \"currency\":\"USD\" }",
+          "response": "201 {transferId,status:\"completed\",commitToken} | 202 {transferId,status:\"pending\",statusUrl} | 409 {code:\"idempotency_conflict\"}",
+          "notes": [
+            {
+              "vi": "Đây là illustrative product API, không universal payment-provider format.",
+              "en": "This is an illustrative product API, not a universal provider format."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/v1/transfers/{transferId}",
+          "description": {
+            "vi": "Authorized durable workflow status; pending/unknown external steps không bị đoán là failure.",
+            "en": "Authorized durable workflow status without guessing uncertain steps failed."
+          },
+          "response": "200 {transferId,status,amountMinor,currency,updatedAt,commitToken?}"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/wallets/{id}/balance?minVersion={token}",
+          "description": {
+            "vi": "Display view có bounded freshness; no overspend decision không dựa stale cache.",
+            "en": "Bounded-freshness display views do not authorize stale spends."
+          },
+          "response": "200 {currency,postedMinor,heldMinor,availableMinor,asOfVersion} | 503 {code:\"view_not_caught_up\"}"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/wallets/{id}/transactions?cursor={cursor}",
+          "description": {
+            "vi": "Authorized stable history, entries/transfer links và pending classification rõ.",
+            "en": "Authorized stable history with entry/transfer links and pending classification."
+          },
+          "response": "200 {items,nextCursor,asOfVersion}"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "5. Một authority cho commit, nhiều views cho đọc",
+        "en": "5. One commit authority with multiple read views"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline dùng relational ledger: một transaction commit entries, balance/hold updates nếu materialized, result record và outbox. Alternative measured-scale engine có deterministic state và replicated commit protocol, nhưng vẫn cần một authoritative acceptance/result history. Optional command log là queued intent; event/result journal là accepted decisions. Hai logs ghi độc lập tạo crash gap nếu không có atomic publication/recovery protocol; không chỉ vẽ arrows rồi coi toàn bộ atomic.",
+          "en": "A relational baseline atomically commits entries, balance/hold updates, results and outboxes. A measured-scale deterministic engine still needs authoritative result history and replication. Queued commands differ from committed decisions, and independently written command/event logs need a recovery/publication protocol rather than assumed atomic arrows."
+        },
+        {
+          "vi": "Sơ đồ tách monetary authority, cross-owner coordinator, transit accounts, projections, snapshots và external reconciliation. Authority check-and-spend dùng current version/ownership; projections phục vụ read models. Chọn trace để theo completed local transfer, pending cross-owner flow, freshness-aware read, recovery retry hoặc external funding. React labs bên dưới chỉ minh họa pure state; durable decisions được giả định, không thay tested storage/consensus code.",
+          "en": "The diagram separates monetary authority, coordination, transit, views, snapshots and external reconciliation. Trace local commits, pending transfers, versioned reads, recovery and funding. The pure offline labs assume durable decisions; they do not implement storage/consensus."
+        }
+      ],
+      "diagram": {
+        "id": "wallet-authority-and-money",
+        "title": {
+          "vi": "Theo tiền, quyết định và bằng chứng recovery",
+          "en": "Trace money, decisions and recovery evidence"
+        },
+        "caption": {
+          "vi": "Baseline có một ledger authority; state-machine engine là lựa chọn scale khi có bằng chứng. Projections không quyết định spend; cross-owner transfer cần durable decision/step identities; statements là independent evidence.",
+          "en": "A ledger authority is the baseline, with state-machine engines as a measured scaling option. Projections do not authorize spending; cross-owner transfers need durable decisions/step identities, and statements provide independent evidence."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Wallet client",
+              "en": "Wallet client"
+            },
+            "detail": {
+              "vi": "Persist intent ID trước submit; retry cùng identity/body, không tạo transfer mới khi timeout.",
+              "en": "Persists intent IDs before submission and retries identical intents after timeouts."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Wallet API",
+              "en": "Wallet API"
+            },
+            "detail": {
+              "vi": "Auth, sender ownership, exact amount/currency, payload fingerprint và status lookup.",
+              "en": "Checks authority, exact amounts/currencies, fingerprints and status lookups."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "authority",
+            "label": {
+              "vi": "Ledger authority",
+              "en": "Ledger authority"
+            },
+            "detail": {
+              "vi": "Validate available funds; atomic journal/results/holds hoặc deterministic committed transitions.",
+              "en": "Validates funds and atomically commits journals/results/holds or deterministic transitions."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "journal",
+            "label": {
+              "vi": "Journal / result state",
+              "en": "Journal / result state"
+            },
+            "detail": {
+              "vi": "Append-only entries, transfer state, idempotency results và durable outbox.",
+              "en": "Stores journal entries, transfer states, idempotency results and outboxes."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "command",
+            "label": {
+              "vi": "Optional command log",
+              "en": "Optional command log"
+            },
+            "detail": {
+              "vi": "Durable command acceptance khác completed monetary effect.",
+              "en": "Durable command acceptance differs from completed money movements."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "queue"
+          },
+          {
+            "id": "coordinator",
+            "label": {
+              "vi": "Transfer coordinator",
+              "en": "Transfer coordinator"
+            },
+            "detail": {
+              "vi": "Recoverable COMMIT/CANCEL decision; step IDs, ownership epochs và retries.",
+              "en": "Owns recoverable decisions, step identities, epochs and retries."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "destination",
+            "label": {
+              "vi": "Destination authority",
+              "en": "Destination authority"
+            },
+            "detail": {
+              "vi": "Current account/currency policy, idempotent incoming credit và decision checks.",
+              "en": "Checks accounts/currencies and applies identified credits under decisions."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "transit",
+            "label": {
+              "vi": "Transit / settlement accounts",
+              "en": "Transit / settlement accounts"
+            },
+            "detail": {
+              "vi": "Represent in-flight value và external settlement obligations, không để tiền biến mất giữa steps.",
+              "en": "Represents in-flight value and settlement obligations explicitly."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "projection",
+            "label": {
+              "vi": "Balance / history views",
+              "en": "Balance / history views"
+            },
+            "detail": {
+              "vi": "Versioned coherent cuts, read-your-write token, no spend decisions từ stale caches.",
+              "en": "Provides coherent versions and read-your-write tokens without authorizing stale spends."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "store"
+          },
+          {
+            "id": "snapshot",
+            "label": {
+              "vi": "Snapshots / replay",
+              "en": "Snapshots / replay"
+            },
+            "detail": {
+              "vi": "Exact cut, balances, holds, receipts/results, pending decisions và schema versions.",
+              "en": "Pins cuts, balances, reservations, receipts, decisions and schemas."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "store"
+          },
+          {
+            "id": "provider",
+            "label": {
+              "vi": "Bank / PSP adapter",
+              "en": "Bank / PSP adapter"
+            },
+            "detail": {
+              "vi": "Verified external outcomes, stable request IDs và uncertainty/reconciliation.",
+              "en": "Verifies external outcomes with stable identities and reconciliation."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "service"
+          },
+          {
+            "id": "recon",
+            "label": {
+              "vi": "Reconciliation",
+              "en": "Reconciliation"
+            },
+            "detail": {
+              "vi": "Independent internal recomputation và external statement matching; investigate mismatches.",
+              "en": "Independently recomputes internal state and matches external statements."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "local",
+            "label": {
+              "vi": "Transfer cùng authority",
+              "en": "Transfer within one authority"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Send identified transfer intent với exact minor-unit string.",
+                  "en": "Send identified intent with an exact minor-unit string."
+                }
+              },
+              {
+                "from": "api",
+                "to": "authority",
+                "description": {
+                  "vi": "Authorize source, validate fingerprint/limits và route current owner.",
+                  "en": "Authorize sources, fingerprints/limits and current ownership."
+                }
+              },
+              {
+                "from": "authority",
+                "to": "journal",
+                "description": {
+                  "vi": "Atomically commit balanced entries, available check, transfer result và outbox.",
+                  "en": "Commit balanced entries, available checks, results and outboxes atomically."
+                }
+              },
+              {
+                "from": "authority",
+                "to": "client",
+                "description": {
+                  "vi": "Return completed only after monetary commit boundary.",
+                  "en": "Return completion only after the monetary commit boundary."
+                }
+              },
+              {
+                "from": "journal",
+                "to": "projection",
+                "description": {
+                  "vi": "Apply versioned projection; duplicate delivery không nhân history.",
+                  "en": "Apply identified versioned projections without duplicates."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "cross",
+            "label": {
+              "vi": "Transfer cross-owner có transit",
+              "en": "Transfer across owners through transit"
+            },
+            "steps": [
+              {
+                "from": "api",
+                "to": "coordinator",
+                "description": {
+                  "vi": "Create stable transfer identity và durable pending workflow.",
+                  "en": "Create stable identities and pending workflows."
+                }
+              },
+              {
+                "from": "coordinator",
+                "to": "authority",
+                "description": {
+                  "vi": "Reserve/depart dưới current authority với identified step.",
+                  "en": "Reserve/depart under current authority and stable step identities."
+                }
+              },
+              {
+                "from": "authority",
+                "to": "transit",
+                "description": {
+                  "vi": "Record source decrease và in-flight value bằng balanced entries.",
+                  "en": "Balance source decreases against in-flight value."
+                }
+              },
+              {
+                "from": "coordinator",
+                "to": "destination",
+                "description": {
+                  "vi": "Deliver identified credit under durable COMMIT; timeout không tự CANCEL.",
+                  "en": "Deliver identified credits under durable commit; timeouts do not cancel."
+                }
+              },
+              {
+                "from": "destination",
+                "to": "transit",
+                "description": {
+                  "vi": "Post destination credit cùng corresponding transit resolution contract.",
+                  "en": "Resolve destination credits and transit under a defined accounting contract."
+                }
+              },
+              {
+                "from": "coordinator",
+                "to": "client",
+                "description": {
+                  "vi": "Expose pending/completed/canceled truth, không đoán từ transport success.",
+                  "en": "Expose pending/completed/canceled states rather than infer them from transport."
+                }
+              }
+            ]
+          },
+          {
+            "id": "read",
+            "label": {
+              "vi": "Đọc có freshness",
+              "en": "Read with freshness"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Request balance/history, có optional minVersion từ completed transfer.",
+                  "en": "Request balances/history with an optional completed-write version."
+                }
+              },
+              {
+                "from": "api",
+                "to": "projection",
+                "description": {
+                  "vi": "Read authorized coherent projection cut; wait/fallback bounded nếu chưa đủ version.",
+                  "en": "Read authorized coherent cuts with bounded waiting/fallback."
+                }
+              },
+              {
+                "from": "api",
+                "to": "authority",
+                "description": {
+                  "vi": "Strong available-funds lookup nếu contract yêu cầu, tách khỏi display cache.",
+                  "en": "Use authoritative available-funds checks when required."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recover",
+            "label": {
+              "vi": "Restore và retry sau lost reply",
+              "en": "Restore and retry after lost replies"
+            },
+            "steps": [
+              {
+                "from": "journal",
+                "to": "snapshot",
+                "description": {
+                  "vi": "Publish snapshot tại committed cut, pin compatible retained tail.",
+                  "en": "Publish committed snapshots with compatible retained tails."
+                },
+                "async": true
+              },
+              {
+                "from": "snapshot",
+                "to": "authority",
+                "description": {
+                  "vi": "Load balances/holds/results/decisions/epochs và validate integrity.",
+                  "en": "Load complete monetary/control state and validate integrity."
+                }
+              },
+              {
+                "from": "journal",
+                "to": "authority",
+                "description": {
+                  "vi": "Replay committed tail once theo version/sequence; no external calls trong fold.",
+                  "en": "Replay versioned committed tails without external calls in folds."
+                }
+              },
+              {
+                "from": "client",
+                "to": "authority",
+                "description": {
+                  "vi": "Retry cùng scoped key; return persisted result hoặc payload conflict.",
+                  "en": "Retry scoped keys for persisted results or payload conflicts."
+                }
+              }
+            ]
+          },
+          {
+            "id": "external",
+            "label": {
+              "vi": "Nạp/rút và đối soát",
+              "en": "Fund, withdraw and reconcile"
+            },
+            "steps": [
+              {
+                "from": "authority",
+                "to": "provider",
+                "description": {
+                  "vi": "Durable outbox intent cùng payment/withdrawal identity; provider outcome có thể unknown.",
+                  "en": "Submit durable identified intents with potentially uncertain outcomes."
+                },
+                "async": true
+              },
+              {
+                "from": "provider",
+                "to": "journal",
+                "description": {
+                  "vi": "Verified provider facts → idempotent settlement postings, không trust client redirect.",
+                  "en": "Convert verified facts into identified postings rather than trust redirects."
+                }
+              },
+              {
+                "from": "journal",
+                "to": "recon",
+                "description": {
+                  "vi": "Independent journal/projector checks theo cut/currency/account class.",
+                  "en": "Independently compare journals/projections by cut, currency and account class."
+                },
+                "async": true
+              },
+              {
+                "from": "provider",
+                "to": "recon",
+                "description": {
+                  "vi": "Match independent statements, fees/timing/pending và external IDs.",
+                  "en": "Match independent statements, fees, timing and external identities."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "relational",
+      "title": {
+        "vi": "6. Bắt đầu bằng ACID ledger nếu phù hợp",
+        "en": "6. Start with an ACID ledger when appropriate"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một internal transfer cùng database có thể lock source/destination theo deterministic order, kiểm currency/account state/available funds và ghi balanced entries cùng result trong transaction. Unique scoped intent key chống concurrent duplicates. Conditional update hoặc serializable transaction cũng là lựa chọn khi thiết kế đủ constraints; isolation level mặc định không tự chứng minh mọi cross-row invariant. Serialization/deadlock failure cần retry toàn transaction với same business identity, không apply một nửa statements.",
+          "en": "Within one database, deterministically ordered locks can protect availability and balanced postings/results. Unique scoped intent keys prevent duplicate claims. Conditional updates or serializable transactions are alternatives when constraints are correctly modeled; defaults do not prove every cross-row invariant. Retry whole failed transactions under the same business identity."
+        },
+        {
+          "vi": "Materialized balances là optimization cần atomic consistency với journal; chỉ append entries rồi update cache eventual không đủ cho spend authority. Transactional outbox emit projection/workflow events sau commit và có identified replay. Benchmark realistic hot-account/skew, indexes, log durability và replication trước khi đổi architecture. “Một transaction/transfer chắc chắn không đủ” là khẳng định thiếu workload và measurements; many products không cần extreme-scale state machine.",
+          "en": "Materialized authority balances must remain atomic with journals. Eventual cache updates alone cannot authorize spending. Use identified transactional outboxes for downstream work. Benchmark skew, indexes, durability and replication before adopting a more complex engine; there is no workload-independent transaction-per-transfer ceiling."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Relational baseline",
+            "en": "Relational baseline"
+          },
+          "icon": "check",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "ACID transaction, constraints, journal/result/outbox atomicity; familiar recovery.",
+              "en": "Transactions and constraints align journals, results and outboxes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Measured bottleneck",
+            "en": "Measured bottleneck"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Đo contention, cross-shard ratio, log latency và repair thay vì chỉ total RPS.",
+              "en": "Measure contention, coordination, log latency and recovery."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Engine alternative",
+            "en": "Engine alternative"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Deterministic partitions thêm protocol/schema/snapshot/rebalance complexity.",
+              "en": "Deterministic engines add protocol, schema, snapshot and rebalance complexity."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "event-model",
+      "title": {
+        "vi": "7. Commands là yêu cầu, events là accepted facts",
+        "en": "7. Commands are requests; events are accepted facts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Command validate against current authoritative state rồi tạo accepted decision/event. Deterministic fold không gọi clock/random/network; timestamps, exchange quotes và external outcomes phải là explicit inputs/facts có provenance. Event schema version và account policy tại thời điểm decision cần replay rules. Single-threaded mutation trong partition giảm local races nhưng không loại bỏ ownership fencing, cross-partition coordination, disk concurrency hoặc tất cả locks của hệ thống.",
+          "en": "Commands are validated against authoritative state before accepted facts are committed. Folds do not call clocks, randomness or networks; external facts are explicit versioned inputs. Single-threaded mutation reduces local races without eliminating ownership, cross-partition or storage concerns."
+        },
+        {
+          "vi": "Ack completed sau committed decision cùng result/dedup state, không sau speculative memory mutation. Khi log commit fail, discard/reconcile speculative state trước xử lý tiếp. Recovery chỉ fold accepted committed prefix đúng một lần; command log replay không được re-call PSP hoặc re-decide business command bằng policy/clock mới như lần đầu. Persist rejection result nếu API contract hứa retry ổn định, hoặc nêu rõ rejected request nào được evaluate lại.",
+          "en": "Completion follows committed decisions/results rather than speculative memory changes. Failed commits require speculative-state reconciliation. Recovery folds accepted facts without repeating external calls or re-deciding old commands under new clocks/policies. Persist business rejections when stable retry results are promised."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một command thành monetary result",
+          "en": "Turn a command into a monetary result"
+        },
+        "caption": {
+          "vi": "Request durability và monetary commit không đồng nghĩa.",
+          "en": "Durable requests and monetary commits are distinct."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Authorize / identify",
+              "en": "Authorize and identify"
+            },
+            "detail": {
+              "vi": "Source rights, fingerprint và current owner.",
+              "en": "Check source rights, fingerprints and ownership."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Validate current state",
+              "en": "Validate current state"
+            },
+            "detail": {
+              "vi": "Available funds, account/currency/limits.",
+              "en": "Check available funds, accounts/currencies and limits."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Commit accepted fact",
+              "en": "Commit accepted facts"
+            },
+            "detail": {
+              "vi": "Atomic entries, result/dedup và durable workflow intents.",
+              "en": "Align entries, results and workflow intents."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Apply / project",
+              "en": "Apply and project"
+            },
+            "detail": {
+              "vi": "Deterministic state, versioned views và receipts.",
+              "en": "Apply deterministic state and versioned views."
+            },
+            "icon": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recovery",
+      "title": {
+        "vi": "8. Snapshot phải giữ đủ retry và pending state",
+        "en": "8. Snapshots must retain retry and pending state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Snapshot tag committed cut, partition identity/ownership generation, schema versions, balances, holds, pending transfer decisions/step identities và dedup/results trong supported scope. Publish snapshot bytes/checksum/manifest coherently, giữ compatible log tail và previous recovery point cho tới khi valid. Không snapshot speculative memory ở sequence chưa commit. Multiple partitions cần coordinated cut hoặc recovery protocol xử lý cross-partition in-flight state; không gom arbitrary latest snapshots rồi mặc định consistent.",
+          "en": "Snapshots pin committed cuts, ownership/schema versions, balances, reservations, pending decisions/steps and supported retry results. Publish verified bytes/manifests while retaining compatible tails and previous recovery points. Avoid speculative cuts; cross-partition recovery needs consistent cuts or explicit in-flight protocols."
+        },
+        {
+          "vi": "Load snapshot rồi apply strictly ordered committed tail sau cut; detect gap/epoch/schema mismatch. Dedup/results là một phần recovery state: giữ balances đúng nhưng bỏ command receipts có thể charge lại sau retry. TTL không tự giải quyết forever IDs: nếu muốn từ chối expired intent, API cần enforceable creation epoch/window hoặc durable archival registry; server không biết arbitrary random UUID đã cũ chỉ từ chuỗi ID. Không thu nhỏ dedup retention mà không đổi product retry guarantees.",
+          "en": "Restore ordered committed tails and detect gaps/version mismatches. Correct balances with missing results can duplicate payments. Expiry needs enforceable scopes/epochs or durable registries; arbitrary UUIDs do not reveal age. Retention changes must preserve declared retry guarantees."
+        },
+        {
+          "vi": "Lab so snapshot cut 0–3: c1/c2 completed, c3 rejected. Giữ receipts cho identical retry trả stored result và altered payload conflict. Bug bỏ receipts ở cut 2 làm total vẫn 100 nhưng c1 trả lần hai. Full replay từcut 0 có thể tái tạo receipts nên không lỗi ấy; đây là lý do phải test recovery ở nhiều cuts thay vì một happy path.",
+          "en": "The lab compares snapshot cuts after completed and rejected commands. Preserved receipts return stable results or conflicts; dropping them at cut two duplicates a balanced transfer. Full replay from zero reconstructs identities, showing why recovery tests need multiple cuts."
+        }
+      ],
+      "experiment": "wallet-recovery"
+    },
+    {
+      "id": "cross-owner",
+      "title": {
+        "vi": "9. Cross-owner transfer cần quyết định có thể phục hồi",
+        "en": "9. Cross-owner transfers need recoverable decisions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu source/destination không cùng transaction authority, một local debit không thể atomically làm recipient credit. Options gồm distributed transactions trên cooperating stores, escrow/reservation protocol hoặc saga có durable progress/compensation. 2PC có prepared-state/recovery blocking concerns; replicated decision authority có thể giảm failure window nhưng không loại mọi availability trade-off. TCC/business holds vẫn cần atomic resource reservation và resolver races; “không DB locks” không có nghĩa không concurrency control.",
+          "en": "Across authorities, local debits cannot atomically establish credits. Options include cooperating distributed transactions, escrow/reservations or durable sagas. Prepared states, decision recovery and availability trade-offs remain. Business holds still require atomic reservation and race-safe resolution."
+        },
+        {
+          "vi": "Một debit-first flow minh họa giảm source posted và tăng transit value cùng journal boundary, rồi resolve destination credit hoặc source refund theo mutually exclusive decision. Transit là explicit accounting state, không phải tiền biến mất. Timeout destination là unknown/pending, không proof fail. Không refund chỉ vì timeout rồi cho late credit cùng chạy: có thể mint value hoặc tạo negative clearing exposure. Credit/refund cần stable per-step IDs, decision evidence và participant ownership checks.",
+          "en": "A debit-first flow balances the source against explicit transit value before a mutually exclusive credit/refund resolution. Destination timeouts are pending uncertainty, not proven failure. Refunding on timeout while allowing late credits risks duplicated value or negative clearing exposure. Steps need stable identities, decision evidence and ownership checks."
+        },
+        {
+          "vi": "Không mặc định recipient credit không bao giờ fail: account closed/frozen, currency mismatch, limits hoặc storage availability đều cần policy. Validate/reserve destination capability trước final commit nếu protocol cần guaranteed completion, hoặc giữ pending và operator resolution dưới documented rules. Compensation là new audited movement, không xóa original entries. Lab giả định decision authority đã durable và chỉ mô phỏng rules tại một observer; full implementation cần state/ACK/recovery ở từng shard.",
+          "en": "Recipient closure, freezes, currencies, limits and outages need explicit policies. Validate/reserve destination capability where required, or retain pending obligations under documented resolution. Compensation adds audited movement rather than erase history. The lab assumes durable authority; real participants need their own persistence/ACK/recovery protocols."
+        }
+      ],
+      "experiment": "wallet-transfer"
+    },
+    {
+      "id": "holds",
+      "title": {
+        "vi": "10. Posted, held và available có semantics riêng",
+        "en": "10. Posted, held and available have different semantics"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong simple no-overdraft wallet: available = posted − active debit holds, còn pending incoming credits thường chưa spendable nếu product chưa cho phép. Reserve chỉ giữ khả năng chi, không giảm posted journal balance như completed debit. Một available check và hold creation phải serialize/transaction atomically; hai requests nhìn cùng stale100 rồi mỗi hold 60 tạo available−20 dù posted vẫn 100. Kiểm posted>=0 một mình không bắt lỗi.",
+          "en": "In a simple no-overdraft wallet, availability subtracts active debit holds; incoming pending credits need explicit spendability rules. Reserving differs from posting. Availability checks and reservations must be atomic: concurrent stale reads can over-reserve while posted balances remain nonnegative."
+        },
+        {
+          "vi": "Resolve hold bằng post, void hoặc expiry dưới một transition authority. Partial post 40 của hold 60 chuyển40 và release20 dư; original hold identity và resolution identity liên kết, audit không bị overwrite. Concurrent expiry/post hoặc delayed confirm chỉ có một valid terminal outcome. Clock dùng để trigger request kiểm state, không tự chứng minh expired hold không thể được confirmed bởi old worker; epoch/state conditions phải enforce tại authority.",
+          "en": "Resolve holds by posting, voiding or expiry under one authority. Partial posting spends part and releases the rest with linked immutable identities. Expiry/confirmation races need a single terminal winner; clocks trigger checks rather than authorize obsolete workers."
+        },
+        {
+          "vi": "Các pending totals không được cộng vào posted totals như thêm tiền mới. Nếu reserve gồm fee và principal, define partial capture/fee/rounding allocation; expiry/reversal cũng phải clear đúng reserved components. Lab chỉ dùng fixed60 và post 40 để nhìn arithmetic, không claim đã implement concurrent storage resolver.",
+          "en": "Pending totals are not extra posted money. Principal/fee reservations need partial-resolution and rounding rules. The fixed sixty/forty lab illustrates arithmetic rather than implement concurrent durable resolution."
+        }
+      ],
+      "experiment": "wallet-holds"
+    },
+    {
+      "id": "reads",
+      "title": {
+        "vi": "11. Freshness, audit và reconciliation không cùng authority",
+        "en": "11. Freshness, audit and reconciliation use different evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Balance/history/search/analytics projections consume committed facts theo event identity/version và advance cursor sau applied changes. Read-your-write token từ completed transfer cho phép bounded wait/fallback; không simply set projection cursor lên notification seq chưa apply. Recovery snapshot+tail phải có exact cut, delete/reversal/version semantics và no duplicate postings. Stale display được label rõ; spend command vẫn validate authoritative available funds.",
+          "en": "Views apply identified versioned facts before advancing cursors. Completed-write tokens support bounded catch-up or fallback rather than pretend notifications are applied state. Rebuilds need exact cuts and reversal/version rules. Label stale displays while authorizing spends against current monetary state."
+        },
+        {
+          "vi": "Internal audit independently recompute journal totals, transfer completeness, dedup uniqueness và holds/available bounds, rồi so projections ở compatible cut. External reconciliation match bank/PSP statements theo identities, amount/currency, fees, settlement date và timing differences. Statements không phải một less-trusted projection của log: chúng là independent evidence có own corrections/latency. Khi mâu thuẫn, investigate cả hai nguồn và record correction có reason, không mặc định log luôn đúng hoặc sửa balance cho khớp.",
+          "en": "Independently recompute journals, transfer completeness, identities and reservations, comparing views at compatible cuts. External statements provide independent evidence with fees, timing and corrections; they are not merely lower-trust projections. Investigate discrepancies and record justified corrections rather than blindly privilege a log or overwrite balances."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Authoritative spend",
+            "en": "Authoritative spend"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Current funds/holds, durable accepted decisions và fenced owner.",
+              "en": "Current availability, committed decisions and fenced ownership."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Derived views",
+            "en": "Derived views"
+          },
+          "icon": "inspect",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Rebuildable balances/history với applied version và freshness.",
+              "en": "Rebuildable views with applied versions and freshness."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Independent evidence",
+            "en": "Independent evidence"
+          },
+          "icon": "compare",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Bank/PSP statements và independent journal recomputation phát hiện errors khác nhau.",
+              "en": "Statements and independent recomputation detect different error classes."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "external",
+      "title": {
+        "vi": "12. Nạp/rút nối hai hệ thống tiền bằng pending state",
+        "en": "12. Funding and withdrawals connect monetary systems through pending state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nạp tiền không credit wallet chỉ từ client redirect hoặc HTTP request đã gửi tới PSP. Create identified funding intent/outbox, verify provider response/webhook, dedup event và post counterpart entries theo business acceptance/settlement policy. Provider acceptance, authorization, capture và settlement khác nhau; reversible/chargeback risk cần policy/state riêng. Unknown request giữ pending và query/reconcile bằng stable external identity, không issue một charge mới vì timeout.",
+          "en": "Do not fund wallets from redirects or sent requests alone. Persist identified intents/outboxes, verify provider facts and post counterpart entries under explicit acceptance/settlement policies. Authorization, capture and settlement differ, while reversals need policy. Resolve uncertainty through stable identities and reconciliation rather than new charges."
+        },
+        {
+          "vi": "Rút tiền reserve/debit theo chosen model, create payout intent rồi nhận external progress. Failure đã chứng minh có thể dẫn compensating postings; unknown vẫn pending. Fees, FX nếu được thêm và settlement timing cần accounts riêng; một bank statement net amount không luôn bằng transfer gross. Reconciliation kiểm provider duplicates, missing callbacks, out-of-order events và delayed returns. Wallet flow reuse Payments/Notifications patterns, không coi webhook delivery là monetary truth không cần verify.",
+          "en": "Withdrawals reserve/debit under a chosen model and track payout progress. Proven failures may compensate, while unknown states remain pending. Fees, FX and timing require counterpart accounts. Reconcile duplicate/missing/out-of-order facts and delayed returns; callbacks require verification and state rules."
+        }
+      ]
+    },
+    {
+      "id": "hot-accounts",
+      "title": {
+        "vi": "13. Hot accounts và migration không phá no-overdraft",
+        "en": "13. Hot accounts and migration must preserve spending constraints"
+      },
+      "paragraphs": [
+        {
+          "vi": "Merchant nhận nhiều credits có thể dùng subaccounts/buckets với logical balance aggregate nếu product cho phép delayed visibility. Debit cần authority phân quyền spending/escrow giữa buckets, không sum eventual stale counters rồi chi. Batch credits giảm overhead nhưng thêm latency và phải giữ per-intent audit/dedup. Async credit cần durable transit obligation/decision; không áp dụng unconditional nếu recipient validity còn unknown.",
+          "en": "Receive-heavy merchants can use buckets if delayed aggregate visibility is acceptable. Debits need spending rights/escrow rather than stale aggregate sums. Batching trades latency while retaining identities. Asynchronous credits require durable obligations and valid resolution conditions."
+        },
+        {
+          "vi": "Di chuyển partition cần snapshot committed cut, stream tail catch-up, ownership fence/cutover và pending workflows/dedup state. Old owner không serve writes sau new generation; clients refresh route và retry same intent. Account graph locality có thể giảm cross-owner traffic nhưng tăng rebalance complexity và hot-neighbor skew. DR cần explicit RPO/RTO và split-brain protection; restoring backup thiếu recent successful transfers không được gọi no-loss.",
+          "en": "Migration carries committed cuts, tails, pending workflows and retry state before fenced cutover. Preserve intent IDs through routing refreshes. Locality reduces some coordination at operational cost. DR specifies loss/recovery objectives and prevents split authority rather than label stale restores loss-free."
+        }
+      ]
+    },
+    {
+      "id": "data-model",
+      "title": {
+        "vi": "14. Data model chứa cả entries lẫn quyết định",
+        "en": "14. Model entries together with decisions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tables/streams tối thiểu cần accounts(currency,type,status,ownerVersion), transfers(intent scope/fingerprint/status), entries(transferId,accountId,side,amount,currency), holds/resolutions, durable step results và outbox. Balance materialization có version/checkpoint tương ứng. Dùng unique constraints cho supported identities và foreign/reference validation; transfer completed phải có đủ required postings dưới transaction protocol. Không infer completion từ hai independent records xuất hiện eventual trong analytics.",
+          "en": "Model accounts, scoped intents/fingerprints, entries, reservations/resolutions, workflow steps and outboxes, with compatible balance versions. Identity/reference constraints and commit protocols establish completion; eventual analytics records alone do not."
+        },
+        {
+          "vi": "Schema minh họa sau dùng strings cho exact amounts/sequence representation. Events versioned giữ old replay interpretation; migration/upcasters phải deterministic, tested trên archived facts và không rewrite economic meaning. Per-partition seq không global order. Retention/compression/archive policy giữ enough audit/recovery evidence, backup restore được test; “events sống mãi” không phải lý do bỏ lifecycle/access design.",
+          "en": "The illustrative schema encodes exact amounts/versions as strings. Versioned replay/upcasters preserve economic meaning and are tested against archived facts. Partition sequences are not global order; archives still need lifecycle, access and restore design."
+        }
+      ],
+      "code": {
+        "language": "ts",
+        "caption": {
+          "vi": "Illustrative monetary fact và snapshot metadata; không là database implementation hoàn chỉnh.",
+          "en": "Illustrative facts and snapshot metadata, not a complete database implementation."
+        },
+        "content": "type MonetaryFact = {\n  partition: string; seq: string; schemaVersion: number;\n  intentScope: string; intentId: string; fingerprint: string;\n  result: \"completed\" | \"rejected\" | \"pending\";\n  transferId: string; currency: string;\n  entries: { accountId: string; side: \"debit\" | \"credit\"; amountMinor: string }[];\n};\n\ntype RecoveryManifest = {\n  partition: string; committedCut: string; ownerEpoch: string;\n  schemaVersion: number; checksum: string;\n  stateObject: string; // balances, holds, results, pending decisions/steps\n  compatibleTail: { fromExclusive: string; generation: string };\n};"
+      }
+    },
+    {
+      "id": "security",
+      "title": {
+        "vi": "15. Authorization và audit controls là phần commit path",
+        "en": "15. Authorization and audit controls belong in the commit path"
+      },
+      "paragraphs": [
+        {
+          "vi": "Authenticate caller, verify source ownership/delegation và enforce amount/recipient/currency limits tại authority; biết walletId không cấp quyền. High-risk operations có approval/risk signals theo product requirements, nhưng external risk call không đặt trong deterministic replay fold. Persist relevant decision facts, version và reason. Protect sensitive data in events/snapshots/exports và avoid credentials/PII trong idempotency keys; public status endpoint không leak account graph.",
+          "en": "Authorize sources/delegations and enforce monetary limits at authority; IDs are not capabilities. Risk/approval checks occur outside replay folds with recorded versioned facts. Protect sensitive facts, snapshots and exports; identity keys and status lookups must not leak secrets or account relationships."
+        },
+        {
+          "vi": "Correction/refund/admin adjustment cần identified permission, reason và immutable journal trail, không direct UPDATE balance không counterpart. Separate operational roles, scoped access, encryption/key rotation và monitored break-glass actions phù hợp threat model. Security/audit requirements cần xác định theo sản phẩm; bài này mô tả engineering controls, không hứa rằng một schema tự đáp ứng mọi jurisdiction.",
+          "en": "Adjustments/refunds need authorized identified counterpart postings and reasons rather than untracked balance edits. Apply scoped roles, encryption, rotation and monitored emergency access under product requirements; a schema alone does not establish every jurisdictional obligation."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "16. Test lost replies, stale owners và incomplete snapshots",
+        "en": "16. Test lost replies, stale owners and incomplete snapshots"
+      },
+      "paragraphs": [
+        {
+          "vi": "Monitor completed/rejected/pending transfers, oldest in-flight/transit exposure, available-balance violations, duplicate/conflicting keys, projection version/age, snapshot restore time, outbox retry age và reconciliation unmatched totals theo currency. Track one transfer through source, transit, destination, decisions và external facts bằng IDs, không log full sensitive payload. Pending age escalates bằng workflow state, không một timeout job tự refund mọi thứ.",
+          "en": "Monitor transfer outcomes/age, transit exposure, availability violations, identity conflicts, view lag, restores, outboxes and currency-specific reconciliation gaps. Trace identities without leaking payloads. Escalate pending work according to state rather than automatic blanket refunds."
+        },
+        {
+          "vi": "Fault injection: crash sau journal trước reply; duplicate same key/body; changed payload; failover mất receipt state; snapshot tại nhiều cuts; coordinator chết sau decision trước message; delayed credit sau cancel; concurrent hold expiry/post; stale owner writes và duplicated provider callbacks. Assert balances/journal/results equivalence sau replay và no double resolution/effect. Audit sums có thể pass trong duplicate-transfer bug nên test economic intent riêng.",
+          "en": "Inject journal/reply crashes, duplicate/conflicting keys, incomplete snapshots, coordinator/message gaps, late credits, reservation races, obsolete writers and provider retries. Check monetary/result equivalence and unique resolutions; balanced sums alone miss duplicated intent."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure",
+            "en": "Failure"
+          },
+          {
+            "vi": "Expected behavior",
+            "en": "Expected behavior"
+          },
+          {
+            "vi": "Invariant",
+            "en": "Invariant"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Reply lost after commit",
+              "en": "Reply lost after commit"
+            },
+            {
+              "vi": "Same intent returns stored result.",
+              "en": "Same intent returns stored result."
+            },
+            {
+              "vi": "No extra monetary effect.",
+              "en": "No extra monetary effect."
+            }
+          ],
+          [
+            {
+              "vi": "Recipient unavailable",
+              "en": "Recipient unavailable"
+            },
+            {
+              "vi": "Pending transit, retry authorized step.",
+              "en": "Pending transit; retry authorized steps."
+            },
+            {
+              "vi": "No timeout-based contradictory refund.",
+              "en": "No contradictory timeout refund."
+            }
+          ],
+          [
+            {
+              "vi": "Snapshot missing receipts",
+              "en": "Snapshot missing receipts"
+            },
+            {
+              "vi": "Recovery validation/test detects retry divergence.",
+              "en": "Detect retry-state divergence."
+            },
+            {
+              "vi": "Result state matches committed history.",
+              "en": "Results match committed history."
+            }
+          ],
+          [
+            {
+              "vi": "Two stale holds",
+              "en": "Two stale holds"
+            },
+            {
+              "vi": "Atomic authority admits only supported funds.",
+              "en": "Atomic authority bounds reservations."
+            },
+            {
+              "vi": "Available not below product limit.",
+              "en": "Availability respects product bounds."
+            }
+          ],
+          [
+            {
+              "vi": "Statement mismatch",
+              "en": "Statement mismatch"
+            },
+            {
+              "vi": "Investigate timing/fees/missing/duplicate facts.",
+              "en": "Investigate timing, fees and missing/duplicate facts."
+            },
+            {
+              "vi": "No silent balance overwrite.",
+              "en": "No silent balance overwrite."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "17. Luyện nói bằng money state và recovery evidence",
+        "en": "17. Practice using monetary states and recovery evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ T1 từ A qua transit tới B: lost reply sau source debit, coordinator restart, recipient tạm down và client retry. Chỉ ra committed facts, result identity, quyết định có thể lật không, khi nào funds spendable và snapshot cần chứa gì. Sau đó đổi currency hoặc payload cùng key, rồi hỏi total vẫn bằng100 có đủ chứng minh correctness không.",
+          "en": "Draw a transfer through transit with lost replies, coordinator restart, destination outage and client retries. Identify committed facts, identities, irreversible decisions, spendability and snapshot contents. Then change payload/currency under the same key and test whether total conservation is sufficient."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Tại sao total 100 vẫn có thể sai?",
+            "en": "Why can total one hundred still be wrong?"
+          },
+          "answer": [
+            {
+              "vi": "Hai balanced transfers thay vì một giữ total nhưng sai intent; excessive holds giữ posted total nhưng âm available; wrong recipient cũng balanced. Kiểm independent invariants về identity, authority, amount/currency, bounds và completion.",
+              "en": "Duplicates, excessive holds and wrong recipients can preserve totals. Test identities, authority, amounts, bounds and completion separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Snapshot chỉ giữ balances và seq có đủ không?",
+            "en": "Are balances and a sequence enough for snapshots?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu runtime còn receipts/results, holds, decisions, step identities và ownership/schema state cần recovery. Bỏ receipts rồi retry có thể double-pay dù initial balances restore đúng. Exact cut và compatible committed tail cũng bắt buộc.",
+              "en": "Not when recovery needs results, reservations, decisions, steps and versions. Missing identities can duplicate payments after an apparently correct restore."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một event log ACK có làm transfer completed không?",
+            "en": "Does an acknowledged event log append establish transfer completion?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi event và protocol thực sự commit monetary effects/result đúng scope. Command accepted hoặc một local debit chưa chứng minh cross-owner destination credit. Expose pending và complete theo declared commit model.",
+              "en": "Only if the event/protocol commits all required monetary effects/results. Queued commands and isolated debits do not prove cross-owner completion."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Recipient timeout có refund ngay được không?",
+            "en": "Can destination timeouts trigger immediate refunds?"
+          },
+          "answer": [
+            {
+              "vi": "Không từ timeout đơn thuần. Outcome có thể unknown; durable mutually exclusive decision và participant guards phải ngăn refund/late credit cùng xảy ra. Giữ transit/pending và reconcile theo protocol.",
+              "en": "Not from a timeout alone. Preserve pending/transit state and resolve under mutually exclusive decisions and participant guards."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Khi nào chọn event sourcing thay relational ledger?",
+            "en": "When should event sourcing replace a relational baseline?"
+          },
+          "answer": [
+            {
+              "vi": "Khi measured workload/recovery/audit needs justify complexity và có team vận hành protocol/state/schema evolution. Đo contention/skew/cross-shard/durability; không suy từ RPS target đơn lẻ. Event sourcing cũng không miễn transaction/coordination boundaries.",
+              "en": "When measured needs justify operational complexity. Evaluate contention, skew, coordination and recovery rather than target RPS alone."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Single-threaded engine có bỏ hết locks và deadlocks không?",
+            "en": "Does a single-threaded engine eliminate every lock and deadlock?"
+          },
+          "answer": [
+            {
+              "vi": "Nó serialize local mutation trong partition, không loại cross-partition coordination, prepared resources, ownership migration, storage/network concurrency hay every lock trong process. Fencing và durable decisions vẫn cần.",
+              "en": "It serializes local mutations without removing coordination, migrations, storage concurrency or durable authority requirements."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Projection và bank statement mâu thuẫn thì log luôn thắng à?",
+            "en": "Must the internal log always win over external statements?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Internal projections có thể rebuild từ committed facts, nhưng statements là independent external evidence. Investigate timing/fees/duplicates/missing/incorrect facts và post justified corrections; đừng xếp statement như lower-trust derived view.",
+              "en": "No. Statements are independent evidence. Investigate timing and incorrect/missing facts, then record justified corrections."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hold60 nhưng post 40 ảnh hưởng available thế nào?",
+            "en": "How does posting forty from a sixty-unit hold affect availability?"
+          },
+          "answer": [
+            {
+              "vi": "Với posted 100: reserve60 làm available 40 nhưng posted vẫn 100. Post40 giảm posted60, clear hold 60, credit destination40 và release20 unused; available nguồn60. Post/void/expiry resolver phải chỉ một winner.",
+              "en": "Posted one hundred with a sixty hold leaves forty available. Posting forty clears the hold and releases twenty unused, leaving sixty available. Resolution must have a single winner."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

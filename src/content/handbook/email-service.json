@@ -1,0 +1,1324 @@
+{
+  "id": "email-service",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Email Service: acceptance, trust và mailbox sync",
+    "en": "Designing an Email Service: acceptance, trust and mailbox sync"
+  },
+  "summary": {
+    "vi": "Theo dõi final SMTP acceptance, domain alignment, spam trade-offs và applied history; nối durable receipts, private storage/search, outbound delivery và multi-device recovery.",
+    "en": "Explore SMTP acceptance, domain alignment, spam trade-offs and applied history across durable receipts, private storage/search, outbound delivery and device recovery."
+  },
+  "prerequisites": [
+    "messaging",
+    "object-storage",
+    "consistency",
+    "notifications"
+  ],
+  "relatedTopics": [
+    "network",
+    "auth",
+    "database",
+    "storage-search",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Final DATA acceptance khác intermediate 250 và API202 submission.",
+      "en": "Final DATA acceptance differs from intermediate responses and API submission."
+    },
+    {
+      "vi": "Internal receipt identity khác untrusted Message-ID và end-to-end delivery identity.",
+      "en": "Internal receipts differ from header identities and end-to-end delivery identities."
+    },
+    {
+      "vi": "DMARC cần passing aligned mechanism; authentication không bảo đảm wanted mail.",
+      "en": "DMARC needs passing aligned mechanisms; authentication does not prove wanted mail."
+    },
+    {
+      "vi": "Mailbox history cursor phản ánh applied state, push chỉ là hint.",
+      "en": "Applied history cursors represent state; pushes are hints."
+    },
+    {
+      "vi": "Content sharing/search isolation vẫn cần authorization và reference-safe lifecycle.",
+      "en": "Shared content/search still requires authorization and safe lifecycles."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Đi theo trách nhiệm và state của một thư",
+      "en": "Trace message responsibility and state"
+    },
+    "caption": {
+      "vi": "Nhiều bước thành công không đồng nghĩa user đã đọc thư.",
+      "en": "Intermediate successes do not prove reading."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Receive / accept",
+          "en": "Receive and accept"
+        },
+        "detail": {
+          "vi": "Envelope, checks, recoverable content và final boundary.",
+          "en": "Envelopes, checks, recoverable content and final boundaries."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "File / index",
+          "en": "File and index"
+        },
+        "detail": {
+          "vi": "Scoped receipt dedup, metadata và versioned projections.",
+          "en": "Scoped deduplication, metadata and versioned projections."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Read / sync",
+          "en": "Read and synchronize"
+        },
+        "detail": {
+          "vi": "Authorization, applied cursors và safe snapshots.",
+          "en": "Authorization, applied cursors and safe snapshots."
+        },
+        "icon": "users"
+      },
+      {
+        "title": {
+          "vi": "Deliver / retain",
+          "en": "Deliver and retain"
+        },
+        "detail": {
+          "vi": "Per-recipient outcomes, retention và safe GC.",
+          "en": "Recipient outcomes, retention and safe reclamation."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Tách envelope, nội dung thư và mailbox state",
+        "en": "1. Separate envelopes, message content and mailbox state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Baseline là mail provider: receive/send qua SMTP, web/mobile mailbox, labels/folders, read flags, search, attachments và change sync. IMAP compatibility là một adapter/protocol surface riêng cần thiết kế, không chỉ đổi HTTP thành socket. MAIL FROM/RCPT TO thuộc SMTP envelope; From/To/Cc/Message-ID thuộc message headers; Bcc và routing recipients không nên suy đơn giản từ visible headers. Người dùng có thể đọc cùng một raw message qua nhiều mailbox states độc lập.",
+          "en": "The provider receives/sends SMTP and serves clients with labels, flags, search, attachments and synchronization. IMAP adds a separate protocol surface rather than a socket wrapper. SMTP envelopes differ from visible headers, and routing/Bcc cannot be inferred blindly from displayed recipients. Shared raw content can belong to independent mailbox states."
+        },
+        {
+          "vi": "Chốt accepted-mail durability theo failure model, latency cho inbox/search, quotas, message/wire size, retention, regions và abuse handling. “Không mất thư” không là một promise không giới hạn cho mọi disaster. Final positive completion sau mail DATA nhận trách nhiệm deliver/relay hoặc xử lý failure theo protocol/policy; RCPT250 trước body không có cùng ý nghĩa. Local sent/pending, remote accepted, inbox placement và user read là bốn trạng thái khác nhau.",
+          "en": "Define durability under explicit failures alongside latency, quotas, sizes, retention, regions and abuse handling. Final positive completion after mail data transfers delivery responsibility; earlier recipient responses mean something different. Submission, remote acceptance, inbox placement and reading are distinct states."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Internet transport",
+            "en": "Internet transport"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "SMTP envelope, retries và final acceptance boundary.",
+              "en": "SMTP envelopes, retries and final acceptance boundaries."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Private mailbox",
+            "en": "Private mailbox"
+          },
+          "icon": "users",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Per-user flags/labels/history và authorized content access.",
+              "en": "Per-user flags/labels/history and authorized content."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Trust / policy",
+            "en": "Trust / policy"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Domain authentication khác spam quality và authorization.",
+              "en": "Domain authentication differs from spam quality and authorization."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Logical deliveries khác SMTP transactions và unique blobs",
+        "en": "2. Logical deliveries differ from transactions and unique blobs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 1B users nhận 40 mailbox deliveries/ngày và gửi 10 outbound deliveries/ngày. Inbound là 40B/day≈463K deliveries/s, outbound 10B/day≈116K/s trước peak. Một SMTP transaction có thể có nhiều accepted recipients nên transaction rate còn phụ thuộc fan-out; đừng coi 40B mailbox copies là 40B unique bodies. Giả định mỗi logical delivery có 50 KB body,20% có 500 KB attachments và 1 KB metadata thì daily logical payload là 2 PB body +4 PB attachments +40 TB metadata trước dedup/compression/replicas.",
+          "en": "Assume one billion users receive 40 mailbox deliveries and send 10 outbound deliveries daily. That is roughly 463K incoming and 116K outgoing deliveries/s before peaks. SMTP recipient fan-out changes transaction counts; mailbox copies are not unique bodies. Assumed 50 KB bodies, 20% with 500 KB attachments and 1 KB metadata yield 2 PB/4 PB/40 TB of daily logical payload before deduplication, compression and replication."
+        },
+        {
+          "vi": "Metadata bytes nhỏ hơn content nhưng chịu inbox lists, flags, labels và sync queries. Retention nhiều năm, versions/holds, trash, indexes, spool và replication đổi total capacity rất lớn; không hứa dedup savings nếu chưa biết attachment distribution và encryption scope. Attachment binary limit 25 MB có thể thành khoảng 33,3 MB base 64 trước line wrapping/headers. API binary cap và SMTP MIME wire cap phải được đặt tên khác nhau.",
+          "en": "Metadata is smaller but serves lists, flags, labels and synchronization. Retention, versions, trash, indexes, spools and replication dominate long-term sizing; deduplication savings depend on distributions/encryption scopes. A 25 MB binary attachment takes roughly 33.3 MB in base64 before wrapping/headers, so distinguish binary and wire-size limits."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Quantity",
+            "en": "Quantity"
+          },
+          {
+            "vi": "Conditional arithmetic",
+            "en": "Conditional arithmetic"
+          },
+          {
+            "vi": "Result",
+            "en": "Result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Inbound deliveries",
+              "en": "Inbound deliveries"
+            },
+            {
+              "vi": "1B ×40 /86.400",
+              "en": "1B ×40 /86,400"
+            },
+            {
+              "vi": "≈463K/s",
+              "en": "≈463K/s"
+            }
+          ],
+          [
+            {
+              "vi": "Logical bodies/day",
+              "en": "Logical bodies/day"
+            },
+            {
+              "vi": "40B ×50 KB",
+              "en": "40B ×50KB"
+            },
+            {
+              "vi": "2 PB",
+              "en": "2PB"
+            }
+          ],
+          [
+            {
+              "vi": "Logical attachments/day",
+              "en": "Logical attachments/day"
+            },
+            {
+              "vi": "40B ×20% ×500 KB",
+              "en": "40B ×20% ×500KB"
+            },
+            {
+              "vi": "4 PB",
+              "en": "4PB"
+            }
+          ],
+          [
+            {
+              "vi": "Metadata/day",
+              "en": "Metadata/day"
+            },
+            {
+              "vi": "40B ×1 KB",
+              "en": "40B ×1KB"
+            },
+            {
+              "vi": "40 TB trước indexes/replicas",
+              "en": "40TB before indexes/replicas"
+            }
+          ],
+          [
+            {
+              "vi": "Base64 payload",
+              "en": "Base64 payload"
+            },
+            {
+              "vi": "25 MB ×4/3",
+              "en": "25MB ×4/3"
+            },
+            {
+              "vi": "≈33,3 MB + framing",
+              "en": "≈33.3MB + framing"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "apis",
+      "title": {
+        "vi": "3. Mailbox API và SMTP có contracts khác nhau",
+        "en": "3. Mailbox APIs and SMTP have different contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Remote MTAs dùng SMTP; authenticated clients có thể dùng JSON API hoặc submission protocol. API send 202 chỉ nhận job intent, không hứa mọi recipient đã delivered. Scoped idempotency key bảo vệ một submission intent; envelope recipients có outcome riêng. Attachment upload phải authorize ownership, kiểm durable upload state/size và pin reference trước accept-send, không chỉ lưu một presigned URL tạm rồi coi bytes đã an toàn.",
+          "en": "Remote MTAs speak SMTP; clients use APIs or submission protocols. API acceptance only records intent, with separate recipient outcomes. Scoped idempotency protects submissions. Attachment submission validates ownership, durable upload state and references rather than trusting temporary URLs."
+        },
+        {
+          "vi": "List cần cursor theo stable ordering/tie-breaker và snapshot semantics đã nêu; mutation có expected version hoặc explicit last-writer policy. GET body/attachment kiểm mailbox access trước signed grant scoped/expiry. Search authorization phải giữ user/delegation boundary ở query và fetch stages. Change cursor là applied-history context, không lấy timestamp hoặc số push events làm substitute.",
+          "en": "Lists need stable ordering/cursors and declared snapshot semantics; mutations need versions or explicit conflict policies. Authorize content before scoped grants. Search/query/fetch stages preserve access boundaries, while synchronization cursors represent applied history rather than clocks or notification counts."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/messages/send",
+          "description": {
+            "vi": "Persist authenticated submission và recipient job intent.",
+            "en": "Persist authenticated submission and recipient jobs."
+          },
+          "request": "{envelopeRecipients,subject,bodyRef,attachmentRefs,idempotencyKey}",
+          "response": "202 {submissionId,recipientStatuses:\"queued\"}"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/mailboxes/{id}/messages",
+          "description": {
+            "vi": "Caller phải có quyền mailbox; label/cursor theo contract.",
+            "en": "Authorized mailbox listing under explicit cursor contracts."
+          },
+          "request": "?label=inbox&cursor=...&limit=50",
+          "response": "{items[],nextCursor,stateVersion}"
+        },
+        {
+          "method": "PATCH",
+          "path": "/v1/messages/{id}/state",
+          "description": {
+            "vi": "Flags/labels không đổi raw content.",
+            "en": "Flags/labels do not rewrite raw content."
+          },
+          "request": "{expectedVersion,addLabels[],removeLabels[],read?}",
+          "response": "{stateVersion,historyCursor} | conflict"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/mailboxes/{id}/changes",
+          "description": {
+            "vi": "Fetch retained deltas; expired cursor cần replacement snapshot.",
+            "en": "Retained deltas or explicit snapshot recovery."
+          },
+          "request": "?after=cursor&limit=...",
+          "response": "{changes[],throughCursor,hasMore} | RESYNC_REQUIRED"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/search",
+          "description": {
+            "vi": "Authorized logical mailbox scope; index freshness được nêu rõ.",
+            "en": "Authorized logical scopes with declared index freshness."
+          },
+          "request": "?mailbox=...&q=...&cursor=...",
+          "response": "{items[],nextCursor,indexThroughCursor}"
+        },
+        {
+          "method": "WS",
+          "path": "/v1/mailboxes/{id}/events",
+          "description": {
+            "vi": "Hint có thể duplicate/lost, không chứa proof đã apply.",
+            "en": "Hints may be duplicated/lost and do not prove application."
+          },
+          "response": "{mailboxId,changedThroughHint}"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Durable ingress tách khỏi mailbox/search tốc độ khác nhau",
+        "en": "4. Separate durable ingress from mailbox/search progress"
+      },
+      "paragraphs": [
+        {
+          "vi": "SMTP edge làm bounded protocol/auth/abuse checks và prepare accepted bytes. Durable receipt queue giữ envelope, recipient tasks và raw content hoặc pinned immutable references trước final acceptance. Mailbox consumers retry idempotently; một mailbox shard chậm tạo backlog có bound/retention monitoring thay vì làm mất thư đã nhận. Queue không thể buffer vô hạn: capacity/quota policy phải defer/reject trước acceptance khi không đảm bảo contract.",
+          "en": "Ingress bounds checks and prepares bytes before durable acceptance. Receipts retain envelopes/tasks and protected content. Idempotent mailbox consumers can lag under monitored retention/capacity bounds. Queues are not infinite: defer/reject before acceptance when guarantees cannot be maintained."
+        },
+        {
+          "vi": "Mailbox authority commit metadata, flags/labels, history và outbox event dưới chosen transaction protocol. Search và push là projections có lag riêng. Blob writes cần prepare/publish/GC fencing để metadata không trỏ bytes mất và orphan không bị giữ mãi. Outbound jobs là durable per-recipient state machine; không gửi Internet SMTP bên trong database transaction đang giữ locks. Sơ đồ là architecture học tập, không claim private implementation của provider nào.",
+          "en": "Mailbox authorities coordinate metadata, state, history and outboxes under explicit transactions. Search/push can lag. Blob preparation/publication needs GC protection. Recipient delivery jobs are durable state machines rather than SMTP calls inside held database transactions. This is an educational architecture."
+        }
+      ],
+      "diagram": {
+        "id": "email-acceptance-mailbox",
+        "title": {
+          "vi": "Hai thế giới gặp nhau tại mailbox",
+          "en": "Two worlds meet at the mailbox"
+        },
+        "caption": {
+          "vi": "SMTP envelope và raw message phải recover được trước final acceptance. Mailbox metadata, blobs, search và push có ownership/consistency riêng; downstream retry không được làm mất hoặc nhân đôi accepted instances.",
+          "en": "SMTP envelopes/raw messages must be recoverable before final acceptance. Metadata, blobs, search and push have separate ownership/consistency; downstream retries preserve accepted instances."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "remote",
+            "label": {
+              "vi": "Remote MTA",
+              "en": "Remote MTA"
+            },
+            "detail": {
+              "vi": "Trao SMTP theo recipient envelope; lost final reply có thể dẫn tới retransmission.",
+              "en": "Transfers SMTP recipient envelopes; lost final replies can cause retransmission."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "SMTP / submission edge",
+              "en": "SMTP / submission edge"
+            },
+            "detail": {
+              "vi": "Validate recipient/limits, TLS policy và bounded reads; inbound relay khác authenticated user submission.",
+              "en": "Validates recipients/limits, TLS and bounded reads; inbound delivery differs from authenticated submission."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "filter",
+            "label": {
+              "vi": "Authentication / filtering",
+              "en": "Authentication / filtering"
+            },
+            "detail": {
+              "vi": "SPF/DKIM/DMARC evidence, spam/malware scoring và preaccept/postaccept policy rõ.",
+              "en": "Evaluates authentication and spam/malware evidence under explicit acceptance policies."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "queue",
+            "label": {
+              "vi": "Durable receipt queue",
+              "en": "Durable receipt queue"
+            },
+            "detail": {
+              "vi": "Accepted receipt ID, envelope, raw bytes hoặc pinned durable references; retry per recipient.",
+              "en": "Stores receipt identities, envelopes and bytes/pinned references with per-recipient retries."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "queue"
+          },
+          {
+            "id": "client",
+            "label": {
+              "vi": "Mail clients",
+              "en": "Mail clients"
+            },
+            "detail": {
+              "vi": "Web/mobile hoặc IMAP adapters; applied cursors khác notification hints.",
+              "en": "Web/mobile/IMAP adapters distinguish applied cursors from hints."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Mailbox API",
+              "en": "Mailbox API"
+            },
+            "detail": {
+              "vi": "Authenticate user/delegation, authorized listing/search/send và optimistic concurrency.",
+              "en": "Authenticates users/delegations and serves authorized operations with concurrency checks."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "edge"
+          },
+          {
+            "id": "mailbox",
+            "label": {
+              "vi": "Mailbox authority",
+              "en": "Mailbox authority"
+            },
+            "detail": {
+              "vi": "Per-user logical ownership, receipt dedup, labels/read state, history và outbox.",
+              "en": "Owns logical mailboxes, receipt deduplication, labels/flags, history and outboxes."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "metadata",
+            "label": {
+              "vi": "Metadata / history",
+              "en": "Metadata / history"
+            },
+            "detail": {
+              "vi": "User-scoped records/indexes, atomic mutation/history contract và bucketed physical layout.",
+              "en": "Stores scoped records/indexes and coherent mutations/history in bounded physical partitions."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "outbound",
+            "label": {
+              "vi": "Outbound relay",
+              "en": "Outbound relay"
+            },
+            "detail": {
+              "vi": "Per-recipient/domain queues, destination limits, signing, retries và delivery outcomes.",
+              "en": "Owns recipient/domain queues, limits, signatures, retries and delivery outcomes."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "worker"
+          },
+          {
+            "id": "blob",
+            "label": {
+              "vi": "Bodies / attachments",
+              "en": "Bodies / attachments"
+            },
+            "detail": {
+              "vi": "Immutable durable content, scoped authorization, retention references và safe GC.",
+              "en": "Stores immutable content with authorization, retention references and safe reclamation."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "store"
+          },
+          {
+            "id": "search",
+            "label": {
+              "vi": "Search projection",
+              "en": "Search projection"
+            },
+            "detail": {
+              "vi": "Logical mailbox isolation, bounded extraction, versioned deletes và rebuild cursors.",
+              "en": "Projects isolated mailboxes with bounded extraction, versioned deletion and rebuild cursors."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "worker"
+          },
+          {
+            "id": "push",
+            "label": {
+              "vi": "Change notifications",
+              "en": "Change notifications"
+            },
+            "detail": {
+              "vi": "Hint mailbox changed; lost/duplicate delivery không đổi applied cursor.",
+              "en": "Hints at changes without treating notifications as applied data."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "receive",
+            "label": {
+              "vi": "Nhận và commit trách nhiệm",
+              "en": "Receive and commit responsibility"
+            },
+            "steps": [
+              {
+                "from": "remote",
+                "to": "edge",
+                "description": {
+                  "vi": "MAIL/RCPT/DATA: envelope recipients và message headers là lớp khác nhau.",
+                  "en": "Exchange envelope recipients and separate message headers."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "filter",
+                "description": {
+                  "vi": "Chạy checks có bounded timeout/size; verdict trước final acceptance theo policy.",
+                  "en": "Run bounded checks under preacceptance policies."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "blob",
+                "description": {
+                  "vi": "Prepare durable bytes hoặc staging objects có reservation pin.",
+                  "en": "Prepare durable bytes or protected staging objects."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "queue",
+                "description": {
+                  "vi": "Commit receipt/envelope + recoverable content references.",
+                  "en": "Commit receipts/envelopes and recoverable content references."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "remote",
+                "description": {
+                  "vi": "Final positive completion sau DATA mới chuyển trách nhiệm; reply có thể mất.",
+                  "en": "Final positive DATA completion transfers responsibility, though replies may be lost."
+                }
+              },
+              {
+                "from": "queue",
+                "to": "mailbox",
+                "description": {
+                  "vi": "Deliver accepted recipient task với stable internal receipt identity.",
+                  "en": "Deliver accepted recipient tasks with stable internal receipt identities."
+                },
+                "async": true
+              },
+              {
+                "from": "mailbox",
+                "to": "metadata",
+                "description": {
+                  "vi": "Idempotent mailbox insert và history/outbox dưới ownership contract.",
+                  "en": "Insert idempotently with coherent history/outboxes."
+                }
+              }
+            ]
+          },
+          {
+            "id": "read",
+            "label": {
+              "vi": "Đọc thư và attachments",
+              "en": "Read messages and attachments"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Request authenticated mailbox/message identity.",
+                  "en": "Request authorized mailbox/message identities."
+                }
+              },
+              {
+                "from": "api",
+                "to": "mailbox",
+                "description": {
+                  "vi": "Authorize current user/delegation; không tin userId client đưa.",
+                  "en": "Authorize current users/delegations rather than trust client IDs."
+                }
+              },
+              {
+                "from": "mailbox",
+                "to": "metadata",
+                "description": {
+                  "vi": "Read small header/snippet/label rows và bounded indexes.",
+                  "en": "Read bounded metadata/indexes."
+                }
+              },
+              {
+                "from": "mailbox",
+                "to": "blob",
+                "description": {
+                  "vi": "Fetch/give scoped grants cho body/attachment đã authorize.",
+                  "en": "Read or grant scoped access to authorized content."
+                }
+              },
+              {
+                "from": "mailbox",
+                "to": "client",
+                "description": {
+                  "vi": "Return data với mutation/history generation phù hợp.",
+                  "en": "Return data with compatible state/history generations."
+                }
+              }
+            ]
+          },
+          {
+            "id": "sync",
+            "label": {
+              "vi": "Mailbox change tới mọi device",
+              "en": "Synchronize mailbox changes"
+            },
+            "steps": [
+              {
+                "from": "mailbox",
+                "to": "metadata",
+                "description": {
+                  "vi": "Commit flags/labels/delete cùng durable history evidence.",
+                  "en": "Commit mutations and durable history evidence."
+                }
+              },
+              {
+                "from": "metadata",
+                "to": "search",
+                "description": {
+                  "vi": "Project versioned changes; delete không bị stale event revive.",
+                  "en": "Project versioned changes without stale-event resurrection."
+                },
+                "async": true
+              },
+              {
+                "from": "metadata",
+                "to": "push",
+                "description": {
+                  "vi": "Emit scoped mailbox-changed hint và cursor reference.",
+                  "en": "Emit scoped change hints and cursor references."
+                },
+                "async": true
+              },
+              {
+                "from": "push",
+                "to": "client",
+                "description": {
+                  "vi": "Device nhận hint, không advance applied cursor chỉ vì push.",
+                  "en": "Devices receive hints without advancing applied state."
+                }
+              },
+              {
+                "from": "client",
+                "to": "mailbox",
+                "description": {
+                  "vi": "Fetch deltas theo last applied cursor hoặc explicit resync.",
+                  "en": "Fetch retained deltas or explicitly resynchronize."
+                }
+              }
+            ]
+          },
+          {
+            "id": "send",
+            "label": {
+              "vi": "Submission và outbound delivery",
+              "en": "Submit and deliver outbound mail"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "api",
+                "description": {
+                  "vi": "Submit với authenticated intent và scoped idempotency key.",
+                  "en": "Submit authenticated intent with scoped idempotency."
+                }
+              },
+              {
+                "from": "api",
+                "to": "mailbox",
+                "description": {
+                  "vi": "Validate attachment grants/size, envelope và anti-abuse controls.",
+                  "en": "Validate attachments, envelopes, sizes and abuse controls."
+                }
+              },
+              {
+                "from": "mailbox",
+                "to": "metadata",
+                "description": {
+                  "vi": "Persist Sent state và per-recipient job intent/outbox.",
+                  "en": "Persist sent state and identified recipient job intents/outboxes."
+                }
+              },
+              {
+                "from": "mailbox",
+                "to": "outbound",
+                "description": {
+                  "vi": "Enqueue durable recipient tasks; API202 chưa là remote delivery.",
+                  "en": "Queue recipient tasks; API acceptance is not remote delivery."
+                },
+                "async": true
+              },
+              {
+                "from": "outbound",
+                "to": "remote",
+                "description": {
+                  "vi": "Resolve destination, sign/send, handle 4xx/5xx/unknown per transaction.",
+                  "en": "Resolve destinations and handle temporary/permanent/ambiguous outcomes."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recover",
+            "label": {
+              "vi": "Retry, index rebuild và GC",
+              "en": "Retry, rebuild indexes and reclaim bytes"
+            },
+            "steps": [
+              {
+                "from": "queue",
+                "to": "mailbox",
+                "description": {
+                  "vi": "Redeliver cùng receipt sau crash; không tạo mailbox row mới.",
+                  "en": "Redeliver the same receipt after crashes without duplicating rows."
+                },
+                "async": true
+              },
+              {
+                "from": "metadata",
+                "to": "search",
+                "description": {
+                  "vi": "Snapshot tại cut + contiguous/versioned tail cho rebuild.",
+                  "en": "Rebuild from consistent cuts and compatible tails."
+                },
+                "async": true
+              },
+              {
+                "from": "metadata",
+                "to": "blob",
+                "description": {
+                  "vi": "Release references chỉ sau retention/reader/upload/version checks.",
+                  "en": "Release references under retention/reader/upload/version checks."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "acceptance",
+      "title": {
+        "vi": "5. Final DATA acceptance, crash và duplicate receipts",
+        "en": "5. Final DATA acceptance, crashes and duplicate receipts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các SMTP250 ở MAIL/RCPT xác nhận các protocol steps; final successful completion sau DATA mới là handoff trách nhiệm cho accepted recipients. Bounded scans có thể reject/defer trước đó. Chọn durability boundary gồm body/envelope/recipient intent và failures sẽ chịu được; một replicated metadata row không cứu body chỉ nằm RAM. ACK trước boundary rồi crash là accepted-mail loss, dù một sender đôi khi còn retry được.",
+          "en": "Intermediate positive replies differ from final completion after DATA. Bounded checks can reject/defer beforehand. Define recoverable content/envelope/recipient intent and failure coverage; metadata replication cannot restore volatile-only bodies. Early acceptance followed by crashes violates that boundary even if some senders later retry."
+        },
+        {
+          "vi": "Final response mất sau commit khiến sender unknown và có thể retransmit. Public SMTP không có universal idempotency key; cùng Message-ID/body không tự chứng minh cùng accepted business instance, còn khác messages có thể reuse header. Dùng internal receipt identity cho retries trong queue/mailbox, và chỉ dùng external duplicate heuristics dưới policy tránh mất thư hợp lệ. Không hứa end-to-end exactly-once từ internal dedup.",
+          "en": "Lost final responses can cause retransmission. SMTP lacks universal idempotency, and untrusted headers/body similarity do not establish unique business instances. Internal receipts deduplicate internal retries; external duplicate heuristics need policies that avoid suppressing legitimate mail. Internal deduplication is not end-to-end exactly-once delivery."
+        }
+      ],
+      "experiment": "email-receipt"
+    },
+    {
+      "id": "authentication",
+      "title": {
+        "vi": "6. SPF/DKIM/DMARC: result, alignment và disposition",
+        "en": "6. SPF/DKIM/DMARC results, alignment and disposition"
+      },
+      "paragraphs": [
+        {
+          "vi": "SPF kiểm việc sending host được authorize dùng MAIL FROM/HELO identity theo protocol, không authenticate con người hoặc trực tiếp visible From. Evaluation có DNS limits và có thể nhiều lookups, temporary errors hoặc missing policy; không chỉ một DNS query. Forwarding đổi sending IP có thể làm SPF fail. DKIM xác minh signature của signing domain trên selected headers/body theo canonicalization; signing domain không nhất thiết là From, và body/list rewrites có thể phá signature.",
+          "en": "SPF authorizes hosts for protocol identities rather than human senders or visible From. DNS evaluation has limits/errors and forwarding can affect results. DKIM validates signing-domain signatures over selected canonicalized content, with separate signing and author domains; modifications can invalidate signatures."
+        },
+        {
+          "vi": "DMARC pass khi có ít nhất một passing SPF identity hoặc passing DKIM signing domain align với visible From domain theo configured mode. Raw pass không align chưa đủ; domain align nhưng mechanism fail cũng chưa đủ. Published none/quarantine/reject policy và receiver disposition là tầng khác, có local handling/overrides. Authenticated domain có thể gửi spam; pass không cấp inbox privilege và không bảo đảm nội dung an toàn.",
+          "en": "DMARC requires at least one passing aligned mechanism; pass alone or alignment alone is insufficient. Published policy and receiver disposition are separate, with local handling. Authenticated domains can send spam, so passing does not grant inbox placement or content safety."
+        }
+      ],
+      "experiment": "email-auth"
+    },
+    {
+      "id": "spam",
+      "title": {
+        "vi": "7. Lọc spam phải theo dõi false positives riêng",
+        "en": "7. Spam filtering must track false positives separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách domain authentication khỏi reputation, content/URL/malware scanning và classifier decisions. Cheap connection/recipient/size checks có thể làm sớm, nhưng body signatures và attachment scans cần đủ data; expensive classifiers cần timeout/budget. Decide reject/defer trước final acceptance khi policy cho phép. Sau accepted message không thể gửi SMTP5xx ngược một session đã xong; quarantine/spam/review/failure handling phải theo contract và chống backscatter về spoofed senders.",
+          "en": "Separate authentication from reputation, content/malware checks and classifiers. Some checks are early, while body signatures/scans need data and bounded resources. Rejections/deferrals precede final acceptance; later filtering uses explicit quarantine/review/failure handling rather than retroactive SMTP errors or unsafe backscatter."
+        },
+        {
+          "vi": "Optimize chỉ spam catch rate dễ giấu invoices/OTP/thư công việc trong Spam. Đo legitimate false positives, hard rejects, missed spam, appeals/recovery và slices theo language/domain/message type; labels đánh giá cũng có bias/lag. Threshold từ samples nhỏ không phải calibrated probability hay production SLO. Human-safe recovery và clear quarantine state quan trọng ngang classifier throughput.",
+          "en": "Catch-rate-only optimization can hide valuable mail. Track legitimate false positives, hard rejection, missed spam and recovery across meaningful slices, accounting for label bias/delay. Small fixtures do not establish calibrated probabilities or production quality; recoverability matters alongside throughput."
+        }
+      ],
+      "experiment": "email-spam"
+    },
+    {
+      "id": "storage",
+      "title": {
+        "vi": "8. Hot metadata và immutable content có reference lifecycle",
+        "en": "8. Hot metadata and immutable content need reference lifecycles"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metadata record gồm mailbox/receipt/message identity, received ordering key, snippet, thread hint, flags/labels, auth verdict và body/attachment refs. Logical ownership theo user giúp route common queries; physical store vẫn cần buckets/limits cho unbounded mailbox và hot account. Label indexes có fan-out nhiều rows, nên commit/update consistency và rebuild/repair được định nghĩa; không phải mọi inbox query lúc nào cũng một partition scan nếu dữ liệu bucketed hoặc multi-label.",
+          "en": "Metadata contains scoped identities, ordering, snippets, state, verdicts and content references. Logical ownership routes common queries, while physical partitions need growth/hot-user bounds. Label indexes create multiple rows requiring consistency and repair; bucketed layouts need not be single-partition scans."
+        },
+        {
+          "vi": "Immutable body/attachment blobs có compression/tiering và dedup scope phù hợp tenant/encryption/privacy. Content hash không là authorization token; existence/timing oracle và cross-tenant linking có thể leak. Prepare bytes, pin upload/receipt references rồi publish metadata/outbox; reclaim orphans bằng fenced reachability/retention rules. Shared blob refcount một mình chưa đủ khi concurrent publication, readers, held versions hoặc GC race.",
+          "en": "Immutable content can be compressed/tiered/deduplicated within explicit isolation scopes. Hashes are not authorization and shared existence signals can leak information. Prepare/pin bytes before metadata publication and reclaim with fenced reference/retention rules beyond simple counters."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "State owner",
+            "en": "State owner"
+          },
+          {
+            "vi": "Identity / data",
+            "en": "Identity / data"
+          },
+          {
+            "vi": "Invariant",
+            "en": "Invariant"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Ingress receipt",
+              "en": "Ingress receipt"
+            },
+            {
+              "vi": "internalReceiptId + accepted envelope + bytes/ref",
+              "en": "internalReceiptId + accepted envelope + bytes/ref"
+            },
+            {
+              "vi": "Recoverable trước final acceptance.",
+              "en": "Recoverable before final acceptance."
+            }
+          ],
+          [
+            {
+              "vi": "Mailbox row",
+              "en": "Mailbox row"
+            },
+            {
+              "vi": "(mailboxId, internalReceiptId), metadata + content refs",
+              "en": "(mailboxId, internalReceiptId), metadata + content refs"
+            },
+            {
+              "vi": "Internal redelivery không tạo thêm instance.",
+              "en": "Internal retries do not create extra instances."
+            }
+          ],
+          [
+            {
+              "vi": "Mailbox history",
+              "en": "Mailbox history"
+            },
+            {
+              "vi": "generation + applied cursor + changes",
+              "en": "generation + applied cursor + changes"
+            },
+            {
+              "vi": "Mutation/history không silently gap.",
+              "en": "Mutations/history do not silently gap."
+            }
+          ],
+          [
+            {
+              "vi": "Outbound task",
+              "en": "Outbound task"
+            },
+            {
+              "vi": "submissionId + recipientTaskId + attempt/outcome",
+              "en": "submissionId + recipientTaskId + attempt/outcome"
+            },
+            {
+              "vi": "Retry theo recipient, không resend toàn batch đã accepted.",
+              "en": "Retry recipients rather than entire accepted batches."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "labels-threads",
+      "title": {
+        "vi": "9. Labels, read flags và threads là mutable projections",
+        "en": "9. Labels, flags and threads are mutable projections"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một raw message có thể có nhiều mailbox copies, labels và read state khác nhau. Label-based archive/move có thể chỉ đổi index/state, nhưng nếu expose IMAP folders thì phải map folder membership, flags và UID semantics đúng; không nói mọi move trong mọi backend là không bao giờ copy. Concurrent PATCH cần expected version hoặc per-field merge/LWW policy rõ. Deletion/trash transitions cần tombstone/history evidence để các device không resurrect stale mail.",
+          "en": "Copies can share content but differ in labels/read state. Label archive operations can avoid copying, while IMAP folder operations need correct membership/UID semantics and may differ internally. Concurrent state mutations require version/conflict policies and deletion evidence that prevents stale resurrection."
+        },
+        {
+          "vi": "Message-ID, References và In-Reply-To hỗ trợ threading nhưng có thể missing, forged, duplicated hoặc trỏ ngoài mailbox. Subject fallback là heuristic có thể merge hai conversations khác; không dùng thread ID làm quyền truy cập. Thread metadata phải repair được, giới hạn deep/cyclic references và chỉ expose messages user có quyền. Raw headers và mailbox-generated canonical IDs nên được lưu tách để audit/debug.",
+          "en": "Headers assist threading but can be absent, forged or duplicated. Subject fallback can merge unrelated conversations; threads never confer access. Bound/repair cyclic references and expose only authorized messages, keeping original headers separate from canonical internal identities."
+        }
+      ]
+    },
+    {
+      "id": "sync-imap",
+      "title": {
+        "vi": "10. Mailbox history và IMAP UIDs phục vụ mục đích khác",
+        "en": "10. Mailbox history and IMAP UIDs have different roles"
+      },
+      "paragraphs": [
+        {
+          "vi": "Push/IDLE báo mailbox có thay đổi; client cần authoritative fetch/catch-up. Custom history cursor phải chỉ tiến sau apply coherent deltas, hoặc sau replace snapshot tại known cut. Notifications duplicate/lost không làm mất state nếu cursor giữ đúng. History hết retention trả explicit resync; snapshot load/live-tail handoff cần barrier và include deletes/absence semantics. Không union snapshot mới vào old state rồi giữ deleted rows mãi.",
+          "en": "Push/IDLE notifications require authoritative synchronization. Custom applied cursors advance only with deltas/coherent replacement snapshots. Expired retention triggers resync, while snapshot/live-tail handoffs need barriers and deletion semantics rather than unions that retain removed rows."
+        },
+        {
+          "vi": "IMAP message sequence numbers có thể đổi khi mailbox membership thay đổi. UID ổn định theo mailbox và UIDVALIDITY, không được reuse trong cùng validity; UID gaps không tự là lost messages và UID không là global history cursor. Adapter phải map flags/expunge/copy/move và validity resets đúng. Bài lab dùng contiguous toy revisions cho custom protocol; không coi đó là implementation IMAP hoặc JMAP state tokens.",
+          "en": "IMAP sequence numbers can change with membership. UIDs belong to mailbox validity contexts, must not be reused there and can have gaps without missing messages. They are not global history cursors. Adapters implement flags/expunges/moves and validity changes separately from this custom contiguous-revision lab."
+        }
+      ],
+      "experiment": "email-sync"
+    },
+    {
+      "id": "search",
+      "title": {
+        "vi": "11. Logical mailbox isolation không thay authorization",
+        "en": "11. Logical isolation does not replace authorization"
+      },
+      "paragraphs": [
+        {
+          "vi": "Search thường dùng per-mailbox logical scope và có thể pack nhiều users vào physical shards. Shared index không tự sai và per-user index không tự an toàn: query routing, delegated/shared mailbox ACLs, result hydration và snippet/attachment access đều phải enforce quyền. Physical shard ID không phải proof caller owns mailbox. Idle mailboxes có thể cold-load indexes, nhưng latency/cost/eviction phải đo và tenant quotas tránh noisy neighbors.",
+          "en": "Search can use per-mailbox logical scopes packed into shared physical shards. Neither shared nor separate indexes automatically establish security; queries, delegated access, result hydration and content all enforce authorization. Cold-loading indexes requires measured latency/cost/eviction and isolation."
+        },
+        {
+          "vi": "Indexing async từ committed history/outbox, giữ version/order/dedup để stale add không revive deleted message. Fresh metadata/read-after-write contract khác index freshness; expose lag/through-cursor nếu cần. Rebuild dùng consistent snapshot + tail, verify rồi switch generation. Attachment extraction chạy sandbox/bounds cho archives, PDFs và decompression; không để search parser/extractor đọc arbitrary filesystem/network hoặc unbounded bytes.",
+          "en": "Asynchronous projections retain versioned deletion/deduplication behavior and explicit freshness. Rebuild from consistent snapshots/tails before generation switches. Sandboxed bounded extraction protects against malicious files, archives and decompression workloads."
+        }
+      ]
+    },
+    {
+      "id": "outbound",
+      "title": {
+        "vi": "12. Outbound là state machine theo từng recipient",
+        "en": "12. Outbound delivery is a per-recipient state machine"
+      },
+      "paragraphs": [
+        {
+          "vi": "Persist submission/Sent state và recipient tasks trước API acceptance; authenticated sender intent khác visible From header nên phải chống unauthorized spoof/relay. Resolve destination routing theo MX/DNS semantics, enforce timeouts/TLS policy và per-domain/account limits. Null MX, absent MX fallback và temporary DNS failures có handling khác nhau theo supported standards; không hardcode “DNS có lỗi thì bounce” cho mọi trường hợp.",
+          "en": "Persist submissions and recipient tasks before API acceptance, checking sender authorization independently of visible headers. Routing uses supported DNS/MX semantics with bounded TLS/timeouts and destination/account controls. Explicit no-mail domains, absent MX records and transient DNS failures need distinct handling."
+        },
+        {
+          "vi": "SMTP4xx thường là temporary retry/defer,5xx là permanent response cho operation/recipient theo context. Retain per-recipient accepted/retryable/failed/unknown outcomes, backoff+jitter và retry horizon. Khi final reply mất, remote có thể đã accept nên retry có thể duplicate; Sent copy hoặc API idempotency không xóa ambiguity ngoài Internet. Remote accepted cũng chưa là inbox placement hay read receipt. Bounces/DSNs cần null reverse-path/anti-loop và anti-backscatter controls theo protocol.",
+          "en": "Temporary, permanent and ambiguous outcomes are tracked per recipient/operation with bounded retries. Lost final replies can duplicate remote delivery despite API idempotency. Remote acceptance does not prove inbox placement or reading. Delivery-status messages need loop/backscatter-safe handling."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Mỗi recipient có outcome riêng",
+          "en": "Track recipients independently"
+        },
+        "caption": {
+          "vi": "Không gửi lại recipient đã known accepted chỉ vì người khác bị defer.",
+          "en": "Do not resend known-accepted recipients because others were deferred."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Queue",
+              "en": "Queue"
+            },
+            "detail": {
+              "vi": "Durable identified recipient task.",
+              "en": "Durable identified recipient tasks."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Attempt",
+              "en": "Attempt"
+            },
+            "detail": {
+              "vi": "Destination policy, signing và bounded SMTP transfer.",
+              "en": "Destination policies, signing and bounded transfers."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Classify",
+              "en": "Classify"
+            },
+            "detail": {
+              "vi": "Accepted, temporary, permanent hoặc unknown.",
+              "en": "Accepted, temporary, permanent or ambiguous outcomes."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Recover",
+              "en": "Recover"
+            },
+            "detail": {
+              "vi": "Retry/notify/reconcile theo outcome và horizon.",
+              "en": "Retry, report or reconcile under outcome policies."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "security",
+      "title": {
+        "vi": "13. MIME và attachments là untrusted inputs",
+        "en": "13. MIME and attachments are untrusted inputs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bound header count/line length, MIME nesting, message size, parsing time và decoded attachment bytes. Wire size và decompressed size đều cần limits; zip bombs không bị chặn chỉ bằng 25 MB upload cap. Sanitize HTML mail, disable dangerous active content theo rendering policy, isolate preview origins và kiểm remote resource loading/privacy. Scanner parser và client renderer có thể diễn giải data khác nhau; preserve canonical/raw evidence và test malformed MIME.",
+          "en": "Bound headers, MIME depth, bytes, time and decompression as separate risks. Sanitize/isolate HTML previews and control remote resources. Different parsers/renderers can disagree, so preserve evidence and test malformed inputs rather than rely on upload size alone."
+        },
+        {
+          "vi": "Không open relay: remote SMTP chỉ nhận recipients/domains provider chịu trách nhiệm; authenticated submission có account/recipient quotas, compromised-account detection và outbound scoring. Domain signing keys, grants và mailbox credentials cần scoped authorization/rotation/auditing. SMTP transport TLS bảo vệ một hop theo policy, không tự E2EE; E2EE hạn chế server plaintext search/scanning và cần client/key-management alternatives theo threat model, không xóa metadata exposure.",
+          "en": "Prevent open relays and constrain authenticated submissions/compromised accounts. Protect signing keys, grants and credentials. Hop encryption is not end-to-end secrecy; E2EE changes plaintext feature availability and key-management design without hiding all metadata."
+        }
+      ]
+    },
+    {
+      "id": "retention-regions",
+      "title": {
+        "vi": "14. Retention, region recovery và content cost",
+        "en": "14. Retention, regional recovery and content costs"
+      },
+      "paragraphs": [
+        {
+          "vi": "User delete, trash retention, administrative holds, named versions và backup recovery có lifecycle khác nhau theo product requirements. Đây là engineering policies, không suy universal legal retention rule. Shared blob cleanup cần tham chiếu từ mọi mailbox/version/reader/upload còn hợp lệ, cộng fencing/reconciliation; xóa một row không đủ chứng minh bytes có thể reclaim. Egress/restore/index rebuild và slow cold-tier latency cùng nằm trong cost model.",
+          "en": "Deletion, trash, administrative holds, versions and backups have distinct product lifecycles rather than universal retention rules. Shared content reclamation checks all protected references with fencing/reconciliation. Costs include restoration, egress, rebuilding and cold latency."
+        },
+        {
+          "vi": "Pin logical mailbox region và transfer owner/generation có fence; ingress cần durable cross-region routing policy khi home region unavailable. Async copies có lag/RPO, synchronous durability đổi latency/availability. Không ACK với guarantee vượt replica/content/encryption-key recovery thực có. Drill restore gồm receipt queue, mailbox history, blobs, signing/encryption dependencies và indexes có thể rebuild; “replica healthy” không phải full mailbox recovery evidence.",
+          "en": "Regional ownership transfers need fencing and explicit ingress durability during outages. Asynchronous and synchronous copies have different recovery/latency contracts. Restore drills include receipts, history, content and key dependencies, distinguishing rebuildable indexes from authoritative state."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "15. Đo accepted instances tới terminal outcomes",
+        "en": "15. Trace accepted instances to terminal outcomes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Track final accepted receipts, durable queue age/backlog, per-recipient delivery states, mailbox dedup conflicts, blob-reference integrity, history retention floor, sync resets, index lag và spam false positives. SMTP response codes theo stage quan trọng hơn một success-rate gộp tất cả 250. Outbound destination-specific latency/rejection và complaint/reputation evidence giúp không để một tenant làm hỏng shared delivery capacity.",
+          "en": "Track receipts through queues/delivery, deduplication, references, history floors, projections and filtering. Stage-specific response metrics beat aggregate positive-reply counts, while destination/account evidence protects shared delivery capacity."
+        },
+        {
+          "vi": "Inject crashes trước/sau body persistence, final reply loss, mailbox commit trước consumer ACK, lost push, stale index delete, expired cursor và concurrent blob GC. Check invariants thay vì chỉ process healthy: accepted bytes recover, retries không nhân internal instances, authorization không leak, client cursor tương ứng applied data và projections không resurrect deletes. Capacity alert cần retry/spool reserves chứ không chỉ metadata disk còn trống.",
+          "en": "Inject persistence/reply/consumer crashes, missing notifications, stale indexes, expired cursors and reclamation races. Verify recoverability, internal uniqueness, authorization, valid cursors and deletion behavior rather than only liveness."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure",
+            "en": "Failure"
+          },
+          {
+            "vi": "Expected behavior",
+            "en": "Expected behavior"
+          },
+          {
+            "vi": "Guard",
+            "en": "Guard"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Final reply lost",
+              "en": "Final reply lost"
+            },
+            {
+              "vi": "Sender unknown; receiver giữ accepted responsibility.",
+              "en": "Sender uncertain; receiver retains responsibility."
+            },
+            {
+              "vi": "Durable receipt + explicit duplicate policy.",
+              "en": "Durable receipts and duplicate policies."
+            }
+          ],
+          [
+            {
+              "vi": "Mailbox retry",
+              "en": "Mailbox retry"
+            },
+            {
+              "vi": "Cùng internal instance không tạo thêm row.",
+              "en": "Internal retries retain one instance."
+            },
+            {
+              "vi": "Scoped receipt key + transactional state/history.",
+              "en": "Scoped receipt identity and coherent history."
+            }
+          ],
+          [
+            {
+              "vi": "Header ID reused",
+              "en": "Header ID reused"
+            },
+            {
+              "vi": "Không drop thư khác chỉ vì header trùng.",
+              "en": "Do not suppress independent messages."
+            },
+            {
+              "vi": "Internal identity, bounded heuristics.",
+              "en": "Internal identities and bounded heuristics."
+            }
+          ],
+          [
+            {
+              "vi": "Push gap",
+              "en": "Push gap"
+            },
+            {
+              "vi": "Catch-up bằng applied cursor.",
+              "en": "Catch up from applied cursors."
+            },
+            {
+              "vi": "History hoặc explicit replacement snapshot.",
+              "en": "Retained history or replacement snapshots."
+            }
+          ],
+          [
+            {
+              "vi": "Postaccept spam verdict",
+              "en": "Postaccept spam verdict"
+            },
+            {
+              "vi": "No retroactive SMTP reject.",
+              "en": "No retroactive SMTP rejection."
+            },
+            {
+              "vi": "Declared quarantine/failure/abuse policy.",
+              "en": "Declared quarantine/failure policies."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Câu hỏi về responsibility, identity và private state",
+        "en": "16. Questions about responsibility, identity and private state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ một thư có hai recipients: một mailbox đang down, final SMTP reply bị mất và search chưa index. Chỉ ra sender/receiver biết gì, bytes nằm đâu, recipient nào retry và client sync từ cursor nào. Sau đó cho một thư khác reuse Message-ID và giải thích vì sao không được drop nó một cách mù quáng.",
+          "en": "Draw two-recipient delivery with a down mailbox, lost SMTP reply and lagging search. Identify knowledge, protected bytes, retries and applied cursors, then consider an independent message reusing the same header identity."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Mọi250 có nghĩa server đã giữ thư bền chưa?",
+            "en": "Does every positive SMTP reply prove durable message acceptance?"
+          },
+          "answer": [
+            {
+              "vi": "Không. MAIL/RCPT replies xác nhận protocol steps; final completion sau DATA mới chuyển mail responsibility. Durability implementation phải bảo vệ content/envelope trước final acceptance theo chosen failures.",
+              "en": "No. Intermediate replies differ from final DATA completion. Protect content/envelopes before that boundary under explicit failures."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Dùng Message-ID chống trùng mọi thư có an toàn không?",
+            "en": "Can Message-ID safely deduplicate every message?"
+          },
+          "answer": [
+            {
+              "vi": "Không: headers có thể reused/forged/missing, và các accepted instances độc lập có thể trùng. Internal receipt key bảo vệ internal retry; external heuristics cần đánh đổi tránh mất valid mail và không hứa end-to-end exactly-once.",
+              "en": "No. Untrusted headers can collide. Internal receipts protect internal retries while external heuristics need explicit false-suppression trade-offs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "SPF pass nhưng domain khác From có đủ DMARC không?",
+            "en": "Does unaligned SPF pass establish DMARC pass?"
+          },
+          "answer": [
+            {
+              "vi": "Không chỉ từ SPF đó. Cần passing aligned SPF hoặc ít nhất một passing aligned DKIM signature. Alignment không thay PASS, policy action không thay auth result và pass không bảo đảm inbox.",
+              "en": "Not from that result. At least one passing aligned mechanism is required; policy and inbox placement remain separate."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sau final accept có gửi 5xx để reject spam được không?",
+            "en": "Can accepted mail be retroactively rejected with SMTP errors?"
+          },
+          "answer": [
+            {
+              "vi": "Không qua transaction đã kết thúc. Quyết định reject/defer trước acceptance, hoặc áp dụng declared postaccept quarantine/failure/abuse policy phù hợp; tránh backscatter tới forged sender.",
+              "en": "Not through an already completed transaction. Use preaccept rejection or declared postaccept handling with backscatter protection."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Search shard theo user có làm auth miễn phí không?",
+            "en": "Does user-based search sharding eliminate authorization?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Route/query/hydration/delegation/body grants đều enforce quyền. Physical packing có thể shared; shard placement không chứng minh caller có quyền read.",
+              "en": "No. Routing, querying, hydration, delegation and content access all enforce rights independently of physical layout."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Nhận push revision 6 có đặt cursor 6 ngay không?",
+            "en": "Can revision notifications directly advance applied cursors?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu chưa apply changes. Push là hint, cursor đại diện materialized state; lost earlier deltas làm cursor trông mới nhưng mailbox sai. Fetch retained pages hoặc load coherent replacement snapshot.",
+              "en": "Not before applying data. Fetch retained changes or coherent replacement snapshots rather than confuse notification knowledge with materialized state."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "UID gap trong IMAP có luôn là lost mail không?",
+            "en": "Do IMAP UID gaps always mean lost mail?"
+          },
+          "answer": [
+            {
+              "vi": "Không. UIDs có validity/scope và không phải contiguous history counters; sequence numbers còn đổi theo mailbox membership. Respect UIDVALIDITY và adapter semantics, không map custom revisions một cách mù quáng.",
+              "en": "No. UIDs have scoped validity and may be noncontiguous; sequence numbers have different membership behavior. Implement validity-aware adapters."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hash của shared attachment có đủ để GET hoặc GC không?",
+            "en": "Is a shared attachment hash sufficient for access or reclamation?"
+          },
+          "answer": [
+            {
+              "vi": "Không. GET cần current authorization/grant; GC cần protected references/readers/uploads/retention và fencing. Hash là content identity trong scope đã chọn, không capability hoặc proof không còn owner.",
+              "en": "No. Access needs authorization; reclamation needs protected-reference and fencing checks. Hashes are neither capabilities nor evidence of unreferenced content."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

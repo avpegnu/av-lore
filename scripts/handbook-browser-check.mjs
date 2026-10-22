@@ -60,7 +60,9 @@ for(const locale of ['','en/'])for(const route of routes){
     }else if(await worksheet.locator('input[type=checkbox]').count()){
       await worksheet.locator('input[type=checkbox]').first().click();
     }else{
-      await worksheet.locator('.worksheet-choices button,button[aria-pressed=false]').last().click();
+      const choices=worksheet.locator('.worksheet-choices button,button[aria-pressed=false]');
+      if(await choices.count())await choices.last().click();
+      else await worksheet.locator('button[data-action]:not([disabled])').first().click();
     }
     await page.waitForFunction(({index,previous})=>document.querySelectorAll('main .handbook-experiment')[index]?.innerHTML!==previous,{index:i,previous:before});
   }

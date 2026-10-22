@@ -1,0 +1,1244 @@
+{
+  "id": "collaborative-editor",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Collaborative Editor: contexts, offline và durable sync",
+    "en": "Designing a Collaborative Editor: contexts, offline work and durable sync"
+  },
+  "summary": {
+    "vi": "Thử concurrent edits, stale offsets, deleted anchors và ACK/retry; thiết kế OT/CRDT sync, snapshots, undo, presence và fenced document authority.",
+    "en": "Explore concurrent edits, stale offsets, deleted anchors and retries across OT/CRDT synchronization, snapshots, undo, presence and fenced document authorities."
+  },
+  "prerequisites": [
+    "consistency",
+    "messaging",
+    "file-sync",
+    "object-storage"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "javascript",
+    "distributed",
+    "security",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Convergence, intent và durable acceptance là các yêu cầu riêng.",
+      "en": "Convergence, intent and durable acceptance are distinct requirements."
+    },
+    {
+      "vi": "OT cần compatible contexts và client protocol, không chỉ một transform function.",
+      "en": "OT requires compatible contexts and client protocols beyond one function."
+    },
+    {
+      "vi": "CRDT merge không thay auth/schema/resource/offline retention policies.",
+      "en": "CRDT merging does not replace authorization/schema/resource/retention policies."
+    },
+    {
+      "vi": "Snapshots giữ full merge/recovery state; compaction không phá old anchors âm thầm.",
+      "en": "Snapshots retain full merge/recovery state and compaction respects anchors."
+    },
+    {
+      "vi": "Hot-doc fan-out, presence và safe recovery cần ownership riêng.",
+      "en": "Hot-document fan-out, presence and recovery need explicit ownership."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một edit đi qua những context nào?",
+      "en": "Which contexts does an edit cross?"
+    },
+    "caption": {
+      "vi": "Gắn trạng thái nhìn thấy với acceptance và recovery evidence.",
+      "en": "Connect visible state to acceptance and recovery evidence."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Local intent",
+          "en": "Local intent"
+        },
+        "detail": {
+          "vi": "Optimistic apply, identity và pending queue.",
+          "en": "Optimistic application, identities and pending work."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Shared merge",
+          "en": "Shared merge"
+        },
+        "detail": {
+          "vi": "OT contexts hoặc CRDT dependencies.",
+          "en": "OT contexts or CRDT dependencies."
+        },
+        "icon": "compare"
+      },
+      {
+        "title": {
+          "vi": "Durable accept",
+          "en": "Durable acceptance"
+        },
+        "detail": {
+          "vi": "Auth, commit, dedup và fenced ownership.",
+          "en": "Authorization, commitment, deduplication and fencing."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Recover / retain",
+          "en": "Recover and retain"
+        },
+        "detail": {
+          "vi": "Snapshots, offline history, anchors và selective undo.",
+          "en": "Snapshots, offline history, anchors and selective undo."
+        },
+        "icon": "route"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Convergence, ý định sửa và trạng thái đã lưu",
+        "en": "1. Convergence, editing intent and saved state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn collaborative plain text làm baseline: nhiều người sửa cùng document, local optimistic typing, remote edits, presence, offline reconnect, sharing và version history. Rich text cần schema/formatting ranges; canvas cần object/tree/property merge; spreadsheet cần dependency/formula semantics. Chúng không được giải chỉ bằng đổi một string thành JSON. Bài này dùng central document authority cho vận hành, không nói mọi CRDT đều cần server hoặc mọi editor có cùng architecture.",
+          "en": "The plain-text baseline supports concurrent edits, optimistic typing, remote updates, presence, reconnects, sharing and history. Rich text adds schemas/formatting ranges, canvases add object/tree/property semantics and spreadsheets add dependencies/formulas. Replacing strings with JSON does not solve those models. This operational baseline has a document authority without claiming every CRDT requires one."
+        },
+        {
+          "vi": "Ba mục tiêu khác nhau: replicas cuối cùng converge khi có cùng accepted updates; intent/rule semantics hợp lý; update đã ACK sống qua failure model đã hứa. Converge về cùng text sai vẫn sai, và text đã hiện local chưa chắc saved. Local keystroke latency gồm input/IME/rendering; optimistic apply bỏ network RTT khỏi immediate feedback chứ không làm latency bằng zero. Chốt SLO riêng cho local render, remote visibility, durable ACK và recovery.",
+          "en": "Three goals differ: convergence after exchanging accepted updates, sensible intent/rules and survival of acknowledged changes under the stated failures. Identical wrong text remains wrong, and local display does not prove saving. Optimistic application removes network RTT from immediate feedback but not input/IME/rendering costs. Define separate local, remote, durability and recovery objectives."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Local view",
+            "en": "Local view"
+          },
+          "icon": "inspect",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Confirmed state + pending edits, saved indicator rõ.",
+              "en": "Confirmed state plus pending edits and explicit saved status."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Shared correctness",
+            "en": "Shared correctness"
+          },
+          "icon": "compare",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Compatible contexts/identities, convergence và intent tests.",
+              "en": "Compatible contexts/identities, convergence and intent tests."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Service guarantees",
+            "en": "Service guarantees"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Auth, durable ACK, ownership và safe recovery.",
+              "en": "Authorization, durable acknowledgements, ownership and recovery."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Đếm batches, operations và fan-out riêng",
+        "en": "2. Count batches, operations and fan-out separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 10 triệu connected clients ở peak, 20% đang gõ, batch mỗi 250 ms và 250 B mỗi batch. Peak là 8 triệu batches/s, 2 GB/s payload ingress. Một batch có thể nhiều atomic edits nên đừng gọi cả hai cùng là một op. Với một daily scenario riêng 100 triệu users ×1.000 batches/user ×250 B, raw payload là 25 TB/ngày trước framing/index/replicas. Peak duy trì một giờ tạo 7,2 TB; không nhân peak cả ngày rồi lẫn với daily assumption.",
+          "en": "Assume 10 million peak connections, 20% typing, 250 ms batches and 250-byte batches. Peak traffic is 8 million batches/s and 2 GB/s of payload. Batches can contain multiple atomic edits, so distinguish the units. A separate daily scenario of 100 million users ×1,000 batches ×250 bytes yields 25 TB before framing/indexes/replicas. An hour at peak yields 7.2 TB; do not confuse peak extrapolation with the daily assumptions."
+        },
+        {
+          "vi": "Nếu một gateway được benchmark chịu 100.000 sockets trong chosen workload thì 10M/100K =100 nodes chỉ là lower sizing chưa reserve. TLS/socket memory, reconnect storms, message rate, regional failover và hot document distribution có thể đòi nhiều hơn. Average document ít editors không bảo vệ hot doc. Chốt per-doc limits, payload/operation bounds, library metadata growth và retention; CPU transform/merge cũng phải benchmark theo document/queue size tail.",
+          "en": "If workload-specific benchmarks support 100,000 sockets per gateway, 100 nodes is only a pre-reserve sizing floor. TLS/socket memory, reconnect storms, message rates, regional failover and hot documents can require more. Low average editor counts do not protect hot documents. Bound document sizes, operations, metadata and retention; benchmark transform/merge work against size and queue tails."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sizing assumption",
+            "en": "Sizing assumption"
+          },
+          {
+            "vi": "Phép tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Kết quả",
+            "en": "Result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Peak typists",
+              "en": "Peak typists"
+            },
+            {
+              "vi": "10M ×20%",
+              "en": "10M ×20%"
+            },
+            {
+              "vi": "2M",
+              "en": "2M"
+            }
+          ],
+          [
+            {
+              "vi": "Peak batch rate",
+              "en": "Peak batch rate"
+            },
+            {
+              "vi": "2M ×4/s",
+              "en": "2M ×4/s"
+            },
+            {
+              "vi": "8M/s",
+              "en": "8M/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak payload",
+              "en": "Peak payload"
+            },
+            {
+              "vi": "8M/s ×250B",
+              "en": "8M/s ×250B"
+            },
+            {
+              "vi": "2 GB/s",
+              "en": "2 GB/s"
+            }
+          ],
+          [
+            {
+              "vi": "Daily payload giả định",
+              "en": "Assumed daily payload"
+            },
+            {
+              "vi": "100M ×1.000 ×250B",
+              "en": "100M ×1,000 ×250B"
+            },
+            {
+              "vi": "25 TB/day",
+              "en": "25 TB/day"
+            }
+          ],
+          [
+            {
+              "vi": "Hot doc: 5 typists, 5.000 sessions",
+              "en": "Hot doc: 5 typists, 5,000 sessions"
+            },
+            {
+              "vi": "5 ×4/s ×4.999 recipients",
+              "en": "5 ×4/s ×4,999 recipients"
+            },
+            {
+              "vi": "99.980 deliveries/s",
+              "en": "99,980 deliveries/s"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "3. API context phụ thuộc backend OT hoặc CRDT",
+        "en": "3. API contexts depend on OT or CRDT backends"
+      },
+      "paragraphs": [
+        {
+          "vi": "Load phải trả coherent snapshot + cut và tail/subscription handoff không gap. OT submit chứa confirmed base revision, client instance/sequence hoặc stable update ID và compatible change set. CRDT submit chứa library-specific binary updates và protocol/document generation; state vector không đơn giản là global revision. Có thể gắn server commit cursor cho audit/catch-up nhưng nó không thay CRDT causal metadata. Không decode CRDT binary rồi giả thành arbitrary positional JSON ops.",
+          "en": "Loads need coherent snapshots/cuts and gap-free tail/subscription handoffs. OT submissions carry confirmed revisions, stable client/update identities and compatible change sets. CRDT submissions use library-specific updates and protocol/document generations; state vectors are not global revision numbers. Server cursors may serve audit/recovery without replacing causal metadata. Do not pretend arbitrary positional JSON is interchangeable with CRDT updates."
+        },
+        {
+          "vi": "Cùng update ID và cùng payload trả retained result; ID reuse với payload khác là conflict. Scope theo doc/generation/client instance và retention rõ, không dùng một user ID làm clock namespace cho mọi thiết bị. Log durable ACK khác transport receipt; lost reply cần resend cùng identity. Khi history context không còn hoặc schema khác, trả RESYNC_REQUIRED/INCOMPATIBLE kèm safe recovery path, không clamp positions và chèn vào text hiện tại cho “đỡ lỗi”.",
+          "en": "The same ID/payload returns retained results, while changed payloads conflict. Scope identities by document/generation/client instance with explicit retention; a user ID is not a universal device clock namespace. Durable acknowledgement differs from transport receipt, and lost replies retry original identities. Expired contexts or incompatible schemas require explicit resync paths rather than clamping offsets into current text."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/v1/docs/{id}/state",
+          "description": {
+            "vi": "Authorized load tại consistent cut.",
+            "en": "Authorized loading at consistent cuts."
+          },
+          "response": "{generation, mode, schemaVersion, snapshotCut, fullState, tail[], nextCursor}"
+        },
+        {
+          "method": "WS",
+          "path": "/v1/docs/{id}/session",
+          "description": {
+            "vi": "Content lane có IDs/context; presence lane có quota riêng.",
+            "en": "Identified/contextual content and independently bounded presence lanes."
+          },
+          "request": "{type:\"update\", updateId, generation, mode, context, encodedChanges}",
+          "response": "durableAck {updateId, acceptedCut} | remoteUpdate | rejected | resyncRequired"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/docs/{id}/updates?after={cursor}",
+          "description": {
+            "vi": "Catch-up trong retained interval; auth lại mỗi request.",
+            "en": "Catch-up within retained intervals with authorization."
+          },
+          "response": "{updates[], throughCursor, hasMore} | RESYNC_REQUIRED"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/docs/{id}/versions",
+          "description": {
+            "vi": "Pin một committed cut, không chỉ text client đang pending.",
+            "en": "Pin committed cuts rather than pending local text."
+          },
+          "request": "{name, expectedGeneration, committedCut}",
+          "response": "201 {versionId, generation, cut}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/docs/{id}/restore",
+          "description": {
+            "vi": "Authorized restore action có conflict/epoch policy; không reset identity âm thầm.",
+            "en": "Authorized restoration with explicit conflict/epoch policies."
+          },
+          "request": "{versionId, expectedGeneration, idempotencyKey}",
+          "response": "{newCutOrGeneration, reconciliationPolicy}"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Authority, content và presence tách ownership",
+        "en": "4. Separate authority, content and presence ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Document owner giữ live model, validate operations và ghi accepted updates. Directory route doc→owner/epoch; storage và các output boundaries phải reject stale owners. Lease hết hạn không làm process cũ tự biến mất; consistent hashing chỉ là placement/routing hint. Một linearizable acquisition protocol, fenced writes và explicit recovery cut giữ ownership contract. Nếu authority uncertain thì giữ edits local/pending hoặc read-only theo product policy thay vì ACK hai histories.",
+          "en": "Owners hold live models, validate operations and persist accepted updates. Directories route documents/epochs, while storage/output boundaries reject stale owners. Expiring leases do not stop old processes, and consistent hashing is a routing/placement hint. Ownership needs acquisition, fencing and recovery cuts. Uncertain authority keeps edits pending or enters the designed read-only mode rather than acknowledging divergent histories."
+        },
+        {
+          "vi": "OT baseline cần ordered authoritative revisions. CRDT có thể giữ một service owner để auth/durability/fan-out, nhưng valid updates vẫn merge theo library semantics chứ không nhờ total order tạo ra convergence. Tách best-effort presence khỏi durable content queues để cursor floods không đẩy accepted text ra khỏi RAM budget. ACL metadata và snapshot manifests là state riêng cần consistent boundaries, không phải Redis cache nào cũng làm authority được.",
+          "en": "OT uses authoritative ordered revisions. CRDT services can centralize authorization/durability/fan-out while merge correctness still comes from library semantics. Separate ephemeral awareness from durable content so cursor floods cannot displace accepted changes. ACLs and snapshot manifests also need explicit consistency; caches are not automatically authorities."
+        }
+      ],
+      "diagram": {
+        "id": "collaborative-document-authority",
+        "title": {
+          "vi": "Optimistic local view, durable shared history",
+          "en": "Optimistic local views and durable shared history"
+        },
+        "caption": {
+          "vi": "Baseline chọn một fenced authority cho mỗi document. OT dùng ordered revisions; CRDT có thể dùng cùng durable service nhưng merge correctness không dựa vào server total order. Presence đi đường riêng khỏi content log.",
+          "en": "This baseline chooses one fenced authority per document. OT uses ordered revisions; CRDT can use the same durable service without depending on its total order for merging. Presence is separate from the content log."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Editor / local queue",
+              "en": "Editor / local queue"
+            },
+            "detail": {
+              "vi": "Optimistic view, stable update identities, confirmed base và pending local work; saved indicator phản ánh durable ACK.",
+              "en": "Owns optimistic views, stable update identities, confirmed bases and pending work; saved indicators reflect durable acknowledgements."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Session gateway",
+              "en": "Session gateway"
+            },
+            "detail": {
+              "vi": "Authenticate socket, route document/epoch, bound frames/queues và bảo vệ tenant.",
+              "en": "Authenticates sessions, routes documents/epochs and bounds frames/queues per tenant."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "owner",
+            "label": {
+              "vi": "Document authority",
+              "en": "Document authority"
+            },
+            "detail": {
+              "vi": "Validate edit permissions/schema, rebase OT hoặc accept CRDT update, commit under fenced owner epoch.",
+              "en": "Checks edit permissions/schemas, rebases OT or accepts CRDT updates and commits under fenced ownership."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "log",
+            "label": {
+              "vi": "Updates + dedup log",
+              "en": "Updates + dedup log"
+            },
+            "detail": {
+              "vi": "Durable accepted updates, stable IDs/results và exact document cut; old writer epoch bị reject.",
+              "en": "Stores accepted updates, stable IDs/results and exact cuts while rejecting stale writer epochs."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "queue"
+          },
+          {
+            "id": "directory",
+            "label": {
+              "vi": "Owner directory",
+              "en": "Owner directory"
+            },
+            "detail": {
+              "vi": "Strong ownership acquisition/renewal và epoch, routing hints không tự là write authority.",
+              "en": "Acquires/renews ownership and epochs; routing hints alone are not write authority."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "acl",
+            "label": {
+              "vi": "Metadata / ACL",
+              "en": "Metadata / ACL"
+            },
+            "detail": {
+              "vi": "Per-document rights, ACL version và revocation policy tại admission/commit boundary.",
+              "en": "Owns document rights, ACL versions and revocation policies at defined boundaries."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "presence",
+            "label": {
+              "vi": "Ephemeral presence",
+              "en": "Ephemeral presence"
+            },
+            "detail": {
+              "vi": "Throttled cursor/selection updates, session expiry và bounded fan-out; không giả là content durability.",
+              "en": "Throttles cursor/selection updates with session expiry and bounded fan-out, separate from content durability."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "snapshotter",
+            "label": {
+              "vi": "Snapshot / history",
+              "en": "Snapshot / history"
+            },
+            "detail": {
+              "vi": "Build full model state tại exact cut, verify rồi publish manifest; giữ dependencies cho replay/undo/offline.",
+              "en": "Builds complete model state at exact cuts, verifies before publication and retains required dependencies."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "viewer",
+            "label": {
+              "vi": "Read-only viewers",
+              "en": "Read-only viewers"
+            },
+            "detail": {
+              "vi": "Catch-up snapshot + ordered stream; dropped projection cần gap recovery và freshness status.",
+              "en": "Consumes snapshots/ordered projections with gap recovery and freshness status."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "client"
+          },
+          {
+            "id": "relay",
+            "label": {
+              "vi": "Read fan-out tier",
+              "en": "Read fan-out tier"
+            },
+            "detail": {
+              "vi": "Separate viewers khỏi mutation owner; snapshot barrier, batching và backpressure rõ.",
+              "en": "Separates viewers from mutation ownership with snapshot barriers, batching and backpressure."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "worker"
+          },
+          {
+            "id": "objects",
+            "label": {
+              "vi": "Verified snapshots",
+              "en": "Verified snapshots"
+            },
+            "detail": {
+              "vi": "Immutable full-state snapshots, schema/config/epoch/cut và retained named versions.",
+              "en": "Stores immutable full-state snapshots with schema/configuration/epoch/cuts and retained named versions."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "edit",
+            "label": {
+              "vi": "Một edit được lưu",
+              "en": "Save an edit"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "gateway",
+                "description": {
+                  "vi": "Local view đổi ngay; gửi stable ID và context đúng backend.",
+                  "en": "Update local views and submit stable IDs with backend-specific contexts."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "owner",
+                "description": {
+                  "vi": "Route theo document và ownership generation; stale route retry không đổi business identity.",
+                  "en": "Route by document/generation; stale-route retries retain business identities."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "acl",
+                "description": {
+                  "vi": "Kiểm quyền/schema theo revocation contract, không tin role client gửi.",
+                  "en": "Check rights/schemas under revocation contracts rather than client-supplied roles."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "log",
+                "description": {
+                  "vi": "Commit accepted update và dedup result dưới current epoch.",
+                  "en": "Commit accepted updates/results under the current epoch."
+                }
+              },
+              {
+                "from": "log",
+                "to": "owner",
+                "description": {
+                  "vi": "Xác nhận durable cut theo failure model đã chọn.",
+                  "en": "Confirm durable cuts under the stated failure model."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "client",
+                "description": {
+                  "vi": "ACK result và remote update stream; client rebase pending trước apply.",
+                  "en": "Return acknowledgements/remote streams; clients rebase pending work appropriately."
+                }
+              }
+            ]
+          },
+          {
+            "id": "join",
+            "label": {
+              "vi": "Mở và catch up",
+              "en": "Open and catch up"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "gateway",
+                "description": {
+                  "vi": "Join bằng auth và last confirmed context hoặc state vector.",
+                  "en": "Join with authorization and confirmed contexts or state vectors."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "directory",
+                "description": {
+                  "vi": "Lookup/acquire owner bằng epoch protocol.",
+                  "en": "Look up/acquire owners through epoch protocols."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "owner",
+                "description": {
+                  "vi": "Join owner current epoch và establish consistent loading barrier.",
+                  "en": "Join current owners and establish loading barriers."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "objects",
+                "description": {
+                  "vi": "Load full snapshot ở cut S, không chỉ visible text nếu cần merge metadata.",
+                  "en": "Load full snapshots at S, including required merge metadata."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "log",
+                "description": {
+                  "vi": "Fetch contiguous accepted suffix sau S và attach live subscription không gap.",
+                  "en": "Read contiguous suffixes after S and attach gap-free live subscriptions."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "client",
+                "description": {
+                  "vi": "Trả consistent snapshot/tail và resync policy cho context đã hết retention.",
+                  "en": "Return snapshots/tails and resync policies for expired contexts."
+                }
+              }
+            ]
+          },
+          {
+            "id": "snapshot",
+            "label": {
+              "vi": "Snapshot và compaction",
+              "en": "Snapshot and compact"
+            },
+            "steps": [
+              {
+                "from": "log",
+                "to": "snapshotter",
+                "description": {
+                  "vi": "Read exact committed cut, capture compatible schema/merge/dedup state.",
+                  "en": "Read exact cuts with compatible schema/merge/dedup state."
+                },
+                "async": true
+              },
+              {
+                "from": "snapshotter",
+                "to": "objects",
+                "description": {
+                  "vi": "Write immutable candidate, verify integrity và replay equivalence.",
+                  "en": "Write immutable candidates and verify integrity/replay equivalence."
+                }
+              },
+              {
+                "from": "snapshotter",
+                "to": "log",
+                "description": {
+                  "vi": "Publish verified manifest trước trim; giữ history đang được offline/undo/version policy tham chiếu.",
+                  "en": "Publish verified manifests before trimming and retain history needed by offline/undo/version policies."
+                }
+              }
+            ]
+          },
+          {
+            "id": "viewers",
+            "label": {
+              "vi": "Hot document không ép mọi viewer qua owner",
+              "en": "Keep hot-document viewers off the mutation owner"
+            },
+            "steps": [
+              {
+                "from": "owner",
+                "to": "relay",
+                "description": {
+                  "vi": "Emit committed projection cùng document generation và cut.",
+                  "en": "Emit committed projections with generations/cuts."
+                },
+                "async": true
+              },
+              {
+                "from": "relay",
+                "to": "viewer",
+                "description": {
+                  "vi": "Batched updates sau snapshot barrier; slow viewer phải catch up/resync.",
+                  "en": "Deliver batched updates after snapshot barriers; slow viewers catch up/resync."
+                }
+              },
+              {
+                "from": "client",
+                "to": "presence",
+                "description": {
+                  "vi": "Send bounded ephemeral awareness trong auth scope.",
+                  "en": "Send bounded ephemeral awareness within authorization scope."
+                }
+              },
+              {
+                "from": "presence",
+                "to": "viewer",
+                "description": {
+                  "vi": "Chỉ publish counts/avatars hoặc selected cursors theo scale/privacy policy.",
+                  "en": "Publish counts/avatars or selected cursors under scale/privacy policies."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "recover",
+            "label": {
+              "vi": "Owner chết và client retry",
+              "en": "Recover owners and retry"
+            },
+            "steps": [
+              {
+                "from": "directory",
+                "to": "owner",
+                "description": {
+                  "vi": "Cấp epoch mới và fence old authority ở storage/output boundaries.",
+                  "en": "Grant new epochs and fence old authorities at storage/output boundaries."
+                }
+              },
+              {
+                "from": "objects",
+                "to": "owner",
+                "description": {
+                  "vi": "Restore full snapshot và compatible library/rule version.",
+                  "en": "Restore complete snapshots and compatible versions."
+                }
+              },
+              {
+                "from": "log",
+                "to": "owner",
+                "description": {
+                  "vi": "Replay accepted suffix gồm retained update IDs/results.",
+                  "en": "Replay accepted suffixes including retained identities/results."
+                }
+              },
+              {
+                "from": "client",
+                "to": "owner",
+                "description": {
+                  "vi": "Resend unacked IDs; reconcile rejected/expired contexts mà giữ local work.",
+                  "en": "Resend unacknowledged identities and reconcile rejected/expired contexts while preserving local work."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ot",
+      "title": {
+        "vi": "5. OT: đổi context trước khi apply remote edit",
+        "en": "5. OT changes operation context before remote application"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hai clients bắt đầu CODE. A insert X ở index1; B delete ký tự O ở index1. Apply B raw sau A sẽ xóa X thay vì O. Transform B thành delete index2 trong context đã có X; ngược lại A insert index1 trên context B đã delete O. Hai paths ra CXDE. Khi cả hai cùng delete O, operation thứ hai trở thành NOOP; không xóa D chỉ vì index1 giờ chứa D. Same-position inserts cần deterministic tie-break theo protocol.",
+          "en": "From CODE, A inserts X at index 1 while B deletes O at index 1. Applying B unchanged after A deletes X. Transform B to index 2 after the insertion; on the reverse path A remains at index 1. Both produce CXDE. Concurrent deletes of O make the second deletion a no-op instead of deleting the new character at that offset. Same-position inserts need deterministic protocol tie-breaks."
+        },
+        {
+          "vi": "Pair transform chỉ hợp lệ khi operations được diễn giải theo compatible contexts. Convergence của hai ops không chứng minh arbitrary multi-client histories, rich-text attributes hoặc arbitrary reorder correct. Lab dùng một edit/client và kiểm tra cả delivery orders; production cần compatible algorithm + client/server protocol, không copy một hàm cộng/trừ index rồi tự nhận đã xây OT engine.",
+          "en": "Pair transformations require compatible contexts. Two-operation convergence does not prove arbitrary histories, rich-text attributes or delivery schedules correct. The lab limits each client to one edit and checks both orders. Production needs compatible algorithms and client/server protocols rather than a small index-arithmetic function alone."
+        }
+      ],
+      "experiment": "collab-pair"
+    },
+    {
+      "id": "client-protocol",
+      "title": {
+        "vi": "6. Confirmed base, outstanding và buffer phải cùng context",
+        "en": "6. Confirmed bases, outstanding work and buffers must stay compatible"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một client protocol phổ biến giữ confirmed revision, một submitted/outstanding change và buffered local changes. Typing áp dụng local ngay. Khi remote update đến, rebase remote qua outstanding/buffer và rebase pending changes qua remote theo đúng algorithm; khi ACK đến, reconcile stable identity/revision rồi gửi buffer tiếp. Không xóa pending chỉ vì đã send bytes hoặc thấy revision tăng. Batching/composition cũng cần đúng semantics, không concat arbitrary operation arrays khác contexts.",
+          "en": "A common protocol tracks confirmed revisions, submitted/outstanding work and buffered local edits. Typing is optimistic. Remote updates rebase through pending changes while pending changes rebase through remote updates under the selected algorithm. Acknowledgements reconcile identities/revisions before subsequent sends. Sending bytes or observing newer revisions does not justify dropping pending work. Batch composition must also preserve contexts."
+        },
+        {
+          "vi": "Server chỉ transform qua retained relevant history hoặc reject context quá cũ. Client đang lag không nên bị retry mãi do stale-revision rejection nếu protocol hỗ trợ safe server rebase; nhưng nếu không có history thì cũng không thể đoán intent. Sequence gaps cần catch-up; duplicate updates cần dedup. User-facing saved/offline/error indicators phải dựa trên acceptance state, và rejected local work cần cách giữ/export/fork thay vì biến mất.",
+          "en": "Servers transform through retained relevant history or explicitly reject expired contexts. Supported rebasing avoids endless stale-revision retry starvation, but missing history cannot be replaced with guesses. Gaps need catch-up and duplicates need deduplication. Saved/offline/error indicators follow acceptance state, and rejected work needs preservation/export/fork options."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Theo dõi context suốt vòng đời",
+          "en": "Track context throughout the lifecycle"
+        },
+        "caption": {
+          "vi": "Local view có thể mới hơn confirmed shared state.",
+          "en": "Local views can be ahead of confirmed shared state."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Confirmed base",
+              "en": "Confirmed base"
+            },
+            "detail": {
+              "vi": "Exact revision/model generation đã biết.",
+              "en": "Exact known revisions/model generations."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Optimistic queue",
+              "en": "Optimistic queue"
+            },
+            "detail": {
+              "vi": "Outstanding và buffer có identity/context.",
+              "en": "Outstanding/buffered work retains identities/contexts."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Remote rebase",
+              "en": "Remote rebase"
+            },
+            "detail": {
+              "vi": "Transform hai chiều theo protocol, không stale offsets.",
+              "en": "Rebase both directions under the protocol."
+            },
+            "icon": "compare"
+          },
+          {
+            "title": {
+              "vi": "Durable result",
+              "en": "Durable result"
+            },
+            "detail": {
+              "vi": "ACK đúng ID; giữ unaccepted local work.",
+              "en": "Acknowledge identities and preserve unaccepted work."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "crdt",
+      "title": {
+        "vi": "7. CRDT: identity và merge rules không thay thế application rules",
+        "en": "7. CRDT identities and merge rules do not replace application rules"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sequence CRDT thường giữ stable element identities, origin/order metadata và delete information thay vì chỉ offsets. Một update có thể đến trước dependencies; implementation phải giữ/resolve chúng theo algorithm. Valid updates với unique identities và eventual delivery có thể merge dù reorder/duplicate, nhưng lost updates, forged IDs, schema violations hoặc destructive compaction không tự thừa hưởng guarantee đó. Không phải mọi CRDT đều là mỗi ký tự một tombstone node; nhiều implementation dùng runs/blocks và encoding khác.",
+          "en": "Sequence CRDTs commonly retain stable identities, ordering/origin metadata and deletion information instead of only offsets. Updates may precede dependencies, which implementations must retain/resolve. Valid uniquely identified updates can tolerate reordering/duplicates after eventual delivery, but lost updates, forged IDs, schema violations and destructive compaction are outside that guarantee. Representations vary and may use compressed runs/blocks rather than literal per-character nodes."
+        },
+        {
+          "vi": "Library giải một phần algorithm, không giải xong permission, schema evolution, content limits, intent hoặc product undo. OT cũng không tự bảo đảm intent chỉ vì có server. Concurrent text runs có thể interleave khó đọc tùy algorithm/constraints; test với real editing patterns. Document update algebra và practical rich-text semantics là hai tầng khác nhau. Không dùng actor IDs ổn định theo user rồi reset counters gây identity collision.",
+          "en": "Libraries solve algorithmic pieces without automatically solving permissions, schemas, limits, intent or undo. Server-backed OT also needs intent testing. Concurrent runs can interleave poorly depending on algorithms/constraints; test realistic edits. Update algebra and practical rich-text semantics are separate layers. Reusing actor identities with reset counters can create collisions."
+        }
+      ]
+    },
+    {
+      "id": "anchors-gc",
+      "title": {
+        "vi": "8. Xóa visible text và bỏ causal structure là hai việc khác nhau",
+        "en": "8. Deleting visible content differs from discarding structure"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một offline insert có thể tham chiếu element đã bị người khác delete. Giữ delete marker/structural identity giúp đặt nó vào đúng neighborhood; chỉ lưu visible string có thể mất anchors, relative positions và causal metadata. Safe compaction có thể dùng structural compression/redirects hoặc protocol biết causal stability; một server không được tự suy “không thấy online nên không còn update cũ”. Offline replicas có thể trở lại sau nhiều ngày.",
+          "en": "Offline inserts can reference concurrently deleted elements. Retained structural identities/deletion information preserve their neighborhood, while visible strings alone can lose anchors/causal state. Safe compaction can retain compressed structure/redirects or establish causal stability; absence from online sessions does not prove old updates cannot return."
+        },
+        {
+          "vi": "Nếu product giới hạn offline window, history epoch transition phải explicit: old generation không còn merge trực tiếp, client resync và reconcile local work theo documented policy. Không ép arbitrary positional ops vào new snapshot. Xóa deleted payload bytes để giảm memory, giữ ordering identity để merge và retention của version/audit là các contracts khác nhau. Không đánh đồng mọi CRDT GC với lab drop-anchor cố ý sai; dùng semantics library thực đã chọn.",
+          "en": "Offline windows require explicit epoch transitions: old updates cannot merge blindly into new generations, and clients need resync/reconciliation policies. Never force stale offsets into new snapshots. Reclaiming payloads, retaining merge identities and keeping historical versions are distinct contracts. The deliberately broken drop-anchor lab is not a description of every CRDT garbage collector."
+        }
+      ],
+      "experiment": "collab-anchors"
+    },
+    {
+      "id": "choice",
+      "title": {
+        "vi": "9. Chọn OT hay CRDT theo workload và ownership",
+        "en": "9. Choose OT or CRDT for the workload and ownership model"
+      },
+      "paragraphs": [
+        {
+          "vi": "Central rich-text product có authority/auth/history sẵn có có thể chọn mature OT stack; offline-first hoặc multi-peer có thể chọn mature CRDT stack. Cả hai vẫn cần network sync, storage và acceptance policies. Server centralization không “miễn phí”: editor khác region chịu remote commit RTT; CRDT không “miễn phí conflict”: metadata, merge validation và semantic anomalies vẫn có cost. Thử library với schema, editor binding và offline workload thực thay vì chọn chỉ vì thuật toán mới hơn.",
+          "en": "Central rich-text products can use mature OT stacks, while offline-first/multi-peer products may favor mature CRDT stacks. Both require synchronization, persistence and acceptance policies. Centralization adds cross-region acknowledgement costs; CRDTs still incur metadata, validation and semantic risks. Evaluate libraries with actual schemas, bindings and offline workloads rather than novelty."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Khía cạnh",
+            "en": "Aspect"
+          },
+          {
+            "vi": "Server-ordered OT baseline",
+            "en": "Server-ordered OT baseline"
+          },
+          {
+            "vi": "CRDT-based option",
+            "en": "CRDT-based option"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Context",
+              "en": "Context"
+            },
+            {
+              "vi": "Positions/change sets + retained revisions.",
+              "en": "Positions/change sets and retained revisions."
+            },
+            {
+              "vi": "Identities/dependencies + library sync state.",
+              "en": "Identities/dependencies and library synchronization state."
+            }
+          ],
+          [
+            {
+              "vi": "Offline",
+              "en": "Offline"
+            },
+            {
+              "vi": "Rebase pending qua đủ history hoặc explicit resync.",
+              "en": "Rebase through retained history or explicitly resync."
+            },
+            {
+              "vi": "Merge valid updates, chịu retention/epoch policy.",
+              "en": "Merge valid updates under retention/epoch policies."
+            }
+          ],
+          [
+            {
+              "vi": "Metadata",
+              "en": "Metadata"
+            },
+            {
+              "vi": "History, buffers và dedup vẫn có cost.",
+              "en": "History, buffers and dedup still cost space."
+            },
+            {
+              "vi": "Encoding/GC dependent; không chỉ plain text.",
+              "en": "Encoding/GC-dependent state beyond visible text."
+            }
+          ],
+          [
+            {
+              "vi": "Authority",
+              "en": "Authority"
+            },
+            {
+              "vi": "Central order là một phần chosen protocol.",
+              "en": "Central ordering is part of this protocol."
+            },
+            {
+              "vi": "Có thể dùng server hoặc peer topology; auth/durability vẫn thiết kế.",
+              "en": "Server/peer topology still needs authorization and durability."
+            }
+          ],
+          [
+            {
+              "vi": "Intent/undo",
+              "en": "Intent/undo"
+            },
+            {
+              "vi": "Compatible transforms + selective undo rules.",
+              "en": "Compatible transformations and selective undo rules."
+            },
+            {
+              "vi": "Library + schema/undo/anchor policies.",
+              "en": "Library, schema, undo and anchor policies."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "durability",
+      "title": {
+        "vi": "10. Durable ACK, retry và owner fencing",
+        "en": "10. Durable acknowledgements, retries and owner fencing"
+      },
+      "paragraphs": [
+        {
+          "vi": "ACK accepted update sau recoverable commit theo failure contract, và giữ identity/result đủ để retry không tạo effect mới. Local disk fsync chịu một số failures khác với replicated committed log; RAM snapshot chưa publish không là durable evidence. Một reply bị mất sau commit là unknown chứ không rejected. Storage append cần conditional document revision/generation và fencing epoch để old owner không viết sau transfer; output stream cũng cần chống stale authority.",
+          "en": "Acknowledgements follow recoverable commitment under a stated failure model, retaining identities/results to avoid duplicate effects. Local fsync and replicated logs cover different failures; unpublished RAM snapshots are not durability evidence. Lost replies after commits are ambiguous. Conditional revisions/generations and fenced appends prevent stale owners from writing after transfers; publication boundaries also need authority checks."
+        },
+        {
+          "vi": "Lab tách ba knobs: persist-before-ACK, lost reply và fencing. Nếu ACK trước persistence rồi crash, client có thể đã xóa pending dù server mất update. Nếu commit trước mà reply mất, retry original ID trả result revision cũ. Nếu snapshot chỉ giữ text mà bỏ accepted-ID state, failover retry có thể apply thêm dấu !. Durability của content, idempotency và ownership là ba invariants cần kiểm chứng riêng.",
+          "en": "The lab separates persistence-before-acknowledgement, lost replies and fencing. Early acknowledgements can leave clients with no pending work after server loss. Lost replies after commits recover retained results under original identities. Text-only snapshots that omit identity state can duplicate retried edits. Durability, idempotency and ownership are separate invariants."
+        }
+      ],
+      "experiment": "collab-durable"
+    },
+    {
+      "id": "snapshots-history",
+      "title": {
+        "vi": "11. Snapshot ở exact cut rồi mới trim history",
+        "en": "11. Publish exact-cut snapshots before trimming history"
+      },
+      "paragraphs": [
+        {
+          "vi": "Snapshot chứa full backend state, schema/library version, document generation, exact committed cut và integrity; metadata/dedup state cần recover tương ứng theo acceptance retention. Worker đọc coherent cut S, fold tail tới S, ghi immutable candidate, verify rồi publish manifest bằng conditional update. Không publish pointer trước bytes tồn tại. New owner load snapshot S rồi suffix >S contiguous; live subscription phải có barrier để edits phát sinh trong lúc load không bị bỏ qua.",
+          "en": "Snapshots include complete backend state, versions, generations, exact cuts and integrity, with compatible recovery of metadata/deduplication. Workers fold coherent cuts into immutable candidates, verify before conditional manifest publication and never expose missing bytes. New owners load S and contiguous later updates, using live-subscription barriers to avoid load-time gaps."
+        },
+        {
+          "vi": "Trim log theo retention, snapshots verified, named versions, offline/rebase window và undo requirements; không chỉ vì text snapshot đã upload. Store named version là pin committed state/cut, không snapshot optimistic local draft chưa accepted. Restore version cũ là authorized new history action: có thể transaction theo chosen model hoặc coordinated generation transition. Không reset revision về N rồi reuse operation IDs; phải reconcile edits đang in-flight/offline, giữ local work khi cần fork.",
+          "en": "Trim under verified snapshots, retained versions, offline/rebase windows and undo requirements rather than upload completion alone. Named versions pin committed state rather than optimistic drafts. Restoration is an authorized new history action, using model-compatible transactions or coordinated generations. Never reset revisions/reuse identities; reconcile in-flight/offline work and preserve local forks when needed."
+        }
+      ]
+    },
+    {
+      "id": "presence-undo",
+      "title": {
+        "vi": "12. Presence, anchors và undo có lifecycle riêng",
+        "en": "12. Presence, anchors and undo have distinct lifecycles"
+      },
+      "paragraphs": [
+        {
+          "vi": "Presence là ephemeral session state: avatars/cursors/selections có TTL/heartbeat, throttle và audience scope; disconnect detection có delay, không globally instant. Không ghi mỗi cursor move vào durable content log theo baseline, nhưng security/access audit có thể là hệ thống riêng. Cursor index tuyệt đối dễ trôi khi remote edits tới; dùng transformed positions hoặc library relative anchors có side affinity. Anchor có thể không resolve khi target/type mất; comments cần orphan/reattach policy thay vì lặng lẽ trỏ nhầm text.",
+          "en": "Presence is ephemeral session state with heartbeats/expiry, throttling and audience scopes; disconnections are detected with delays. This baseline excludes cursor moves from durable content logs while allowing separate security audits. Absolute offsets drift; use transformed positions or relative anchors with explicit side affinity. Missing targets can make anchors unresolved, requiring orphan/reattachment policies for comments."
+        },
+        {
+          "vi": "Undo của tôi không nên rewind toàn document và xóa edits của bạn. Track local origins/transactions, grouping và inverse/selective undo theo library semantics; transform hoặc merge undo trước current remote state. Undo delete có thể restore content với identity/position policy riêng, không đơn giản unmark mọi tombstone. IME composition, paste nhiều ký tự và user action grouping cần editor binding đúng; unit operation boundaries không luôn là user-perceived undo boundaries.",
+          "en": "My undo must not rewind the whole document over your edits. Track local origins/transactions, grouping and compatible selective/inverse operations against current state. Undoing deletion has explicit identity/position semantics rather than globally clearing tombstones. IME, paste and user-action grouping require correct bindings because atomic operations and user undo steps are not identical."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Presence",
+            "en": "Presence"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Throttled, ephemeral, scoped và expiry-aware.",
+              "en": "Throttled, ephemeral, scoped and expiry-aware."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Comments/cursors",
+            "en": "Comments/cursors"
+          },
+          "icon": "target",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Relative anchors, affinity và unresolved-target policy.",
+              "en": "Relative anchors, affinity and unresolved-target policies."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Selective undo",
+            "en": "Selective undo"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Theo local origin và user transaction grouping.",
+              "en": "Scoped to local origins and user transaction grouping."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "schema-auth",
+      "title": {
+        "vi": "13. Rich text và permission changes ảnh hưởng acceptance",
+        "en": "13. Rich text and permission changes affect acceptance"
+      },
+      "paragraphs": [
+        {
+          "vi": "Rich text cần invariants như list nesting, marks/ranges, embedded object references và schema migration. Valid binary merge không chứng minh document semantically valid hoặc renderer an toàn. Sanitize rendered content, validate bounds/capabilities và use compatible schema/library versions. Một malformed update có thể tốn CPU/memory trước khi decode xong; giới hạn frame/decompressed bytes, operation counts, depth và per-tenant work, không chỉ text length sau merge.",
+          "en": "Rich text adds nesting, marks/ranges, embedded references and schema migrations. Valid binary merging does not establish semantic validity or safe rendering. Sanitize output, validate capabilities/bounds and use compatible versions. Malformed updates can consume resources before decoding finishes, so bound frames, decompressed bytes, operation counts, depths and tenant work rather than final text length alone."
+        },
+        {
+          "vi": "Check ACL ở join chưa đủ: revoked session có thể còn socket và cached role. Chốt revocation boundary—ví dụ serialized ACL version check tại admission/commit—và propagate/fence caches theo contract. Offline edit có thể valid về merge nhưng không còn được authorize khi reconnect; reject với preservation/export/fork policy. Đóng socket không thu hồi bytes đã đọc. E2EE giảm server khả năng validate plaintext/schema; metadata authorization, key distribution, revocation limits và abuse handling vẫn cần product design.",
+          "en": "Joining ACL checks do not cover later revocations on open sockets. Define boundaries such as serialized ACL-version checks at admission/commit with compatible cache fencing. Offline changes can merge correctly yet fail current authorization; reject while preserving work under export/fork policies. Closing sockets cannot recall received bytes. E2EE limits plaintext/schema validation without eliminating metadata access control, key distribution or revocation limits."
+        }
+      ]
+    },
+    {
+      "id": "hot-documents",
+      "title": {
+        "vi": "14. Hot document thường nghẽn fan-out trước write rate",
+        "en": "14. Hot documents often exhaust fan-out before mutation rates"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với 5 editors ×4 batches/s và 5.000 sessions, owner nhận 20 batches/s nhưng naive broadcast tới4.999 recipients tạo99.980 deliveries/s; payload250B là khoảng25MB/s trước framing. Nếu cả5.000 sessions phát cursor2Hz tới mọi người thì gần50M deliveries/s, không còn là “presence nhỏ”. Nếu chỉ editors phát thì là49.990 deliveries/s; có thể giảm audience/viewport và chỉ gửi counts/avatars cho viewers. Đây là conditional arithmetic, không benchmark.",
+          "en": "Five editors at four batches/s create only 20 incoming batches/s, but 5,000 sessions produce 99,980 naive deliveries/s or roughly 25 MB/s at 250 bytes before framing. All 5,000 sessions sending 2 Hz cursors produce nearly 50 million deliveries/s. Restricting publishers to five editors yields 49,990 deliveries/s, with further audience/viewport limits or viewer counts/avatars. These are calculations, not benchmarks."
+        },
+        {
+          "vi": "Tách mutation owner và read-only relays, batch projections và bound per-subscriber queues. Không drop content delta rồi vẫn gọi client current: stale/gap cần catch-up hoặc new snapshot; presence intermediate updates có thể coalesce/drop theo contract. Admission cap editors, large-doc loading budgets và read-only fallback giảm blast radius. Không shard một paragraph tùy tiện nếu formatting/selection/undo cross-boundary vẫn cần atomic semantics.",
+          "en": "Separate mutation owners from read relays, batch projections and bound subscriber queues. Dropped content deltas require catch-up/snapshots rather than pretending clients remain current; ephemeral updates can be coalesced under their policies. Editor caps, large-document budgets and read-only fallback limit blast radii. Paragraph sharding still needs cross-boundary formatting/selection/undo semantics."
+        }
+      ]
+    },
+    {
+      "id": "regions-operations",
+      "title": {
+        "vi": "15. Regions, observability và convergence evidence",
+        "en": "15. Regions, observability and convergence evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Pin owner theo active editors có thể giảm phần lớn RTT, nhưng remote editors vẫn chịu inter-region ACK/visibility latency dù gõ local nhanh. Migrate owner bằng fence và exact state/cut transfer; routing cũ retry giữ identity. Async regional copies có RPO/lag theo contract, không tuyên bố zero-loss trong region destruction nếu acceptance không bảo vệ failure đó. CRDT multi-writer topology giảm một số coordination cho merge nhưng authorization, durability, history epochs và schema decisions vẫn cần consistent policy.",
+          "en": "Placing owners near active editors reduces some RTTs, while remote editors still pay acknowledgement/visibility costs. Migrations require fencing and exact state/cut transfer with stable retry identities. Asynchronous regional copies have explicit RPO/lag and cannot promise unprotected failure survival. CRDT multi-writer merging does not remove authorization, durability, schema or epoch policies."
+        },
+        {
+          "vi": "Đo pending age, durable ACK latency, remote visibility, accepted/rejected/duplicate updates, log/snapshot/replay lag, per-doc fan-out queues, presence load và merge CPU/metadata size. Shadow replay full state từ snapshot+tail và convergence tests bắt một số divergence nhưng không chứng minh intent đúng. Fault injection cần crashes trước/sau commit/ACK, duplicate/reordered updates, expired offline contexts, stale owners, permission revoke, Unicode/IME và malformed payloads. Per-doc read-only kill switch cần giữ local drafts để user không mất work.",
+          "en": "Measure pending age, acknowledgements, visibility, acceptance/rejection/retries, replay lag, fan-out queues, presence and merge/metadata costs. Shadow replay and convergence tests expose some divergence without proving intent. Inject commit/ACK crashes, reordered/duplicate updates, expired contexts, stale owners, revocations, Unicode/IME and malformed payloads. Read-only kill switches must preserve local drafts."
+        }
+      ]
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Luyện giải thích context và failure boundaries",
+        "en": "16. Practice contexts and failure boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ một edit optimistic, reply bị mất, snapshot đã trim history và một offline client quay lại sau revocation. Mỗi bước phải nêu local text, accepted shared state, pending identity, quyền hiện tại và recovery policy; không chỉ vẽ hai mũi tên WebSocket.",
+          "en": "Draw optimistic editing, a lost reply, trimmed history and an offline client returning after revocation. Identify local text, accepted shared state, pending identities, current rights and recovery policies at each step."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Hai replicas giống text đã đủ đúng chưa?",
+            "en": "Does identical replica text establish correctness?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Hai deletes cùng target có thể cùng xóa nhầm ký tự kế tiếp nếu dùng stale offsets; lab naive converge về CE thay vì CDE. Kiểm convergence, targeted intent/rules, durability và authorization riêng.",
+              "en": "No. Stale concurrent deletes can converge while removing the next character too. The naive lab produces CE instead of CDE. Test convergence, targeted rules/intent, durability and authorization separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Chỉ transform incoming op ở server có đủ OT không?",
+            "en": "Is server-only transformation sufficient for OT?"
+          },
+          "answer": [
+            {
+              "vi": "Không với optimistic clients còn pending work. Context của remote và outstanding/buffer phải rebase theo compatible protocol; ACK/retry/history cũng cần identity và ordering. Pair transform không tự là toàn editor protocol.",
+              "en": "Not when optimistic clients have pending work. Remote and pending contexts need compatible rebasing with acknowledgement/retry/history handling. Pairwise transformations alone are not a complete protocol."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "CRDT có bỏ được auth service không?",
+            "en": "Does a CRDT remove authorization services?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Merge validity khác permission. Revoked/offline clients vẫn phải qua acceptance policy, và schema/resource validation có threat model riêng. Peer/E2EE deployment thay đổi nơi enforce chứ không tự giải quyền.",
+              "en": "No. Merge validity differs from permission. Revoked/offline clients still face acceptance policies and resource/schema validation. Peer/E2EE topologies change enforcement rather than solve authorization automatically."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao visible-text snapshot chưa đủ merge offline?",
+            "en": "Why can visible-text snapshots fail offline merges?"
+          },
+          "answer": [
+            {
+              "vi": "Nó có thể bỏ stable element IDs, origins/tombstones hoặc causal state; offline updates còn trỏ history cũ. Giữ full backend state hoặc explicit epoch/resync policy bảo toàn local work, không đoán offset mới.",
+              "en": "It may omit identities, origins/deletions and causal state referenced by offline updates. Retain complete backend state or use explicit epoch/resync policies preserving work rather than guessing offsets."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "ACK mất sau commit thì retry thế nào?",
+            "en": "How should clients retry after lost commit acknowledgements?"
+          },
+          "answer": [
+            {
+              "vi": "Giữ original stable ID/payload và pending state, reconnect/catch-up rồi recover retained result. Accepted-ID/dedup state phải phục hồi cùng durable history; fresh ID có thể tạo duplicate effect.",
+              "en": "Retain original identities/payloads and pending state, then recover results through reconnect/catch-up. Durable recovery must include accepted identities; fresh IDs can create duplicate effects."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Undo có phải load snapshot cũ không?",
+            "en": "Is undo just loading an older snapshot?"
+          },
+          "answer": [
+            {
+              "vi": "Không cho selective local undo trong shared doc. Track origin/user transaction và inverse/undo theo library, giữ remote work. Restore named version là action riêng có history/epoch/reconciliation contract.",
+              "en": "Not for selective local undo. Track origins/user transactions and compatible undo while preserving remote work. Named-version restoration is a distinct history/epoch/reconciliation action."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "5.000 viewers có cần shard book text không?",
+            "en": "Do 5,000 viewers require sharding text mutation?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa chắc: số editors có thể nhỏ, bottleneck là fan-out/presence. Tách viewer relays, batch và bounded catch-up, giảm cursor audience; benchmark merge owner trước khi phân mảnh document semantics.",
+              "en": "Not necessarily: few editors may leave fan-out/presence dominant. Use relays, batching, bounded catch-up and smaller cursor audiences before fragmenting document semantics."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Lease timeout có bảo đảm old owner ngừng ghi không?",
+            "en": "Does a lease timeout guarantee old owners stop writing?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Old process có thể partition rồi tiếp tục chạy. Storage/output boundary enforce current epoch, new owner restore exact committed cut; uncertain authority không được ACK conflicting histories.",
+              "en": "No. Partitioned processes may continue. Enforce epochs at storage/output boundaries and restore exact committed cuts; uncertain authority must not acknowledge conflicting histories."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

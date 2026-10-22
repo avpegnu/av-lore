@@ -1,0 +1,1310 @@
+{
+  "id": "llm-serving",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế LLM Inference Platform: scheduling, streams và usage",
+    "en": "Designing an LLM Inference Platform: scheduling, streams and usage"
+  },
+  "summary": {
+    "vi": "Nối GPU memory, iteration scheduling, prefix routing và token escrow với TTFT/ITL, cancellation, metering và unit economics ở SLO đã nêu.",
+    "en": "Connect memory, iteration scheduling, prefix routing and token escrow to latency, cancellation, metering and SLO-constrained economics."
+  },
+  "prerequisites": [
+    "ai-inference",
+    "messaging",
+    "rate-limiting",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "backend",
+    "api",
+    "kubernetes",
+    "observability",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Goodput tại latency/quality target khác raw token throughput.",
+      "en": "SLO/quality-constrained goodput differs from raw throughput."
+    },
+    {
+      "vi": "Paged KV/prefix reuse vẫn cần per-rank memory, compatible identities và hard allocator.",
+      "en": "Paged/prefix KV still needs per-rank capacity, compatible identities and hard allocation."
+    },
+    {
+      "vi": "Continuous batching tiết kiệm idle slots nhưng batch/context thay execution cost.",
+      "en": "Continuous batching reduces idle slots while contexts/batches change execution cost."
+    },
+    {
+      "vi": "Streaming/cancel/retry giữ explicit attempt ownership và partial-output semantics.",
+      "en": "Streaming/cancellation/retries need explicit ownership and partial-output semantics."
+    },
+    {
+      "vi": "Queue rejects rollback reservations; final usage settle có durable dedup/reconciliation.",
+      "en": "Queue rejections roll back reservations; final usage needs durable settlement/reconciliation."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một generation có nhiều resource contracts",
+      "en": "A generation has several resource contracts"
+    },
+    "caption": {
+      "vi": "Giữ latency, memory và accounting cùng đúng.",
+      "en": "Preserve latency, memory and accounting together."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Admit",
+          "en": "Admit"
+        },
+        "detail": {
+          "vi": "Validate/count, reserve quota và bound queues.",
+          "en": "Validate/count, reserve quota and bound queues."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Place / execute",
+          "en": "Place and execute"
+        },
+        "detail": {
+          "vi": "Warm compatibility, hard KV allocation, prefill/decode.",
+          "en": "Warm compatibility, hard allocation and execution."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Stream và cancellation",
+          "en": "Stream and cancel"
+        },
+        "detail": {
+          "vi": "Bound buffers, explicit attempts và terminal outcomes.",
+          "en": "Bound buffers with explicit attempts/outcomes."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Meter / reconcile",
+          "en": "Meter and reconcile"
+        },
+        "detail": {
+          "vi": "Authoritative usage, identity và safe release.",
+          "en": "Authoritative usage, identities and safe release."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Inference platform là lifecycle, không chỉ GPU endpoint",
+        "en": "1. Inference platforms own lifecycles beyond GPU endpoints"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài này thiết kế hosted generation API với streaming, nhiều model/adapter revisions, interactive/batch tiers, quotas và usage metering. Training, RAG/tool orchestration và model quality research là scope riêng; request vẫn cần security/safety hooks theo product. AI Inference Fundamentals giải thích computation/memory cơ bản; case này nối gateway, scheduler, KV ownership, streams và final accounting thành một service có failure contract.",
+          "en": "This generation service supports streams, model/adapter revisions, interactive/batch tiers, quotas and metering. Training, retrieval/tool orchestration and model research are separate scopes, with product-specific safety/security hooks. Inference fundamentals explain computation/memory; this case connects gateways, scheduling, KV ownership, streams and final accounting under explicit failure contracts."
+        },
+        {
+          "vi": "Tối ưu cost per useful output ở latency/quality target, không tối đa raw tokens/s bất chấp user bị timeout. Chốt model shapes, context distribution, input/output tails, concurrency, regions, availability và maximum queue delay. Một request có 10 tokens và request có 100K tokens không cùng cost; limit chỉ bằng requests/s bỏ qua token work, KV residency và output fan-out.",
+          "en": "Optimize useful output cost under latency/quality targets rather than raw throughput with timeouts. Define shapes, context distributions, input/output tails, concurrency, regions, availability and queue bounds. Tiny and very long requests differ in work/KV residency, so requests-per-second alone cannot represent cost."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "User latency",
+            "en": "User latency"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "TTFT, inter-token gaps và terminal failures theo tier.",
+              "en": "TTFT, inter-token gaps and terminal failures by tier."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "GPU resources",
+            "en": "GPU resources"
+          },
+          "icon": "scope",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Compute, bandwidth, per-rank HBM và topology.",
+              "en": "Compute, bandwidth, per-rank memory and topology."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Request lifecycle",
+            "en": "Request lifecycle"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Admission, attempt ownership, cancel và final usage.",
+              "en": "Admission, attempt ownership, cancellation and final usage."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Tách input capacity, decode capacity và occupancy",
+        "en": "2. Separate input capacity, decode capacity and occupancy"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định 50M requests/day, average 1.000 input +300 output tokens, peak 3× average. Rate trung bình≈579 requests/s, output≈173,6K tokens/s và input≈578,7K tokens/s; peak≈1.736 requests/s,521K output và 1,736M input tokens/s. Những con số là scenario sizing, không traffic đo được. Prefill và decode có resource curves khác nhau; cached input giảm một phần prefill compute nhưng không tự giảm logical input counts hay xóa decode cost.",
+          "en": "Assume 50 million daily requests, means of 1,000 input/300 output tokens and a threefold peak. Average demand is about 579 requests/s, 173.6K output tokens/s and 578.7K input tokens/s; peaks are roughly 1,736 requests/s, 521K output tokens/s and 1.736M input tokens/s. These are sizing inputs, not measurements. Prefill/decode need separate resource curves; caching can reduce prefill work without automatically changing logical usage or decode cost."
+        },
+        {
+          "vi": "Nếu một benchmark giả định tại đúng SLO/mix cho 2.500 output tokens/s trên decode replica 8 GPUs, peak decode lower bound là ceil(520.833/2.500)=209 replicas,1.672 GPUs trước headroom. Không dùng số này làm whole-fleet count: thêm prefill capacity, redundancy, warm capacity, skew và actual goodput. Little’s Law dùng stable average arrival×mean in-system duration; nếu 579/s và 12s giả định thì≈6.944 requests trong system, không đồng nghĩa tất cả giữ KV vì queue/admission chưa vào GPU.",
+          "en": "If a hypothetical validated SLO/workload benchmark yields 2,500 output tokens/s per eight-GPU decode replica, peak decode sizing is 209 replicas or 1,672 GPUs before reserves. This excludes prefill, redundancy, warming, skew and goodput losses. Little’s Law relates stable averages: roughly 579/s and an assumed 12-second mean imply about 6,944 requests in-system, not necessarily all KV-resident because admission queues precede GPU residency."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Demand",
+            "en": "Demand"
+          },
+          {
+            "vi": "Calculation",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Result / limit",
+            "en": "Result / limit"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Average requests",
+              "en": "Average requests"
+            },
+            {
+              "vi": "50M /86.400",
+              "en": "50M /86,400"
+            },
+            {
+              "vi": "≈578,7/s",
+              "en": "≈578.7/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak output",
+              "en": "Peak output"
+            },
+            {
+              "vi": "578,7 ×3 ×300",
+              "en": "578.7 ×3 ×300"
+            },
+            {
+              "vi": "≈520.833 tokens/s",
+              "en": "≈520,833 tokens/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak input",
+              "en": "Peak input"
+            },
+            {
+              "vi": "578,7 ×3 ×1.000",
+              "en": "578.7 ×3 ×1,000"
+            },
+            {
+              "vi": "≈1,736M tokens/s",
+              "en": "≈1.736M tokens/s"
+            }
+          ],
+          [
+            {
+              "vi": "Hypothetical decode replicas",
+              "en": "Hypothetical decode replicas"
+            },
+            {
+              "vi": "ceil(520.833 /2.500)",
+              "en": "ceil(520,833 /2,500)"
+            },
+            {
+              "vi": "209; chưa prefill/headroom",
+              "en": "209; excludes prefill/reserves"
+            }
+          ],
+          [
+            {
+              "vi": "FP16-like weight payload",
+              "en": "FP16-like weight payload"
+            },
+            {
+              "vi": "70B parameters ×2B",
+              "en": "70B parameters ×2B"
+            },
+            {
+              "vi": "140 GB; chưa runtime/KV",
+              "en": "140 GB; excludes runtime/KV"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "3. Request, attempt và stream event không cùng identity",
+        "en": "3. Request, attempt and stream events have distinct identities"
+      },
+      "paragraphs": [
+        {
+          "vi": "API dưới đây là teaching contract, không tuyên bố wire compatibility của một provider. Request ID giữ user intent/pinned model parameters; attempt ID giữ execution lease/generation; event sequence phục vụ stream delivery nếu platform thật hỗ trợ resume. Chỉ set idempotency header không tự tái tạo KV, sampling state hoặc missed tokens. SSE là response stream của HTTP request; event/chunk có thể chứa nhiều tokens, metadata hoặc terminal status, không mặc định một event=một token.",
+          "en": "This teaching API does not claim provider wire compatibility. Request identities retain intent/model parameters, attempt identities track execution generations and event sequences support explicitly implemented resume protocols. Headers alone cannot reconstruct KV, sampling state or missed output. HTTP/SSE chunks may contain multiple tokens, metadata or terminal states rather than one token each."
+        },
+        {
+          "vi": "Before headers, quota/validation/admission errors dùng HTTP contract rõ. Sau stream start, HTTP status không thể đổi như một response mới; dùng typed terminal/error event nếu connection còn sống và persist server outcome. Client disconnect không bảo đảm thấy final usage. Resume phải có durable retained events/cursor và compatible execution state theo policy; nếu không hỗ trợ thì báo interrupted partial generation và explicit retry action, không nối âm thầm câu trả lời mới.",
+          "en": "Before headers, validation/admission errors follow HTTP contracts. Once streaming begins, the status cannot become a fresh response; use terminal/error events when possible and persist server outcomes. Disconnects can hide final usage. Resume needs retained events/cursors and compatible execution state; otherwise expose interrupted partial output and explicit retries rather than silently splice new answers."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/generations",
+          "description": {
+            "vi": "Validate input, output cap, model/version và tenant before admission.",
+            "en": "Validate input/output bounds and model/tenant intent before admission."
+          },
+          "request": "{requestId, modelRevision, adapterRevision?, input, maxOutputTokens, sampling, stream:true}",
+          "response": "SSE: admitted? → delta {attemptId,sequence,text}* → terminal {status,usageRef}; errors may interrupt"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/generations/{id}/cancel",
+          "description": {
+            "vi": "Cancel intent; response phân biệt requested và confirmed stopped.",
+            "en": "Cancellation intent distinguishes requests from confirmed stops."
+          },
+          "response": "{requestId, attemptId, status:\"cancel_requested\"|\"terminal\"}"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/generations/{id}/status",
+          "description": {
+            "vi": "Authorized reconciliation, không implicit resume generation.",
+            "en": "Authorized reconciliation rather than implicit generation resumption."
+          },
+          "response": "{requestId,attempts[],terminalStatus?,usageStatus,retainedOutputPolicy}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/batches",
+          "description": {
+            "vi": "Separate offline tier, job identity và completion-window policy.",
+            "en": "A separate offline tier with job identities and window policies."
+          },
+          "request": "{inputRef,modelRevision,deadline,idempotencyKey}",
+          "response": "202 {jobId,statusUrl}"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Một front door quen thuộc, resource ownership khác",
+        "en": "4. Familiar gateways with different resource ownership"
+      },
+      "paragraphs": [
+        {
+          "vi": "Gateway authenticate/validate stream; admission reserve quota và bounded queue; scheduler chọn warm eligible replica rồi allocator enforce hard capacity. Colocated replica thực hiện prefill/decode và quản KV state; prefix cache có compatibility/isolation keys. Registry pin weights/tokenizer/template/adapters. Usage log và settlement độc lập với client stream để retries/disconnect không làm mất accounting. Đừng đặt mọi queue trong unbounded gateway RAM.",
+          "en": "Gateways authenticate/validate streams, admission reserves quota/bounds queues and schedulers select warm replicas before hard allocation. Colocated replicas own prefill/decode/KV, prefix caches enforce compatibility/isolation and registries pin all relevant versions. Durable metering is independent of client streams. Unbounded gateway RAM is not an admission strategy."
+        },
+        {
+          "vi": "Scheduler observations có thể stale; free KV hint không phải allocation guarantee. Worker/allocator phải atomically reserve hoặc preempt/reject trước actual execution; retries giữ request/attempt identity và cleanup ownership. Queue limit cần bound estimated tokens/work/deadlines ngoài request count, vì một long context có thể chiếm nhiều tài nguyên. Per-tier fairness cần tránh batch starvation hoặc interactive bị batch chiếm hết.",
+          "en": "Scheduler hints can be stale, so hard allocation must atomically reserve, preempt or reject before execution. Preserve identities and cleanup ownership across retries. Queue bounds include estimated token work/deadlines because request counts hide long contexts. Tier fairness must also address starvation."
+        }
+      ],
+      "diagram": {
+        "id": "llm-serving-request-lifecycle",
+        "title": {
+          "vi": "Từ admitted request tới final usage",
+          "en": "From admitted requests to final usage"
+        },
+        "caption": {
+          "vi": "Baseline colocated prefill/decode trong một replica; disaggregated path là lựa chọn có transfer contract riêng. Request identity, attempt identity, KV ownership và terminal usage có lifecycle khác nhau.",
+          "en": "The baseline colocates prefill/decode; disaggregation is an option with transfer contracts. Request/attempt identities, KV ownership and terminal usage have distinct lifecycles."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "App / SDK",
+              "en": "App / SDK"
+            },
+            "detail": {
+              "vi": "Request identity, stream event cursor nếu protocol hỗ trợ, partial output và cancellation state.",
+              "en": "Tracks request identities, supported stream cursors, partial output and cancellation."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Gateway / stream",
+              "en": "Gateway / stream"
+            },
+            "detail": {
+              "vi": "Authenticate, validate limits, hold response stream; disconnect chuyển thành cancel/reconciliation.",
+              "en": "Authenticates and bounds requests/streams; disconnects trigger cancellation/reconciliation."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "admission",
+            "label": {
+              "vi": "Quota / admission",
+              "en": "Quota / admission"
+            },
+            "detail": {
+              "vi": "Atomic token reservation và tier queue bounds; rejection phải rollback reservation.",
+              "en": "Atomically reserves token budgets and bounds queues; rejection rolls back reservations."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "queue",
+            "label": {
+              "vi": "Tier / model queues",
+              "en": "Tier / model queues"
+            },
+            "detail": {
+              "vi": "Deadlines, fairness và bounded token work; batch không làm interactive starvation.",
+              "en": "Bounds token work/deadlines with fairness between interactive and batch traffic."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "queue"
+          },
+          {
+            "id": "router",
+            "label": {
+              "vi": "GPU-aware scheduler",
+              "en": "GPU-aware scheduler"
+            },
+            "detail": {
+              "vi": "Warm model/adapter compatibility, queue/estimated work, hard KV admission và bounded prefix affinity.",
+              "en": "Checks warm compatibility, queues/work, hard KV admission and bounded prefix affinity."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "prefill",
+            "label": {
+              "vi": "Prefill execution",
+              "en": "Prefill execution"
+            },
+            "detail": {
+              "vi": "Tokenize/encode và build compatible prompt KV; chunking/transfer là workload-dependent choices.",
+              "en": "Encodes prompts and builds compatible KV; chunking/transfers are workload-dependent choices."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "decode",
+            "label": {
+              "vi": "Decode execution",
+              "en": "Decode execution"
+            },
+            "detail": {
+              "vi": "Iteration-level scheduling, token generation, output counters và cooperative cancellation.",
+              "en": "Schedules iterations, generates tokens, counts output and processes cancellation."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "prefix",
+            "label": {
+              "vi": "Paged KV / prefix",
+              "en": "Paged KV / prefix"
+            },
+            "detail": {
+              "vi": "Per-rank blocks, pinned references, exact compatibility keys và tenant isolation.",
+              "en": "Owns per-rank pages, pinned references, compatible keys and tenant isolation."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "registry",
+            "label": {
+              "vi": "Model / adapter registry",
+              "en": "Model / adapter registry"
+            },
+            "detail": {
+              "vi": "Immutable versions, tokenizer/chat template, formats/kernels và verified warm readiness.",
+              "en": "Pins model/adapter/tokenizer/template versions and compatible kernels with verified readiness."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "store"
+          },
+          {
+            "id": "usage",
+            "label": {
+              "vi": "Terminal usage log",
+              "en": "Terminal usage log"
+            },
+            "detail": {
+              "vi": "Durable authoritative usage, status, attempt IDs và dedup/reconciliation; không phụ thuộc client đọc final event.",
+              "en": "Durably records usage/status/attempt IDs with deduplication and reconciliation, independent of client receipt."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "queue"
+          },
+          {
+            "id": "billing",
+            "label": {
+              "vi": "Usage settlement",
+              "en": "Usage settlement"
+            },
+            "detail": {
+              "vi": "Settle reservation đúng một lần theo identity/policy, audit counts và refunds.",
+              "en": "Settles reservations under identities/policies and audits counters/refunds."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "generation",
+            "label": {
+              "vi": "Generate và stream",
+              "en": "Generate and stream"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "gateway",
+                "description": {
+                  "vi": "Gửi pinned model intent, max output và stable request identity.",
+                  "en": "Submit model intent, output bounds and stable identities."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "admission",
+                "description": {
+                  "vi": "Validate context/tokenizer, reserve quota và establish admission decision.",
+                  "en": "Validate contexts/tokenization and reserve quota under admission rules."
+                }
+              },
+              {
+                "from": "admission",
+                "to": "queue",
+                "description": {
+                  "vi": "Enqueue có bound; reject trước worker start thì refund theo reservation ID.",
+                  "en": "Bound queue insertion and refund rejected pre-start admissions by identity."
+                }
+              },
+              {
+                "from": "queue",
+                "to": "router",
+                "description": {
+                  "vi": "Select eligible warm replica theo deadline/work/KV evidence.",
+                  "en": "Select eligible warm replicas using deadlines/work/KV evidence."
+                }
+              },
+              {
+                "from": "router",
+                "to": "prefill",
+                "description": {
+                  "vi": "Atomic capacity admission rồi prefill prompt/suffix.",
+                  "en": "Atomically admit capacity before prefilling prompts/suffixes."
+                }
+              },
+              {
+                "from": "prefill",
+                "to": "decode",
+                "description": {
+                  "vi": "Same-replica handoff hoặc explicit compatible KV transfer.",
+                  "en": "Hand off locally or transfer compatible KV under explicit protocols."
+                }
+              },
+              {
+                "from": "decode",
+                "to": "gateway",
+                "description": {
+                  "vi": "Sequenced deltas có thể chứa nhiều tokens/chunk; bounded buffers.",
+                  "en": "Stream sequenced deltas with potentially multiple tokens per chunk and bounded buffers."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "client",
+                "description": {
+                  "vi": "Render partial output, finish/error/cancel state rõ.",
+                  "en": "Render partial output with explicit completion/error/cancellation states."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cache",
+            "label": {
+              "vi": "Prefix hit có điều kiện",
+              "en": "Conditional prefix reuse"
+            },
+            "steps": [
+              {
+                "from": "queue",
+                "to": "router",
+                "description": {
+                  "vi": "Request prefix signature và scope được xét cùng load.",
+                  "en": "Consider prefix signatures/scopes alongside load."
+                }
+              },
+              {
+                "from": "router",
+                "to": "prefix",
+                "description": {
+                  "vi": "Match effective tokens/model/adapter/KV/position config và tenant scope.",
+                  "en": "Match effective tokens, versions, KV/position settings and tenant scopes."
+                }
+              },
+              {
+                "from": "prefix",
+                "to": "prefill",
+                "description": {
+                  "vi": "Pin reusable pages; chỉ prefill suffix không cached.",
+                  "en": "Pin reusable pages and prefill uncached suffixes."
+                }
+              },
+              {
+                "from": "prefill",
+                "to": "decode",
+                "description": {
+                  "vi": "Decode vẫn tạo output mới và cần KV growth.",
+                  "en": "Decode still generates new output and grows KV state."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Disconnect và cancel",
+              "en": "Disconnect and cancel"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "gateway",
+                "description": {
+                  "vi": "Connection mất hoặc client gửi cancel; outcome chưa tự terminal.",
+                  "en": "Disconnect or request cancellation without assuming terminal outcomes."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "decode",
+                "description": {
+                  "vi": "Signal current attempt cancellation; worker kiểm boundary an toàn.",
+                  "en": "Signal the current attempt and stop at safe execution boundaries."
+                }
+              },
+              {
+                "from": "decode",
+                "to": "usage",
+                "description": {
+                  "vi": "Publish terminal outcome và authoritative counters sau stop/finalize.",
+                  "en": "Publish terminal outcomes and authoritative counters after stopping/finalization."
+                },
+                "async": true
+              },
+              {
+                "from": "usage",
+                "to": "billing",
+                "description": {
+                  "vi": "Dedup terminal event rồi settle used/refund; unknown cần reconcile.",
+                  "en": "Deduplicate terminal events and settle usage/refunds, reconciling unknown outcomes."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "meter",
+            "label": {
+              "vi": "Final usage dù client đã rời",
+              "en": "Record usage even after clients leave"
+            },
+            "steps": [
+              {
+                "from": "decode",
+                "to": "usage",
+                "description": {
+                  "vi": "Record input/cached/generated counts, pinned versions và termination status.",
+                  "en": "Record input/cache/generated counts, pinned versions and termination status."
+                },
+                "async": true
+              },
+              {
+                "from": "usage",
+                "to": "billing",
+                "description": {
+                  "vi": "Apply identified final usage/settlement một lần; retry không double charge/refund.",
+                  "en": "Apply identified settlements once without duplicate charges/refunds."
+                },
+                "async": true
+              },
+              {
+                "from": "billing",
+                "to": "admission",
+                "description": {
+                  "vi": "Release remaining reservation theo policy; rate-limit refill là contract khác.",
+                  "en": "Release reservations under policy, separately from rate-limit refill semantics."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "rollout",
+            "label": {
+              "vi": "Warm model rồi nhận traffic",
+              "en": "Warm models before accepting traffic"
+            },
+            "steps": [
+              {
+                "from": "registry",
+                "to": "router",
+                "description": {
+                  "vi": "Publish compatible revision/config và eligibility metadata.",
+                  "en": "Publish compatible revisions/configurations and eligibility metadata."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "prefill",
+                "description": {
+                  "vi": "Load/verify weights, tokenizer/template và kernels; readiness sau warm checks.",
+                  "en": "Load/verify weights, templates and kernels before warm readiness."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "decode",
+                "description": {
+                  "vi": "Warm pinned version; drain streams cũ, không mix incompatible KV.",
+                  "en": "Warm pinned versions and drain old streams without incompatible KV reuse."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "metrics-phases",
+      "title": {
+        "vi": "5. TTFT, inter-token latency và goodput đo những gì?",
+        "en": "5. What do TTFT, inter-token latency and goodput measure?"
+      },
+      "paragraphs": [
+        {
+          "vi": "TTFT ở client boundary gồm network, auth/tokenization/admission, queue, prefill/transfer và first generation/flush tùy implementation. Prefill completion không luôn trùng first visible chunk. ITL là các gaps giữa output events/tokens theo measurement rule; TPOT trung bình sau first token có thể định nghĩa là (thời điểm token cuối − thời điểm token đầu)/(số output tokens −1) khi có ít nhất 2 tokens, nhưng không thay p95/p99 gap distribution. Chunk buffering ở proxy cũng có thể tạo burst dù engine đều. Track denominators và one-token outputs riêng.",
+          "en": "Client TTFT includes networking, admission/tokenization, queues, prefill/transfers and initial generation/flush as implemented. Prefill completion need not equal visible output. ITL tracks defined event/token gaps; mean post-first-token TPOT can be defined as (last-token time − first-token time)/(output count −1) for at least two tokens, and does not replace gap distributions. Proxy buffering can burst otherwise regular engine output. Define denominators and handle single-token outputs separately."
+        },
+        {
+          "vi": "Prefill thường compute-heavy khi prompt/batch phù hợp; small-batch decode thường nặng weight/KV bandwidth. Long context, big batch, attention variants, parallel communication và multimodal encoders thay bottleneck; không dùng hai nhãn này như định luật. Goodput là useful throughput thỏa latency/quality/termination criteria đã chọn. Đếm chỉ completed requests và bỏ timeout/cancel có thể làm dashboard đẹp giả trong overload.",
+          "en": "Prefill often emphasizes compute and small-batch decode bandwidth, but contexts, batching, attention, communication and multimodal work change bottlenecks. Goodput means useful work satisfying stated latency/quality/termination criteria. Completed-only metrics can hide overload by excluding abandoned or failed requests."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Before first output",
+            "en": "Before first output"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Queue age, tokenization/prefill/transfer và proxy flush.",
+              "en": "Queue age, tokenization/prefill/transfers and flushing."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "During generation",
+            "en": "During generation"
+          },
+          "icon": "chart",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "ITL tails, batch changes, KV reads và backpressure.",
+              "en": "ITL tails, batching, KV reads and backpressure."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Outcome",
+            "en": "Outcome"
+          },
+          "icon": "check",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Completion/cancel/error counts cùng SLO denominator.",
+              "en": "Completion/cancellation/errors in SLO denominators."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "batching",
+      "title": {
+        "vi": "6. Continuous batching tái dùng slots, không tạo free compute",
+        "en": "6. Continuous batching reuses slots without creating free compute"
+      },
+      "paragraphs": [
+        {
+          "vi": "Static group có thể giữ capacity cho đến khi whole group finish; short request vẫn có thể được stream/return sớm. Iteration-level scheduling cho sequences rời/vào tại iteration boundaries, giảm idle slots trong heterogeneous output lengths. Real engines vẫn có batch/token budgets, allocator và prefill scheduling; thêm sequences tăng attention/compute/KV traffic nên “32 sequences cost như 1” chỉ là intuition weight reuse ở một số regimes, không performance law.",
+          "en": "Static groups may retain capacity until completion while returning short results earlier. Iteration-level scheduling reuses freed slots across heterogeneous outputs. Real engines still have token/batch budgets, allocation and prefill scheduling. Adding sequences increases compute/attention/KV work; weight-reuse intuition is not a constant-cost performance law."
+        },
+        {
+          "vi": "Mô phỏng dưới chỉ giữ mỗi active sequence một token/tick để thấy occupancy, không dự đoán GPU speedup. So sánh đúng token work, arrival và short-response finish times trước khi suy luận efficiency. Batch tăng có thể nâng throughput nhưng xấu ITL/TTFT; tối ưu ở SLO chứ không chỉ occupancy 100%.",
+          "en": "The fixed-token-per-tick lab isolates occupancy rather than predict GPU speedups. Compare identical work/arrivals and early completion behavior first. Larger batches can improve throughput while worsening latency; optimize under SLOs rather than occupancy alone."
+        }
+      ],
+      "experiment": "serving-batch"
+    },
+    {
+      "id": "memory",
+      "title": {
+        "vi": "7. HBM capacity phải đúng shape và đúng từng rank",
+        "en": "7. Memory capacity needs correct shapes and per-rank budgets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Full-attention KV payload/token =2 ×layers ×KV heads ×head dimension ×bytes, với factor 2 cho K/V; dùng KV heads của GQA/MQA thay query heads. Ví dụ shape 80 layers,8 KV heads,128 dim,2-byte KV:327.680B=320KiB/token;1.300 tokens≈426MB≈406,25MiB per sequence trước pages/metadata. Đây là shape giả định, không gán mọi 70B model cùng configuration. Sliding windows, MLA/compressed state, cross-attention và multimodal state cần formula riêng.",
+          "en": "Full-attention KV payload per token is 2 ×layers ×KV heads ×head dimension ×bytes, using KV rather than query heads. An assumed 80-layer/eight-KV-head/128-dimensional/two-byte shape uses 320 KiB per token and roughly 426 MB or 406.25 MiB for 1,300 tokens before overheads. This is not universal across 70B models; other attention/state architectures need different accounting."
+        },
+        {
+          "vi": "Weights70B ×2B =140GB không chứng minh 2 × 80GB đủ chạy: runtime/graphs/activations/workspace, KV, allocator/padding, communication buffers và safety headroom còn thiếu. Aggregate HBM không cứu một rank OOM. TP có thể shard KV heads nhưng KV replication/padding và parallel plan ảnh hưởng actual per-rank memory; phải validate layout. Weight quantization không tự quantize KV; capacity gain/quality/kernel support cần eval, không mặc định tổngcapacity 2×.",
+          "en": "140 GB of weights does not prove two 80 GB devices suffice after runtime, workspace, graphs, KV, communication and reserves. Aggregate memory cannot rescue per-rank OOMs. Parallel layouts can shard, replicate or pad KV, so validate actual ranks. Weight quantization does not automatically quantize KV, and total gains/quality/kernel compatibility require evaluation."
+        },
+        {
+          "vi": "Paged allocation giảm một số fragmentation và hỗ trợ sharing nhưng cần block tables, pinned references và safe release. Allocate maximum whole context bảo thủ có thể giảm utilization; incremental allocation cần growth/headroom/preemption policy. KV exhaustion có thể queue, preempt/recompute hoặc offload theo engine; không giả mọi engine luôn swap được hoặc recompute miễn phí. Cancel xác nhận xong mới release KV ownership ở safe boundary.",
+          "en": "Paging reduces some fragmentation and supports sharing but needs block tables, pinning and safe release. Maximum reservations are conservative; incremental growth needs reserves/preemption. Engines differ in queueing, recomputation/offload support and costs. Release KV at safe boundaries after confirmed cancellation."
+        }
+      ]
+    },
+    {
+      "id": "placement",
+      "title": {
+        "vi": "8. Prefix affinity phải có load bound và isolation",
+        "en": "8. Prefix affinity needs load bounds and isolation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache reuse cần exact effective token prefix và compatible model revision, adapter, positional/attention configuration, KV representation cùng namespace isolation. Same text có thể tokenize khác vì template/version; semantic similarity không đủ. Prefix pages đã cache vẫn chiếm memory; active sequences pin shared pages và private suffix pages. Cache hit giảm eligible prefill work, không trả cached answer, không tránh decoding output và không tự cấp quota discount.",
+          "en": "Reuse requires exact effective token prefixes plus compatible models/adapters, positional/attention settings, KV formats and isolation namespaces. Templates/tokenizers can change the tokens for similar text. Cached pages occupy memory and active requests pin shared/private pages. Reuse saves eligible prefill work, not output generation or automatic quota discounts."
+        },
+        {
+          "vi": "Affinity không thắng mọi queue: route tới cache-hot replica bị backlog lớn có thể xấu TTFT hơn cold replica rảnh. Scheduler cần warm compatibility, estimated queue/token work, free KV và deadline/tier. Observed headroom phải được allocator xác nhận atomic. Lab dùng work units không phải latency oracle; production cần workload-calibrated prediction và fairness để không giấu long prompts trong queue count nhỏ.",
+          "en": "Warm caches can be worse than idle cold replicas when backlog dominates. Routing considers compatibility, queue/work, KV and deadlines/tiers, followed by atomic allocation. The lab uses abstract work units; production predictions need calibration and fairness rather than raw queue counts."
+        }
+      ],
+      "experiment": "serving-placement"
+    },
+    {
+      "id": "prefill-disaggregation",
+      "title": {
+        "vi": "9. Chunk prefill hay tách pools theo evidence",
+        "en": "9. Choose chunking or disaggregation from evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Long unchunked prefill trong mixed replica có thể delay decode iterations. Chunked prefill giới hạn prompt work mỗi scheduling round để cân TTFT với ITL, nhưng chunk size/budget/kernel overhead vẫn workload-dependent. Tách prefill/decode pools giảm interference và cho independent sizing/parallelism, nhưng thêm queue, allocation handoff và KV transfer. Không mặc định prefill “một pass cả prompt” luôn là actual scheduler behavior.",
+          "en": "Long unchunked prefills can delay mixed decode iterations. Chunking bounds prompt work per round while trading TTFT, ITL and overheads. Separate pools reduce interference and allow independent sizing/parallelism but add queues, handoffs and transfers. Actual scheduling may not process every prompt in one indivisible pass."
+        },
+        {
+          "vi": "Ví dụ KV 320KiB/token ×8.192 prompt tokens=2,5 GiB. Link hiệu dụng 50GB/s thập phân có serialization lower bound≈53,7ms cho payload đó, chưa contention/latency/serialization/layout conversion; không lấy tốc độ NIC nominal làm throughput end-to-end. Transfer cần version/layout compatibility, ownership, pin/release và cancellation/error cleanup. So sánh SLO goodput và total cost với colocated/chunked baseline trước rollout.",
+          "en": "At 320 KiB/token, an 8,192-token prompt has 2.5 GiB of KV. An assumed effective 50 GB/s link has a roughly 53.7 ms payload serialization lower bound before contention, latency or layout conversions. Nominal NIC rates are not end-to-end rates. Transfers need compatible layouts/versions, ownership/pinning and cancellation cleanup. Compare SLO goodput and total cost against colocated/chunked baselines."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "KV handoff có ownership",
+          "en": "KV handoffs need ownership"
+        },
+        "caption": {
+          "vi": "Không release nguồn khi target chưa nhận responsibility.",
+          "en": "Do not release sources before targets own the state."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Prepare",
+              "en": "Prepare"
+            },
+            "detail": {
+              "vi": "Target reserve blocks và xác minh layout/version.",
+              "en": "Targets reserve blocks and verify compatibility."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Transfer",
+              "en": "Transfer"
+            },
+            "detail": {
+              "vi": "Copy/check data dưới attempt identity.",
+              "en": "Copy/check data under attempt identities."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Accept",
+              "en": "Accept"
+            },
+            "detail": {
+              "vi": "Target confirm usable state, source release theo protocol.",
+              "en": "Targets confirm usable state before source release."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Recover",
+              "en": "Recover"
+            },
+            "detail": {
+              "vi": "Timeout/cancel reconcile current owner và reclaim an toàn.",
+              "en": "Reconcile owners on timeouts/cancellation and reclaim safely."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
+    },
+    {
+      "id": "admission-usage",
+      "title": {
+        "vi": "10. Reservation, usage và rate-limit refill là contracts khác",
+        "en": "10. Reservations, usage and rate-limit refill differ"
+      },
+      "paragraphs": [
+        {
+          "vi": "Validate prompt/context/output cap và count bằng pinned tokenizer; reserve bounded input+max output hoặc equivalent cost budget theo tenant/tier. Queue insertion reject phải rollback đúng reservation ID—không chỉ return 503 sau đã trừ tokens. Fixed spending budget, TPM rate limiter và billable monetary ledger có semantics khác; refill/refund không dùng một công thức chung cho mọi bucket. Cache discounts và reasoning/hidden/generated token categories cũng cần explicit product policy.",
+          "en": "Validate/count under pinned tokenizers and reserve bounded token or cost budgets. Queue rejection must roll back identified reservations rather than return an error after spending them. Fixed budgets, TPM limiters and monetary ledgers have distinct refill/refund semantics. Cache discounts and generated/hidden/reasoning token categories also require explicit policies."
+        },
+        {
+          "vi": "Final usage đến từ trusted execution counters và request/attempt identity, gồm completed, cancelled và failed attempts theo policy. Mới cancel requested chưa đủ giải phóng reservation vì worker có thể đang compute. Terminal event phải durable, dedup và reconcile khi worker/gateway crash; client không nhận usage chunk không làm server quên charge/refund. Corrections nếu có cần version/monotonic policy, không last-arrival overwrite arbitrary cumulative counts.",
+          "en": "Final usage comes from trusted execution counters with request/attempt identities and status-specific policy. Cancellation requests alone cannot release ongoing exposure. Persist/deduplicate/reconcile terminal events despite worker/gateway failures or missing client receipts. Corrections need versioned policies rather than arbitrary last-arrival replacement."
+        }
+      ],
+      "experiment": "serving-usage"
+    },
+    {
+      "id": "retry-cancel",
+      "title": {
+        "vi": "11. Streaming retry không chỉ phụ thuộc first token",
+        "en": "11. Stream retries depend on more than first output"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trước first visible output, old attempt vẫn có thể được admitted/running hoặc đã compute output trong buffer. Blind failover có thể chạy hai generations và double bill. Dùng attempt lease/fencing hoặc provider execution contract để xác nhận chưa accepted, đã cancel/stopped hay reconcile retained result. Sau partial output không silent restart rồi ghép response khác; explicit retry tạo attempt mới phải có UI/output/accounting semantics. Same seed cũng không tự bảo đảm bitwise same output khi engine/config/hardware thay đổi.",
+          "en": "Before visible output, previous attempts can be running or buffering generated tokens. Blind failover can duplicate work/charges. Use execution ownership/fencing or contracts establishing nonacceptance, confirmed stopping or retained results. Partial streams cannot silently splice restarted generations. Explicit retries need new-attempt/output/accounting policies, and seeds alone do not guarantee identical outputs across execution changes."
+        },
+        {
+          "vi": "Disconnect detection và cancel delivery có delay; some kernels không interrupt ngay. Stop tại safe scheduler boundary, record final counts, release KV và unused reservation theo owner. Worker loss có thể mất volatile KV/sampling state nên generic stream resume không available; log enough replay/output evidence nếu product hứa resume. Slow consumers cần bounded gateway buffers và policy cancel/spool/backpressure, không để một mobile client giữ GPU/KV vô hạn.",
+          "en": "Disconnection/cancellation are delayed and kernels may stop only at safe boundaries. Record counts and release state under ownership. Worker loss can destroy volatile KV/sampling state, so resumption requires explicitly retained evidence. Slow consumers need bounded buffers and cancellation/spooling/backpressure policies rather than unlimited GPU/KV retention."
+        }
+      ]
+    },
+    {
+      "id": "registry-parallelism",
+      "title": {
+        "vi": "12. Version model, adapter và execution configuration cùng nhau",
+        "en": "12. Version models, adapters and execution configurations together"
+      },
+      "paragraphs": [
+        {
+          "vi": "Registry pin weights, tokenizer/chat template, adapter/base compatibility, quantization, kernels và context/attention config. Readiness cần load/verify/warm, không chỉ pod started. Rollout canary quality/latency, keep old streams pinned và drain trước unload; cache key generations phải tránh reuse incompatible KV. Cold-start duration đo theo image/weight distribution, host cache, allocation và warmup, không assume mọi model mất đúng vài phút.",
+          "en": "Registries pin weights, tokenizers/templates, adapters, quantization, kernels and contexts. Readiness follows loading, verification and warmup rather than pod starts. Canary quality/latency and drain version-pinned streams before unloading, avoiding incompatible cache reuse. Measure cold starts across distribution/caching/allocation/warmup instead of assuming fixed durations."
+        },
+        {
+          "vi": "Data parallel replicas thêm throughput; tensor/pipeline/expert/context strategies thay per-rank memory và communication. Không chọn GPU count chỉ bằng weights/80GB. Nhiều LoRA adapters có thể share compatible base với supported kernels/registry/cache; full fine-tunes đổi base weights không tự share cùng payload. Adapter affinity và eviction cũng cần tenant fairness; không hứa mọi adapter/kernel batch chung mà không test support.",
+          "en": "Data replication adds throughput while other parallel layouts change rank memory/communication. Weight-size division alone cannot choose GPU counts. Compatible LoRA adapters can share supported bases/kernels under registry/cache policies; full-weight fine-tunes do not automatically share base payloads. Adapter affinity/eviction needs fairness and verified execution support."
+        }
+      ]
+    },
+    {
+      "id": "economics",
+      "title": {
+        "vi": "13. Cost per million tokens phải đi cùng SLO và phạm vi cost",
+        "en": "13. Unit costs need SLOs and explicit cost boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định giả lập 8 GPUs ×$3/GPU-hour=$24/hour và decode goodput 2.500 output tokens/s=9M/hour, decode-GPU-only cost≈$2,67/M output tokens ở sustained full goodput. Nếu actual useful throughput bằng 50% thì≈$5,33/M với cost không đổi. Đây không phải price hiện hành hay tổng serving price: prefill, CPU, network, storage, idle/warm replicas, redundancy và failed attempts chưa gồm. Không so engines bằng unit cost nếu quality/context/SLO hoặc workload khác.",
+          "en": "Under hypothetical eight-GPU costs of $3/device-hour and 2,500 useful output tokens/s, decode-GPU-only cost is about $2.67 per million outputs at full sustained goodput, or $5.33 at half useful throughput with unchanged cost. These are not current prices or total costs: prefill, infrastructure, warming, redundancy and failures are excluded. Comparisons require matched quality, contexts, workloads and SLOs."
+        },
+        {
+          "vi": "Prefix reuse, quantization, speculative decoding và batching tác động các phần khác nhau. Speculation thêm draft/verification work và acceptance-rate dependence; không chắc thắng ở high batch hoặc workload khó dự đoán. Quantization có numerical/kernel/quality trade-offs không chỉ memory ratio. Batch/offline tiers có thể dùng cheaper flexible capacity theo deadline nhưng region/spot interruptions cần recovery/cost controls; interactive không tự phù hợp.",
+          "en": "Caching, quantization, speculation and batching affect different costs. Speculation adds drafting/verification and depends on acceptance; high batches or hard workloads may not benefit. Quantization changes numerical/kernel/quality behavior beyond size ratios. Flexible offline capacity needs interruption/deadline controls and is not automatically appropriate for interactive traffic."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lever",
+            "en": "Lever"
+          },
+          {
+            "vi": "Potential gain",
+            "en": "Potential gain"
+          },
+          {
+            "vi": "Evidence needed",
+            "en": "Evidence needed"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Prefix reuse",
+              "en": "Prefix reuse"
+            },
+            {
+              "vi": "Ít uncached prefill work.",
+              "en": "Less uncached prefill work."
+            },
+            {
+              "vi": "Compatible hit rate, queue skew và isolation.",
+              "en": "Compatible hits, skew and isolation."
+            }
+          ],
+          [
+            {
+              "vi": "Continuous batching",
+              "en": "Continuous batching"
+            },
+            {
+              "vi": "Ít slot idle ở heterogeneous jobs.",
+              "en": "Less idle capacity across heterogeneous jobs."
+            },
+            {
+              "vi": "ITL/TTFT goodput, KV/compute bounds.",
+              "en": "Latency goodput and memory/compute bounds."
+            }
+          ],
+          [
+            {
+              "vi": "Quantization",
+              "en": "Quantization"
+            },
+            {
+              "vi": "Weight/KV payload có thể nhỏ hơn.",
+              "en": "Potentially smaller payloads."
+            },
+            {
+              "vi": "Dtype-specific kernels, evals và runtime overhead.",
+              "en": "Compatible kernels, evaluations and overheads."
+            }
+          ],
+          [
+            {
+              "vi": "Disaggregation",
+              "en": "Disaggregation"
+            },
+            {
+              "vi": "Independent sizing, ít interference.",
+              "en": "Independent sizing and less interference."
+            },
+            {
+              "vi": "Transfer/topology cost và end-to-end SLO.",
+              "en": "Transfer/topology costs and end-to-end SLOs."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "scaling-security",
+      "title": {
+        "vi": "14. Warm capacity, fairness và safety budgets",
+        "en": "14. Warm capacity, fairness and safety budgets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Autoscale theo queued token work/age, KV pressure, SLO goodput, preemptions và per-model/tier skew; CPU% hoặc GPU utilization một mình không đủ, nhưng không phải hoàn toàn vô ích cho diagnosis. Keep measured warm headroom, prefetch model assets và smooth traffic; node provisioning/model warmup có delay nên reactive scale không chữa instant burst. Admission shed/retry-after ở known nonacceptance boundary bảo vệ SLO thay vì unbounded queue.",
+          "en": "Scale from queued work/age, KV pressure, goodput, preemptions and model/tier skew. CPU/GPU utilization alone is insufficient but can still aid diagnosis. Warm reserves/prefetching and traffic smoothing account for provisioning delays. Shed at known nonacceptance boundaries rather than queue indefinitely."
+        },
+        {
+          "vi": "Tenant token/cost budgets chống denial-of-wallet, đồng thời bound context/output, parallel requests, adapters, prefix namespaces và retained outputs. Treat model artifacts/adapters như untrusted supply-chain inputs theo chosen format/runtime controls. Safety/classification stages có latency/throughput/cancel policy riêng; output moderation có thể cần buffering làm tăng TTFT/ITL. Không để prompts/keys/stream content lộ trong logs; cache isolation và data retention là service requirements chứ không chỉ optimization flags.",
+          "en": "Bound tenant spending, context/output, parallelism, adapters, caches and retained output. Model artifacts/adapters need supply-chain controls. Safety stages add their own latency/throughput/cancellation behavior, potentially buffering output. Protect prompts/keys/logs and enforce cache isolation and retention as service requirements."
+        }
+      ]
+    },
+    {
+      "id": "failure-data",
+      "title": {
+        "vi": "15. Data model và failure evidence",
+        "en": "15. Data models and failure evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Request record giữ tenant/request ID, pinned input/model intent hash, status và attempt history; attempt record giữ worker ownership, epoch/cancellation state, admission/reservation reference và terminal usage identity. Usage events gồm counter definitions, model/adapter/tokenizer revisions, input/cached/generated counts, outcome và settlement version. Replica status là observation có timestamp/epoch; scheduler không dùng một stale kvFreeBlocks như lock. Persistent ledger không nhất thiết nằm trên per-token streaming hot path nhưng final outcomes không được chỉ best-effort fire-and-forget.",
+          "en": "Requests retain tenant identities, pinned intents and attempts; attempts track ownership/cancellation/reservations/terminal usage. Events define counters, revisions, statuses and settlement versions. Replica observations need freshness/epochs and are not allocation locks. Final ledgers can avoid per-token hot paths without becoming best-effort fire-and-forget records."
+        },
+        {
+          "vi": "Drill gateway chết sau reserve, queue reject, worker chết mid-stream, client chậm/disconnect, duplicate terminal event và replica model rollout. Check quota conservation, no double settlement, no live KV early release, version-compatible cache, bounded queues và client-visible partial status. Plot latency distributions gồm failures/cancels và time-series per replica để tìm affinity hot spots; average fleet GPU utilization có thể che skew.",
+          "en": "Drill reservation crashes, queue rejection, mid-stream loss, slow/disconnected clients, duplicate terminal events and rollouts. Verify conservation, settlement identity, KV ownership, compatible caches, bounded queues and visible partial outcomes. Include failures/abandonment and per-replica series rather than hide skew in fleet averages."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Fault",
+            "en": "Fault"
+          },
+          {
+            "vi": "Guard",
+            "en": "Guard"
+          },
+          {
+            "vi": "Evidence",
+            "en": "Evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Queue reject sau reserve",
+              "en": "Queue rejection after reservation"
+            },
+            {
+              "vi": "Identified rollback trước compute.",
+              "en": "Identified pre-compute rollback."
+            },
+            {
+              "vi": "No leaked held budget.",
+              "en": "No leaked reservations."
+            }
+          ],
+          [
+            {
+              "vi": "Disconnect mid-stream",
+              "en": "Mid-stream disconnection"
+            },
+            {
+              "vi": "Cancel/reconcile current attempt.",
+              "en": "Cancel/reconcile the current attempt."
+            },
+            {
+              "vi": "Final counts + safe KV release.",
+              "en": "Final counts and safe release."
+            }
+          ],
+          [
+            {
+              "vi": "Warm-prefix hot spot",
+              "en": "Warm-prefix hot spot"
+            },
+            {
+              "vi": "Bound affinity bằng work/deadline.",
+              "en": "Bound affinity by work/deadlines."
+            },
+            {
+              "vi": "Per-replica queue/TTFT skew.",
+              "en": "Per-replica queue/TTFT skew."
+            }
+          ],
+          [
+            {
+              "vi": "Worker mất state",
+              "en": "Worker loses state"
+            },
+            {
+              "vi": "Explicit interrupted outcome/resume contract.",
+              "en": "Explicit interruption/resume contract."
+            },
+            {
+              "vi": "No silent generation splice.",
+              "en": "No silent output splicing."
+            }
+          ],
+          [
+            {
+              "vi": "Terminal event retry",
+              "en": "Terminal event retry"
+            },
+            {
+              "vi": "Durable dedup settlement.",
+              "en": "Durably deduplicated settlement."
+            },
+            {
+              "vi": "Actual counts charged/refunded once.",
+              "en": "Once-applied charges/refunds."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Luyện thiết kế ở latency và failure boundaries",
+        "en": "16. Practice latency and failure boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ request có long prompt, prefix hit trên hot replica, client disconnect sau partial output và terminal event bị gửi hai lần. Nêu mỗi stage giữ quota/KV gì, worker nào còn authority và client biết outcome tới đâu. Chỉ ra phép đo nào cần trước khi tăng batch hoặc tách pools.",
+          "en": "Draw long prompts, overloaded prefix hits, partial-output disconnects and duplicate terminal events. Identify quota/KV ownership, execution authority and client knowledge at each stage, then specify measurements before changing batching/pools."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "TPOT mean tốt có chứng minh stream mượt không?",
+            "en": "Does good mean TPOT prove smooth streams?"
+          },
+          "answer": [
+            {
+              "vi": "Không. ITL tails, proxy chunk buffering, stalls và cancelled/failed requests có thể bị mean che. Định nghĩa token/event boundaries và denominator; one-token responses không có cùng TPOT formula.",
+              "en": "No. Gap tails, buffering, stalls and excluded failures can hide behind means. Define measurement boundaries/denominators and single-token behavior."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Cache hit nhiều mà TTFT xấu thì sao?",
+            "en": "Why can high cache hit rates coexist with poor TTFT?"
+          },
+          "answer": [
+            {
+              "vi": "Affinity có thể tạo queue skew; prefix chỉ giảm eligible prefill. Kiểm per-replica work/age, compatibility và hard KV allocator; cold replica rảnh có thể finish nhanh hơn cache-hot replica backlog.",
+              "en": "Affinity can create queue skew, and caching only reduces eligible prefill. Compare work/age, compatibility and hard memory admission against idle cold replicas."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Reserve quota rồi queue reject cần làm gì?",
+            "en": "What happens when queues reject reserved requests?"
+          },
+          "answer": [
+            {
+              "vi": "Rollback reservation bằng stable identity, đúng một lần. Không bỏ qua refund vì return 503; tách fixed budget, TPM limiter và monetary settlement semantics.",
+              "en": "Roll back identified reservations exactly once. Error returns do not replace refunds; distinguish spending budgets, TPM refill and monetary settlement."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Client disconnect có refund hết ngay không?",
+            "en": "Should disconnections immediately refund everything?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu worker còn active/unknown. Signal cancel, confirm terminal counts, settle actual used và release remainder theo policy. Client-visible tokens không chắc bằng generated counters.",
+              "en": "Not while execution is active/unknown. Cancel, confirm authoritative terminal usage and settle/release under policy; visible text need not equal generated counts."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Chưa first token có được blind fallback model không?",
+            "en": "Can pre-first-token requests blindly fall back?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động: old attempt có thể running hoặc output đang buffer. Cần known nonacceptance, stopped/fenced attempt hoặc execution dedup/reconciliation. Partial outputs cần explicit restart/resume policy.",
+              "en": "Not automatically: previous work may be running or buffered. Establish nonacceptance, stopping/fencing or execution deduplication/reconciliation, with explicit partial-output policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "140GB weights có đủ chọn 2 × 80GB không?",
+            "en": "Do 140 GB of weights justify two 80 GB GPUs?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Cần per-rank runtime/workspace/KV/graphs/communication/headroom và topology/kernel plan. Aggregate fit và bytes/parameter không chứng minh execution fit hay SLO.",
+              "en": "No. Per-rank runtime, KV, workspaces, communication, reserves and execution topology must fit and meet SLOs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Disaggregate luôn tốt hơn colocated không?",
+            "en": "Is disaggregation always better?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nó giảm interference/cho independent sizing nhưng KV transfer, network topology, target allocation và failures thêm cost. So với chunked colocated baseline bằng same workload/quality/SLO goodput và total cost.",
+              "en": "No. It adds transfer, topology, allocation and failure costs. Compare against chunked colocation under matched quality/workload/SLO and total costs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Final usage qua message broker có tự exactly-once bill không?",
+            "en": "Do broker usage events imply exactly-once billing?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Durable event/outcome và sink dedup/settlement identity/version phải phối hợp. Duplicate event, lost reply, corrections và cancellation có recovery policy; budget balance đẹp không chứng minh actual charge đúng.",
+              "en": "No. Durable outcomes must cooperate with identified/versioned sink settlement. Duplicates, lost replies, corrections and cancellation need recovery; arithmetic balance alone does not prove correct charges."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

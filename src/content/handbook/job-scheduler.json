@@ -1,0 +1,1350 @@
+{
+  "id": "job-scheduler",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Job Scheduler: occurrences, leases và effect boundaries",
+    "en": "Designing a Job Scheduler: occurrences, leases and effect boundaries"
+  },
+  "summary": {
+    "vi": "Lập lịch có version, materialize unique runs/outbox, recover missed buckets, kiểm lease/fencing thực và explicit DST; tách logical occurrence, attempt và business effect.",
+    "en": "Version schedules, materialize unique runs/outboxes, recover missed buckets and inspect lease/fencing/DST boundaries while separating occurrences, attempts and effects."
+  },
+  "prerequisites": [
+    "messaging",
+    "consistency",
+    "reliability"
+  ],
+  "relatedTopics": [
+    "messaging",
+    "distributed",
+    "observability",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Occurrences, attempts và effects có identity/guarantees khác nhau.",
+      "en": "Occurrences, attempts and effects have distinct identities/guarantees."
+    },
+    {
+      "vi": "Durable frontier và atomic run/outbox tránh silent miss khi crash/outage.",
+      "en": "Durable progress and atomic materialization prevent silent crash/outage gaps."
+    },
+    {
+      "vi": "Lease expiry không dừng worker; sink enforcement quyết định effect safety.",
+      "en": "Lease expiry does not stop workers; sinks enforce effect safety."
+    },
+    {
+      "vi": "Highest-seen fencing không biết token mới trước khi quan sát/activate nó.",
+      "en": "Highest-seen fencing cannot know tokens before observation/activation."
+    },
+    {
+      "vi": "Deadline, overlap, catch-up và DST là explicit versioned product policies.",
+      "en": "Deadlines, overlap, catch-up and DST are explicit versioned policies."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ lịch tới effect có thể kiểm tra",
+      "en": "From schedule to inspectable effects"
+    },
+    "caption": {
+      "vi": "Giữ đúng identity và state qua mỗi failure boundary.",
+      "en": "Preserve identities and state across failures."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Plan occurrence",
+          "en": "Plan occurrences"
+        },
+        "detail": {
+          "vi": "Dialect/zone, policy/generation và stable UTC identity.",
+          "en": "Resolve dialects/zones, policies and stable identities."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Materialize run",
+          "en": "Materialize runs"
+        },
+        "detail": {
+          "vi": "Unique occurrence, run/outbox và safe progress.",
+          "en": "Commit unique runs/outboxes and safe progress."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Claim / execute",
+          "en": "Claim and execute"
+        },
+        "detail": {
+          "vi": "Current attempt, bounded work và sink guards.",
+          "en": "Use current attempts, bounds and sink guards."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Account / recover",
+          "en": "Account and recover"
+        },
+        "detail": {
+          "vi": "Explicit skips, catch-up, terminal evidence và absence monitor.",
+          "en": "Record skips, catch up and monitor missing evidence."
+        },
+        "icon": "inspect"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Quyết định khi nào chạy khác việc thực thi",
+        "en": "1. Deciding when to run differs from executing work"
+      },
+      "paragraphs": [
+        {
+          "vi": "Scheduler quản lý recurring/one-off jobs, target/payload, time zone, retries, concurrency, pause/cancel và run history. Baseline ở đây gọi authorized endpoints hoặc giao bounded work cho controlled workers; sandbox arbitrary untrusted code là scope riêng. Timing SLO nên là due-to-dispatch và due-to-start distribution theo workload/priority, không chỉ “cron chạy đúng giờ”. Job completion time còn phụ thuộc service time và target dependencies.",
+          "en": "The scheduler owns recurring/one-off definitions, targets, zones, retries, concurrency, cancellation and history. This baseline invokes authorized endpoints or controlled workers; arbitrary untrusted-code sandboxing is separate. Measure due-to-dispatch/start distributions by priority, distinguishing them from completion time."
+        },
+        {
+          "vi": "Chốt duplicate-vs-miss policy theo job. Billing/reporting/cleanup có requirements khác nhau: một job có thể chấp nhận coalesce, job khác phải account mọi interval và alert khi missed. Không hứa vừa tuyệt đối không miss vừa không duplicate arbitrary effects qua unreliable network nếu sink không hợp tác. Các guarantees cần nói về logical occurrence, execution attempt và business effect riêng, có assumptions về durable storage, clock và failure domains.",
+          "en": "Choose duplication/miss policies per job. Some work coalesces; other work accounts for every interval and alerts on misses. Arbitrary unreliable remote effects cannot acquire unconditional uniqueness/completeness promises without sink cooperation. State guarantees separately for occurrences, attempts and effects."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Occurrence",
+            "en": "Occurrence"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Một intended lần chạy theo schedule generation và resolved time.",
+              "en": "One intended scheduled instance under a definition generation."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Attempt",
+            "en": "Attempt"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Một claim/execution có token, deadline và outcome riêng.",
+              "en": "One claim/execution with its own token, deadline and outcome."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Effect",
+            "en": "Effect"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "External action cần sink identity/transaction/fencing riêng.",
+              "en": "External actions need sink identities, transactions or fencing."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Average nhỏ vẫn có thể thua một burst đúng giờ",
+        "en": "2. Modest averages can still fail at synchronized bursts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định10 triệu jobs, interval trung bình600 giây: average16.666,7 occurrences/giây. Nếu sustained và history row500 bytes cho một attempt thì 1,44 tỷ rows/day, raw720 GB/day thập phân trước indexes/replication. Definitions1 KB/job cho10 GB raw. Retries, worker heartbeats, log detail và retention nhân storage/requests; 720 GB không phải full capacity plan.",
+          "en": "Assume ten million jobs averaging six hundred seconds between occurrences: about 16,666.7 occurrences/second. Sustained execution with a 500-byte row per single attempt yields 1.44 billion daily rows or 720 decimal GB before indexes/replication. Definitions at one KB each use ten GB raw. Retries, heartbeats and detail retention add substantial work."
+        },
+        {
+          "vi": "Một triệu occurrences cùng UTC second là burst assumption cho aligned cohort, không suy từ tất cả users ở nhiều time zones có local midnight. Với effective100.000 starts/giây, riêng burst cần ít nhất10 giây drain trước normal traffic/limits; không thể vừa để một triệu simultaneous due vừa hứa mọi job start trong2 giây ở capacity này. Flexible execution windows và deterministic jitter có thể dàn tải nếu semantics cho phép; strict schedules cần capacity/admission riêng.",
+          "en": "A million occurrences at one UTC second assumes an aligned cohort rather than all local midnights worldwide. At one hundred thousand effective starts/second, draining alone takes at least ten seconds before competing traffic. Flexible windows/jitter help only when semantics allow; strict deadlines need separate capacity/admission."
+        },
+        {
+          "vi": "Nếu average job chạy5 giây, Little’s Law cho khoảng83.333 concurrent executions ở steady average, chưa retries/tails/burst. Heartbeat mỗi10 giây tạo khoảng8.333 requests/giây cho lượng concurrency đó. Phân biệt dispatch QPS, active workers/slots, target concurrency và internal write load; thêm dispatchers không làm target endpoint xử lý nhanh hơn.",
+          "en": "Five-second average jobs imply roughly 83,333 concurrent executions at steady average; ten-second heartbeats add roughly 8,333 requests/second. Separately size dispatch, execution slots, target concurrency and internal writes. More dispatchers do not increase target capacity."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Giả định",
+            "en": "Assumption"
+          },
+          {
+            "vi": "Calculation",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Result",
+            "en": "Result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Occurrence rate",
+              "en": "Occurrence rate"
+            },
+            {
+              "vi": "10M /600s",
+              "en": "10M /600s"
+            },
+            {
+              "vi": "≈16.667/s",
+              "en": "≈16,667/s"
+            }
+          ],
+          [
+            {
+              "vi": "History logical/day",
+              "en": "History logical/day"
+            },
+            {
+              "vi": "10M /600 ×86400 ×500B",
+              "en": "10M /600 ×86400 ×500B"
+            },
+            {
+              "vi": "720 GB",
+              "en": "720GB"
+            }
+          ],
+          [
+            {
+              "vi": "Concurrent work",
+              "en": "Concurrent work"
+            },
+            {
+              "vi": "16.666,7/s ×5s",
+              "en": "16,666.7/s ×5s"
+            },
+            {
+              "vi": "≈83.333",
+              "en": "≈83,333"
+            }
+          ],
+          [
+            {
+              "vi": "Burst drain lower bound",
+              "en": "Burst drain lower bound"
+            },
+            {
+              "vi": "1M /100K starts/s",
+              "en": "1M /100K starts/s"
+            },
+            {
+              "vi": "10s",
+              "en": "10s"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. Definitions, occurrences và attempts có IDs khác nhau",
+        "en": "3. Definitions, occurrences and attempts have different IDs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Create/update job cần tenant authorization, validated schedule dialect/time zone, target capability, size/secret refs và policies. Update dùng expected version để không overwrite concurrent edits. Definition generation thay đổi schedule/payload policies có effective time; already-materialized runs follow explicit update/cancel rules, không tự sửa đang chạy. Manual run có request id riêng; nó không vô tình collide với scheduled occurrence cùng clock time.",
+          "en": "Validate tenant authority, schedule dialect/zone, target capabilities, payload/secret references and policies. Expected versions protect concurrent edits. Generation changes define effective times and handling for existing runs. Manual requests use distinct identities rather than collide with scheduled occurrences."
+        },
+        {
+          "vi": "Run ID ổn định qua attempts; attempt ID/token tăng khi ownership đổi. Completion/heartbeat phải conditional trên run state/current attempt/generation và server-side lease rules. Sink idempotency thường scoped run+step+operation fingerprint, không attempt ID vì sẽ coi mọi retry là effect mới. List history có as-of pagination và error redaction; operator redrive cần audit lineage và policy chọn retry cùng intent hay tạo intent mới.",
+          "en": "Run IDs survive retries while attempt tokens change with ownership. Condition renewals/completions on current state/attempt and authority-side lease rules. Effect identities usually use run/step scopes rather than attempts. History and redrive need stable pagination, redaction and explicit intent lineage."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/jobs",
+          "description": {
+            "vi": "Create versioned schedule và preview các resolved occurrences.",
+            "en": "Create versioned schedules and preview resolved occurrences."
+          },
+          "request": "{schedule:\"0 9 * * MON\",dialect:\"five-field\",timeZone:\"Europe/Paris\",targetRef,payloadRef,retry,concurrency:\"forbid\",missedRuns:\"latest\",startingDeadlineSec:3600}",
+          "response": "201 {jobId,version,nextOccurrences:[{intendedLocalTime,resolvedAtUtc}]}"
+        },
+        {
+          "method": "PATCH",
+          "path": "/v1/jobs/{id}",
+          "description": {
+            "vi": "Expected version và effective policy; pause khác cancel running.",
+            "en": "Expected versions/effective policies; pausing differs from canceling running work."
+          },
+          "request": "{expectedVersion:3,paused:true,existingRuns:\"retain\"}",
+          "response": "200 {version:4} | 409 {code:\"version_conflict\"}"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/jobs/{id}/runs",
+          "description": {
+            "vi": "Manual intent có Idempotency-Key riêng.",
+            "en": "Manual intent uses its own idempotency key."
+          },
+          "response": "202 {runId,statusUrl}"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/runs:claim",
+          "description": {
+            "vi": "Atomic claim dưới tenant/target budgets; workerId không phải capability.",
+            "en": "Atomic claims under budgets; worker names are not capabilities."
+          },
+          "response": "200 {runs:[{runId,attemptId,token,leaseUntil,payloadRef}]}"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/runs/{runId}:heartbeat",
+          "description": {
+            "vi": "Renew current attempt có bounded runtime; stale token bị reject.",
+            "en": "Renew current bounded attempts and reject obsolete tokens."
+          },
+          "request": "{attemptId,token}",
+          "response": "200 {leaseUntil} | 409 {code:\"lost_attempt\"}"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/runs/{runId}:complete",
+          "description": {
+            "vi": "Persist terminal result conditionally; retry duplicate request an toàn theo same outcome.",
+            "en": "Persist conditional results with identified completion retries."
+          },
+          "request": "{attemptId,token,outcome,resultRef?}",
+          "response": "200 {state} | 409 {code:\"stale_or_conflicting_completion\"}"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Planner, materializer và workers không cùng trách nhiệm",
+        "en": "4. Planners, materializers and workers have different responsibilities"
+      },
+      "paragraphs": [
+        {
+          "vi": "Planner biến versioned definitions thành bounded future occurrences; due index giúp tìm eligible candidates. Materializer tạo unique durable runs/outbox dưới active policy. Queue publish có thể retry; workers claim attempt ownership tại authority và gọi target. Completion journal và expected-occurrence monitor theo dõi từ intended schedule tới terminal outcome. Queue delivery không làm source-of-truth của schedule, và dispatcher process alive không chứng minh không missed.",
+          "en": "Planners resolve future occurrences, materializers create durable unique runs/outboxes, queues deliver retryably, and workers claim execution authority. Journals/monitors compare intentions with outcomes. Queue delivery is not schedule truth, and a live dispatcher does not prove completeness."
+        },
+        {
+          "vi": "Chọn trace register/fire/recover/misfire/update để theo identity và commit boundary. Một strongly consistent lease/epoch store là một phần protocol, không thay transaction giữa due progress/run/outbox. Snapshot/recovery của planners cần enough definition history/progress để account outage intervals; background repair có thể tái tạo candidates mà không nhân logical runs.",
+          "en": "Trace registration, execution, recovery, misfires and updates through identity/commit boundaries. Leases do not replace coherent progress/run/outbox commits. Planners retain enough history/progress to account outage intervals; repair regenerates candidates without duplicating logical runs."
+        }
+      ],
+      "diagram": {
+        "id": "scheduler-occurrence-authority",
+        "title": {
+          "vi": "Từ định nghĩa lịch tới effect có bằng chứng",
+          "en": "From schedule definitions to evidenced effects"
+        },
+        "caption": {
+          "vi": "Planner tính occurrences; materialization commit run/outbox; dispatcher/worker ownership dùng generations. Sink quyết định có thể dedup/fence effect hay không; scheduler completion không tự undo external calls.",
+          "en": "Planners resolve occurrences, materialization commits runs/outboxes, and owners use generations. Sinks enforce supported effect guards; scheduler completion cannot undo external calls."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "tenant",
+            "label": {
+              "vi": "Tenant / operator",
+              "en": "Tenant / operator"
+            },
+            "detail": {
+              "vi": "Create/version schedules, inspect next occurrences và explicit replay/cancel.",
+              "en": "Creates schedules, previews occurrences and explicitly replays/cancels."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Scheduler API",
+              "en": "Scheduler API"
+            },
+            "detail": {
+              "vi": "Auth, dialect/zone validation, target policy, quotas và optimistic definition updates.",
+              "en": "Validates authority, dialects/zones, targets, quotas and definition versions."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "jobs",
+            "label": {
+              "vi": "Versioned definitions",
+              "en": "Versioned definitions"
+            },
+            "detail": {
+              "vi": "Schedule, zone/DST, payload, retries, overlap/misfire policies và active generation.",
+              "en": "Stores schedules, zones, policies, payloads and active generations."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "planner",
+            "label": {
+              "vi": "Occurrence planner",
+              "en": "Occurrence planner"
+            },
+            "detail": {
+              "vi": "Bounded horizon, tzdata-aware resolution và stable intended occurrence identities.",
+              "en": "Plans bounded horizons with versioned timezone resolution and stable identities."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "worker"
+          },
+          {
+            "id": "due",
+            "label": {
+              "vi": "Due index / progress",
+              "en": "Due index / progress"
+            },
+            "detail": {
+              "vi": "Time+shard index với durable accounted-through cursor, không chỉ current bucket.",
+              "en": "Indexes time/shards with durable progress beyond current-bucket scans."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "dispatch",
+            "label": {
+              "vi": "Materializer / dispatcher",
+              "en": "Materializer / dispatcher"
+            },
+            "detail": {
+              "vi": "Fenced shard owner, unique occurrence claim và atomic run/outbox commit.",
+              "en": "Fences shard ownership and atomically materializes unique runs/outboxes."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "runs",
+            "label": {
+              "vi": "Runs / attempts / outbox",
+              "en": "Runs / attempts / outbox"
+            },
+            "detail": {
+              "vi": "Stable run identity, per-attempt epochs/leases, pending delivery và terminal results.",
+              "en": "Persists run identities, attempt epochs/leases, deliveries and results."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "queue",
+            "label": {
+              "vi": "Ready queues",
+              "en": "Ready queues"
+            },
+            "detail": {
+              "vi": "Identified retryable delivery, fair priority/tenant budgets và bounded backlog.",
+              "en": "Delivers identified work under fair budgets and bounded backlog."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "queue"
+          },
+          {
+            "id": "worker",
+            "label": {
+              "vi": "Execution workers",
+              "en": "Execution workers"
+            },
+            "detail": {
+              "vi": "Claim, heartbeat, bounded calls, cooperative cancel và conditional completion.",
+              "en": "Claim work, renew leases, make bounded calls and complete conditionally."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "worker"
+          },
+          {
+            "id": "sink",
+            "label": {
+              "vi": "Target / side-effect store",
+              "en": "Target / side-effect store"
+            },
+            "detail": {
+              "vi": "Supports scoped run/step idempotence or atomic authority checks khi có thể.",
+              "en": "Enforces scoped effect identities or atomic authority checks where supported."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "service"
+          },
+          {
+            "id": "dlq",
+            "label": {
+              "vi": "Exhausted / review",
+              "en": "Exhausted / review"
+            },
+            "detail": {
+              "vi": "Terminal reason, attempt history, operator permissions và replay lineage.",
+              "en": "Stores reasons/history and authorized replay lineage."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "queue"
+          },
+          {
+            "id": "monitor",
+            "label": {
+              "vi": "Absence / freshness monitor",
+              "en": "Absence / freshness monitor"
+            },
+            "detail": {
+              "vi": "Expected occurrences vs actual progress/success; detect silent misses và stalled catch-up.",
+              "en": "Compares expected occurrences with progress/success to detect absence."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "register",
+            "label": {
+              "vi": "Định nghĩa và plan",
+              "en": "Define and plan"
+            },
+            "steps": [
+              {
+                "from": "tenant",
+                "to": "api",
+                "description": {
+                  "vi": "Submit schedule dialect/zone/policies và target reference.",
+                  "en": "Submit dialects, zones, policies and targets."
+                }
+              },
+              {
+                "from": "api",
+                "to": "jobs",
+                "description": {
+                  "vi": "Commit validated version và active generation.",
+                  "en": "Commit validated active generations."
+                }
+              },
+              {
+                "from": "jobs",
+                "to": "planner",
+                "description": {
+                  "vi": "Observe versioned changes; recompute bounded horizon.",
+                  "en": "Observe changes and recompute bounded horizons."
+                },
+                "async": true
+              },
+              {
+                "from": "planner",
+                "to": "due",
+                "description": {
+                  "vi": "Write stable occurrences, resolved UTC và generation metadata.",
+                  "en": "Write identified occurrences with UTC/generation metadata."
+                }
+              }
+            ]
+          },
+          {
+            "id": "fire",
+            "label": {
+              "vi": "Materialize và execute",
+              "en": "Materialize and execute"
+            },
+            "steps": [
+              {
+                "from": "due",
+                "to": "dispatch",
+                "description": {
+                  "vi": "Read due range từ persisted progress qua current time.",
+                  "en": "Read due ranges from persisted progress."
+                }
+              },
+              {
+                "from": "dispatch",
+                "to": "jobs",
+                "description": {
+                  "vi": "Validate active generation, pause/deadline/overlap theo commit policy.",
+                  "en": "Validate generations and policies at the materialization boundary."
+                }
+              },
+              {
+                "from": "dispatch",
+                "to": "runs",
+                "description": {
+                  "vi": "Unique run + outbox trong atomic transaction/protocol.",
+                  "en": "Atomically create unique runs and outboxes."
+                }
+              },
+              {
+                "from": "runs",
+                "to": "queue",
+                "description": {
+                  "vi": "Publish identified run delivery; lost ACK có thể redeliver.",
+                  "en": "Publish identified deliveries with retryable ambiguity."
+                },
+                "async": true
+              },
+              {
+                "from": "queue",
+                "to": "worker",
+                "description": {
+                  "vi": "Claim current attempt token và lease tại authority.",
+                  "en": "Claim current attempt tokens/leases at authority."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "sink",
+                "description": {
+                  "vi": "Execute bounded request cùng run/step identity và supported sink guards.",
+                  "en": "Execute identified bounded effects under supported sink guards."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "runs",
+                "description": {
+                  "vi": "Complete conditionally bằng current attempt, không tin workerId đơn lẻ.",
+                  "en": "Complete under current attempts rather than worker names alone."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recover",
+            "label": {
+              "vi": "Worker pause và retry",
+              "en": "Recover paused workers"
+            },
+            "steps": [
+              {
+                "from": "worker",
+                "to": "runs",
+                "description": {
+                  "vi": "Heartbeat fail/lease expire là suspicion, không proof process dừng.",
+                  "en": "Lease expiry suspects failure without stopping processes."
+                }
+              },
+              {
+                "from": "runs",
+                "to": "queue",
+                "description": {
+                  "vi": "Create next eligible attempt theo bounded retry policy.",
+                  "en": "Create eligible bounded retry attempts."
+                },
+                "async": true
+              },
+              {
+                "from": "queue",
+                "to": "worker",
+                "description": {
+                  "vi": "New worker claim token mới, old attempt có thể còn chạy.",
+                  "en": "A new worker claims authority while old code may remain active."
+                }
+              },
+              {
+                "from": "worker",
+                "to": "sink",
+                "description": {
+                  "vi": "Sink dedup/fence nếu contract hỗ trợ; precheck alone không đủ.",
+                  "en": "Sinks enforce supported guards; prechecks alone are insufficient."
+                }
+              },
+              {
+                "from": "runs",
+                "to": "dlq",
+                "description": {
+                  "vi": "Exhausted/permanent outcomes giữ history và explicit resolution.",
+                  "en": "Persist exhausted/permanent outcomes and resolution history."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "misfire",
+            "label": {
+              "vi": "Catch-up sau outage",
+              "en": "Catch up after outages"
+            },
+            "steps": [
+              {
+                "from": "jobs",
+                "to": "planner",
+                "description": {
+                  "vi": "Reconcile expected occurrences theo definition history và policy.",
+                  "en": "Reconcile expected occurrences under versioned policies."
+                }
+              },
+              {
+                "from": "planner",
+                "to": "due",
+                "description": {
+                  "vi": "Restore missing horizon, classify expired/coalesced occurrences.",
+                  "en": "Restore horizons and classify expired/coalesced occurrences."
+                }
+              },
+              {
+                "from": "due",
+                "to": "dispatch",
+                "description": {
+                  "vi": "Page backlog theo persisted frontier; deferred không bị skip.",
+                  "en": "Page backlog without advancing past deferred work."
+                }
+              },
+              {
+                "from": "dispatch",
+                "to": "queue",
+                "description": {
+                  "vi": "Backfill qua fair budgets, không starve live due work.",
+                  "en": "Backfill under fair budgets that protect live work."
+                },
+                "async": true
+              },
+              {
+                "from": "monitor",
+                "to": "runs",
+                "description": {
+                  "vi": "Compare expected occurrence states với materialized/terminal outcomes.",
+                  "en": "Compare expected occurrences with materialized/terminal states."
+                }
+              }
+            ]
+          },
+          {
+            "id": "update",
+            "label": {
+              "vi": "Sửa lịch hoặc hủy",
+              "en": "Update schedules or cancel"
+            },
+            "steps": [
+              {
+                "from": "tenant",
+                "to": "api",
+                "description": {
+                  "vi": "Submit expected definition version và effective change policy.",
+                  "en": "Submit expected versions and effective-change policies."
+                }
+              },
+              {
+                "from": "api",
+                "to": "jobs",
+                "description": {
+                  "vi": "Commit new generation; running/pending handling theo documented rules.",
+                  "en": "Commit generations under explicit pending/running rules."
+                }
+              },
+              {
+                "from": "jobs",
+                "to": "due",
+                "description": {
+                  "vi": "Invalidate/replan old future candidates; materializer rechecks generation.",
+                  "en": "Invalidate/replan candidates with materialization generation checks."
+                },
+                "async": true
+              },
+              {
+                "from": "api",
+                "to": "runs",
+                "description": {
+                  "vi": "Cancel request là state transition; terminal success có race cần winner.",
+                  "en": "Cancellation races with completion through defined state transitions."
+                }
+              },
+              {
+                "from": "runs",
+                "to": "worker",
+                "description": {
+                  "vi": "Cooperative stop; external already-accepted effects cần own resolution.",
+                  "en": "Request cooperative stop with separate handling for accepted effects."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "due-index",
+      "title": {
+        "vi": "5. Due index tối ưu range scan, không xóa bài toán recovery",
+        "en": "5. Due indexes optimize range scans without eliminating recovery"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một indexed range query theo nextRunAt với limit/locking có thể phù hợp nhiều workloads; không nhất thiết scan mọi row hoặc có hard ceiling vài triệu jobs. Time buckets + shard giúp bounded pages/fairness khi workload lớn; timing wheel hữu ích near-term local timers nhưng cần durable backing/rebuild. Chọn bucket granularity theo precision, volume, history và storage limits; một minute bucket vẫn chứa hàng triệu cùng due time nếu không shard.",
+          "en": "Indexed bounded range queries can suit many workloads without full scans or universal size ceilings. Time/shard buckets support pagination and fairness; local timing wheels need durable backing. Choose granularity from precision, volume and storage constraints, and shard synchronized buckets."
+        },
+        {
+          "vi": "Persist per-shard accounted-through frontier và lookback/repair policy. Sau outage không chỉ đọc current minute rồi bỏ old buckets; cũng không advance frontier qua deferred/page chưa materialize. Due row chứa job/version, intended occurrence, resolved UTC và candidate state. Replanning checks active generation tại materialization boundary để old candidates không fire sau update; already-committed runs follow documented policy. Dynamic shard count cần ownership epoch/migration, không hash modulo mới rồi coi row cũ tự chuyển.",
+          "en": "Persist accounted-through frontiers and repair policies. Do not ignore old buckets or advance beyond deferred pages. Candidates carry definition/occurrence/version metadata and are checked at materialization. Existing committed runs follow explicit policies. Shard-count changes require migration/ownership handling rather than silent hash remapping."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Account một khoảng due work",
+          "en": "Account for a due range"
+        },
+        "caption": {
+          "vi": "Frontier chỉ tiến sau durable decisions cho mọi candidate trước nó.",
+          "en": "Advance frontiers only after durable decisions cover preceding candidates."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Read range",
+              "en": "Read range"
+            },
+            "detail": {
+              "vi": "Từ persisted frontier tới bounded now/horizon.",
+              "en": "Read from saved progress to bounded time."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Validate policy",
+              "en": "Validate policy"
+            },
+            "detail": {
+              "vi": "Generation, deadline, pause và overlap.",
+              "en": "Check generations, deadlines, pause and overlap."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Materialize / classify",
+              "en": "Materialize or classify"
+            },
+            "detail": {
+              "vi": "Unique run/outbox hoặc explicit skipped reason.",
+              "en": "Create unique runs/outboxes or record skip reasons."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Advance safely",
+              "en": "Advance safely"
+            },
+            "detail": {
+              "vi": "Không đi qua deferred/uncommitted work.",
+              "en": "Do not cross deferred/uncommitted work."
+            },
+            "icon": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "materialization",
+      "title": {
+        "vi": "6. Unique occurrence và outbox xử lý crash gaps",
+        "en": "6. Unique occurrences and outboxes close crash gaps"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tạo run với unique occurrence identity và delivery intent/outbox trong một transaction hoặc equivalent protocol. Crash trước commit không để frontier coi đã xong; crash sau commit trước queue send thì publisher đọc outbox và gửi lại. Send thành công nhưng ACK mất có thể duplicate queue message; worker claim same run không tạo independent logical job. Nếu ghi run rồi enqueue riêng và mark due done ở giữa, có thể có run không bao giờ được execute; ngược lại enqueue trước có orphan work không có authoritative state.",
+          "en": "Commit unique runs and delivery intents coherently. Precommit crashes retain pending progress, postcommit crashes replay outboxes, and lost send replies can duplicate delivery without creating new logical runs. Disconnected run/queue/progress writes otherwise create stranded runs or orphan work."
+        },
+        {
+          "vi": "Dispatcher lease giảm contention nhưng lease holder pause vẫn có thể chồng old/new process. Conditional epoch/generation checks và unique occurrence constraint bảo vệ durable mutations; worker execution có boundary khác. Run IDs nên encode/reference schedule generation và resolved occurrence identity, xử lý DST fold và manual intent rõ. Definition đổi không nên dùng payload hash như sole dedup identity rồi vô tình duplicate cùng business occurrence.",
+          "en": "Dispatcher leases reduce contention without preventing paused old processes. Epoch checks and uniqueness protect mutations, while execution has separate boundaries. Occurrence identities handle definition generations, resolved times, folds and manual intents explicitly; payload hashes alone do not define business occurrences."
+        }
+      ]
+    },
+    {
+      "id": "leases",
+      "title": {
+        "vi": "7. Lease expiry không dừng old worker",
+        "en": "7. Lease expiry does not stop obsolete workers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Claim tạo attempt token và leaseUntil từ authority; heartbeat chỉ renew current eligible attempt. Lease duration cân bằng false expiry vs recovery delay, cần measured runtime/tail/heartbeat loss và bounded maximum execution; không có “chọn lớn hơn worst case” khi runtime unbounded. Monotonic durations hữu ích trong process, UTC dùng schedule; authority evaluates leases và monitored clock skew thay vì tin wall clock mọi host như tuyệt đối.",
+          "en": "Authority creates/renews current attempt leases. Choose durations from measured runtimes and failure/recovery trade-offs with execution bounds rather than nonexistent unbounded worst cases. Distinguish local monotonic durations from scheduled UTC and monitor authority clock behavior."
+        },
+        {
+          "vi": "Paused A có thể tỉnh dậy sau B claim; scheduler reject stale completion không undo external charge đã accepted. Worker precheck lease rồi call sink có race giữa check và mutation. Monotonically increasing tokens chỉ có tác dụng khi protected resource thực sự enforce; highest-seen token chưa biết token8 thì có thể nhận old7. Muốn reject ngay sau new authority cần sink fence activation/current-authority transaction, không một check HTTP rời rạc.",
+          "en": "A paused worker can resume after reassignment; stale-completion rejection cannot undo accepted effects. Lease prechecks race with mutations. Tokens protect resources only when enforced: highest-seen fencing cannot know an unseen newer token. Immediate invalidation needs coordinated activation or atomic authority checks at the resource."
+        },
+        {
+          "vi": "Run/step idempotency chống duplicate supported effect bất kể A/B tới trước, nhưng cần payload fingerprint, retained result scope và atomic operation+dedup. Nó không ngăn worker execute code và không làm arbitrary remote endpoints exactly-once. Lab so no guard/highest-seen/idempotence/current-authority+idempotence với hai arrival orders; current-authority là explicit sink cooperation assumption, không protocol miễn phí.",
+          "en": "Identified effect deduplication needs fingerprints, retention and atomic results. It does not prevent code execution or make arbitrary endpoints exactly-once. The lab compares guard models under both arrival orders and explicitly assumes sink cooperation for current-authority checks."
+        }
+      ],
+      "experiment": "sched-fencing"
+    },
+    {
+      "id": "misfires",
+      "title": {
+        "vi": "8. Missed-run policy phải account cả deferred và skipped",
+        "en": "8. Misfire policies account for deferred and skipped work"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sau outage, enumerate expected occurrences từ durable progress/definition history rồi áp starting deadline, pause/resume và missed-run policy. Catch-up-all giữ từng business interval; latest coalesce theo semantics job; skip ghi reason/metric. Backfill có cap/page, priority và tenant budget để không gây outage lần hai. Late does not mean useless cho mọi job; product quyết định deadline và allowed delay, không hard-code một policy cho billing lẫn cache refresh.",
+          "en": "Enumerate expected occurrences from saved progress/history, applying deadlines and policies. Catch-up preserves intervals, latest coalesces by job semantics and skip records reasons. Bound backfill pages/priorities/budgets to protect live traffic. Use product-specific deadlines rather than equate lateness with useless work."
+        },
+        {
+          "vi": "Lab ở phút 45, deadline 20 phút xét occurrences tại phút 10, 20, 30 và 40: phút 10/20 expired, phút 30/40 eligible. Cap 1 admit phút 30 và giữ phút 40 deferred, nên frontier không vượt phút 30. Latest admit phút 40 và account phút 30 là coalesced; skip ghi eligible occurrences là policy-skipped. Đây là recovery-page worksheet, không durable execution; repeated reads cần stable IDs và unique materialization. Theo dõi skipped-by-policy khác lost/unaccounted occurrence.",
+          "en": "The lab at minute forty-five with deadline twenty expires ten/twenty and retains thirty/forty. Cap one admits thirty and defers forty, limiting progress. Latest coalesces thirty; skip explicitly records eligible omissions. Stable identities protect repeated pages. Distinguish policy skips from unaccounted losses."
+        }
+      ],
+      "experiment": "sched-catchup"
+    },
+    {
+      "id": "calendar",
+      "title": {
+        "vi": "9. Cron dialect, UTC instants và DST policies",
+        "en": "9. Cron dialects, UTC instants and DST policies"
+      },
+      "paragraphs": [
+        {
+          "vi": "Store intended cron/local schedule, named IANA zone, policy version và relevant tzdata/planner version; resolve UTC occurrences bằng tested library. Five-field/six-field dialects, weekday/month-day rules, macros và special symbols khác nhau giữa products; không đem một “?” extension của hệ này sang hệ kia rồi hứa same semantics. API preview next occurrences giúp users thấy DST/misfire behavior trước save. Interval-based every24h khác local09:00daily qua DST.",
+          "en": "Store intended schedules, named zones, policy versions and relevant planner/timezone versions. Tested libraries resolve UTC occurrences; cron dialects differ in fields, day rules and extensions. Preview actual occurrences. Fixed twenty-four-hour intervals differ from daily local wall-clock schedules across DST."
+        },
+        {
+          "vi": "Local gap không có instant; fold có hai. Policy có thể skip, next-valid, preserve-shift-duration hoặc select first/both fold; chọn và document, không âm thầm để OS decide. Lab cố định America/New_York 2026: spring02:30gap next-valid thành03:00, fall01:30 có 05:30Z và 06:30Z. Hai folds cần distinct occurrence IDs nếu chọnboth. Đây là calendar fixture, không general cron parser; schedule/tzdata update cần replan và identity policy cho already-materialized runs.",
+          "en": "Gaps lack instants and folds have two. Explicit policies select skipped/shifted gaps and fold occurrences. The fixed New York fixture chooses next-valid 03:00 for the spring gap and distinct UTC identities for both fall occurrences. It is not a general parser; replanning needs policies for existing materialized work."
+        }
+      ],
+      "experiment": "sched-dst"
+    },
+    {
+      "id": "overlap",
+      "title": {
+        "vi": "10. Allow, Forbid và Replace là policy chứ không magic fencing",
+        "en": "10. Overlap policies do not magically fence effects"
+      },
+      "paragraphs": [
+        {
+          "vi": "Allow cho independent occurrences overlap trong quotas. Forbid giữ một logical active run trong chosen scope nhưng cần atomic active-run check/claim, deadline và misfire behavior khi run cũ xong. Replace yêu cầu cancellation/supersession rồi launch latest theo explicit policy; cancel request không bảo đảm old process hoặc remote effect đã stop. “Latest wins” chỉ đúng nếu target validate generation hoặc effect design cho phép replacement.",
+          "en": "Allow permits budgeted independent overlap. Forbid needs atomic active-run checks and later deadline/misfire rules. Replace requests cancellation/supersession under explicit launch policies; cancellation alone does not prove old code/effects stopped. Latest-wins behavior requires cooperating generations or replaceable effects."
+        },
+        {
+          "vi": "Scope có thể là một job definition, tenant resource hoặc target business entity. Hai definitions khác nhau cùng update một report không được bảo vệ chỉ vì mỗi job Forbid. Pause stops future admission theo policy, không tự kill mọi running attempt; delete cần audit/tombstone để stale planners không revive job. Terminal outcome vs cancel race có one-winner state transition và external reconciliation khi necessary.",
+          "en": "Define overlap scope: individual definitions do not protect shared resources across jobs. Pausing future admission differs from stopping active work. Deletion requires protection against stale resurrection, while cancellation/completion races need authoritative winners and possible external reconciliation."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Policy",
+            "en": "Policy"
+          },
+          {
+            "vi": "Suitable condition",
+            "en": "Suitable condition"
+          },
+          {
+            "vi": "Extra guard",
+            "en": "Extra guard"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Allow",
+              "en": "Allow"
+            },
+            {
+              "vi": "Independent bounded effects.",
+              "en": "Independent bounded effects."
+            },
+            {
+              "vi": "Tenant/target concurrency và sink identity.",
+              "en": "Concurrency budgets and effect identities."
+            }
+          ],
+          [
+            {
+              "vi": "Forbid",
+              "en": "Forbid"
+            },
+            {
+              "vi": "Một logical active run trong defined scope.",
+              "en": "One logical active run within scope."
+            },
+            {
+              "vi": "Atomic ownership + explicit missed-run behavior.",
+              "en": "Atomic ownership and misfire rules."
+            }
+          ],
+          [
+            {
+              "vi": "Replace",
+              "en": "Replace"
+            },
+            {
+              "vi": "Superseded result có thể bỏ/thay.",
+              "en": "Superseded results can be discarded/replaced."
+            },
+            {
+              "vi": "Cancellation + target generation/fencing khi required.",
+              "en": "Cancellation and target generation/fencing where needed."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "retries",
+      "title": {
+        "vi": "11. Retry cùng intent, bounded deadline và DLQ resolution",
+        "en": "11. Retry the same intent under bounded deadlines"
+      },
+      "paragraphs": [
+        {
+          "vi": "Phân transient, permanent và ambiguous failures. Backoff exponential với cap/full jitter chỉ trong retry/start/execution deadline đã chốt; attempt budget có total elapsed time và target-specific Retry-After/quota. Stable run/step ID giữ qua retries; attempt ID mới dùng ownership/history. HTTP5xx/timeout không luôn proof no effect. Không retry side effect non-idempotent vô hạn chỉ vì delivery chưa được ACK.",
+          "en": "Distinguish transient, permanent and uncertain failures. Bound exponential/jittered retries by attempts and elapsed deadlines while respecting target throttles. Preserve effect identities across new attempt ownership. Timeouts/errors do not universally prove absence of effects, and non-idempotent work needs explicit resolution."
+        },
+        {
+          "vi": "Exhausted/DLQ giữ error category/redacted history, last known effect evidence và owner/runbook; không chỉ “needs human” rồi mất workflow responsibility. Redrive same logical intent khi mục tiêu finish original work; new business intent phải explicit vì dedup key mới có thể tạo another valid effect. Retry queue ordering và per-target concurrency không được để poison job starve tất cả. Dead state khác successful cancellation hoặc policy skip.",
+          "en": "Exhausted work retains evidence, ownership and runbooks. Redriving an original intent differs from creating a new one, which may legitimately cause another effect. Isolate poison work and distinguish dead, canceled and skipped states."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một attempt thất bại có trách nhiệm tiếp theo",
+          "en": "Account for the next step after failure"
+        },
+        "caption": {
+          "vi": "Outcome uncertainty đi cùng workflow, không bị xóa khi requeue.",
+          "en": "Carry uncertainty through retries rather than discard it."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Classify",
+              "en": "Classify"
+            },
+            "detail": {
+              "vi": "Known fail, ambiguous effect hoặc permanent error.",
+              "en": "Separate failure, uncertainty and permanent error."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Persist / schedule",
+              "en": "Persist and schedule"
+            },
+            "detail": {
+              "vi": "Retain evidence, same intent và bounded next eligibility.",
+              "en": "Retain evidence and bounded retry eligibility."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Retry safely",
+              "en": "Retry safely"
+            },
+            "detail": {
+              "vi": "New ownership token, supported sink dedup/guards.",
+              "en": "Use current ownership and supported effect guards."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Resolve / escalate",
+              "en": "Resolve or escalate"
+            },
+            "detail": {
+              "vi": "Terminal evidence và authorized redrive.",
+              "en": "Record outcomes and authorize redrive."
+            },
+            "icon": "flag"
+          }
+        ]
+      }
+    },
+    {
+      "id": "fairness",
+      "title": {
+        "vi": "12. Quotas, jitter và catch-up phải bảo vệ live work",
+        "en": "12. Budgets, jitter and catch-up protect live work"
+      },
+      "paragraphs": [
+        {
+          "vi": "Creation quota giới hạn definitions/occurrences, admission quota giới hạn starts, execution quota giới hạn active runtime/concurrency. Weighted fair queues theo tenant/priority tránh một tenant chiếm toàn workers; per-target limits bảo vệ endpoint. Fairness theo request count không luôn fair CPU/runtime/bytes; long jobs cần resource-aware budgets. Strict priority có starvation nên thêm aging/reserves hoặc documented lower-class SLO.",
+          "en": "Separate definition, start and execution quotas. Weighted queues and target limits protect shared workers/endpoints; count fairness may still ignore runtime/byte costs. Strict priorities need aging/reserves or explicit lower-class service guarantees."
+        },
+        {
+          "vi": "Deterministic jitter từ occurrence identity giúp retry/replan giữ same chosen fire time trong allowed window; flexible=0 phải no jitter, không modulo zero. Đừng randomize lại key/time mỗi retry hoặc shift ngoài deadline. Catch-up dùng bounded share cùng live traffic; autoscale dựa due lag, queue age, service time và target ceilings chứ không chỉ worker CPU. Resource cap có thể dẫn delayed/skipped work theo policy và phải visible.",
+          "en": "Deterministic occurrence-based jitter preserves resolved times across replans inside allowed windows, with zero flexibility meaning no jitter. Do not mutate identities/times on retries. Backfill shares capacity with live work; scale using lag, age, service time and target limits while exposing policy outcomes."
+        }
+      ]
+    },
+    {
+      "id": "workflows",
+      "title": {
+        "vi": "13. Từ trigger sang durable workflow",
+        "en": "13. From triggers to durable workflows"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cron chỉ nên tạo occurrence/launch một workflow khi work nhiều steps, dependencies hoặc waits. Workflow history giữ step intents/results, retries và data interval; crash resume từ durable state nhưng activities vẫn có thể retry sau lost result. Export/load/notify mỗi effect cần step identity/contract; “checkpoint từng bước” không tự guarantee notification một lần. Long waits dùng durable timers, không giữ worker process/memory chỉ để ngủ.",
+          "en": "For multistep work, schedules launch workflows with durable step/result history and data intervals. Recovery resumes recorded state, but activities can still retry after lost results. Each external effect needs its own contract; checkpointing does not make notifications unique. Durable timers avoid sleeping worker processes."
+        },
+        {
+          "vi": "Data interval của aggregation/report khác wall-clock attempt start. Backfill giờ 01:00 chạy lúc05:00 vẫn cần query intended interval01:00, không Date.now() bên worker rồi update wrong window. Job version/payload schema được pin tại run creation hoặc explicit upgrade policy; deterministic workflow replay không tùy tiện dùng code/clock mới để re-decide old accepted outcomes.",
+          "en": "Intended data intervals differ from execution clocks. Backfilled reports query original intervals rather than current time. Pin definition/payload versions or define upgrades, and avoid replaying old outcomes under arbitrary new code/clocks."
+        }
+      ]
+    },
+    {
+      "id": "security",
+      "title": {
+        "vi": "14. Target execution là quyền truy cập tài nguyên",
+        "en": "14. Execution targets grant resource access"
+      },
+      "paragraphs": [
+        {
+          "vi": "Validate tenant authority và target allowlists/capabilities; arbitrary URLs có SSRF/credential forwarding risks. Resolve/connect policy phải xử lý DNS/private address changes và redirects, không chỉ string prefix check. Payload/secret refs có scope/version, short-lived credentials và redacted logs. Internal claim/heartbeat/completion APIs cần authenticated workers và token authorization, không tin workerId do request tự khai.",
+          "en": "Target invocation needs scoped capabilities and protection against SSRF, redirects and address changes. Reference scoped secrets with controlled credentials and redact logs. Authenticate internal workers and authorize tokens rather than trust self-declared names."
+        },
+        {
+          "vi": "Manual run/cancel/delete/redrive là privileged actions có audit actor/reason. Queue/history/snapshot retention cân bằng diagnosis và sensitive data lifecycle; keep enough identity/result state cho declared retry scope. Tenant isolation gồm timeouts, response-size limits, network pools, resource limits và kill/quarantine policy, không chỉ database tenantId filter.",
+          "en": "Audit privileged manual/replay actions. Retention preserves necessary retry evidence while protecting sensitive data. Isolation includes network/runtime/response/resource limits, not merely tenant filters."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "15. Quan sát cả những lần không có gì xảy ra",
+        "en": "15. Observe occurrences that never produce events"
+      },
+      "paragraphs": [
+        {
+          "vi": "Monitor planner horizon coverage, accounted-through lag, due-to-materialization/start latency, ready age, active leases/expired attempts, lost completions, retry/DLQ age, skipped reasons và last expected success. Alert “expected occurrence chưa có accounted state” khác “last run failed”; absence có thể không tạo error log. Compare expected schedules trong supported definition history với runs ở independent monitor, có maintenance/pause exceptions rõ.",
+          "en": "Monitor horizons, progress lag, start latency, ready age, lease loss, retries, skips and expected success. Unaccounted occurrences differ from failed runs; silence may produce no error log. Independent expected-run comparison respects pauses and maintenance rules."
+        },
+        {
+          "vi": "Fault tests: dispatcher crash trước/sau run/outbox commit, publisher ACK loss, planner stale generation, missed buckets after outage, paused A trước B, sink arrival-order reversal, completion/cancel race, clock jumps, DST gap/fold, target throttling và shard migration. Assert every expected occurrence accounted theo policy, no stale state commit và effect guarantees chỉ trong supported sink contract. UI green succeeded không chứng minh external side effect đúng một lần.",
+          "en": "Test commit/publication gaps, stale plans, outage buckets, paused workers, sink arrival orders, cancellation races, clock/DST changes, throttles and migrations. Assert policy-accounted occurrences, fenced state and supported effect guarantees rather than equate green completion with uniqueness."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure",
+            "en": "Failure"
+          },
+          {
+            "vi": "Expected response",
+            "en": "Expected response"
+          },
+          {
+            "vi": "Evidence",
+            "en": "Evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Queue ACK loss",
+              "en": "Queue ACK loss"
+            },
+            {
+              "vi": "Identified redelivery và same run.",
+              "en": "Identified redelivery of the same run."
+            },
+            {
+              "vi": "Unique occurrence + outbox/claim state.",
+              "en": "Unique occurrence and durable delivery/claim state."
+            }
+          ],
+          [
+            {
+              "vi": "Old worker resumes",
+              "en": "Old worker resumes"
+            },
+            {
+              "vi": "Stale completion reject; effects depend sink guards.",
+              "en": "Reject stale completion; effects depend on sinks."
+            },
+            {
+              "vi": "Attempt token và effect receipt.",
+              "en": "Attempt authority and effect receipts."
+            }
+          ],
+          [
+            {
+              "vi": "Outage over buckets",
+              "en": "Outage over buckets"
+            },
+            {
+              "vi": "Account old due range, cap backfill.",
+              "en": "Account old ranges with bounded backfill."
+            },
+            {
+              "vi": "Persisted frontier + skipped/deferred reasons.",
+              "en": "Saved progress and explicit policy states."
+            }
+          ],
+          [
+            {
+              "vi": "Clock/DST changes",
+              "en": "Clock/DST changes"
+            },
+            {
+              "vi": "Apply explicit resolution/version policy.",
+              "en": "Apply explicit versioned resolution policies."
+            },
+            {
+              "vi": "Intended time + resolved UTC + planner metadata.",
+              "en": "Intended times, UTC instants and planner metadata."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Luyện trace một occurrence qua mọi boundary",
+        "en": "16. Trace an occurrence through every boundary"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn run9: planner đã materialize, queue ACK mất, A pause sau claim, B takeover, A tới sink trước B và completion bị reject. Hãy phân biệt bao nhiêu logical runs, attempts và effects. Sau đó cho controller down45 phút, deadline 20 phút, cap 1 và hỏi frontier được tiến tới đâu; thêm DST fold để kiểm identity có collide không.",
+          "en": "Trace lost queue replies, paused workers and reversed sink arrivals, counting runs, attempts and effects separately. Then recover forty-five minutes of schedules under deadlines/caps and examine fold occurrence identities."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Worker precheck lease trước HTTP call đã đủ an toàn chưa?",
+            "en": "Is checking leases before HTTP calls sufficient?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Ownership có thể đổi sau check trước mutation. Sink phải enforce atomic idempotency/authority contract hoặc job chấp nhận duplicate/uncertainty với reconciliation. Heartbeat chỉ giảm expiry không chứng minh pause không xảy ra.",
+              "en": "No. Ownership can change before mutation; use cooperating sink guards or explicit uncertainty/reconciliation."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Highest-seen token có chặn old7 ngay khi scheduler cấp8 không?",
+            "en": "Does highest-seen fencing reject seven immediately when eight is issued?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu sink chưa biết8. Lab A-first chấp nhận7 rồi8; B-first mới chặn7. Cần fence activation/current-authority checks tại protected resource khi yêu cầu invalidation ngay, và idempotency vẫn là vấn đề riêng.",
+              "en": "Not before the sink observes/activates eight. Immediate invalidation and duplicate-effect prevention require distinct supported guards."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao effect key không nên là attempt ID?",
+            "en": "Why should effect identities usually differ from attempt IDs?"
+          },
+          "answer": [
+            {
+              "vi": "Mỗi retry có attempt mới nhưng vẫn same business operation. Key đổi theo attempt làm sink coi retry là operation mới; dùng stable run/step scope và fingerprint trong declared retention.",
+              "en": "Attempts change ownership while business intent remains stable; preserve identified effect scope and fingerprints."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sau downtime có chỉ đọc current bucket được không?",
+            "en": "Can recovery scan only the current bucket?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu đã promise account old occurrences. Dùng durable frontier/history, deadline/misfire policy và bounded catch-up. Deferred work không bị cursor advance vượt; explicit skipped reason khác silent loss.",
+              "en": "Not when older occurrences require accounting. Retain progress and bounded policy-aware catch-up without crossing deferred work."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Replace có chắc old worker không thể ghi nữa không?",
+            "en": "Does replacement prove old workers cannot write?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Cancellation là intent; paused worker/remote request có thể tiếp tục. Target generation/fencing hoặc replaceable effect design mới bảo vệ latest-wins. Forbid scope cũng phải nêu rõ.",
+              "en": "No. Replacement needs cooperating generation/fencing or replaceable effects, and overlap scopes remain explicit."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Daily local09:00 có luôn cách nhau24 giờ không?",
+            "en": "Are daily local nine-AM occurrences always twenty-four hours apart?"
+          },
+          "answer": [
+            {
+              "vi": "Không qua DST/timezone policy changes. Resolve intended local schedule bằng named zone/version và explicit gap/fold rules, store UTC instants/identity; interval24h là schedule khác.",
+              "en": "No. Wall-clock schedules and fixed intervals differ across zone transitions; resolve and identify occurrences explicitly."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "10Mjobs/10 phút với500Bhistory cho bao nhiêu daily bytes?",
+            "en": "What daily history follows ten million jobs every ten minutes at five hundred bytes?"
+          },
+          "answer": [
+            {
+              "vi": "10M/600×86400=1,44Boccurrences/day;×500B=720 GB thập phân trước extra attempts/indexes/replication. Không dùng rounded17K/s rồi trình bày734 GB như exact same assumption.",
+              "en": "The exact assumptions yield 1.44 billion occurrences and 720 decimal GB before overhead; avoid presenting rounded-rate arithmetic as exact."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Workflow checkpoints có làm notify exactly-once không?",
+            "en": "Do workflow checkpoints make notifications exactly-once?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự động. Lost activity result có thể retry sau accepted notify; step identity và provider/sink cooperation quyết định supported effect semantics. Workflow history giúp recovery orchestration, không thay external transactional boundary.",
+              "en": "Not automatically. Activity retries still need supported sink identities/transactions; orchestration history does not replace external boundaries."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

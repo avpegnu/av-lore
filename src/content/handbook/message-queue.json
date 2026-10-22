@@ -1,0 +1,1450 @@
+{
+  "id": "message-queue",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Distributed Message Queue: log, replicas và visibility",
+    "en": "Designing a Distributed Message Queue: logs, replicas and visibility"
+  },
+  "summary": {
+    "vi": "Xây durable partitioned log từ segment/index tới producer ACK, replication, consumer cursors, transaction visibility, compaction và tiered recovery; theo dõi từng boundary qua mô phỏng có thể kiểm chứng.",
+    "en": "Build a durable partitioned log from segments/indexes through ACKs, replication, cursors, transactions, compaction and tiered recovery with inspectable boundary simulations."
+  },
+  "prerequisites": [
+    "messaging",
+    "consistency",
+    "object-storage"
+  ],
+  "relatedTopics": [
+    "messaging",
+    "distributed",
+    "storage-search",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Producer ACK, replicated prefix, transaction visibility và consumer effect là boundaries riêng.",
+      "en": "ACKs, replication, transaction visibility and consumer effects are separate boundaries."
+    },
+    {
+      "vi": "Logical offsets không phải byte positions và không nhất thiết liên tục sau compaction.",
+      "en": "Logical offsets differ from byte positions and can contain compaction gaps."
+    },
+    {
+      "vi": "Replication safety cần eligibility, epochs/fencing và declared failure assumptions.",
+      "en": "Replication safety needs eligibility, fencing and declared failure assumptions."
+    },
+    {
+      "vi": "Retention/tombstone windows và snapshots quyết định supported replay/rebuild.",
+      "en": "Retention/tombstone windows and snapshots determine supported replay/rebuild."
+    },
+    {
+      "vi": "Sizing phải kiểm retention, bandwidth, skew, consumer replay và repair reserves.",
+      "en": "Size retention, bandwidth, skew, replay and repair reserves together."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Theo record từ append tới recovery",
+      "en": "Follow records from append to recovery"
+    },
+    "caption": {
+      "vi": "Nhìn bytes, authority và processing state ở từng bước.",
+      "en": "Inspect bytes, authority and processing state at each step."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Append bytes",
+          "en": "Append bytes"
+        },
+        "detail": {
+          "vi": "Batches, segments, sparse indexes và recoverable framing.",
+          "en": "Batches, segments, sparse indexes and recoverable framing."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Commit / fence",
+          "en": "Commit and fence"
+        },
+        "detail": {
+          "vi": "Eligible replicas, epochs, ACK và failure recovery.",
+          "en": "Eligible replicas, epochs, ACKs and failure recovery."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Expose / process",
+          "en": "Expose and process"
+        },
+        "detail": {
+          "vi": "HW/LSO, consumer ownership và safe effects.",
+          "en": "HW/LSO, consumer ownership and safe effects."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Retain / rebuild",
+          "en": "Retain and rebuild"
+        },
+        "detail": {
+          "vi": "Compaction, remote manifests và resnapshot windows.",
+          "en": "Compaction, remote manifests and resnapshot windows."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Thiết kế broker, không chỉ dùng một queue",
+        "en": "1. Design the broker rather than merely use a queue"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài Messaging giải thích cách ứng dụng dùng queues/streams. Ở đây ta xây dịch vụ log: producers append records vào topic partitions; mỗi consumer group giữ cursor riêng, có replay trong retention window. Product baseline cần per-partition append order, durable acceptance theo failure model đã chốt, bounded fetch, group membership/offsets, replication/failover và vận hành multi-tenant. Delay scheduling, priority queue, global order và arbitrary exactly-once side effects không tự xuất hiện từ thiết kế này.",
+          "en": "The Messaging lesson explains application use of queues/streams. Here we design the log service itself: producers append to topic partitions, while independent consumer groups replay within retention windows. The baseline provides per-partition append order, acceptance under stated failure assumptions, bounded fetch, group cursors, replication/failover and tenant controls. Delays, priorities, global order and arbitrary exactly-once effects are separate requirements."
+        },
+        {
+          "vi": "Định nghĩa p99 producer ACK latency theo batch size/ACK mode, fetch latency khi có data và khi long poll, accepted-data loss theo failure scenarios, recovery time và maximum tolerated consumer lag. “Không mất message” phải nói rõ mất một broker, cả rack, toàn AZ hay mọi replica cùng mất điện. Append vào OS page cache khác fsync xuống thiết bị; replication giữa failure domains có thể bảo vệ single-node loss nhưng không thay thế mọi power-loss/backup policy.",
+          "en": "Define ACK latency by batch/ACK mode, fetch latency with data and long polls, data-loss guarantees by failure scenario, recovery time and supported lag. Durability claims distinguish broker, rack, zone and correlated power failures. Page-cache appends are not per-record fsyncs; replication across failure domains does not replace every persistence and backup policy."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Ordering contract",
+            "en": "Ordering contract"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Thứ tự append trong một partition; cross-producer business causality cần protocol riêng.",
+              "en": "Append order within a partition; business causality needs additional protocols."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Durability contract",
+            "en": "Durability contract"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "ACK boundary, replica eligibility, fencing và declared failures phải khớp nhau.",
+              "en": "ACK boundaries, eligibility, fencing and declared failures must agree."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Replay contract",
+            "en": "Replay contract"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Retention, compaction holes, committed cursor và sink cooperation đều ảnh hưởng recovery.",
+              "en": "Retention, compaction holes, cursors and sink cooperation affect recovery."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Tính ingress, copies, retention và replay riêng",
+        "en": "2. Size ingress, copies, retention and replay separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định trung bình một triệu records/giây, mỗi record 1.000 bytes trước compression/framing, RF=3, retention bảy ngày và ba full-stream consumer groups. Logical ingress là 1 GB/s; replica append tổng 3 GB/s; follower replication thêm khoảng 2 GB/s bên cạnh producer ingress. Consumer payload egress khoảng 3 GB/s. Storage thô là 1.000.000 ×1.000 ×604.800 ×3 = 1,8144 PB thập phân. Đây là giả định arithmetic, không phải benchmark hoặc cấu hình khuyến nghị.",
+          "en": "Assume one million records/second, 1,000 bytes each before compression/framing, RF=3, seven-day retention and three full-stream groups. Logical ingress is 1 GB/s; aggregate replica appends are 3 GB/s, with about 2 GB/s of follower replication beyond producer ingress. Consumer payload egress is about 3 GB/s. Raw replicated retention is 1,000,000 ×1,000 ×604,800 ×3 = 1.8144 decimal PB. These are arithmetic assumptions, not benchmarks or deployment recommendations."
+        },
+        {
+          "vi": "Nếu thử budget 10 MB/s logical ingress/partition thì cần ít nhất 100 partitions cho average, nhưng hot keys, peak, CPU compression, partition overhead và consumer parallelism có thể đổi con số. Với giả định 100 MB/s usable replica-write/node, bandwidth floor là 30 nodes. Nếu mỗi node chỉ 30 TB usable cho retained data thì capacity floor là ceil(1.814,4/30)=61 nodes, trước reserve/rebuild. Chọn lớn hơn trong disk/network/CPU/capacity constraints, rồi kiểm skew và mất một failure domain; 30 nodes theo throughput không có nghĩa đã đủ đĩa.",
+          "en": "A hypothetical 10 MB/s logical ingress budget per partition implies at least 100 partitions on average, subject to hot keys, peaks, CPU, overhead and consumer parallelism. A hypothetical 100 MB/s replica-write budget per node gives a 30-node bandwidth floor. At only 30 TB usable retained capacity/node, the capacity floor is ceil(1,814.4/30)=61 nodes before reserves/rebuilds. Size all constraints and failure-domain loss; throughput alone does not establish disk sufficiency."
+        },
+        {
+          "vi": "Compression ratio phải đo trên actual batches; index, headers, compaction rewrite amplification, temporary rewrite files, producer retries, slow group replay và recovery traffic cần headroom. Rebuild một replica 10 TB qua effective 200 MB/s mất ít nhất 50.000 giây, khoảng 13,9 giờ, chưa tính concurrent ingest và throttles. Capacity plan phải cho hệ thống chịu thêm failure trong cửa sổ repair đã chốt, không chỉ ngày hoạt động bình thường.",
+          "en": "Measure compression on representative batches and reserve for indexes, headers, compaction amplification, temporary files, retries, replay and recovery. Rebuilding 10 TB at an effective 200 MB/s takes at least 50,000 seconds, roughly 13.9 hours, before competing traffic and throttles. Plan failure tolerance during repair, not only steady-state operation."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Budget giả định",
+            "en": "Assumed budget"
+          },
+          {
+            "vi": "Phép tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Kết quả",
+            "en": "Result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Logical ingress",
+              "en": "Logical ingress"
+            },
+            {
+              "vi": "1M/s ×1 KB",
+              "en": "1M/s ×1KB"
+            },
+            {
+              "vi": "1 GB/s",
+              "en": "1GB/s"
+            }
+          ],
+          [
+            {
+              "vi": "Replica append",
+              "en": "Replica append"
+            },
+            {
+              "vi": "1 GB/s ×RF3",
+              "en": "1GB/s ×RF3"
+            },
+            {
+              "vi": "3 GB/s",
+              "en": "3GB/s"
+            }
+          ],
+          [
+            {
+              "vi": "Consumer payload",
+              "en": "Consumer payload"
+            },
+            {
+              "vi": "1 GB/s ×3 groups",
+              "en": "1GB/s ×3 groups"
+            },
+            {
+              "vi": "3 GB/s",
+              "en": "3GB/s"
+            }
+          ],
+          [
+            {
+              "vi": "Replicated retention",
+              "en": "Replicated retention"
+            },
+            {
+              "vi": "1 GB/s ×604800s ×3",
+              "en": "1GB/s ×604800s ×3"
+            },
+            {
+              "vi": "1,8144 PB",
+              "en": "1.8144PB"
+            }
+          ],
+          [
+            {
+              "vi": "Capacity floor trước reserves",
+              "en": "Capacity floor before reserves"
+            },
+            {
+              "vi": "1814,4 TB /30 TB usable",
+              "en": "1814.4TB /30TB usable"
+            },
+            {
+              "vi": "61 nodes",
+              "en": "61 nodes"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "protocol",
+      "title": {
+        "vi": "3. Protocol trả offsets, epochs và lỗi có ý nghĩa",
+        "en": "3. Protocols expose meaningful offsets, epochs and errors"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng logical operations dưới đây để nói rõ contract; đây không phải HTTP endpoints hoặc wire format tương thích Kafka. Metadata discovery trả partition owner/epoch và refresh policy. Produce request chứa topic/partition, identified batch, producer epoch/sequence nếu hỗ trợ idempotence, ACK requirements và timeout. Broker validate auth/quota/schema bounds/CRC, reject stale ownership và trả first/last offsets khi đủ boundary. Timeout có thể là unknown outcome sau append, không chứng minh record chưa tồn tại.",
+          "en": "These logical operations define contracts rather than HTTP endpoints or Kafka-compatible wire formats. Metadata discovery returns owners/epochs and refresh rules. Produce requests identify partitions, batches, producer epochs/sequences, ACK requirements and timeouts. Brokers enforce authorization, quotas, size/checksum bounds and ownership; timeouts can leave an append outcome unknown."
+        },
+        {
+          "vi": "Fetch cần start offset, isolation mode, max bytes/records và bounded wait/min bytes. Broker tránh một large batch làm client không tiến được bằng size/oversized-batch contract rõ. Cursor offsets là logical positions; control records, compaction và transaction filtering có thể tạo gaps. CommitOffset là next offset đã xử lý an toàn theo group contract, không phải lần cuối fetch được record nào. Errors như stale epoch, out-of-range, insufficient replicas và quota throttling cần retry/reset semantics khác nhau.",
+          "en": "Fetches specify offsets, isolation, byte/record bounds and wait/minimum-byte rules, including progress with oversized batches. Offsets are logical positions; controls, compaction and transaction filtering create gaps. Offset commits describe safely processed next positions, not merely fetched records. Stale epochs, expired offsets, insufficient replicas and quotas require different recovery policies."
+        }
+      ],
+      "api": [
+        {
+          "method": "PRODUCE",
+          "path": "topic / partition",
+          "description": {
+            "vi": "Append batch dưới current leader epoch; response không biến unknown timeout thành failed append.",
+            "en": "Append under the current epoch without equating timeouts with failed appends."
+          },
+          "request": "{partition, leaderEpoch, producerId, producerEpoch, firstSequence, batch, requiredAcks, timeoutMs}",
+          "response": "{baseOffset, lastOffset, leaderEpoch, error?, throttleMs}"
+        },
+        {
+          "method": "FETCH",
+          "path": "partition / nextOffset",
+          "description": {
+            "vi": "Bounded long poll theo visibility boundary và retention.",
+            "en": "Bounded long polls under visibility and retention constraints."
+          },
+          "request": "{partition, nextOffset, isolation, maxBytes, minBytes, maxWaitMs}",
+          "response": "{batches, highWatermark, logStartOffset, lastStableOffset?, error?}"
+        },
+        {
+          "method": "JOIN / HEARTBEAT",
+          "path": "consumer group",
+          "description": {
+            "vi": "Membership và generation-aware assignment.",
+            "en": "Membership and generation-aware assignments."
+          },
+          "request": "{groupId, memberId?, generation?, subscriptions}",
+          "response": "{memberId, generation, assignments, error?}"
+        },
+        {
+          "method": "COMMIT_OFFSET",
+          "path": "group / partition",
+          "description": {
+            "vi": "Commit next offset dưới ownership/generation hiện hành.",
+            "en": "Commit next offsets under current ownership/generations."
+          },
+          "request": "{groupId, memberId, generation, partition, nextOffset}",
+          "response": "{accepted, error?}"
+        },
+        {
+          "method": "END_TRANSACTION",
+          "path": "producer / transaction",
+          "description": {
+            "vi": "Durable transaction decision trên cooperating log participants.",
+            "en": "Durable transaction decisions across cooperating log participants."
+          },
+          "request": "{producerId, producerEpoch, transactionId, decision}",
+          "response": "{decisionState, error?}"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Tách metadata authority khỏi partition data plane",
+        "en": "4. Separate metadata authority from partition data planes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Metadata quorum quản lý topic configuration, replica placement, leader epochs và ownership transitions. Partition leaders ghi/fetch data, followers replicate suffixes. Group và transaction coordinators có state durability riêng và thường được partition theo IDs; không cho một global lock xử lý mọi produce. Metadata cache giảm per-request coordination, nhưng stale metadata cần fenced requests và refresh. Một consensus protocol của metadata không có nghĩa mọi data partition dùng chính cùng protocol ấy.",
+          "en": "A metadata quorum owns configurations, placement, epochs and ownership transitions. Leaders/followers handle partition data, while group/transaction coordinators shard their own durable state. Cache discovery without permitting stale authority. Metadata consensus does not imply that each data partition uses the same replication algorithm."
+        },
+        {
+          "vi": "Một client request đi tới đúng owner, được authorize trước append/fetch, bị giới hạn memory/bytes và được ghi dưới current epoch. Follower progress và eligibility cập nhật theo protocol; fetch chỉ expose records đạt isolation boundary. Maintenance chạy có quota để không chiếm hết I/O của foreground. Sơ đồ có thể click từng component và chọn trace produce, consume, election, transaction hoặc tiering để xem boundary cụ thể.",
+          "en": "Authorized bounded requests reach current owners and carry epochs. Replica progress establishes protocol-specific visibility, while maintenance has budgets that protect foreground I/O. Select produce, consume, election, transaction or tiering traces and inspect each component to follow the boundaries."
+        }
+      ],
+      "diagram": {
+        "id": "log-authority-and-storage",
+        "title": {
+          "vi": "Từ producer batch tới committed log và consumer state",
+          "en": "From producer batches to committed logs and consumer state"
+        },
+        "caption": {
+          "vi": "Metadata plane xác định ownership/epochs; data plane ghi và replicate partitions. Producer ACK, fetch visibility và consumer side effects có boundaries riêng.",
+          "en": "The metadata plane assigns ownership/epochs; the data plane writes and replicates partitions. ACKs, fetch visibility and consumer effects have distinct boundaries."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "producer",
+            "label": {
+              "vi": "Producer client",
+              "en": "Producer client"
+            },
+            "detail": {
+              "vi": "Batch/compress, key routing, bounded retries, producer identity và sequence.",
+              "en": "Batches/compresses, routes keys and retains bounded retry identities/sequences."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "leader",
+            "label": {
+              "vi": "Partition leader",
+              "en": "Partition leader"
+            },
+            "detail": {
+              "vi": "Validate epoch/sequence/quota, append segments và track commit boundary.",
+              "en": "Validates epochs/sequences/quotas, appends segments and tracks commits."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "follower",
+            "label": {
+              "vi": "Data replicas",
+              "en": "Data replicas"
+            },
+            "detail": {
+              "vi": "Fetch ordered suffix, report progress; lag/eligibility khác chỉ còn sống.",
+              "en": "Fetch ordered suffixes and report progress; liveness is not eligibility."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "metadata",
+            "label": {
+              "vi": "Metadata quorum",
+              "en": "Metadata quorum"
+            },
+            "detail": {
+              "vi": "Durable assignments, leader epochs, replica eligibility và safe state transitions.",
+              "en": "Persists assignments, epochs, replica eligibility and safe transitions."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "disk",
+            "label": {
+              "vi": "Segments / indexes",
+              "en": "Segments / indexes"
+            },
+            "detail": {
+              "vi": "Append bytes, sparse offsets, checksums, recovery/truncation và local retention.",
+              "en": "Owns bytes, sparse offsets, checksums, recovery/truncation and retention."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "fetch",
+            "label": {
+              "vi": "Fetch service",
+              "en": "Fetch service"
+            },
+            "detail": {
+              "vi": "Bounded long poll, HW/LSO visibility, local/tiered reads và backpressure.",
+              "en": "Serves bounded long polls under visibility, tiering and backpressure rules."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "group",
+            "label": {
+              "vi": "Group coordinator",
+              "en": "Group coordinator"
+            },
+            "detail": {
+              "vi": "Membership/generation, partition assignment và committed next offsets.",
+              "en": "Owns memberships/generations, assignments and committed next offsets."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "tx",
+            "label": {
+              "vi": "Transaction coordinator",
+              "en": "Transaction coordinator"
+            },
+            "detail": {
+              "vi": "Producer fencing, transaction state/markers và recovery decisions.",
+              "en": "Owns producer fencing, transaction states/markers and recovery decisions."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "service"
+          },
+          {
+            "id": "consumer",
+            "label": {
+              "vi": "Consumer workers",
+              "en": "Consumer workers"
+            },
+            "detail": {
+              "vi": "Process replayable records, contiguous completion và ownership-aware commits.",
+              "en": "Process replayable records with contiguous completion and ownership checks."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "client"
+          },
+          {
+            "id": "sink",
+            "label": {
+              "vi": "External effects",
+              "en": "External effects"
+            },
+            "detail": {
+              "vi": "Idempotent/fenced writes hoặc cooperating transactions; commit offset không undo được side effect.",
+              "en": "Needs idempotency/fencing or cooperating transactions; offsets cannot undo effects."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "store"
+          },
+          {
+            "id": "maintenance",
+            "label": {
+              "vi": "Retention / compaction",
+              "en": "Retention / compaction"
+            },
+            "detail": {
+              "vi": "Rewrite closed segments, publish manifests, respect reader pins và tombstone windows.",
+              "en": "Rewrites closed segments with publication, reader pins and tombstone windows."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "worker"
+          },
+          {
+            "id": "remote",
+            "label": {
+              "vi": "Remote segment tier",
+              "en": "Remote segment tier"
+            },
+            "detail": {
+              "vi": "Immutable segments/indexes và committed metadata trước local eviction.",
+              "en": "Stores immutable segments/indexes with committed metadata before eviction."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "produce",
+            "label": {
+              "vi": "Append và ACK",
+              "en": "Append and acknowledge"
+            },
+            "steps": [
+              {
+                "from": "producer",
+                "to": "metadata",
+                "description": {
+                  "vi": "Discover partition owner và metadata generation; cache có refresh bounds.",
+                  "en": "Discover owners/generations with bounded metadata caching."
+                }
+              },
+              {
+                "from": "producer",
+                "to": "leader",
+                "description": {
+                  "vi": "Send identified batch cùng key/sequence, required ACK và timeout.",
+                  "en": "Send identified batches, sequences, ACK requirements and timeouts."
+                }
+              },
+              {
+                "from": "leader",
+                "to": "disk",
+                "description": {
+                  "vi": "Validate, assign offsets và append dưới active leader epoch.",
+                  "en": "Validate, assign offsets and append under the active epoch."
+                }
+              },
+              {
+                "from": "leader",
+                "to": "follower",
+                "description": {
+                  "vi": "Replicate suffix; collect progress theo chosen replication protocol.",
+                  "en": "Replicate suffixes and collect protocol-specific progress."
+                },
+                "async": true
+              },
+              {
+                "from": "leader",
+                "to": "producer",
+                "description": {
+                  "vi": "ACK chỉ khi declared boundary đạt; lost reply để outcome unknown.",
+                  "en": "Acknowledge only at the declared boundary; lost replies leave uncertainty."
+                }
+              }
+            ]
+          },
+          {
+            "id": "consume",
+            "label": {
+              "vi": "Fetch, effect và offset commit",
+              "en": "Fetch, affect and commit offsets"
+            },
+            "steps": [
+              {
+                "from": "consumer",
+                "to": "group",
+                "description": {
+                  "vi": "Join assignment/generation; resume committed next offset.",
+                  "en": "Join assignments/generations and resume committed next offsets."
+                }
+              },
+              {
+                "from": "consumer",
+                "to": "fetch",
+                "description": {
+                  "vi": "Bounded fetch từ cursor, min bytes/max wait và isolation mode.",
+                  "en": "Fetch bounded data using cursors, wait/size bounds and isolation modes."
+                }
+              },
+              {
+                "from": "fetch",
+                "to": "disk",
+                "description": {
+                  "vi": "Seek segment/index, read dưới visibility boundary.",
+                  "en": "Seek segments/indexes below visibility boundaries."
+                }
+              },
+              {
+                "from": "fetch",
+                "to": "consumer",
+                "description": {
+                  "vi": "Return records cùng offsets; holes không nhất thiết missing delivery.",
+                  "en": "Return records/offsets; holes do not necessarily indicate lost delivery."
+                }
+              },
+              {
+                "from": "consumer",
+                "to": "sink",
+                "description": {
+                  "vi": "Apply effect bằng idempotency/fencing contract của sink.",
+                  "en": "Apply effects under sink idempotency/fencing contracts."
+                }
+              },
+              {
+                "from": "consumer",
+                "to": "group",
+                "description": {
+                  "vi": "Commit contiguous processed next offset với current generation.",
+                  "en": "Commit contiguous processed next offsets under current generations."
+                }
+              }
+            ]
+          },
+          {
+            "id": "election",
+            "label": {
+              "vi": "Failure và quyền ghi mới",
+              "en": "Recover failure and writing authority"
+            },
+            "steps": [
+              {
+                "from": "follower",
+                "to": "metadata",
+                "description": {
+                  "vi": "Report replica state; controller dùng eligibility metadata, không chọn node chỉ vì ping được.",
+                  "en": "Report replica state; eligibility requires more than liveness."
+                }
+              },
+              {
+                "from": "metadata",
+                "to": "leader",
+                "description": {
+                  "vi": "Fence old owner và persist leader epoch/assignment transition.",
+                  "en": "Fence old owners and persist ownership transitions."
+                }
+              },
+              {
+                "from": "metadata",
+                "to": "follower",
+                "description": {
+                  "vi": "Promote eligible replica, reconcile epochs/log suffix.",
+                  "en": "Promote eligible replicas and reconcile log suffixes/epochs."
+                }
+              },
+              {
+                "from": "producer",
+                "to": "metadata",
+                "description": {
+                  "vi": "Refresh owner sau stale epoch; retry giữ producer identity khi hợp lệ.",
+                  "en": "Refresh stale owners and retain valid retry identities."
+                }
+              }
+            ]
+          },
+          {
+            "id": "transaction",
+            "label": {
+              "vi": "Atomic log outputs và offsets",
+              "en": "Commit log outputs and offsets atomically"
+            },
+            "steps": [
+              {
+                "from": "producer",
+                "to": "tx",
+                "description": {
+                  "vi": "Start identified transaction; fence obsolete producer instances.",
+                  "en": "Start identified transactions and fence obsolete producers."
+                }
+              },
+              {
+                "from": "producer",
+                "to": "leader",
+                "description": {
+                  "vi": "Append transactional output batches trên các participants.",
+                  "en": "Append transactional outputs to participant partitions."
+                }
+              },
+              {
+                "from": "tx",
+                "to": "leader",
+                "description": {
+                  "vi": "Durable decision và commit/abort markers cần recovery protocol.",
+                  "en": "Coordinate durable decisions and recoverable commit/abort markers."
+                }
+              },
+              {
+                "from": "consumer",
+                "to": "fetch",
+                "description": {
+                  "vi": "read_committed đợi LSO và lọc aborted records.",
+                  "en": "Read committed data below LSO while filtering aborted records."
+                }
+              }
+            ]
+          },
+          {
+            "id": "tier",
+            "label": {
+              "vi": "Compact / tier / reclaim",
+              "en": "Compact, tier and reclaim"
+            },
+            "steps": [
+              {
+                "from": "maintenance",
+                "to": "disk",
+                "description": {
+                  "vi": "Chọn closed segments, rewrite indexes/checksums và giữ logical offsets.",
+                  "en": "Rewrite eligible closed segments and indexes without renumbering offsets."
+                },
+                "async": true
+              },
+              {
+                "from": "maintenance",
+                "to": "remote",
+                "description": {
+                  "vi": "Upload complete immutable segment/index set; incomplete uploads không publish.",
+                  "en": "Upload complete immutable segment/index sets before publication."
+                },
+                "async": true
+              },
+              {
+                "from": "maintenance",
+                "to": "metadata",
+                "description": {
+                  "vi": "Commit lifecycle/version metadata trước local eviction; giữ reader pins.",
+                  "en": "Commit lifecycle/version metadata before eviction while protecting readers."
+                }
+              },
+              {
+                "from": "fetch",
+                "to": "remote",
+                "description": {
+                  "vi": "Cold replay đọc theo committed manifest, checksum và bounded concurrency.",
+                  "en": "Cold replay uses committed manifests, checksums and bounded concurrency."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "segments",
+      "title": {
+        "vi": "5. Append segments, sparse index và recovery tail",
+        "en": "5. Append segments, sparse indexes and recoverable tails"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi partition là ordered logical log, tách thành active segment và closed segments theo size/time policy. Records/batches có length, checksum, schema/version, timestamps và offsets; actual broker format có thể batch/compress nên offset-to-byte không phải phép nhân cố định. Sparse offset index chọn entry gần trước target rồi sequential scan; time index hỗ trợ time-based seek với timestamp semantics rõ. Page cache và sequential batched writes tăng efficiency nhưng disk stalls vẫn tạo ACK tails.",
+          "en": "Partitions have active and closed segments under size/time policies. Lengths, checksums, versions, timestamps and offsets protect framing; compression/batching prevents fixed offset-to-byte arithmetic. Sparse indexes anchor scans, and timestamp indexes need explicit timestamp semantics. Page caches and batching improve efficiency without eliminating storage stalls."
+        },
+        {
+          "vi": "Sau crash, validate framing/checksum của tail, truncate incomplete suffix theo recovery rules và rebuild corrupt/missing indexes từ valid data nếu có thể. Một file tồn tại không chứng minh records đã commit. Reconciliation dùng leader epochs/commit metadata để tránh giữ divergent uncommitted suffix như valid history. Segment deletion/replacement cần reader pins hoặc equivalent lifetime management; không unlink/reuse file dưới reader theo assumptions chưa kiểm.",
+          "en": "Crash recovery validates framing/checksums, truncates incomplete tails under explicit rules and reconstructs indexes where possible. File existence does not establish commit. Epoch-aware reconciliation distinguishes divergent suffixes from valid history, while deletion/replacement protects active readers."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Seek một logical offset",
+          "en": "Seek a logical offset"
+        },
+        "caption": {
+          "vi": "Index chỉ định nơi bắt đầu scan, không bảo đảm target record còn tồn tại.",
+          "en": "An index anchors scanning without promising that a requested record survives."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Check retention",
+              "en": "Check retention"
+            },
+            "detail": {
+              "vi": "So cursor với log start/end boundaries.",
+              "en": "Check start/end boundaries."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Find segment",
+              "en": "Find segment"
+            },
+            "detail": {
+              "vi": "Chọn segment base gần trước requested offset.",
+              "en": "Choose the preceding segment base."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Seek index",
+              "en": "Seek index"
+            },
+            "detail": {
+              "vi": "Floor sparse entry → physical byte position.",
+              "en": "Find a preceding entry and byte position."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Scan / return",
+              "en": "Scan and return"
+            },
+            "detail": {
+              "vi": "Validate batches, skip holes/control records theo isolation contract.",
+              "en": "Validate batches and obey hole/control/isolation rules."
+            },
+            "icon": "check"
+          }
+        ]
+      },
+      "experiment": "log-seek"
+    },
+    {
+      "id": "replication",
+      "title": {
+        "vi": "6. Replication policy quyết định ACK và failover",
+        "en": "6. Replication policies define ACKs and failover"
+      },
+      "paragraphs": [
+        {
+          "vi": "Có nhiều protocol đúng; đừng trộn majority consensus với ISR replication thành một công thức duy nhất. Một ISR-style thiết kế track các replicas đủ điều kiện theo progress/membership. ACK all không có nghĩa chờ đúng minISR replicas: minISR là policy threshold, còn successful boundary phụ thuộc current membership và protocol. Khi membership đổi giữa append và ACK, request có thể bị lỗi hoặc timeout dù bytes đã ghi; retry cần idempotence và known uncertainty.",
+          "en": "Do not merge majority consensus and ISR replication into one universal formula. ISR-style systems track eligibility through progress/membership. An all-replica ACK does not mean waiting for exactly the minimum count; the threshold and successful boundary have different roles. Membership changes can leave appended bytes behind failed/timed-out requests, requiring idempotent retries and explicit uncertainty."
+        },
+        {
+          "vi": "Lab dùng ISR-only fixture: initial committed prefix 0–3 có trên A/B/C; C bị loại trước append; all ACK chờ A và B, dù minISR=1. MinISR=3 chặn append khi chỉ còn hai eligible replicas. Promote B sau A loss giữ prefix; promote C stale sau cả A/B loss làm mất record đã ACK. Giữ clean policy có thể phải unavailable. HW là next-offset boundary trước unsafe election, không phải một hứa hẹn vĩnh viễn khi bạn cố ý phá recovery policy.",
+          "en": "The lab is an ISR-only fixture: C leaves before an append, all ACKs wait for A/B even at minimum one, and minimum three rejects admission. B preserves the prefix after A fails; forcing stale C after A/B failures loses acknowledged data. Clean policies may require unavailability. The displayed HW precedes unsafe election rather than promising preservation after intentionally unsafe recovery."
+        },
+        {
+          "vi": "Trong production cần version/config-specific semantics. Ví dụ ELR-enabled designs có thể lưu replicas ngoài current ISR nhưng vẫn eligible theo durable safety evidence; không kết luận “ngoài ISR luôn unsafe” hoặc tái hiện cả Kafka bằng lab này. Controller metadata quorum và data replication vẫn khác scope. Rack/AZ placement, fsync/device guarantees, corruption handling và repair assumptions phải đi cùng claim durability.",
+          "en": "Production semantics depend on versions/configurations. ELR-enabled designs may preserve safe leader candidates outside current ISR using durable evidence, so current membership alone is insufficient to judge every implementation. This lab is not a complete Kafka model. Placement, persistence, corruption handling and repairs remain part of the durability contract."
+        }
+      ],
+      "experiment": "log-replicas"
+    },
+    {
+      "id": "fencing",
+      "title": {
+        "vi": "7. Epochs, reconciliation và producer retry identities",
+        "en": "7. Epochs, reconciliation and retry identities"
+      },
+      "paragraphs": [
+        {
+          "vi": "Failover cần một authority quyết định leader mới và fencing old owner. Cũ còn process hoặc còn socket không được tiếp tục commit với epoch đã hết hiệu lực. Replicas/client validate epoch; new owner reconcile divergent suffixes trước serve dưới new term. Producer idempotence thường cần producer identity, producer epoch, per-partition sequence và bounded dedup state; state ấy phải recover cùng accepted log. New arbitrary producer ID không tự dedup cùng business event cũ.",
+          "en": "Failover requires authoritative ownership and fencing, not just a new process. Replicas/clients reject obsolete epochs; new owners reconcile divergent suffixes. Idempotence needs producer identity, epochs, per-partition sequences and recoverable bounded deduplication state. New arbitrary identities do not automatically deduplicate old business events."
+        },
+        {
+          "vi": "Batch ACK bị mất: producer giữ identity và retry theo documented ordering/in-flight constraints. Broker phân biệt retry đã accepted, expected next sequence và stale/invalid epoch; không append duplicate chỉ vì response trước thất lạc. Nếu dedup window/state hết hạn hoặc retry chuyển identity, surface uncertainty thay vì hứa unlimited dedup. Applications vẫn có event/business IDs và downstream guards; log producer idempotence không thay consumer side-effect protocol.",
+          "en": "Lost ACKs require documented identity-preserving retries and in-flight rules. Brokers distinguish accepted retries, expected sequences and obsolete identities. Expired state or changed identities need explicit uncertainty rather than unlimited deduplication claims. Applications retain business identities and sink safeguards."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Ownership",
+            "en": "Ownership"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Leader epoch fence ngăn stale writer commit accepted history.",
+              "en": "Leader epochs fence obsolete writing authority."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Retry identity",
+            "en": "Retry identity"
+          },
+          "icon": "inspect",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Stable producer identity/sequence chỉ chống duplicate trong supported scope.",
+              "en": "Stable producer sequences deduplicate within supported scopes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Recovery proof",
+            "en": "Recovery proof"
+          },
+          "icon": "check",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Snapshot/log state phải chứa đủ dedup và commit metadata trước serve.",
+              "en": "Recovery needs sufficient deduplication and commit metadata before serving."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "visibility",
+      "title": {
+        "vi": "8. HW, LSO và read_committed không phải một con số",
+        "en": "8. HW, LSO and read_committed are distinct"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ta dùng boundary notation nhất quán: LEO là next offset sau local append, HW giới hạn replicated/committed prefix của chosen data protocol; records có offset nhỏ hơn HW mới có thể expose trong baseline. Với open transactions, last stable offset còn chặn suffix chưa quyết định. Trong notation của bài, LSO là first unstable offset hoặc HW nếu không có open transaction đang giữ prefix. Tránh đổi qua lại giữa “last readable record” và “next offset boundary” gây off-by-one.",
+          "en": "Use next-offset boundaries consistently: LEO follows local appends, while HW bounds the chosen protocol’s replicated/committed prefix. Transactions impose an additional stability boundary. Here LSO is the first unstable offset, or HW when no open transaction holds the prefix. Do not confuse next boundaries with last-readable record numbers."
+        },
+        {
+          "vi": "Một open transaction ở offset1 có thể giữ normal record offset2 phía sau, dù offset2 đã replicate. Sau commit/abort marker đủ bền, LSO tiến lên; aborted transactional records bị filter trong read_committed, normal records vẫn được trả. Control markers không là business payload. read_uncommitted không có nghĩa được đọc arbitrary corrupt bytes hay mọi local unreplicated append. Long-running transactions có thể tạo apparent lag và memory pressure dù brokers khỏe.",
+          "en": "An open transaction at offset one can hold an interleaved replicated normal record at two. Durable resolution advances stability; committed reads filter aborted data but retain normal records. Controls are not business payloads, and uncommitted isolation does not authorize arbitrary corrupt/local bytes. Long transactions can create lag and pressure despite healthy processes."
+        },
+        {
+          "vi": "Mô phỏng chọn các histories thay thế, không edit một existing log: offset4 là unrelated control record khi TX-A open, hoặc TX-A end marker khi chọn commit/abort; N5 nằm phía sau. Chọn committed/aborted khi HW=4 chưa resolve vì marker vẫn ngoài replicated prefix; HW=5 mới đủ marker. Đây là per-partition visibility fixture, không mô phỏng full distributed transaction coordinator, marker propagation races hay timeout service. Atomicity chỉ có ý nghĩa trên cooperating participants và reader isolation đã chọn.",
+          "en": "The simulation selects alternative histories rather than edit an existing log: offset four is an unrelated control record in the open history, or TX-A’s end marker in commit/abort histories, followed by N5. A selected decision at HW four cannot resolve an unreplicated marker; HW five can. This per-partition fixture omits distributed coordinator races and timeout services. Atomicity depends on cooperating participants and reader isolation."
+        }
+      ],
+      "experiment": "log-visibility"
+    },
+    {
+      "id": "groups",
+      "title": {
+        "vi": "9. Consumer ownership, progress và side effects",
+        "en": "9. Consumer ownership, progress and effects"
+      },
+      "paragraphs": [
+        {
+          "vi": "Group coordinator phân assignment sao cho mỗi partition có một current owner trong group theo protocol; nhiều groups vẫn đọc cùng partition độc lập. Heartbeats/session deadlines giúp detect suspected failure, không chứng minh old worker đã ngừng gọi external APIs. Rebalance cần cooperative/stop-the-world policy, revoke/assign callbacks, current generation checks và work cancellation. Fencing tại log commit không tự fence database/API side effects từ stale owner.",
+          "en": "Groups assign current partition owners while independent groups read separately. Heartbeats suspect failures without proving that old workers stopped external calls. Rebalances need revocation/cancellation and generation checks. Fencing offset commits alone cannot fence obsolete database/API effects."
+        },
+        {
+          "vi": "Nếu xử lý offsets10,11,12 song song,12 xong trước nhưng11 còn fail thì không commit13 chỉ vì thấy max finished12. Commit safe contiguous prefix theo records/offset semantics đã fetched; holes do compaction/control không phải tasks cần đợi mãi. Commit trước effect có thể mất việc sau crash; commit sau effect có thể replay. Dùng sink idempotency, transaction output+offsets trong cooperating log, hoặc sink-specific atomic checkpoint. Arbitrary HTTP charge không tự nằm trong log transaction.",
+          "en": "Parallel completion requires a safe contiguous progress frontier, not the highest finished offset. Interpret holes according to fetched records and isolation rather than wait for nonexistent tasks. Committing before effects risks omission; committing afterwards risks replay. Use sink idempotency or cooperating atomic checkpoints. Arbitrary HTTP charges are outside a log transaction."
+        },
+        {
+          "vi": "Poison record, retry topic và DLQ cần policy về per-key order và recovery ownership. Move một failing event đi rồi xử lý successors có thể phá invariant state machine của key. Pause partition, isolate key, bounded retry hoặc remediation flow tùy requirements; không có lựa chọn miễn phí. Slow consumer phải có lag age, bytes behind và retention-risk alerts, không chỉ lag count.",
+          "en": "Retry topics/DLQs need ordering and recovery policies. Moving a failed event aside while applying successors can violate key state machines. Pausing partitions, isolating keys and remediation each have costs. Monitor lag age, byte distance and retention risk rather than counts alone."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một processing checkpoint đúng nghĩa",
+          "en": "A meaningful processing checkpoint"
+        },
+        "caption": {
+          "vi": "Fetch position, completed work và durable commit là ba trạng thái.",
+          "en": "Fetched positions, completed work and durable commits are distinct states."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Fetch bounded work",
+              "en": "Fetch bounded work"
+            },
+            "detail": {
+              "vi": "Track assignment generation và record identities.",
+              "en": "Track ownership generations and record identities."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Apply safely",
+              "en": "Apply safely"
+            },
+            "detail": {
+              "vi": "Sink idempotency/fencing hoặc atomic transaction.",
+              "en": "Use sink idempotency/fencing or atomic transactions."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Advance frontier",
+              "en": "Advance frontier"
+            },
+            "detail": {
+              "vi": "Chỉ tiến qua các effects đã đạt boundary.",
+              "en": "Advance only across completed safe effects."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Commit / recover",
+              "en": "Commit and recover"
+            },
+            "detail": {
+              "vi": "Persist next offset, replay được sau crash.",
+              "en": "Persist next offsets and support crash replay."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "compaction",
+      "title": {
+        "vi": "10. Retention và compaction là hai lời hứa khác nhau",
+        "en": "10. Retention and compaction make different promises"
+      },
+      "paragraphs": [
+        {
+          "vi": "Delete retention bỏ closed segments theo time/size policy, nên record expiry thường không chính xác từng millisecond. Compaction eventually giữ useful latest values theo key trong scope configured; active/uncleaned segments còn duplicate versions. Nó không tạo unique-key database tức thời, không đổi offsets của records còn giữ và không bảo đảm full historical replay. Kết hợp compact+delete cho phép cả latest key value cũng hết retention; cần chọn contract đúng với rebuild requirements.",
+          "en": "Deletion retention removes closed segments under time/size policies rather than exact per-record deadlines. Compaction eventually keeps useful latest key values, with duplicate versions in uncleaned regions. It is not immediate uniqueness, does not renumber surviving offsets and does not preserve full history. Combined compaction/deletion can expire latest values as well, affecting rebuild guarantees."
+        },
+        {
+          "vi": "Tombstone biểu thị delete key; giữ nó đủ lâu cho consumers/rebuilds được hỗ trợ rồi có thể reclaim theo policy. Một consumer offline lâu vẫn giữ old local value nhưng miss tombstone đã hết retention có thể resurrect stale state. Cần bounded full-scan window, snapshots có cut/version, explicit reset hoặc state replacement; đừng merge một “snapshot” thiếu deleted keys vào old cache rồi coi xong. Compaction iterator phải trả next retained offset khi target hole; offset lower than log start cần error/reset contract rõ.",
+          "en": "Tombstones express deletes and have retention policies. A stale local snapshot can miss an expired tombstone and retain deleted values. Supported scan windows, versioned snapshots and explicit replacement/reset policies prevent resurrection. Compaction holes seek to surviving records; offsets below log start need explicit recovery."
+        },
+        {
+          "vi": "Compactor rewrite closed segment files, build replacement indexes/checksums, publish generation atomically rồi retire old files sau readers/pins. Capacity cần temporary double-space và rewrite I/O. Large/high-cardinality keys, cleaner backlog và minimum compaction lag thay đổi storage/visibility; không suy rằng bật compaction xong disk giảm ngay hoặc delete data khỏi mọi replica/backup ngay.",
+          "en": "Compactors rewrite eligible segments with indexes/checksums, publish generations coherently and retire old files after readers release them. Budget temporary space and rewrite I/O. Key distributions and cleaner lag affect results; compaction does not immediately shrink storage or erase every replica/backup."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Policy",
+            "en": "Policy"
+          },
+          {
+            "vi": "Giữ điều gì",
+            "en": "What it retains"
+          },
+          {
+            "vi": "Rủi ro recovery",
+            "en": "Recovery risk"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Delete retention",
+              "en": "Delete retention"
+            },
+            {
+              "vi": "Một recent byte/time window theo segment policy.",
+              "en": "Recent windows under segment policies."
+            },
+            {
+              "vi": "Consumer chậm có thể out-of-range.",
+              "en": "Slow consumers can fall out of range."
+            }
+          ],
+          [
+            {
+              "vi": "Compaction",
+              "en": "Compaction"
+            },
+            {
+              "vi": "Latest useful key state eventually trong configured scope.",
+              "en": "Eventual useful latest-key state within scope."
+            },
+            {
+              "vi": "Offset holes và expired tombstones cần resnapshot policy.",
+              "en": "Holes and expired tombstones need resnapshot policies."
+            }
+          ],
+          [
+            {
+              "vi": "Compact + delete",
+              "en": "Compact + delete"
+            },
+            {
+              "vi": "Key cleanup và finite history/capacity.",
+              "en": "Key cleanup plus finite history/capacity."
+            },
+            {
+              "vi": "Không hứa permanent complete state changelog.",
+              "en": "Does not promise a permanent complete changelog."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "tiering",
+      "title": {
+        "vi": "11. Tiered storage cần manifest và lifecycle protocol",
+        "en": "11. Tiered storage needs manifests and lifecycle protocols"
+      },
+      "paragraphs": [
+        {
+          "vi": "Closed immutable segments phù hợp upload lên object tier cùng indexes/checksums và identity (topic/partition/epoch/base offset/generation). Publish remote metadata chỉ sau required objects complete và readable; local eviction sau metadata durable, reader safety và configured local-retention policy. Partial upload không được quảng bá là replayable segment. Remote listing eventual behavior không nên là authority duy nhất xác định committed history.",
+          "en": "Upload closed immutable segments with indexes/checksums and scoped identities. Publish metadata only after required objects are complete/readable; evict local files after durable metadata and reader/lifecycle checks. Partial uploads are not replayable published segments, and listings alone should not define committed history."
+        },
+        {
+          "vi": "Cold fetch dùng index/range reads/cache, bounded concurrency và byte quota để một group replay không làm new-data latency timeout. Remote tier giảm local retention-capacity pressure nhưng không xóa ingress, replication, metadata, cache, egress và recovery constraints. Delete/compaction cần generation-aware lifecycle: không để stale remote manifest trỏ dữ liệu đã GC, không xóa replacement trước publication, và enforce topic deletion/retention policy xuyên tiers.",
+          "en": "Cold fetches need indexes, ranges, caches and quotas that protect live traffic. Tiering reduces local capacity pressure without removing ingress, replication, metadata, egress and recovery costs. Generation-aware lifecycle rules prevent dangling manifests, premature reclamation and inconsistent deletion policies across tiers."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Publish",
+            "en": "Publish"
+          },
+          "icon": "check",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Complete bytes + indexes → committed manifest → readable remote segment.",
+              "en": "Complete bytes/indexes precede committed readable manifests."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Serve",
+            "en": "Serve"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Cache/range reads có budgets riêng cho catch-up và live fetch.",
+              "en": "Budget cached/range reads separately for catch-up and live fetches."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Reclaim",
+            "en": "Reclaim"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Lifecycle metadata và reader pins quyết định lúc eviction/GC an toàn.",
+              "en": "Lifecycle metadata and reader pins determine safe eviction/reclamation."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "performance",
+      "title": {
+        "vi": "12. Batching, compression và backpressure phải có bounds",
+        "en": "12. Batching, compression and backpressure need bounds"
+      },
+      "paragraphs": [
+        {
+          "vi": "Producer batch theo partition để amortize syscall, network round trip và compression; linger thêm throughput nhưng tăng queueing latency khi traffic nhỏ. Max in-flight, retry budget, batch memory và delivery deadline ngăn outage biến thành unbounded RAM. Broker dùng bounded request queues, per-tenant byte/request quotas và fair scheduling. Compression trước network/disk tiết kiệm bytes nhưng tốn CPU/decompression work và cần max expanded-size protection.",
+          "en": "Partition batching amortizes syscalls, round trips and compression, trading linger latency against efficiency. Bound in-flight work, retries, memory and delivery deadlines. Brokers need fair bounded queues and tenant quotas. Compression trades bytes for CPU and requires expanded-size limits."
+        },
+        {
+          "vi": "Long polling giảm empty fetch churn: trả khi đủ data hoặc hết bounded wait, có cancellation/connection limits. Zero-copy/sendfile có thể giảm copies ở suitable plaintext/file paths; TLS, transformations, checksums và format conversion ảnh hưởng khả năng dùng. Không coi zero-copy là lời hứa CPU bằng0. Separate follower traffic, compaction/rebalance và remote replay budgets để background work không starve producer ACKs.",
+          "en": "Long polling reduces empty fetch churn under bounded waits and cancellation. Zero-copy paths may reduce copies, but TLS, transformations and conversion affect applicability; CPU work does not disappear. Separate replication, cleaning, reassignment and replay budgets protect ACK latency."
+        },
+        {
+          "vi": "Nếu ingress lớn hơn consumer service rate lâu dài thì backlog tăng vô hạn trong infinite-retention model; ngoài đời retention sẽ hết hoặc quota reject. Lag autoscaling bị giới hạn bởi partitions/key ordering, external sink throughput và rebalance overhead. Đo service times và bytes, không chỉ CPU, để biết thêm workers có giúp hay chỉ tăng contention.",
+          "en": "Sustained arrival above service capacity grows backlog until retention or quotas intervene. Scaling is constrained by partitions, ordering, sinks and rebalances. Service-time and byte metrics reveal whether extra workers help or increase contention."
+        }
+      ]
+    },
+    {
+      "id": "partitioning",
+      "title": {
+        "vi": "13. Hot keys, reassignment và region boundaries",
+        "en": "13. Hot keys, reassignment and regional boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Key routing giữ related records cùng partition theo partitioner version. Tăng partitions có thể remap hash(key), làm old/new records của một key nằm hai nơi và concurrent processing mất required order. Nếu cần strict key continuity, dùng routing epochs/migration barrier, stable virtual shards hoặc drain/cutover procedure có proof; “thêm partitions luôn an toàn” là thiếu contract. Hot key đơn lẻ vẫn bottleneck nếu phải serialize; sharding key chỉ đúng khi domain cho merge/reordering.",
+          "en": "Key routing depends on partitioner versions. Increasing partition counts may remap keys and split ordered histories. Strict continuity needs routing epochs, barriers, stable virtual shards or justified drain/cutover procedures. A serialized hot key remains a bottleneck unless the domain permits sharding/merging."
+        },
+        {
+          "vi": "Replica reassignment copy data trong lúc append, catch up dưới epochs, publish membership rồi mới retire old replica. Budget copy I/O, availability reserve và throttling để không gây ISR churn. Balance theo bytes, leader traffic và consumer hot spots chứ không chỉ partition count. Controller outage có thể giữ current leaders serving trong supported state, nhưng new elections/config changes tùy quorum availability; không hứa control plane mất mà mọi operation vẫn chạy.",
+          "en": "Reassignment copies and catches up data before publishing membership and retiring old replicas. Budget I/O and availability reserves to avoid eligibility churn. Balance traffic/bytes as well as counts. Existing owners may serve during controller outages under supported conditions, while elections and changes still depend on metadata authority."
+        },
+        {
+          "vi": "Cross-region async mirroring có lag/RPO và offset/group translation, producer identity và failback concerns riêng. Sync cross-region replication đổi latency/availability theo quorum placement. Active-active cần conflict/order semantics, không chỉ bật hai writable copies của cùng partition. DR rehearsal đo recovered committed prefix, consumer replay duplicates và routing/epoch cutover; backup không có restore drill chưa là recovery plan.",
+          "en": "Asynchronous cross-region mirroring has lag, offsets/group translation and identity/failback concerns. Synchronous placement trades latency and availability. Active-active needs explicit order/conflict semantics rather than two writable copies. Rehearse recovered prefixes, replay duplicates and ownership cutovers."
+        }
+      ]
+    },
+    {
+      "id": "security",
+      "title": {
+        "vi": "14. Multi-tenancy, quotas và dữ liệu nhạy cảm",
+        "en": "14. Tenancy, quotas and sensitive data"
+      },
+      "paragraphs": [
+        {
+          "vi": "Authenticate clients và authorize theo tenant/topic/group/admin actions; guessed topic name hoặc consumer group không là quyền truy cập. Encrypt transport/storage theo threat model, rotate credentials và tránh secret payloads trong logs/error messages. Schema compatibility và payload validation là producer/consumer governance có versioning; broker binary acceptance không chứng minh downstream business schema hợp lệ.",
+          "en": "Authenticate clients and authorize topic/group/admin operations. Names are not capabilities. Protect transport/storage and credentials while avoiding payload leaks. Schema compatibility requires versioned producer/consumer governance; broker acceptance alone does not validate business meaning."
+        },
+        {
+          "vi": "Quota theo bytes/s, requests, partitions, connections, retained storage và background replay; limits cần fair error/throttle behavior. Isolation pools hoặc dedicated clusters có thể cần cho noisy tenants và differing SLOs. Message-size caps, decompression bombs, unbounded key cardinality, transaction timeouts và metadata churn là resource risks cụ thể. Deletion/retention promises cần bao quát replicas, remote tier, snapshots và backups theo policy đã công bố; không nói một tombstone xóa dữ liệu khỏi mọi nơi tức thì.",
+          "en": "Quota bytes, requests, partitions, connections, storage and replay with clear throttling. Stronger isolation may require dedicated pools/clusters. Payload sizes, decompression, key cardinality, long transactions and metadata churn need bounds. Deletion policies cover replicas, tiers, snapshots and backups rather than claim instantaneous universal erasure."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "15. Quan sát invariant và diễn tập lỗi",
+        "en": "15. Observe invariants and rehearse failures"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo producer ACK p99 theo mode, rejected/unknown outcomes, under-replicated/offline partitions, leader changes, ISR/eligibility churn, disk service-time/space, replication bytes/lag, controller quorum health, oldest open transaction và cleaner/tier backlog. Consumer lag nên có records, bytes, age và distance-to-retention. Một partition end offset lớn nhưng read_committed đứng yên có thể là open transaction, không nhất thiết broker không replicate.",
+          "en": "Measure ACK latency/outcomes, replica availability/eligibility, leadership churn, disk service times/capacity, replication, metadata health, open transactions and maintenance backlogs. Track consumer lag in counts, bytes, age and retention distance. A stalled committed reader can indicate open transactions rather than replication failure."
+        },
+        {
+          "vi": "Fault tests gồm kill leader trước/sau ACK, lost ACK, slow follower/ISR transition, stale old leader writes, torn tail/corrupt index, disk full, rebalance với stale external effect, transaction coordinator restart, expired cursor/tombstone và remote manifest failure. Assertions phải kiểm accepted prefix dưới declared model, no stale commit, bounded memory và correct recovery states. Không chỉ đếm processes alive hoặc thấy traffic tiếp tục là kết luận durability đạt.",
+          "en": "Test leader crashes around ACKs, lost replies, eligibility changes, stale owners, corrupt tails/indexes, full disks, stale rebalance effects, coordinator restarts and expired history/tiering failures. Assert accepted-prefix guarantees, fencing, bounds and recovery states instead of equating liveness with correctness."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure",
+            "en": "Failure"
+          },
+          {
+            "vi": "Behavior cần nêu",
+            "en": "Required behavior"
+          },
+          {
+            "vi": "Evidence",
+            "en": "Evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "ACK mất",
+              "en": "Lost ACK"
+            },
+            {
+              "vi": "Outcome unknown; retry identity-preserving.",
+              "en": "Unknown outcome; identity-preserving retry."
+            },
+            {
+              "vi": "Committed/dedup state, không chỉ client timeout.",
+              "en": "Committed/dedup state rather than timeout alone."
+            }
+          ],
+          [
+            {
+              "vi": "Replica stale",
+              "en": "Stale replica"
+            },
+            {
+              "vi": "Không promote nếu thiếu safety evidence; hoặc explicit unsafe recovery.",
+              "en": "Require safety evidence or explicit unsafe recovery."
+            },
+            {
+              "vi": "Epoch/eligibility metadata và log reconciliation.",
+              "en": "Epoch/eligibility state and reconciliation."
+            }
+          ],
+          [
+            {
+              "vi": "Open transaction lâu",
+              "en": "Long-open transaction"
+            },
+            {
+              "vi": "Bounded timeout/recovery; expose LSO lag.",
+              "en": "Bound timeout/recovery and expose stability lag."
+            },
+            {
+              "vi": "Transaction state/marker progress.",
+              "en": "Transaction state and marker progress."
+            }
+          ],
+          [
+            {
+              "vi": "Expired cursor",
+              "en": "Expired cursor"
+            },
+            {
+              "vi": "Explicit reset/resnapshot, không fake successful replay.",
+              "en": "Explicit reset/resnapshot, not false replay success."
+            },
+            {
+              "vi": "Log start boundary và client policy.",
+              "en": "Log-start boundary and client policy."
+            }
+          ],
+          [
+            {
+              "vi": "Background saturation",
+              "en": "Background saturation"
+            },
+            {
+              "vi": "Throttle repair/clean/replay có reserves cho failure.",
+              "en": "Throttle maintenance/replay with failure reserves."
+            },
+            {
+              "vi": "Foreground tails và per-plane resource budgets.",
+              "en": "Foreground tails and separate budgets."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "16. Luyện giải thích bằng offsets và failure boundaries",
+        "en": "16. Practice with offsets and failure boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bắt đầu một producer batch tại offset4, A/B có record, C chỉ có 0–3, ACK reply bị mất. Hãy nói producer biết gì, replica nào đủ điều kiện, commit/visibility boundary là bao nhiêu và consumer có được gọi external API ngay không. Sau đó thêm transaction open ở 1 và retention đã xóa snapshot tombstone để xem các khái niệm độc lập tương tác như thế nào.",
+          "en": "Start with a batch at offset four on A/B, stale C and a lost reply. Explain producer knowledge, election eligibility, visibility and consumer effects. Then introduce an open transaction and expired tombstones to connect otherwise distinct boundaries."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "MinISR=2 có nghĩa all ACK luôn chỉ cần hai copies không?",
+            "en": "Does minimum two mean all ACKs always wait for only two copies?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Threshold và actual protocol commit/ACK rule khác nhau. Trong ISR-only example có 3 current ISR thì all chờ cả 3; chỉ 2 eligible thì min2 cho phép nhưng vẫn chờ cả 2. Production phải kiểm version/ELR/protocol, không áp majority formula tùy ý.",
+              "en": "No. Thresholds differ from actual ACK rules. All waits for current eligible members in this fixture; production semantics depend on the protocol/configuration."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Producer timeout có thể retry với ID ngẫu nhiên mới cho đơn giản không?",
+            "en": "Can a timed-out producer safely retry with a new random identity?"
+          },
+          "answer": [
+            {
+              "vi": "Timeout có thể xảy ra sau accepted append. New identity có thể tạo duplicate; dùng documented producer sequence/epoch retry scope và application event IDs. Khi scope hết hạn cần reconcile/uncertainty policy, không hứa dedup mãi.",
+              "en": "An append may already have succeeded. Retain supported identity/sequence scopes and business IDs, with reconciliation when those scopes expire."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "HW=6 có bảo đảm read_committed trả mọi record trước6 không?",
+            "en": "Does HW six guarantee every earlier record is returned to committed readers?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Open transaction có thể giữ LSO thấp hơn HW; aborted records và control markers cũng bị filter. Lab open TX ở 1 chỉ trả N0 dù N2 đã replicate.",
+              "en": "No. Stability boundaries, aborted data and control records impose additional visibility rules."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao seek offset5 có thể trả record6?",
+            "en": "Why can a seek to offset five return record six?"
+          },
+          "answer": [
+            {
+              "vi": "Compaction có thể bỏ record5 mà giữ logical offsets. Seek contract trả first retained record at/after target; cursor dưới log start do retention là tình huống khác cần explicit reset. Không re-number mọi offsets sau cleaner.",
+              "en": "Compaction preserves logical gaps. Seeking surviving records differs from expired history, which needs reset policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tombstone đã cleanup thì stale local cache tự đúng lại không?",
+            "en": "Does tombstone cleanup automatically fix stale local caches?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Client có old value và miss tombstone có thể giữ stale data. Bound supported catch-up/full-scan windows hoặc load coherent replacement snapshot/cut rồi tail; merge-only reset không đủ.",
+              "en": "No. Stale clients need supported catch-up windows or coherent replacement snapshots and compatible tails."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Consumer group một owner có bảo đảm external effect đúng một lần không?",
+            "en": "Does single group ownership guarantee exactly-once external effects?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Stale worker có thể còn chạy, crash có thể sau effect trước offset commit. Cần sink idempotency/fencing hoặc cooperating atomic transaction; group generation chỉ bảo vệ operations thực sự kiểm nó.",
+              "en": "No. Obsolete workers and effect/commit crashes require sink cooperation; generations protect only operations that enforce them."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "100 partitions hoặc30 nodes từ bandwidth có đủ kết luận sizing không?",
+            "en": "Do bandwidth-derived partitions/node counts finish sizing?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Example storage1,8144 PB với30 TB usable/node cần ít nhất61 nodes trước reserves. Thêm CPU, network directions, hot keys, replay và rebuild/failure headroom. Các per-node throughput giả định phải benchmark thực.",
+              "en": "No. Retention alone can dominate bandwidth sizing; include CPU, network, skew, replay, repair and measured per-node limits."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tiered storage có xóa nhu cầu replication và metadata quorum không?",
+            "en": "Does tiering eliminate replication and metadata authority?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nó chuyển retained bytes sang remote tier nhưng still cần admission/durability, ownership, coherent manifests, indexes, reader-safe eviction và bounded cold fetch. Incomplete upload không phải committed replayable history.",
+              "en": "No. Remote capacity still needs ownership, durability, coherent manifests, indexes and safe bounded retrieval."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

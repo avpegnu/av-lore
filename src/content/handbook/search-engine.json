@@ -1,0 +1,1252 @@
+{
+  "id": "search-engine",
+  "group": "case",
+  "status": "review",
+  "title": {
+    "vi": "Thiết kế Search Engine: postings, relevance và visibility",
+    "en": "Designing a Search Engine: postings, relevance and visibility"
+  },
+  "summary": {
+    "vi": "Xây keyword serving từ analysis/postings/BM25 tới authorized candidates, shard tails, refresh/delete recovery, stable pagination và judged evaluation; xem cụ thể những gì một score hay ACK chưa chứng minh.",
+    "en": "Build keyword serving through analysis, postings, BM25, authorized candidates, shard tails, visibility/recovery, stable pagination and independent quality evaluation."
+  },
+  "prerequisites": [
+    "web-crawler",
+    "autocomplete",
+    "databases"
+  ],
+  "relatedTopics": [
+    "storage-search",
+    "database",
+    "security",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Analyzer compatibility, postings/positions và scoring scope quyết định match/rank.",
+      "en": "Analyzer compatibility, positions and scoring scopes determine matches/ranks."
+    },
+    {
+      "vi": "ACL trước truncation bảo vệ eligible recall; current rights vẫn cần tại cache/hydration.",
+      "en": "Filtering before truncation preserves eligible recall while current rights remain necessary."
+    },
+    {
+      "vi": "Acceptance, searchable refresh và physical merge/reclamation là separate boundaries.",
+      "en": "Acceptance, reader refresh and physical reclamation are separate boundaries."
+    },
+    {
+      "vi": "Fan-out/hedging đổi tail, cost và completeness; toy timings không là benchmark.",
+      "en": "Fan-out/hedging trade latency, cost and completeness; toy timings are not benchmarks."
+    },
+    {
+      "vi": "Stable pagination và independent judgments cần hơn chỉ cursor hoặc high score.",
+      "en": "Stable pagination and independent judgments require more than cursors or high scores."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ query intent tới result có thể tin",
+      "en": "From query intent to defensible results"
+    },
+    "caption": {
+      "vi": "Giữ relevance, current rights, freshness và completeness cùng nhau.",
+      "en": "Preserve relevance, rights, freshness and completeness together."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Analyze / retrieve",
+          "en": "Analyze and retrieve"
+        },
+        "detail": {
+          "vi": "Compatible terms, postings và authorized scope.",
+          "en": "Use compatible terms, postings and eligible scopes."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Scatter / score",
+          "en": "Scatter and score"
+        },
+        "detail": {
+          "vi": "Bounded shards/candidates, scores và latency budget.",
+          "en": "Bound shards, candidates, scoring and latency."
+        },
+        "icon": "gauge"
+      },
+      {
+        "title": {
+          "vi": "Rerank / hydrate",
+          "en": "Rerank and hydrate"
+        },
+        "detail": {
+          "vi": "Recall, current rights và safe snippets.",
+          "en": "Preserve recall, current rights and safe snippets."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Publish / evaluate",
+          "en": "Publish and evaluate"
+        },
+        "detail": {
+          "vi": "Visibility generations, stable pages và independent quality evidence.",
+          "en": "Track generations, stable pages and independent quality."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Search index và serving là scope riêng",
+        "en": "1. Indexing and serving are their own scope"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài Web Crawler tạo corpus; Autocomplete gợi ý query; bài này xây keyword search có ranked results, filters, snippets, pagination, updates/deletes và visibility SLO. Chọn corpus trước: public web cần spam/link/quality signals; internal/site/product search cần fields, ACL, facets và tenant routing. Không mặc định một ranking formula dùng tốt cho mọi sản phẩm. Hybrid/vector retrieval nối được pipeline nhưng không thay lexical correctness và authorization.",
+          "en": "The crawler builds corpora and autocomplete suggests queries. This lesson designs ranked keyword results, filters, snippets, pagination, updates/deletes and visibility. Public web and private/product corpora require different signals, fields and permissions. Hybrid retrieval can join the pipeline without replacing lexical correctness or authorization."
+        },
+        {
+          "vi": "Chốt p99 latency theo query class, freshness từ source commit tới searchable result, result completeness và relevance metrics. Một illustrative 200 ms query target khác ingest freshness vài giây; write accepted, document retrievable by ID và keyword searchable là contracts khác nhau. Product cần nói partial results có được phép không và stale authorization/delete có được chấp nhận không.",
+          "en": "Define latency by query class, source-to-visible freshness, completeness and relevance. Query latency differs from ingest freshness; accepted writes, ID lookups and searchable visibility are distinct contracts. Specify partial-result and authorization/deletion policies."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Relevance",
+            "en": "Relevance"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Query intent, candidate recall và judged quality; không chỉ score cao.",
+              "en": "Measure intent, candidate recall and judged quality rather than scores alone."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Freshness",
+            "en": "Freshness"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Track source/ingest/writer/reader generations và deletes.",
+              "en": "Track source, ingest, writer and reader states including deletes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Latency / safety",
+            "en": "Latency and safety"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Tail budgets, completeness và quyền hiện hành đi cùng results.",
+              "en": "Pair tail budgets with completeness and current rights."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Fan-out nhân query work, replicas nhân storage",
+        "en": "2. Fan-out multiplies query work; replicas multiply storage"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định một tỷ documents, text trung bình 10 KB: raw 10 TB thập phân. Chọn hypothetical primary index 3 TB để tính, không suy từ raw text vì stored fields, positions, analyzers, vectors, compression và mappings thay ratio. Nếu dùng 64 primary shards thì trung bình 46,875 GB/shard; một replica thêm mỗi primary cho tổng khoảng 6 TB index copies trước merge/rebuild/headroom. Shard-size heuristics không thay benchmark actual query/update distribution.",
+          "en": "Assume a billion documents averaging ten KB, or ten decimal TB raw. A hypothetical three-TB primary index is a sizing input, not a guaranteed compression ratio. Sixty-four primaries average 46.875 GB each; one additional replica doubles copies to six TB before maintenance/reserves. Benchmark actual fields and workloads rather than treat shard-size heuristics as laws."
+        },
+        {
+          "vi": "Peak 10.000 queries/giây fan-out đủ 64 eligible shards tạo 640.000 shard requests/giây trước hedges. Tenant/time/routing pruning có thể giảm eligible set; replicas thường chia query load, không có nghĩa query phải hỏi mọi replica. At K=100/shard, 64 shards trả tối đa 6.400 candidates/query; mỗi candidate giả định 32 bytes thì khoảng 204,8 KB/query và 2,048 GB/s merge ingress tại peak, chưa protocol/features. Model rerank pool nhỏ hơn vẫn cần candidate recall đủ.",
+          "en": "Ten thousand queries/second across sixty-four eligible shards produce 640,000 shard requests before hedges. Routing can prune shards, and replicas distribute load rather than all receive every query. At one hundred 32-byte candidates/shard, a query merges up to 6,400 candidates or 204.8 KB, about 2.048 GB/s at peak before overhead/features. Bounded reranking still needs adequate candidate recall."
+        },
+        {
+          "vi": "Indexing capacity cần update bytes/s, reader refresh cadence, merge amplification, deleted-doc pressure và full reindex coexistence. Small shards tăng scheduling/metadata/fan-out overhead; quá large shard làm recovery/rebalance lâu và query work nặng. Size theo measured heap, CPU, disk bandwidth, cache working set, failure-domain loss và repair time; document count alone không phản ánh postings/cardinality.",
+          "en": "Indexing also needs update, refresh, merge, deletion and coexisting-reindex budgets. Small shards add overhead; large ones extend recovery and query work. Measure memory, CPU, I/O, working sets and repair times rather than count documents alone."
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. API trả visibility và completeness rõ",
+        "en": "3. APIs expose visibility and completeness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Search request có query grammar/mode, filters, pagination/sort context và authenticated principal từ server-side session. Response có result IDs/versions, bounded snippets, next cursor, index/ranking generation và partial/missing-shard status. Không trust tenantId/ACL client tự đưa như quyền; server derives/enforces scope. Query timeout khác empty result: zero matches và failed shard không được gộp một status.",
+          "en": "Requests define query/filter/sort contexts under server-derived principals. Responses include versions, bounded content, cursors, generations and completeness. Client-supplied scopes do not establish rights; distinguish empty matches from failed/incomplete retrieval."
+        },
+        {
+          "vi": "Index update/delete có stable document ID và monotonically interpreted source version hoặc comparable revision token. Accepted response mô tả durability boundary và optional visibility wait token; writer ACK không mặc định immediate search visibility. Bulk errors phân per-item, có bounded retry và order/version rules. Delete retention/rebuild protocol phải chống late stale upsert, nhất là sau tombstone cleanup.",
+          "en": "Updates/deletes have stable IDs and comparable source versions. Acceptance declares durability separately from searchable visibility. Bulk operations have per-item errors, bounds and version-aware retries. Retention/rebuild policies prevent stale resurrection."
+        }
+      ],
+      "api": [
+        {
+          "method": "GET",
+          "path": "/v1/search?q={q}&cursor={cursor}",
+          "description": {
+            "vi": "Ranked authorized results; cursor pin query/sort/generation context.",
+            "en": "Ranked authorized results with pinned query/sort/generation context."
+          },
+          "response": "200 {results:[{id,version,title,snippet,score}],nextCursor,indexGeneration,rankingVersion,partial,missingShards} | 503 {code:\"incomplete_search\"}"
+        },
+        {
+          "method": "PUT",
+          "path": "/v1/documents/{id}",
+          "description": {
+            "vi": "Source-versioned replacement trong recoverable ingest.",
+            "en": "Source-versioned replacement through recoverable ingestion."
+          },
+          "request": "{version:\"42\",title,body,fields,accessPolicyRef}",
+          "response": "202 {acceptedVersion:\"42\",visibilityToken} | 409 {code:\"stale_version\"}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/v1/documents/{id}",
+          "description": {
+            "vi": "Versioned delete; searchable invisibility khác physical erasure.",
+            "en": "Versioned deletion distinguishes invisibility from physical reclamation."
+          },
+          "request": "{version:\"43\"}",
+          "response": "202 {acceptedVersion:\"43\",visibilityToken}"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/visibility/{token}",
+          "description": {
+            "vi": "Bounded observation của reader progress; không proof current caller được đọc.",
+            "en": "Observe bounded reader progress without granting access."
+          },
+          "response": "200 {state:\"pending\"|\"visible\",indexGeneration}"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Hai pipelines chia sẻ versioned readers",
+        "en": "4. Two pipelines share versioned readers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Query service parse/rewrite bounded query, derive permission/filter scope và check scoped cache. Coordinator route eligible shards, merge local candidates rồi bounded rerank/hydrate. Ingest/indexer apply source changes và publish reader generations; merge/lifecycle giảm segment overhead và reclaim old bodies. Evaluation theo cả query quality lẫn freshness/latency, không chỉ health endpoints.",
+          "en": "Queries are bounded, scoped, routed and merged before reranking/hydration. Ingestion publishes versioned readers, while maintenance handles segments/reclamation. Evaluate relevance and freshness/latency in addition to process health."
+        },
+        {
+          "vi": "Sơ đồ có query/cache/update/delete/rebuild traces. Replica routing phải biết compatible reader/schema/sort semantics; failover hoặc reindex không tự cho phép mix incompatible scores/cursors. Một global coordinator có thể scale stateless nhưng response correctness vẫn phụ thuộc query context, authorized candidate pool và completeness policy.",
+          "en": "Trace queries, cache hits, updates, deletes and rebuilds. Replica/schema/sort compatibility matters through failovers. Stateless coordinators still require coherent contexts, authorized candidates and explicit completeness."
+        }
+      ],
+      "diagram": {
+        "id": "search-index-serving",
+        "title": {
+          "vi": "Query serving và index publication gặp nhau ở reader generation",
+          "en": "Queries and indexing meet at reader generations"
+        },
+        "caption": {
+          "vi": "Ingest acceptance, reader refresh, physical merge và authorization có boundaries riêng. Coordinator chỉ gọi eligible shards và phải nêu completeness khi thiếu shard.",
+          "en": "Acceptance, reader refresh, physical merges and authorization have separate boundaries. Coordinators query eligible shards and disclose completeness."
+        },
+        "width": 1180,
+        "height": 850,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Search client",
+              "en": "Search client"
+            },
+            "detail": {
+              "vi": "Query/filter, request generation và stable pagination context.",
+              "en": "Sends queries/filters with request generations and stable pagination contexts."
+            },
+            "x": 130,
+            "y": 110,
+            "kind": "client"
+          },
+          {
+            "id": "query",
+            "label": {
+              "vi": "Query / policy service",
+              "en": "Query / policy service"
+            },
+            "detail": {
+              "vi": "Parse bounded grammar, analyzer/rewrite versions, principal scopes và cache key.",
+              "en": "Parses bounded queries with analyzer/rewrite versions, scopes and cache keys."
+            },
+            "x": 430,
+            "y": 110,
+            "kind": "edge"
+          },
+          {
+            "id": "cache",
+            "label": {
+              "vi": "Scoped result cache",
+              "en": "Scoped result cache"
+            },
+            "detail": {
+              "vi": "Key theo query/filter, auth scope và index/ranking generation; invalidation/freshness rõ.",
+              "en": "Keys query/filter, auth scope and index/ranking generations with explicit freshness."
+            },
+            "x": 740,
+            "y": 110,
+            "kind": "store"
+          },
+          {
+            "id": "coord",
+            "label": {
+              "vi": "Search coordinator",
+              "en": "Search coordinator"
+            },
+            "detail": {
+              "vi": "Eligible shard routing, deadlines, bounded hedges và deterministic merge.",
+              "en": "Routes eligible shards with deadlines, bounded hedges and deterministic merging."
+            },
+            "x": 1040,
+            "y": 110,
+            "kind": "service"
+          },
+          {
+            "id": "source",
+            "label": {
+              "vi": "Source / crawler / CDC",
+              "en": "Source / crawler / CDC"
+            },
+            "detail": {
+              "vi": "Stable document ID, source version, body/ACL changes và deletes.",
+              "en": "Emits stable document IDs, versions, content/ACL changes and deletes."
+            },
+            "x": 130,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "ingest",
+            "label": {
+              "vi": "Recoverable ingest",
+              "en": "Recoverable ingest"
+            },
+            "detail": {
+              "vi": "Bounded validation, durable acceptance và identified ordering/replay.",
+              "en": "Validates bounded updates and preserves acceptance/replay identities."
+            },
+            "x": 430,
+            "y": 410,
+            "kind": "queue"
+          },
+          {
+            "id": "indexer",
+            "label": {
+              "vi": "Analyze / index writer",
+              "en": "Analyze / index writer"
+            },
+            "detail": {
+              "vi": "Version guards, field analyzers, postings, stored fields và reader publication.",
+              "en": "Applies version guards/analyzers and writes postings/fields for publication."
+            },
+            "x": 740,
+            "y": 410,
+            "kind": "worker"
+          },
+          {
+            "id": "shards",
+            "label": {
+              "vi": "Shard readers / replicas",
+              "en": "Shard readers / replicas"
+            },
+            "detail": {
+              "vi": "Immutable segments, doc values, visibility generations và local top candidates.",
+              "en": "Searches segment readers/doc values under generations for local candidates."
+            },
+            "x": 1040,
+            "y": 410,
+            "kind": "store"
+          },
+          {
+            "id": "merge",
+            "label": {
+              "vi": "Merge / lifecycle",
+              "en": "Merge / lifecycle"
+            },
+            "detail": {
+              "vi": "Budgeted rewrites, deleted-body reclamation và reader-safe old segment retirement.",
+              "en": "Budgets rewrites/reclamation and protects old readers."
+            },
+            "x": 130,
+            "y": 740,
+            "kind": "worker"
+          },
+          {
+            "id": "rerank",
+            "label": {
+              "vi": "Candidate re-ranker",
+              "en": "Candidate re-ranker"
+            },
+            "detail": {
+              "vi": "Bounded candidate budget, versioned features/models và fallback.",
+              "en": "Reranks bounded candidates with versioned features/models and fallback."
+            },
+            "x": 430,
+            "y": 740,
+            "kind": "service"
+          },
+          {
+            "id": "hydrate",
+            "label": {
+              "vi": "Authorize / hydrate",
+              "en": "Authorize / hydrate"
+            },
+            "detail": {
+              "vi": "Current rights, version checks, bounded snippets và escaped highlights.",
+              "en": "Checks current rights/versions and builds bounded escaped snippets."
+            },
+            "x": 740,
+            "y": 740,
+            "kind": "service"
+          },
+          {
+            "id": "evaluation",
+            "label": {
+              "vi": "Relevance / freshness evidence",
+              "en": "Relevance / freshness evidence"
+            },
+            "detail": {
+              "vi": "Independent judged sets, online experiments, quality slices và ingest-to-visible lag.",
+              "en": "Tracks judged sets, experiments, quality slices and visibility lag."
+            },
+            "x": 1040,
+            "y": 740,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "query",
+            "label": {
+              "vi": "Query miss tới page",
+              "en": "Query miss to results"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "query",
+                "description": {
+                  "vi": "Send query/filter/cursor cùng current principal.",
+                  "en": "Send queries/filters/cursors under current principals."
+                }
+              },
+              {
+                "from": "query",
+                "to": "coord",
+                "description": {
+                  "vi": "Cache miss; compile authorized bounded retrieval plan.",
+                  "en": "Compile authorized bounded plans on cache misses."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "shards",
+                "description": {
+                  "vi": "Route eligible shards, one suitable replica mỗi shard, deadline/hedge budget.",
+                  "en": "Query eligible shard replicas under deadline/hedge budgets."
+                }
+              },
+              {
+                "from": "shards",
+                "to": "coord",
+                "description": {
+                  "vi": "Return authorized candidates, scores/sort keys và completeness metadata.",
+                  "en": "Return authorized candidates and completeness metadata."
+                }
+              },
+              {
+                "from": "coord",
+                "to": "rerank",
+                "description": {
+                  "vi": "Merge comparable scores và choose bounded candidate pool.",
+                  "en": "Merge comparable scores into bounded candidate pools."
+                }
+              },
+              {
+                "from": "rerank",
+                "to": "hydrate",
+                "description": {
+                  "vi": "Rerank rồi recheck current rights/version trước snippets.",
+                  "en": "Recheck rights/versions before hydrating reranked candidates."
+                }
+              },
+              {
+                "from": "hydrate",
+                "to": "client",
+                "description": {
+                  "vi": "Return results/cursor cùng generation/partial status.",
+                  "en": "Return results/cursors with generations and partial status."
+                }
+              }
+            ]
+          },
+          {
+            "id": "hit",
+            "label": {
+              "vi": "Scoped cache hit",
+              "en": "Scoped cache hit"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "query",
+                "description": {
+                  "vi": "Same query chưa đủ nếu principal/filter/generation khác.",
+                  "en": "Identical query text is insufficient across scopes/generations."
+                }
+              },
+              {
+                "from": "query",
+                "to": "cache",
+                "description": {
+                  "vi": "Lookup compatible query/filter/auth/index/rank key.",
+                  "en": "Look up compatible scoped versioned keys."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "hydrate",
+                "description": {
+                  "vi": "Cached candidates vẫn cần current access/delete policy enforcement.",
+                  "en": "Enforce current access/deletion policies on cached candidates."
+                }
+              },
+              {
+                "from": "hydrate",
+                "to": "client",
+                "description": {
+                  "vi": "Return bounded authorized content, không leak cached forbidden snippets.",
+                  "en": "Return authorized content without leaking forbidden cached snippets."
+                }
+              }
+            ]
+          },
+          {
+            "id": "index",
+            "label": {
+              "vi": "Update thành searchable reader",
+              "en": "Publish updates to searchable readers"
+            },
+            "steps": [
+              {
+                "from": "source",
+                "to": "ingest",
+                "description": {
+                  "vi": "Emit source-versioned document change.",
+                  "en": "Emit source-versioned changes."
+                }
+              },
+              {
+                "from": "ingest",
+                "to": "indexer",
+                "description": {
+                  "vi": "Replay identified change; reject stale version theo supported scope.",
+                  "en": "Replay identified changes while rejecting obsolete versions."
+                },
+                "async": true
+              },
+              {
+                "from": "indexer",
+                "to": "shards",
+                "description": {
+                  "vi": "Build/open compatible segments rồi publish reader generation.",
+                  "en": "Build/open compatible segments and publish reader generations."
+                }
+              },
+              {
+                "from": "shards",
+                "to": "evaluation",
+                "description": {
+                  "vi": "Measure source/accept-to-visible lag, không chỉ writer ACK latency.",
+                  "en": "Measure source/accept-to-visible lag beyond writer ACK latency."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "delete",
+            "label": {
+              "vi": "Delete, stale replay và reclamation",
+              "en": "Delete, stale replay and reclamation"
+            },
+            "steps": [
+              {
+                "from": "source",
+                "to": "ingest",
+                "description": {
+                  "vi": "Delete/ACL revocation mang version và scope.",
+                  "en": "Version deletion/revocation facts."
+                }
+              },
+              {
+                "from": "ingest",
+                "to": "indexer",
+                "description": {
+                  "vi": "Keep version/tombstone guard; old update không revive delete.",
+                  "en": "Retain guards against obsolete update resurrection."
+                },
+                "async": true
+              },
+              {
+                "from": "indexer",
+                "to": "shards",
+                "description": {
+                  "vi": "Publish delete visibility theo refresh policy; rights enforcement có own strictness.",
+                  "en": "Publish deletion under refresh rules and explicit authorization strictness."
+                }
+              },
+              {
+                "from": "merge",
+                "to": "shards",
+                "description": {
+                  "vi": "Merge reclaim obsolete bytes khi readers/pins an toàn, giữ needed guards.",
+                  "en": "Reclaim obsolete bytes safely while retaining required guards."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "rebuild",
+            "label": {
+              "vi": "Reindex và rollout schema/ranking",
+              "en": "Reindex and roll out generations"
+            },
+            "steps": [
+              {
+                "from": "source",
+                "to": "indexer",
+                "description": {
+                  "vi": "Consistent snapshot cut và compatible ordered tail vào new generation.",
+                  "en": "Build new generations from consistent cuts and compatible tails."
+                }
+              },
+              {
+                "from": "indexer",
+                "to": "shards",
+                "description": {
+                  "vi": "Build/warm new readers; verify coverage, versions và permissions.",
+                  "en": "Build/warm readers and verify coverage/permissions."
+                }
+              },
+              {
+                "from": "evaluation",
+                "to": "query",
+                "description": {
+                  "vi": "Gate ranking/schema rollout bằng quality/freshness/latency evidence.",
+                  "en": "Gate rollouts on quality, freshness and latency evidence."
+                }
+              },
+              {
+                "from": "query",
+                "to": "coord",
+                "description": {
+                  "vi": "Atomic alias/generation switch; old pagination context có expiry policy.",
+                  "en": "Switch generations coherently with explicit old-cursor expiry."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "index",
+      "title": {
+        "vi": "5. Term dictionary, postings và positions",
+        "en": "5. Term dictionaries, postings and positions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Inverted index map term tới sorted doc IDs, term frequency và optional positions/offsets. AND query intersect posting lists, thường bắt đầu rare list rồi skip/block structures; OR hợp lists và score candidates. Phrase/proximity cần positions, không chỉ cả hai từ có trong document. Term dictionary/FST giúp lookup/prefix; stored fields phục vụ retrieval/snippets; doc values là column-oriented access cho sorting/facets/features. Query còn có thể đọc field data cho scoring/filter, không chỉ đọc documents khi làm snippet.",
+          "en": "Postings map terms to sorted documents, frequencies and optional positions/offsets. Intersections/unions retrieve candidates; phrase/proximity queries require positions. Dictionaries assist lookup, stored fields hydrate content and columnar doc values support sorting/facets/features. Scoring/filtering can require additional document-field work."
+        },
+        {
+          "vi": "Index/query analysis phải tương thích, không nhất thiết byte-identical: query-time synonym expansion hoặc dedicated search analyzer có thể khác có chủ đích. Chốt Unicode normalization, accents, token boundaries, language stemming, stopwords và keyword fields. Tiếng Việt có segmentation/multi-syllable terms nên lowercase+space split không là production analyzer đầy đủ. Analyzer change có thể cần reindex và versioned rollout; test queries nhiều ngôn ngữ, names, IDs và mixed code/text.",
+          "en": "Index/query analyzers must be compatible, though search-specific synonyms may intentionally differ. Specify normalization, accents, tokenization, language processing and keyword fields. Vietnamese needs more than simple lowercase/space splitting. Version analyzer changes and test multilingual names, identifiers and mixed text."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Từ text tới bounded candidate set",
+          "en": "From text to bounded candidates"
+        },
+        "caption": {
+          "vi": "Index structures giảm scan nhưng broad query vẫn có work cost.",
+          "en": "Indexes avoid many scans without making broad queries free."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Analyze",
+              "en": "Analyze"
+            },
+            "detail": {
+              "vi": "Compatible terms, field semantics và query mode.",
+              "en": "Produce compatible terms and field semantics."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Retrieve",
+              "en": "Retrieve"
+            },
+            "detail": {
+              "vi": "Lookup/intersect/union postings, apply allowed scope.",
+              "en": "Combine postings within allowed scopes."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Score / prune",
+              "en": "Score and prune"
+            },
+            "detail": {
+              "vi": "BM25/features và safe candidate budgets.",
+              "en": "Score/prune under explicit candidate budgets."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Explain / hydrate",
+              "en": "Explain and hydrate"
+            },
+            "detail": {
+              "vi": "Trace score và authorized fields/snippets.",
+              "en": "Explain scores and hydrate authorized fields."
+            },
+            "icon": "check"
+          }
+        ]
+      },
+      "experiment": "search-index"
+    },
+    {
+      "id": "bm25",
+      "title": {
+        "vi": "6. BM25 là retrieval score, không phải relevance truth",
+        "en": "6. BM25 is a retrieval score rather than relevance truth"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một common teaching formulation cộng theo query terms: IDF=ln(1+(N−df+0,5)/(df+0,5)); contribution=IDF×tf×(k1+1)/(tf+k1×(1−b+b×dl/avgdl)). tf saturation giảm lợi ích spam lặp từ; b điều chỉnh length normalization. Field boosts, norms/compression, term overlap và implementation details có thể đổi absolute score. Lab dùng exact small-corpus arithmetic với k1=1,2, b mặc định0,75, không khẳng định tái tạo mọi Lucene score.",
+          "en": "A common teaching BM25 sums IDF and saturated term-frequency contributions with length normalization. Saturation limits repetition benefits, and b controls length adjustment. Fields, norms and implementation details affect absolute scores. The lab uses exact small-corpus arithmetic rather than reproduce every Lucene detail."
+        },
+        {
+          "vi": "Lab hiển thị postings/tf/positions, corpus length và per-term score explanation cho query English. Shared corpus statistics làm scores comparable trong fixture. Production document-sharded indexes có local statistics khác nhau; global-stat query phase hoặc calibrated scoring có trade-offs về latency/work. Safe top-K merge theorem chỉ áp khi same fixed score/total order và mỗi shard trả đủ local K; later rerank theo new features có thể cần oversampling để không miss best candidate.",
+          "en": "Inspect postings and score contributions using shared fixture statistics. Shard-local statistics may differ in production, and global statistics have costs. Exact local-top-K merging assumes comparable fixed scores and sufficient local candidates. Changed reranking features can require larger candidate pools."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "caption": {
+          "vi": "BM25 teaching formulation; các biến thuộc cùng field/statistics scope.",
+          "en": "Teaching BM25 with consistent field/statistics scope."
+        },
+        "content": "idf(term) = ln(1 + (N - df(term) + 0.5) / (df(term) + 0.5))\nnorm(d) = k1 * (1 - b + b * length(d) / averageLength)\nscore(d,q) = sum(idf(t) * tf(t,d) * (k1 + 1) / (tf(t,d) + norm(d)))\n\nN: documents in the chosen statistics scope\ndf: documents containing the term\nk1: nonnegative saturation parameter\nb: length normalization in [0,1]"
+      }
+    },
+    {
+      "id": "permissions",
+      "title": {
+        "vi": "7. Filter trước top-K và kiểm quyền tại hydration",
+        "en": "7. Filter before top-K and authorize hydration"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu top2 gồm private d2 và public d5, lọc d2 sau ranking chỉ còn một result dù public d1 đủ tốt vẫn nằm ngoài pool. Apply ACL/tenant/business filters vào retrieval trước candidate truncation khi cần đúng eligible recall. Rerank/hydrate/cache cũng enforce quyền: stale index ACL có thể cần current-authority validation để đáp ứng strict revocation SLO. Kiểm ở cuối giúp chặn leak nhưng không tự lấy lại authorized candidates đã bỏ; cần refill/retrieval policy rõ.",
+          "en": "Post-truncation filtering can underfill results and miss eligible candidates. Filter within retrieval before candidate limits, then enforce rights through reranking, hydration and caches. Current-authority checks may be needed for revocation guarantees. Final checks prevent leaks without recovering lost recall unless refill/retrieval explicitly does so."
+        },
+        {
+          "vi": "Cache keys gồm normalized query/filter/sort, effective permission scope/version và index/ranking generation theo freshness contract. Shared popular-query cache không được reuse private snippets giữa tenants. Result counts/facets/suggestions/error timing cũng có disclosure risk; access checks không chỉ hide body text. Snippets escaped/sanitized, highlight markers không được execute source HTML/script. Internal fixture deliberately exposes all toy texts để giải thích algorithms, không là production permission design.",
+          "en": "Cache keys include effective scopes and coherent query/index/ranking contexts. Protect snippets, counts, facets, suggestions and timing from cross-tenant disclosure. Escape snippets/highlights. Exposed toy corpus text is educational instrumentation rather than a production authorization design."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Retrieve safely",
+            "en": "Retrieve safely"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Eligible documents vào candidate pool, không truncate forbidden pool trước.",
+              "en": "Build eligible candidate pools before truncation."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Hydrate safely",
+            "en": "Hydrate safely"
+          },
+          "icon": "check",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Current rights, version/delete checks và escaped snippets.",
+              "en": "Enforce current rights/versions/deletions and escape snippets."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Cache safely",
+            "en": "Cache safely"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Scope/generation/freshness áp dụng cả metadata và counts.",
+              "en": "Apply scopes/freshness to cached content and metadata."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "refresh",
+      "title": {
+        "vi": "8. Durability, refresh và merge là ba trục",
+        "en": "8. Durability, refresh and merge are separate axes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Recoverable ingest/writer acceptance có log/replication/persistence contract riêng. Refresh mở/publish reader mới cho changes searchable, có thể không cần full durable index commit. Merge kết hợp segments và reclaim obsolete bodies/deletion bits dưới reader-safe policy; nó không phải bước bắt buộc trước mỗi durability ACK. Không vẽ một linear pipeline buffer→refresh→merge→fsync như mọi write phải đi qua đủ theo thứ tự đó.",
+          "en": "Acceptance has its own recovery/persistence contract. Refresh publishes searchable readers without necessarily making a full index commit. Merges combine/reclaim segments while protecting readers, independently of per-write ACKs. Avoid a mandatory linear refresh/merge/fsync model."
+        },
+        {
+          "vi": "Versioned update/delete guard chặn old CDC event sau newer delete. Tombstone/version metadata retention phải cover supported replay/rebuild window, hoặc có authoritative snapshot/reconciliation thay thế. Lab v1 body→v2 delete→refresh→latev1→refresh cho thấy guard-off resurrect; merge reclaim old bytes không tự sửa resurrected current state. Search invisibility không là physical erasure khỏi mọi replica/snapshot/backup.",
+          "en": "Versioned guards prevent obsolete events from resurrecting deletes. Retain enough metadata for supported replay or use authoritative rebuild protocols. The lab demonstrates how stale updates can resurrect after refresh; merging bytes does not repair incorrect current state. Invisibility differs from universal physical erasure."
+        },
+        {
+          "vi": "Faster refresh có thể tăng small segments/merge work và query tails; choose freshness SLO theo data class/workload. Read-your-write wait token hoặc limited primary overlay có thể phục vụ own edits nhưng overlay cần query/filter/rank/dedup/delete semantics, không chỉ append changed document vào mọi result page. Không hứa globally fresh total ordering khi index còn lag.",
+          "en": "Faster refresh trades freshness against segments/merge/query costs. Visibility waits or carefully scoped overlays can support own edits, but overlays require correct query/ranking/filter/deletion semantics. They do not automatically establish globally fresh ordering."
+        }
+      ],
+      "experiment": "search-refresh"
+    },
+    {
+      "id": "fanout",
+      "title": {
+        "vi": "9. Tail latency tăng theo fan-out và correlation",
+        "en": "9. Fan-out and correlation amplify tails"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu N eligible shards độc lập có per-shard slow probability p, xác suất ít nhất một slow là 1−(1−p)^N. N=100,p=1% cho khoảng63,4%, không phải query p99 cố định63,4%: đây là threshold-event probability tại một slow definition. Shared overload/AZ/network correlation phá independence. Query completion có parse/routing/merge/rerank/hydrate overhead ngoài max shard response; instrument full critical path.",
+          "en": "Under independence, at-least-one-slow probability is one minus (one minus p) to N. This is a threshold-event model rather than a universal percentile claim. Shared overload violates independence, and coordinator/reranking/hydration add critical-path work beyond shard maxima."
+        },
+        {
+          "vi": "Replicas/load-aware routing có thể giảm tails; bounded hedging gửi replica khác sau delay nếu original còn pending. Extra requests tốn CPU/network và có thể làm overload tệ hơn; use request budgets, correlation-aware routing, cancellation và admission. Deadline có thể fail closed hoặc explicit partial theo product; thiếu shard không được báo complete global top-K/counts/facets. Partial pagination còn cần stable completeness semantics.",
+          "en": "Replicas and bounded hedges can reduce delays at additional cost. Budget/cancel hedges and account for correlated overload. Deadlines either fail closed or return explicitly incomplete results; missing shards cannot establish complete global rankings/counts or stable pagination."
+        },
+        {
+          "vi": "Lab tách analytical N/p panel khỏi fixed four-shard trace, tránh lấy toy timings làm benchmark. Primary durations30/40/180/55 ms; backup service times90/90/45/90 ms. Hedge delay30 làm slow shard hoàn tất75 ms và tạo thêm3 requests; deadline80 không hedge trả partial3/4 hoặc fail. Chọn latency policy phải nhìn cả quality/completeness và resource amplification.",
+          "en": "The lab separates analytical probabilities from a fixed four-request trace. Hedge delay thirty reduces its slow request to seventy-five ms with three extra requests; deadline eighty otherwise yields three responses or failure. Evaluate completeness and resource amplification together."
+        }
+      ],
+      "experiment": "search-fanout"
+    },
+    {
+      "id": "ranking",
+      "title": {
+        "vi": "10. Retrieval, ranking và reranking có recall budgets",
+        "en": "10. Retrieval, ranking and reranking have recall budgets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Candidate generation dùng lexical/postings hoặc hybrid sources; cheap features/BM25 chọn larger pool; learning-to-rank/neural rerank chỉ xử lý bounded subset. Model không cứu relevant document chưa vào pool. Measure recall theo stage, languages và query intents; tune oversampling/diversity/dedup để không toàn near-duplicate pages. Feature freshness, model version, deterministic ties và timeout fallback là response contract.",
+          "en": "Retrieval feeds cheap scoring and bounded expensive reranking. Models cannot rescue missing candidates. Measure stage recall across query/language slices and address duplicates/diversity. Feature/model versions, ties and fallback policies affect returned results."
+        },
+        {
+          "vi": "Web corpus thêm link authority/spam/trust/freshness; commerce có availability/price/category và business policies. Learned behavior signals có position/popularity bias và feedback loops; test niche/new items. Score magnitudes giữa lexical/vector/model không mặc định comparable; hybrid normalization/fusion phải có evaluation. RAG dùng retrieved documents còn cần provenance/context constraints được mở sâu ở AI Systems.",
+          "en": "Web and commerce corpora use different signals and constraints. Behavioral features carry bias and feedback loops. Lexical/vector/model scores are not automatically comparable; evaluate fusion and candidate recall, with RAG-specific context constraints covered separately."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Spending relevance compute có chủ đích",
+          "en": "Spend ranking compute intentionally"
+        },
+        "caption": {
+          "vi": "Mỗi truncation cần đo relevant candidates bị bỏ.",
+          "en": "Measure relevant candidates lost at every truncation."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Match / filter",
+              "en": "Match and filter"
+            },
+            "detail": {
+              "vi": "Authorized scope và broad affordable candidates.",
+              "en": "Retrieve broad affordable eligible candidates."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Cheap ranking",
+              "en": "Cheap ranking"
+            },
+            "detail": {
+              "vi": "Comparable scores, bounded per-shard pools.",
+              "en": "Use comparable scores and bounded pools."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Rerank / diversify",
+              "en": "Rerank and diversify"
+            },
+            "detail": {
+              "vi": "Versioned features/models và fallback.",
+              "en": "Apply versioned models/features with fallback."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Hydrate / evaluate",
+              "en": "Hydrate and evaluate"
+            },
+            "detail": {
+              "vi": "Rights, snippets, quality/freshness slices.",
+              "en": "Check rights, content and quality/freshness slices."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "pagination",
+      "title": {
+        "vi": "11. Cursor cần total order và stable reader context",
+        "en": "11. Cursors need total order and stable readers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Deep offset pagination bắt shards thu thập skipped hits cộng page hits, tăng memory/CPU/merge work. search-after dùng last sort tuple nhưng không freeze updates giữa pages. Point-in-time/snapshot reader cùng deterministic total sort/tiebreaker hỗ trợ consistent traversal; internal doc IDs có thể khác replicas và thay sau merges nên không dùng như universal external identity ngoài supported snapshot scope.",
+          "en": "Deep offsets collect skipped hits as well as page hits. Search-after reduces this work without freezing updates. Snapshot readers and total sort/tiebreakers support consistent traversal; internal document IDs are not universally stable external identities."
+        },
+        {
+          "vi": "Cursor opaque/signed bind query/filter/principal scope, sort, ranking/index generation và expiry. Snapshot pin giữ old segments gây resource pressure nên bound lifetime/open contexts và cleanup. ACL revoke/delete strictness có thể cần override old snapshot content; product cần nói stable traversal nhưng current rights vẫn enforced như thế nào. Reindex alias switch không silently đổi reader giữa cùng cursor chain; expired context trả reset contract rõ.",
+          "en": "Bind opaque cursors to contexts and expiry. Reader pins consume resources, requiring limits. Current rights may override snapshot visibility; define that interaction. Reindex switches do not silently mix reader contexts, and expired contexts need explicit restart semantics."
+        }
+      ]
+    },
+    {
+      "id": "evaluation",
+      "title": {
+        "vi": "12. NDCG dùng independent judgments, không tự chấm returned pool",
+        "en": "12. NDCG needs independent judgments beyond returned hits"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giữ judged query set đại diện languages/intents/head-tail và graded relevance, có version/annotation criteria. DCG@K cộng (2^rel−1)/log2(rank+1); IDCG lấy best ordering từ judged candidate universe cho query, không chỉ sort các hits hệ thống vừa trả. Nếu only returned mediocre item được sort làm ideal, metric có thể 1 dù hệ thống miss excellent documents. IDCG=0 cần declared undefined/skip/zero convention và reporting coverage.",
+          "en": "Maintain representative versioned query judgments. DCG discounts graded gains by rank; ideal gain comes from independently judged possibilities, not only returned hits. Otherwise missing excellent documents can still score perfectly. Declare zero-ideal conventions and judgment coverage."
+        },
+        {
+          "vi": "Ví dụ judgments excellent=3, okay=1, bad=0. Return only okay cho DCG1, nhưng IDCG@2 là 7+1/log2(3), nên NDCG khoảng0,131; không phải1. Offline gates còn cần candidate recall, zero-results, permission correctness, freshness và latency slices. Unjudged không đồng nghĩa chắc irrelevant; track missing labels. Click/reformulation/abandonment trong A/B bị position bias và query-mix effects, nên dùng guardrails/segmentation chứ không tối ưu CTR đơn lẻ.",
+          "en": "With excellent three, okay one and bad zero, returning only okay yields about 0.131 at two, not one. Evaluate candidate recall, empty results, rights, freshness and latency alongside ranking. Track unjudged coverage and online biases rather than optimize clicks alone."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Evidence",
+            "en": "Evidence"
+          },
+          {
+            "vi": "What it answers",
+            "en": "What it answers"
+          },
+          {
+            "vi": "Limitation",
+            "en": "Limitation"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Judged ranking metrics",
+              "en": "Judged ranking metrics"
+            },
+            {
+              "vi": "Relevant results ở đúng vị trí không?",
+              "en": "Are relevant results ranked well?"
+            },
+            {
+              "vi": "Coverage, annotator consistency và stale labels.",
+              "en": "Coverage, annotation consistency and stale labels."
+            }
+          ],
+          [
+            {
+              "vi": "Candidate recall",
+              "en": "Candidate recall"
+            },
+            {
+              "vi": "Reranker có nhìn thấy best docs không?",
+              "en": "Can rerankers see the best documents?"
+            },
+            {
+              "vi": "Depends independent relevant set.",
+              "en": "Requires independent relevant sets."
+            }
+          ],
+          [
+            {
+              "vi": "Online experiment",
+              "en": "Online experiment"
+            },
+            {
+              "vi": "Real user outcomes đổi thế nào?",
+              "en": "How do user outcomes change?"
+            },
+            {
+              "vi": "Bias, sample mix và delayed outcomes.",
+              "en": "Bias, cohort mix and delayed outcomes."
+            }
+          ],
+          [
+            {
+              "vi": "Freshness / authorization",
+              "en": "Freshness / authorization"
+            },
+            {
+              "vi": "Current data/rights có respected không?",
+              "en": "Are current data/rights respected?"
+            },
+            {
+              "vi": "Needs end-to-end probes, không chỉ node health.",
+              "en": "Needs end-to-end evidence beyond node health."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "lifecycle",
+      "title": {
+        "vi": "13. Reindex, recovery và resource isolation",
+        "en": "13. Reindexing, recovery and resource isolation"
+      },
+      "paragraphs": [
+        {
+          "vi": "New analyzer/mapping/schema generation build từ consistent source cut và compatible versioned tail. Verify document/delete coverage, permissions, queries và performance trước alias/generation switch; pin old pagination readers hoặc expire rõ. Keep old generation có rollback window nhưng không restore revoked content qua unsafe stale aliases. Snapshot/recovery cần indexes, source/version checkpoints và retained tombstone strategy, không chỉ copy segment files rồi đoán latest.",
+          "en": "Build schema/analyzer generations from coherent cuts and versioned tails, verify coverage/rights/quality and switch readers explicitly. Rollback policies preserve current safety rather than revive revoked content. Recovery includes checkpoints and deletion/version strategy, not just segment files."
+        },
+        {
+          "vi": "Bound query complexity: wildcard/regex/fuzzy expansions, script costs, aggregation cardinality, returned fields/snippet size và per-tenant concurrency. Isolate foreground query pools khỏi refresh/merge/rebuild, nhưng vẫn reserve enough indexing capacity để freshness không chết. Monitor merge backlog/disk temporary space/reader pins/cache churn và hot shards. DLQ malformed ingest giữ source identity/version để repair/replay an toàn.",
+          "en": "Bound expansions, scripts, aggregations, response sizes and concurrency. Protect queries from maintenance without starving freshness. Monitor temporary space, merges, reader pins, churn and skew. Malformed-ingest remediation retains identities/versions for safe replay."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "14. Chứng minh query quality cùng recovery correctness",
+        "en": "14. Verify query quality together with recovery correctness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trace ingest accepted→writer applied→reader visible và query parse→eligible shards→candidate merge→rerank→authorized hydration. Report p50/p95/p99 theo query class, shard completeness, source-to-visible lag, deleted/unauthorized result probes, stage recall, zero-result rates và resource cost. Cache-hit rate cao không chứng minh quality/freshness; score lớn không chứng minh relevance.",
+          "en": "Trace both visibility and query stages. Slice latency, completeness, freshness, forbidden/deleted-result probes, recall, empty results and cost. Cache hits and score magnitudes alone do not establish quality."
+        },
+        {
+          "vi": "Fault tests gồm delayed/stale source updates sau delete, duplicate ingest, shard timeout/replica failover, hedge storm, full disk/merge stall, analyzer rollout mismatch, old PIT expiry và permission revoke trên cached results. Compare against small exact baseline để kiểm postings/ranking/ties/ACL và stable pagination. Review completeness policy bằng missing-shard test, không chỉ all-green cluster.",
+          "en": "Test stale updates, duplicate ingestion, missing shards, hedges, disk/merge failures, schema mismatches, expired contexts and cached revocations. Small exact baselines validate algorithms and pagination; missing-shard tests validate completeness policies."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Algorithm evidence",
+            "en": "Algorithm evidence"
+          },
+          "icon": "check",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Exact small corpus, score contributions và independent judged sets.",
+              "en": "Use exact small corpora, contributions and independent judgments."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Boundary evidence",
+            "en": "Boundary evidence"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Visibility/deletion versions, permissions và snapshot cursor contexts.",
+              "en": "Verify visibility/deletions, rights and cursor contexts."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Failure evidence",
+            "en": "Failure evidence"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Partial shards, correlated tails và maintenance resource contention.",
+              "en": "Exercise incomplete shards, correlated delays and maintenance contention."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "drill",
+      "title": {
+        "vi": "15. Luyện giải thích từ postings tới response contract",
+        "en": "15. Explain postings through the response contract"
+      },
+      "paragraphs": [
+        {
+          "vi": "Vẽ query cache redis có private top candidate, slow shard và recent deleted document. Hỏi filter ở đâu, score statistics scope nào, missing shard có làm page complete không và cached snippet còn quyền không. Sau đó paginate qua refresh/reindex và tính NDCG khi excellent document không được retrieve.",
+          "en": "Trace a query with private candidates, slow shards and recent deletes. Explain filter placement, score scopes, completeness, cached rights and pagination through refreshes, then score a ranking that missed an excellent document."
+        }
+      ],
+      "questions": [
+        {
+          "question": {
+            "vi": "Index/query analyzer có bắt buộc identical không?",
+            "en": "Must index and query analyzers be identical?"
+          },
+          "answer": [
+            {
+              "vi": "Không nhất thiết. Terms/positions/query semantics cần compatible; dedicated search analyzer/synonyms có thể khác có chủ đích. Version và test reindex requirements, nhất là multilingual text.",
+              "en": "Not necessarily; intentional search-time analysis is valid when compatible and tested."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao filter ACL sau top-K không đủ?",
+            "en": "Why is post-top-K authorization insufficient?"
+          },
+          "answer": [
+            {
+              "vi": "Nó có thể block leak cuối cùng nhưng underfill/miss authorized candidates đã bị truncate. Apply eligible scope trong retrieval và enforce current rights xuyên cache/hydration; refill nếu strict revocation drops candidates.",
+              "en": "It can prevent final disclosure while losing eligible recall; filter earlier and preserve current rights throughout."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Refresh có đồng nghĩa durable fsync commit không?",
+            "en": "Does refresh mean a durable fsync commit?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Refresh publish searchable reader; acceptance/recovery persistence và merge lifecycle khác boundaries. Chọn guarantees bằng storage protocol, không suy từ searchable result.",
+              "en": "No. Search visibility, persistence and physical lifecycle have distinct guarantees."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Shard local top-K merge lúc nào exact?",
+            "en": "When is local-top-K merging exact?"
+          },
+          "answer": [
+            {
+              "vi": "Khi fixed comparable scores/total order và đủ local K cho global K trên eligible set. Local statistics khác hoặc later rerank thay scoring có thể cần extra protocol/candidate oversampling; missing shard phá completeness.",
+              "en": "Under comparable fixed scores/order and sufficient local candidates; changed scoring or missing shards alter the guarantee."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Hedge luôn làm hệ thống nhanh hơn không?",
+            "en": "Do hedges always improve performance?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Extra load/correlation/cancellation delay có thể tăng overload. Budget, measure tails và completeness, choose delay dưới actual capacity; toy min(primary,delay+backup) bỏ nhiều costs.",
+              "en": "No. Added load and correlation can worsen overload; measure under bounded budgets."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "search_after có freeze index qua pages không?",
+            "en": "Does search-after freeze index state?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Stable reader/PIT cùng total sort/tiebreaker và context binding mới hỗ trợ stable traversal; permission/deletion/expiry policy vẫn phải define.",
+              "en": "No. Stable readers and total ordering/context binding are additional requirements."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "NDCG ideal có lấy từ returned hits thôi không?",
+            "en": "Can ideal gain use only returned hits?"
+          },
+          "answer": [
+            {
+              "vi": "Không để đánh giá retrieval/ranking đầy đủ. Cần independent judgments để missing excellent docs bị phạt; handle unjudged và IDCG0 explicit. Return only okay trong worked example không score1.",
+              "en": "Not for full evaluation; independent judgments penalize missed excellent results and require explicit coverage/zero-gain rules."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Delete đã invisible thì merge có thể quên version guard ngay không?",
+            "en": "Can invisible deletes immediately discard version guards?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu supported replay còn stale updates. Retain version/tombstone metadata hoặc authoritative rebuild/cutoff protocol; physical reclamation không cho phép resurrection.",
+              "en": "Not while obsolete events can replay; retain enough metadata or authoritative recovery boundaries."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
