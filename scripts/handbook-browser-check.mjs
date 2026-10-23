@@ -57,6 +57,9 @@ for(const locale of ['','en/'])for(const route of routes){
       await range.focus();
       const direction=await range.evaluate(el=>Number(el.value)>=Number(el.max)?'ArrowLeft':'ArrowRight');
       await page.keyboard.press(direction);
+    }else if(await worksheet.locator('.mock-prompt-picker select').count()){
+      const picker=worksheet.locator('.mock-prompt-picker select');
+      await picker.selectOption(await picker.locator('option').last().getAttribute('value'));
     }else if(await worksheet.locator('input[type=checkbox]').count()){
       await worksheet.locator('input[type=checkbox]').first().click();
     }else{
