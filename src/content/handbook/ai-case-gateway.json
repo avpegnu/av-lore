@@ -1,0 +1,1275 @@
+{
+  "id": "ai-case-gateway",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "LLM Gateway: routing có policy, streaming và usage đáng tin cậy",
+    "en": "LLM Gateway: policy-bound routing, streaming and trustworthy usage"
+  },
+  "summary": {
+    "vi": "Thiết kế shared AI data plane: aliases/capability contracts, qualified routing, replay boundaries, hierarchical quotas, atomic reservations, per-attempt usage/cost, scoped caches/logs và multi-region recovery.",
+    "en": "Design shared AI traffic with aliases, qualified routes, replay boundaries, quotas, atomic reservations, per-attempt accounting, scoped caches and multi-region recovery."
+  },
+  "prerequisites": [
+    "ai-production",
+    "ai-safety",
+    "ai-evals",
+    "rate-limiting"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "api",
+    "auth",
+    "distributed",
+    "observability",
+    "cache"
+  ],
+  "takeaways": [
+    {
+      "vi": "Alias là contract được version và kiểm chất lượng; đổi model có thể đổi behavior dù API giống.",
+      "en": "An alias is a versioned, qualified contract; identical API shapes do not imply identical model behavior."
+    },
+    {
+      "vi": "Lọc privacy/region/capability/quality trước ranking cost/latency; fallback không được bỏ hard constraints.",
+      "en": "Filter data, region, capability and qualification constraints before ranking routes; fallback preserves those constraints."
+    },
+    {
+      "vi": "Chưa thấy token không chứng minh replay safe; visible output/tool effects và upstream outcome cần state riêng.",
+      "en": "No visible token does not establish replay safety; track visible output, tool effects and upstream uncertainty separately."
+    },
+    {
+      "vi": "Reservation bảo vệ exposure; usage ledger giữ từng billable attempt và explicit pending evidence.",
+      "en": "Reservations bound exposure; usage ledgers retain billable attempts and explicit pending evidence."
+    },
+    {
+      "vi": "Rate bucket, concurrency cap và durable money budget là các controls khác nhau.",
+      "en": "Rate buckets, concurrency caps and durable financial budgets are different controls."
+    },
+    {
+      "vi": "Tenant cache key và temperature 0 không tự chứng minh access safety, freshness hoặc determinism.",
+      "en": "Tenant cache scope and temperature zero do not establish authorization, freshness or determinism."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ contract tới usage evidence",
+      "en": "From contracts to usage evidence"
+    },
+    "caption": {
+      "vi": "Một request có thể fail trước hoặc sau khi tạo billable work; mỗi transition phải có owner.",
+      "en": "A request can fail before or after billable work; assign ownership to each transition."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Authorize",
+          "en": "Authorize"
+        },
+        "detail": {
+          "vi": "Trusted identity, entitlement và data classification.",
+          "en": "Bind trusted identity, entitlements and data classes."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Reserve / route",
+          "en": "Reserve / route"
+        },
+        "detail": {
+          "vi": "Atomic exposure hold và qualified target.",
+          "en": "Reserve exposure and choose qualified targets."
+        },
+        "icon": "gauge"
+      },
+      {
+        "title": {
+          "vi": "Attempt / stream",
+          "en": "Attempt / stream"
+        },
+        "detail": {
+          "vi": "Deadline, replay policy và generation boundary.",
+          "en": "Enforce deadlines, replay policies and generation boundaries."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Reconcile",
+          "en": "Reconcile"
+        },
+        "detail": {
+          "vi": "Per-attempt evidence, cost revision và pending state.",
+          "en": "Reconcile attempt evidence, costs and unresolved states."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. Gateway giải quyết coordination, không thay application semantics",
+        "en": "1. Centralize coordination while preserving application semantics"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi nhiều teams gọi hosted/self-hosted models, credentials, provider limits, audit và spend attribution dễ phân tán. Gateway cung cấp shared admission/routing/observability boundary. Application vẫn sở hữu task definition, user authorization, prompt/retrieval correctness và tool-effect authority; một proxy compatible endpoint không tự biến mọi models thành interchangeable.",
+          "en": "Many teams introduce fragmented credentials, capacity limits, audit and cost attribution. A gateway centralizes traffic coordination while applications retain task semantics, user authorization, retrieval correctness and tool-effect authority. Compatible endpoints do not make models interchangeable."
+        },
+        {
+          "vi": "Chốt supported modalities, streaming/tool/schema features, aliases, priority tiers, sensitive data rules, tenant budgets và failure contract. Đặt measured overhead/SLO theo workload; mục tiêu 10–20 ms có thể là design input, không là guarantee trên mọi path. Không hứa availability vượt mọi provider khi có common dependencies hoặc correlated outages.",
+          "en": "Define supported modalities, streaming/tools/schemas, aliases, priorities, data rules, budgets and failure behavior. Choose measured workload-specific overhead targets rather than universal millisecond guarantees. Shared dependencies and correlated outages can defeat apparent multi-provider availability."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Application contract",
+            "en": "Application contract"
+          },
+          "icon": "target",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Task/correctness, authorized tools và user-facing recovery.",
+              "en": "Own task correctness, authorized tools and user-facing recovery."
+            },
+            {
+              "vi": "Model alias đổi behavior cần app-specific eval qualification.",
+              "en": "Qualify changed model behavior with application-specific evaluations."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Gateway contract",
+            "en": "Gateway contract"
+          },
+          "icon": "shield",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Authenticate workload, apply data/routing policy và bound exposure.",
+              "en": "Authenticate workloads, enforce routing/data policy and bound exposure."
+            },
+            {
+              "vi": "Preserve attempt/stream/usage identities để diagnose và reconcile.",
+              "en": "Preserve identities needed for diagnosis and reconciliation."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Provider contract",
+            "en": "Provider contract"
+          },
+          "icon": "scope",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Actual capabilities, limits, billing/retention/regions theo deployment.",
+              "en": "Actual capabilities, limits, billing, retention and deployment locations."
+            },
+            {
+              "vi": "Unknown outcome không được diễn giải thành no work/no charge.",
+              "en": "Unknown outcomes do not establish zero work or zero cost."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Ước lượng streams, tokens và logging riêng",
+        "en": "2. Estimate streams, tokens and logging separately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ giả định 300 applications, 50 triệu logical calls/ngày, peak 3× average, 3000 input + 500 output tokens/call và mean active stream 8 giây. Đây là workload inputs minh họa; retries/fallbacks có thể tăng upstream attempts và tokens ngoài logical calls. Little’s Law dùng stable average arrival rate và mean residence time trong cùng boundary, không nhân p99 latency như một định luật.",
+          "en": "Assume 300 applications, 50 million logical calls/day, a 3× peak, 3000 input and 500 output tokens/call, and eight seconds of mean active streaming. These are illustrative workload inputs. Retries can increase upstream attempts. Little’s Law relates compatible average rates and mean residence times, not arbitrary tail percentiles."
+        },
+        {
+          "vi": "Peak khoảng 1736 calls/s và khoảng 13889 concurrent streams nếu peak tương đối ổn định với mean duration đó. Kích thước connection buffers, event overhead, heartbeats, TLS và slow consumers cần load tests. 14 KB raw payload/call tạo 700 GB/ngày theo decimal units; đây là counterfactual storage estimate, không là đề xuất log mọi prompt. Metadata-only logging có profile khác.",
+          "en": "A sustained peak of about 1736 calls/s with that mean duration implies roughly 13889 active streams. Size buffers, event overhead, heartbeats, TLS and slow consumers through load tests. Fourteen kilobytes of raw payload per call would produce 700 GB/day in decimal units; this is a storage estimate, not a recommendation to log every prompt."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng gateway",
+            "en": "Gateway quantity"
+          },
+          {
+            "vi": "Phép tính minh họa",
+            "en": "Illustrative calculation"
+          },
+          {
+            "vi": "Kết quả gateway",
+            "en": "Gateway result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Average / peak logical QPS",
+              "en": "Average / peak logical QPS"
+            },
+            {
+              "vi": "50M / 86400; ×3",
+              "en": "50M / 86400; ×3"
+            },
+            {
+              "vi": "578.70 / 1736.11",
+              "en": "578.70 / 1736.11"
+            }
+          ],
+          [
+            {
+              "vi": "Active streams",
+              "en": "Active streams"
+            },
+            {
+              "vi": "1736.11 × 8 s",
+              "en": "1736.11 × 8 s"
+            },
+            {
+              "vi": "≈13889",
+              "en": "≈13889"
+            }
+          ],
+          [
+            {
+              "vi": "Input / output tokens/ngày",
+              "en": "Input / output tokens/day"
+            },
+            {
+              "vi": "50M ×3000 / ×500",
+              "en": "50M ×3000 / ×500"
+            },
+            {
+              "vi": "150B / 25B",
+              "en": "150B / 25B"
+            }
+          ],
+          [
+            {
+              "vi": "Raw logs nếu lưu toàn payload",
+              "en": "Raw logs if every payload were stored"
+            },
+            {
+              "vi": "50M ×14000 B",
+              "en": "50M ×14000 B"
+            },
+            {
+              "vi": "700 GB/day trước replicas/indexes",
+              "en": "700 GB/day before replicas/indexes"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "title": {
+        "vi": "3. API contract: logical operation, attempt và config version",
+        "en": "3. Separate operation, attempt and configuration identities"
+      },
+      "paragraphs": [
+        {
+          "vi": "Public workload identity phải được xác thực; không tin tenant/team headers tự khai từ browser. API below là internal teaching contract, không claim drop-in compatibility với mọi provider. Reject unsupported features rõ ràng thay vì silently bỏ tool schemas, safety flags hoặc output format. Project attribution do trusted entitlement mapping quyết định.",
+          "en": "Authenticate workloads instead of trusting browser-supplied tenant/team headers. These illustrative internal APIs are not universal provider contracts. Reject unsupported features rather than silently dropping tools, safety controls or output formats. Trusted entitlement mappings govern project attribution."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/generations",
+          "description": {
+            "vi": "Admit logical operation dưới pinned alias contract; streaming có generation ID và typed final/error events.",
+            "en": "Admit operations under pinned aliases with generation IDs and typed final/error events."
+          },
+          "request": "{ alias, requiredCapabilities, messages, maxOutput, deadlineMs, stream, operationKey }",
+          "response": "{ requestId, generationId, routeVersion, output?, usageState } | text/event-stream"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/model-aliases",
+          "description": {
+            "vi": "Chỉ trả aliases/capabilities mà workload có quyền dùng; backing changes vẫn phải qualify.",
+            "en": "Return entitled aliases and capabilities; backing model changes still require qualification."
+          },
+          "response": "{ aliases: [{ id, contractVersion, capabilities, allowedDataClasses }] }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/usage",
+          "description": {
+            "vi": "Query team/project theo current authorization, phân biệt settled/estimated/pending và adjustment version.",
+            "en": "Query authorized attribution with settled, estimated, pending and revision states."
+          },
+          "response": "{ rows: [{ requestId, attemptId, usageState, costMicros, rateVersion }], cursor }"
+        },
+        {
+          "method": "PUT",
+          "path": "/admin/routes/{alias}",
+          "description": {
+            "vi": "Reviewed control-plane update với expectedVersion, hard constraints, qualified targets và rollout/rollback metadata.",
+            "en": "Update reviewed routes with version preconditions, constraints, qualified targets and rollout metadata."
+          },
+          "request": "{ expectedVersion, targets, constraints, qualificationRefs, rollout }",
+          "response": "{ newVersion, activationState }"
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Tách data plane, control plane và accounting plane",
+        "en": "4. Separate data, control and accounting planes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Data plane cần bounded asynchronous I/O và locally usable route snapshots, nhưng stateful admission/ledger authority phải có consistency contract riêng. Provider credentials không nằm trong application repos; adapter lấy scoped credential references. Telemetry/ledger pipeline async có durability/backpressure policy, không “fire-and-forget” rồi mất billing evidence sau crash.",
+          "en": "Use bounded asynchronous data paths and usable route snapshots while giving reservation and ledger authorities explicit consistency contracts. Applications hold no provider secrets. Asynchronous metering requires durable delivery and backpressure, rather than losing evidence after a crash."
+        }
+      ],
+      "diagram": {
+        "id": "gateway-policy-attempt-ledger-paths",
+        "title": {
+          "vi": "Một logical request có thể có nhiều attempts và nhiều usage records",
+          "en": "A logical request can have multiple attempts and usage records"
+        },
+        "caption": {
+          "vi": "Chọn request, failover, metering, policy rollout hoặc recovery trace. Gateway không thể hứa exactly-once upstream execution chỉ bằng request ID; mỗi boundary có authority và failure state riêng.",
+          "en": "Trace requests, failover, metering, policy rollout or recovery. A request ID alone cannot establish exactly-once upstream execution; each boundary has its own authority and failure states."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "app",
+            "label": {
+              "vi": "Apps / SDK",
+              "en": "Apps / SDK"
+            },
+            "detail": {
+              "vi": "Authenticated workload, task capability, deadline và idempotency scope.",
+              "en": "Supply authenticated tasks, capabilities, deadlines and operation identity."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "Gateway admission",
+              "en": "Gateway admission"
+            },
+            "detail": {
+              "vi": "Trusted tenant/team, body limits, route entitlement và reserved budgets.",
+              "en": "Authenticate scopes, bound requests and reserve permitted budgets."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "quota",
+            "label": {
+              "vi": "Reservation authority",
+              "en": "Reservation authority"
+            },
+            "detail": {
+              "vi": "Atomic holds, leases/epochs, usagepending và durable reconciliation.",
+              "en": "Own atomic reservations, epochs and unresolved accounting."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "router",
+            "label": {
+              "vi": "Qualified route policy",
+              "en": "Qualified route policy"
+            },
+            "detail": {
+              "vi": "Hard data/capability gates trước health/cost/latency ranking.",
+              "en": "Enforce hard constraints before ranking eligible healthy targets."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "adapter",
+            "label": {
+              "vi": "Provider adapter",
+              "en": "Provider adapter"
+            },
+            "detail": {
+              "vi": "Explicit feature profile, attempt IDs, protocol errors và usage parsing.",
+              "en": "Bind attempt IDs, supported protocols, errors and usage semantics."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "hosted",
+            "label": {
+              "vi": "Hosted deployment",
+              "en": "Hosted deployment"
+            },
+            "detail": {
+              "vi": "Endpoint/region/data contract, independent limits và upstream usage.",
+              "en": "Serve under actual data contracts, capacity and usage semantics."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "private",
+            "label": {
+              "vi": "Private model fleet",
+              "en": "Private model fleet"
+            },
+            "detail": {
+              "vi": "Qualified models, warm capacity, queue and resource isolation.",
+              "en": "Provide qualified models with measured capacity and isolation."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "stream",
+            "label": {
+              "vi": "Stream lifecycle",
+              "en": "Stream lifecycle"
+            },
+            "detail": {
+              "vi": "Flush bounded events, preserve generation boundaries và disconnect state.",
+              "en": "Flush bounded events while tracking visible output and disconnects."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "usage",
+            "label": {
+              "vi": "Usage evidence inbox",
+              "en": "Usage evidence inbox"
+            },
+            "detail": {
+              "vi": "Per-attempt provider IDs, cumulative/final records, duplicates và gaps.",
+              "en": "Persist attempt evidence, cumulative/final records, duplicates and gaps."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "ledger",
+            "label": {
+              "vi": "Attribution ledger",
+              "en": "Attribution ledger"
+            },
+            "detail": {
+              "vi": "Versioned rates, per-attempt costs, settled/estimated/pending corrections.",
+              "en": "Attribute versioned per-attempt costs with explicit reconciliation states."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "control",
+            "label": {
+              "vi": "Versioned control plane",
+              "en": "Versioned control plane"
+            },
+            "detail": {
+              "vi": "Aliases, credentials, eval gates, rollout/rollback và revocations.",
+              "en": "Govern aliases, credentials, qualifications, rollout and revocations."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "telemetry",
+            "label": {
+              "vi": "Minimized telemetry",
+              "en": "Minimized telemetry"
+            },
+            "detail": {
+              "vi": "Latency/quality/usage without default raw prompt logging; scoped access.",
+              "en": "Collect scoped quality, timing and usage without default raw payload logs."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "request",
+            "label": {
+              "vi": "Admit và stream một request",
+              "en": "Admit and stream a request"
+            },
+            "steps": [
+              {
+                "from": "app",
+                "to": "edge",
+                "description": {
+                  "vi": "Authenticate trusted workload và validate supported request/deadline.",
+                  "en": "Authenticate workloads and validate supported contracts."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "quota",
+                "description": {
+                  "vi": "Reserve bounded quota/budget bằng logical operation identity.",
+                  "en": "Reserve bounded quota and budgets under operation identities."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "router",
+                "description": {
+                  "vi": "Pin current route/policy version và required capabilities.",
+                  "en": "Pin policies and required capabilities."
+                }
+              },
+              {
+                "from": "router",
+                "to": "adapter",
+                "description": {
+                  "vi": "Choose only eligible target và create attempt ID.",
+                  "en": "Select eligible targets and create attempt identities."
+                }
+              },
+              {
+                "from": "adapter",
+                "to": "hosted",
+                "description": {
+                  "vi": "Dispatch normalized request theo exact provider feature profile.",
+                  "en": "Dispatch under explicit provider feature profiles."
+                }
+              },
+              {
+                "from": "hosted",
+                "to": "stream",
+                "description": {
+                  "vi": "Forward typed chunks với bounded buffers và lifecycle state.",
+                  "en": "Forward typed events with bounded buffers and lifecycle state."
+                }
+              },
+              {
+                "from": "stream",
+                "to": "app",
+                "description": {
+                  "vi": "Expose one generation identity; final/error state không nhập nhằng.",
+                  "en": "Expose generation identities and explicit terminal/error states."
+                }
+              }
+            ]
+          },
+          {
+            "id": "failover",
+            "label": {
+              "vi": "Fallback trước expose và theo replay policy",
+              "en": "Fail over within replay and exposure policies"
+            },
+            "steps": [
+              {
+                "from": "hosted",
+                "to": "adapter",
+                "description": {
+                  "vi": "Classify 429/rejection/unknown timeout, retain attempt evidence.",
+                  "en": "Classify failures and retain attempt evidence."
+                }
+              },
+              {
+                "from": "adapter",
+                "to": "router",
+                "description": {
+                  "vi": "Check deadline, retry budget, exposure/effect state và eligible fallback.",
+                  "en": "Check deadlines, attempts, visible effects and fallback eligibility."
+                }
+              },
+              {
+                "from": "router",
+                "to": "private",
+                "description": {
+                  "vi": "Dispatch new attempt nếu policy cho phép, reserve additional exposure phù hợp.",
+                  "en": "Dispatch permitted attempts with appropriate additional reservations."
+                }
+              },
+              {
+                "from": "private",
+                "to": "stream",
+                "description": {
+                  "vi": "Return replacement generation before hidden splice boundary; otherwise explicit error.",
+                  "en": "Return valid replacement generations or explicit errors."
+                }
+              }
+            ]
+          },
+          {
+            "id": "meter",
+            "label": {
+              "vi": "Settle từng attempt có evidence",
+              "en": "Settle evidenced attempts"
+            },
+            "steps": [
+              {
+                "from": "hosted",
+                "to": "usage",
+                "description": {
+                  "vi": "Persist reported usage/provider request ID kể cả abandoned client.",
+                  "en": "Persist provider usage and identities even for abandoned clients."
+                },
+                "async": true
+              },
+              {
+                "from": "private",
+                "to": "usage",
+                "description": {
+                  "vi": "Record measured usage theo self-hosted metering contract.",
+                  "en": "Record usage under the self-hosted metering contract."
+                },
+                "async": true
+              },
+              {
+                "from": "usage",
+                "to": "ledger",
+                "description": {
+                  "vi": "Deduplicate/correct per attempt; không collapse legitimate retries.",
+                  "en": "Deduplicate and correct attempts without collapsing real retries."
+                },
+                "async": true
+              },
+              {
+                "from": "ledger",
+                "to": "quota",
+                "description": {
+                  "vi": "Settle known charges, retain unresolved holds theo policy.",
+                  "en": "Settle known charges and retain unresolved holds under policy."
+                },
+                "async": true
+              },
+              {
+                "from": "ledger",
+                "to": "telemetry",
+                "description": {
+                  "vi": "Attribute scoped totals và estimated/pending differences.",
+                  "en": "Attribute scoped totals and explicit uncertainty."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "control",
+            "label": {
+              "vi": "Rollout alias và governance",
+              "en": "Roll out aliases and governance"
+            },
+            "steps": [
+              {
+                "from": "control",
+                "to": "router",
+                "description": {
+                  "vi": "Publish qualified versioned route set và hard data rules.",
+                  "en": "Publish qualified route versions and hard data rules."
+                },
+                "async": true
+              },
+              {
+                "from": "control",
+                "to": "adapter",
+                "description": {
+                  "vi": "Rotate scoped credentials và capability profiles.",
+                  "en": "Rotate scoped credentials and capability profiles."
+                },
+                "async": true
+              },
+              {
+                "from": "control",
+                "to": "edge",
+                "description": {
+                  "vi": "Distribute entitlement/revocation epochs theo freshness contract.",
+                  "en": "Distribute entitlement and revocation epochs."
+                },
+                "async": true
+              },
+              {
+                "from": "telemetry",
+                "to": "control",
+                "description": {
+                  "vi": "Review canary quality, policy violations, latency và rollback.",
+                  "en": "Review canary quality, violations, timing and rollback."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "recovery",
+            "label": {
+              "vi": "Reconcile sau disconnect hoặc gateway crash",
+              "en": "Reconcile disconnects and crashes"
+            },
+            "steps": [
+              {
+                "from": "stream",
+                "to": "usage",
+                "description": {
+                  "vi": "Persist interrupted state; missing final usage là UNKNOWN.",
+                  "en": "Persist interruptions with unknown usage states."
+                },
+                "async": true
+              },
+              {
+                "from": "quota",
+                "to": "usage",
+                "description": {
+                  "vi": "Find outstanding reservations bằng durable operation/attempt IDs.",
+                  "en": "Find outstanding reservations using durable identities."
+                },
+                "async": true
+              },
+              {
+                "from": "usage",
+                "to": "ledger",
+                "description": {
+                  "vi": "Merge late evidence idempotently, compare provider aggregates/invoices phù hợp.",
+                  "en": "Merge late evidence and reconcile against available upstream records."
+                },
+                "async": true
+              },
+              {
+                "from": "ledger",
+                "to": "quota",
+                "description": {
+                  "vi": "Release/adjust holds theo explicit reconciliation policy, không usage=0 mặc định.",
+                  "en": "Adjust holds under reconciliation policy without assuming zero usage."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "aliases",
+      "title": {
+        "vi": "5. Alias là versioned capability và quality contract",
+        "en": "5. An alias binds capabilities and qualified behavior"
+      },
+      "paragraphs": [
+        {
+          "vi": "Alias như fast hoặc smart chỉ hữu ích khi có owner, capability/context/output limits, safety/data rules và quality gates theo consuming tasks. Pinned deployment/model revisions giúp reproduce; alias rollout có config epoch và fallback set tương thích. “Model hỗ trợ tools” chưa đủ: argument schema, parallel calls, finish reasons, tokenization và error events có thể khác.",
+          "en": "Aliases need owners, capability/context/output limits, data rules and consuming-task quality gates. Pin revisions and compatible fallback sets. Tool support alone does not establish compatible schemas, parallel-call behavior, termination reasons, tokenization or error events."
+        },
+        {
+          "vi": "Adapters normalize phần đã khai báo và preserve provenance/unsupported states. Không chuyển tool-enabled request sang text-only target rồi pretend success. Gateway không nên giấu every vendor distinction trong một lowest-common-denominator contract nếu ứng dụng cần specific features. Version-breaking changes có migration path; canary and rollback phải giữ credential, schema và capacity compatibility.",
+          "en": "Normalize declared features while retaining provenance and unsupported states. Do not silently route tool requests to text-only models. Preserve needed provider distinctions instead of pretending all features are universal. Breaking changes need migration paths, and rollbacks need compatible credentials, schemas and capacity."
+        }
+      ]
+    },
+    {
+      "id": "routing",
+      "title": {
+        "vi": "6. Hard constraints trước health/cost/latency ranking",
+        "en": "6. Apply hard constraints before route preferences"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lọc entitlement, endpoint/region/data-retention rules, capabilities, context size và task-specific qualification trước chọn cost/latency. Healthy endpoint vẫn có thể illegal cho data class hoặc quality chưa đủ. Prediction có uncertainty; ưu tiên cheapest không được hạ chất lượng âm thầm. Fallback capacity/correlated dependencies phải được reserve/test chứ không chỉ ghi trong config.",
+          "en": "Filter entitlements, locations, data handling, capabilities, context size and task qualification before optimizing cost or latency. Healthy endpoints can still violate policy or quality requirements. Predictions are uncertain, and cheap routing must not silently lower quality. Validate fallback capacity and shared dependencies."
+        }
+      ],
+      "experiment": "gateway-route"
+    },
+    {
+      "id": "retries",
+      "title": {
+        "vi": "7. Replay safety không chỉ là “chưa stream token”",
+        "en": "7. Replay safety requires more than no visible token"
+      },
+      "paragraphs": [
+        {
+          "vi": "Phân loại validation/auth errors, capacity 429, connection failure, server errors và timeout có outcome unknown. Connection fail trước dispatch khác request đã đến provider nhưng response mất. Nếu pure generation được policy cho replay, fallback có thể chấp nhận duplicate compute/cost; nếu operation có side effects hoặc nondeterministic commitments, cần application/sink idempotency và recovery contract. Request ID do gateway gán không tự được provider hoặc tool sink honor.",
+          "en": "Distinguish validation/auth errors, capacity rejection, connection failure, server errors and unknown timeouts. A lost response can hide upstream execution. Policy may permit replay of generation while accepting duplicate computation or cost, but side effects need cooperating idempotency and recovery. A gateway request ID is not automatically honored by providers or tools."
+        },
+        {
+          "vi": "Track bytes/events đã expose, tool outputs/effects và generation identity. Sau partial output, không âm thầm nối một model run khác như cùng câu trả lời. Surface interruption hoặc dùng explicit replacement/resume contract do app hỗ trợ. Retry/fallback trước expose vẫn phải pass operation replay policy, remaining deadline, attempt budget và all hard constraints.",
+          "en": "Track exposed events, tool effects and generation identity. After partial output, do not silently splice another run into the same answer. Report interruption or use an explicit application-supported replacement/resume protocol. Even pre-exposure retries must satisfy replay policy, remaining deadlines, attempt budgets and hard constraints."
+        }
+      ],
+      "experiment": "gateway-failover"
+    },
+    {
+      "id": "limits",
+      "title": {
+        "vi": "8. RPM, token rates, concurrency và spend không cùng đơn vị",
+        "en": "8. Request rates, token rates, concurrency and spend differ"
+      },
+      "paragraphs": [
+        {
+          "vi": "Requests/sec bảo vệ CPU/abuse; token rates phản ánh workload theo provider contract; concurrency caps bảo vệ streams, memory và capacity; durable spend budgets giới hạn financial exposure. Provider có thể tách input/output/cache dimensions và tổ chức/workspace/model groups; không assume một global combined TPM bucket đúng cho mọi vendor. Limiter adapter phải hiểu cách provider estimate và reconcile tokens.",
+          "en": "Request rates protect admission resources; token rates follow provider semantics; concurrency caps protect active work; durable spend budgets bound financial exposure. Providers can split input, output and cache accounting across different scopes. Do not assume one combined TPM bucket fits every deployment."
+        },
+        {
+          "vi": "Hierarchical controls gồm org/provider pool, tenant/team/project và priority classes. Reserved shares/headroom có thể bảo vệ interactive traffic, nhưng cần borrowing/reclaim policy và bounded queues/deadlines để tránh starvation. 429 có thể mang Retry-After; parse delay/date theo contract khi có, respect và add bounded jitter, nhưng không retry forever nếu nguyên nhân là entitlement/spend hard cap. SDK retries và gateway retries phải có một end-to-end attempt budget.",
+          "en": "Combine organization/provider, tenant/team/project and priority controls. Reserved shares need borrowing/reclaim rules and bounded queues. Parse available Retry-After information under the contract, respect it with bounded jitter, and avoid endless retries for hard caps. Coordinate SDK and gateway retries under one end-to-end budget."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Control gateway",
+            "en": "Gateway control"
+          },
+          {
+            "vi": "State / đơn vị",
+            "en": "State / units"
+          },
+          {
+            "vi": "Failure policy cần chốt",
+            "en": "Required failure policy"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Rate bucket",
+              "en": "Rate bucket"
+            },
+            {
+              "vi": "Refillable requests hoặc token units/time",
+              "en": "Refillable requests or token units/time"
+            },
+            {
+              "vi": "Burst, refill, cache accounting và provider scope",
+              "en": "Bursts, refill, cache accounting and scope"
+            }
+          ],
+          [
+            {
+              "vi": "Concurrency permit",
+              "en": "Concurrency permit"
+            },
+            {
+              "vi": "Outstanding active operations",
+              "en": "Outstanding active operations"
+            },
+            {
+              "vi": "Crash recovery, leases và stale owner fencing",
+              "en": "Crash recovery, leases and stale-owner fencing"
+            }
+          ],
+          [
+            {
+              "vi": "Spend budget",
+              "en": "Spend budget"
+            },
+            {
+              "vi": "Durable charged + reserved exposure theo currency/rates",
+              "en": "Durable charged plus reserved financial exposure"
+            },
+            {
+              "vi": "Hard/soft caps, unknown bills, reconciliation và overshoot bound",
+              "en": "Caps, unknown usage, reconciliation and bounded overshoot"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "reserve",
+      "title": {
+        "vi": "9. Reserve trước dispatch, settle theo evidence",
+        "en": "9. Reserve before dispatch and settle from evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Output chưa biết trước, nên reserve bounded exposure theo countable input, max output và allowed attempts/pricing assumptions. Estimate cần tokenizer/profile và tool/multimodal overhead phù hợp; reservation không mặc nhiên exact upper bound nếu vendor có additional billable categories hoặc retries ngoài hold. Atomic check-and-hold chống concurrent overspend; idempotent admission gắn operation scope và request payload hash.",
+          "en": "Reserve bounded exposure from input estimates, output caps, allowed attempts and pricing assumptions. Count the applicable tokenizer and overhead. Additional billable categories or unreserved retries can invalidate a claimed upper bound. Atomic check-and-hold prevents concurrent overspend, and idempotent admission binds operation scopes and payload hashes."
+        },
+        {
+          "vi": "Budget reservations, metered usage và rate-limit token buckets không nên gộp bằng một refund function mơ hồ. Refillable buckets có time/cap semantics; durable financial holds phải survive crash, tránh duplicate release/settle và carry unresolved liabilities. Tính budget available = limit − settled exposure − outstanding holds theo consistent policy; guard cho additional exposure thay vì mặc định actual luôn nhỏ hơn reserve.",
+          "en": "Keep refillable rate buckets distinct from durable financial reservations. Financial holds must survive crashes, resist duplicate settlement/release and retain unresolved liabilities. Define available budget consistently as limits less settled exposure and outstanding holds, and handle actual usage that can exceed estimates."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Reservation lifecycle có owner",
+          "en": "Owned reservation lifecycle"
+        },
+        "caption": {
+          "vi": "Crash có thể xảy ra giữa mọi cặp bước; UNKNOWN không là settled-zero.",
+          "en": "Crashes can occur between any steps; unknown is not settled zero."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Hold",
+              "en": "Hold"
+            },
+            "detail": {
+              "vi": "Atomic operation-scoped hold trước external dispatch.",
+              "en": "Create atomic operation-scoped holds before dispatch."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Attempt",
+              "en": "Attempt"
+            },
+            "detail": {
+              "vi": "Persist attempt/deployment/provider IDs và exposure.",
+              "en": "Persist attempt, deployment and exposure identities."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Evidence",
+              "en": "Evidence"
+            },
+            "detail": {
+              "vi": "Merge known usage; missing final event giữ pending state.",
+              "en": "Merge known usage and retain missing final evidence as pending."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Adjust",
+              "en": "Adjust"
+            },
+            "detail": {
+              "vi": "Idempotent settlement/corrections và explicit release policy.",
+              "en": "Apply idempotent settlements, corrections and release rules."
+            },
+            "icon": "check"
+          }
+        ]
+      },
+      "experiment": "gateway-accounting"
+    },
+    {
+      "id": "metering",
+      "title": {
+        "vi": "10. Logical requests, attempts và usage event versions",
+        "en": "10. Distinguish requests, attempts and usage revisions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một logical request có A1 timeout và A2 thành công; cả hai có thể tạo billable work. Ledger có parent request ID để user attribution và child attempt IDs để metering. Dedup event replay theo provider/attempt/event identity hoặc cumulative usage revision; không dedup tất cả bằng request ID rồi bỏ A2. Ngược lại cộng mọi cumulative stream sample cũng double-count; adapter phải distinguish delta/cumulative/final evidence.",
+          "en": "A timed-out first attempt and successful fallback can both incur usage. Attribute through parent request IDs while metering child attempts. Deduplicate replayed evidence by attempt/event identity or cumulative revision, not just the parent request. Summing every cumulative usage sample also overcounts; adapters distinguish deltas, cumulative updates and final evidence."
+        },
+        {
+          "vi": "Giữ provider request ID, deployment/model version, quantities theo category, currency/rate version, evidence source, estimated/final/pending state và correction history. Không sửa history âm thầm; adjustments có lineage. Provider-reported usage là authoritative evidence theo contract nhưng có thể đến muộn/thiếu hoặc khác invoice rounding/categories; reconcile available reports. Client disconnect không chứng minh upstream compute/billing đã stop và cancellation receipt không luôn final usage.",
+          "en": "Retain upstream identities, model revisions, usage categories, currencies/rates, evidence sources, reconciliation states and corrections. Record adjustments with lineage. Reported usage can arrive late or differ from invoice rounding/categories, so reconcile available records. Disconnecting or cancelling does not establish that upstream work or billing stopped."
+        }
+      ]
+    },
+    {
+      "id": "streaming",
+      "title": {
+        "vi": "11. Streaming: bounded memory và explicit lifecycle",
+        "en": "11. Bound stream memory and expose explicit lifecycle states"
+      },
+      "paragraphs": [
+        {
+          "vi": "Use async I/O, bounded buffers, flow control/backpressure và resource limits cho slow consumers. Incremental forwarding không đồng nghĩa tuyệt đối zero buffering: protocol parsing/coalescing/TLS vẫn cần bounded buffers. Configure reverse-proxy buffering, idle/overall timeouts, heartbeats và cancellation propagation; load test connection churn, stalls và gateway draining.",
+          "en": "Use asynchronous I/O with bounded buffering, backpressure and slow-consumer limits. Incremental forwarding still requires protocol/TLS buffers. Configure proxy buffering, idle/overall timeouts, heartbeats, cancellation and graceful draining; load-test churn and stalled clients."
+        },
+        {
+          "vi": "HTTP 200 lúc mở stream không bảo đảm complete generation. Typed content/usage/error/final events có provider-specific ordering; parser cần handle partial frames, unknown supported-version events, tool argument fragments và terminal interruption. Do not fabricate valid JSON from truncated tool output or execute partial arguments. Resume requires explicit retained state/idempotency rather than replay-from-zero presented as continuity.",
+          "en": "A successful HTTP stream opening does not guarantee generation completion. Parse partial frames, versioned events, usage updates, errors and tool fragments under the adapter contract. Do not fabricate valid JSON or execute incomplete arguments. Continuation requires retained state and explicit idempotency rather than disguised replay."
+        }
+      ]
+    },
+    {
+      "id": "cache",
+      "title": {
+        "vi": "12. Cache identity, permissions và freshness",
+        "en": "12. Cache identity includes authorization and freshness"
+      },
+      "paragraphs": [
+        {
+          "vi": "Exact response reuse cần opt-in task semantics, full relevant request/context/tool/schema/settings/model contract, tenant/principal/access scope và dependency/policy versions. Temperature 0 không là universal determinism guarantee; exact-key reuse có thể phục vụ stale data hoặc skip intended tools. Tenant boundary alone không đủ nếu cùng tenant có users với permissions khác. Hit vẫn cần current authorization/freshness checks theo contract.",
+          "en": "Response reuse needs eligible task semantics and identities for requests, context, tools, schemas, settings, models, access scope and dependencies. Temperature zero does not guarantee determinism. Exact keys can still serve stale data or bypass intended tools, and users within a tenant can have different permissions. Hits require current authorization and freshness checks."
+        },
+        {
+          "vi": "Semantic similarity không chứng minh same question/authorization/action. Chỉ dùng trên explicit eligible task classes với validation, scope và measured wrong-reuse risk; không universal “FAQ là safe”. Response cache khác prefix KV cache của provider/model runtime, vì prefix reuse vẫn generate answer mới và có compatibility/residency rules riêng. Do not serve payloads across revoked scopes hoặc fall back to a stale answer vì provider down nếu contract không cho phép.",
+          "en": "Semantic similarity does not establish equivalent questions, permissions or actions. Restrict reuse to eligible classes with validation and measured risk. Prefix KV caching is different: it can reuse compatible model state while generating new output. Revocations and freshness rules still apply during outages."
+        }
+      ]
+    },
+    {
+      "id": "privacy",
+      "title": {
+        "vi": "13. Credentials, data egress và minimized logs",
+        "en": "13. Govern secrets, egress and minimized logs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Gateway tập trung sensitive traffic nên tăng blast radius nếu controls yếu. Dùng workload identity, least-privilege provider credentials, rotation/revocation, separate admin/data-plane permissions và audited config. Data classification/region/retention/training restrictions phải match exact endpoint/contracts; self-hosted không tự có privacy hoặc security nếu logs/storage/network mở.",
+          "en": "Centralized sensitive traffic increases the consequences of weak controls. Use workload identity, scoped credentials, rotation, separated administrative permissions and audited configuration. Data-location, retention and training rules must match actual endpoints. Self-hosting alone does not establish privacy or security."
+        },
+        {
+          "vi": "Default log usage/timing/error categories với scoped pseudonymous IDs, không full prompts/responses. Redaction có false negatives và không thay data minimization, access controls, encryption/retention/deletion. Debug payload capture cần explicit scope, bounded duration/access và policy enforcement trước transmission/storage. Even metadata có thể reveal customers/projects; keep required audit/billing evidence under appropriate retention rather than “always public metadata”.",
+          "en": "Prefer scoped usage, timing and error metadata over full payload logs. Redaction can miss secrets and does not replace minimization, access control or retention/deletion. Bounded debug capture needs explicit authorization and enforcement before transmission/storage. Metadata can also reveal sensitive identities, so govern it appropriately."
+        }
+      ]
+    },
+    {
+      "id": "datamodel",
+      "title": {
+        "vi": "14. Data model và consistency boundaries",
+        "en": "14. Model authoritative records and consistency boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "RouteVersion binds alias contract, targets, capability/data constraints, qualifications, weights, credentials refs và rollout epoch. RequestOperation binds authenticated scope/payload hash, deadline, policy version và result state. Attempt binds deployment/provider IDs, dispatch/exposure/terminal states và usage evidence refs. Reservation binds authority epoch, amount, state và idempotent settlement lineage. UsageAdjustment binds attempt, evidence revision và rate version.",
+          "en": "Version routes with targets, constraints, qualification and rollout epochs. Bind operations to authenticated scope, payload hashes, policies and deadlines. Attempts record dispatch, exposure and usage evidence. Reservations retain authoritative epochs and settlement lineage; adjustments bind evidence and rates."
+        },
+        {
+          "vi": "Trace IDs giúp correlate, không tự enforce uniqueness/exactly-once. State transitions cần storage constraints/CAS/transactions và outbox/inbox khi publish durable events. Không assume quota cache và ledger transaction cross-service atomic; define recovery for hold-without-dispatch, dispatch-without-response và usage-without-settlement. Reconciler ownership/fencing prevents stale workers from double applying corrections.",
+          "en": "Trace IDs provide correlation, not automatic uniqueness or exactly-once effects. Enforce transitions through storage constraints and recovery-aware messaging. Define failures between reservation, dispatch, evidence and settlement rather than assuming cross-service atomicity. Fence reconciliation ownership to prevent duplicate corrections."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Identity gateway",
+            "en": "Gateway identity"
+          },
+          {
+            "vi": "Authority / scope",
+            "en": "Authority / scope"
+          },
+          {
+            "vi": "Không đủ nếu đứng riêng",
+            "en": "Insufficient on its own"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Logical request ID",
+              "en": "Logical request ID"
+            },
+            {
+              "vi": "Application operation + authenticated namespace",
+              "en": "Application operations and authenticated namespaces"
+            },
+            {
+              "vi": "Không dedup upstream attempts/effects tự động",
+              "en": "Does not automatically deduplicate upstream work"
+            }
+          ],
+          [
+            {
+              "vi": "Attempt ID",
+              "en": "Attempt ID"
+            },
+            {
+              "vi": "One dispatch + deployment/provider request refs",
+              "en": "One dispatch with upstream identity"
+            },
+            {
+              "vi": "Không khẳng định final usage khi evidence mất",
+              "en": "Does not establish missing final usage"
+            }
+          ],
+          [
+            {
+              "vi": "Usage evidence revision",
+              "en": "Usage evidence revision"
+            },
+            {
+              "vi": "Provider category/event contract và correction lineage",
+              "en": "Usage-category contracts and correction lineage"
+            },
+            {
+              "vi": "Không cộng mọi cumulative sample",
+              "en": "Do not sum cumulative samples"
+            }
+          ],
+          [
+            {
+              "vi": "Config / authority epoch",
+              "en": "Config / authority epoch"
+            },
+            {
+              "vi": "Routing/revocation/reservation current owner",
+              "en": "Current routing, revocation and reservation authority"
+            },
+            {
+              "vi": "Không chặn stale worker nếu sink không check",
+              "en": "Does not fence stale workers without enforcement"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "resilience",
+      "title": {
+        "vi": "15. Multi-region và quota-store outage có trade-off",
+        "en": "15. Make regional and quota-outage trade-offs explicit"
+      },
+      "paragraphs": [
+        {
+          "vi": "Data planes across zones/regions giảm một số failures nhưng shared DNS, auth, quota store, credential system và upstream org limits vẫn có thể correlate. Last-known-good config cần validity/revocation freshness bounds. Existing streams drain/checkpoint theo actual protocol; reconnect có thể phải explicit new generation, không transparent continuation guarantee.",
+          "en": "Distributed data planes reduce some failures while shared DNS, identity, quota, secrets and upstream pools remain common dependencies. Bound cached configuration validity and revocation freshness. Stream recovery follows actual protocol support and can require an explicit new generation."
+        },
+        {
+          "vi": "Khi quota authority unavailable, fail-open không universal safe. High-risk/hard-budget tenants có thể fail closed; low-risk tier có thể dùng preallocated local leases/tokens với bounded exposure và fencing. Regional allocations/escrow đổi utilization/fairness lấy bounded overshoot; eventual counters alone không enforce strict global cap. Chốt spend/availability/data rules và incident override ownership trước outage.",
+          "en": "Quota outages need explicit policy. Hard-budget tenants may fail closed; other tiers can use preallocated bounded local allowances with ownership controls. Regional allocation trades utilization and fairness for bounded exposure. Eventual counters alone cannot enforce strict global caps. Define availability, spending and incident-override authority before failures occur."
+        }
+      ]
+    },
+    {
+      "id": "rollout",
+      "title": {
+        "vi": "16. Quality, cost và operations cùng quyết định route rollout",
+        "en": "16. Qualify routes with quality, cost and operational evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Track latency distribution theo admission/queue/first useful event/finish, token categories, eligible-route exhaustion, attempts per logical call, 429 reason, pending usage age, budget exposure và data-policy violations. Success HTTP rate không đủ nếu output schema/tool behavior hoặc task quality giảm. Segment by team/task/region/model revision; keep explicit denominators và censored/abandoned streams.",
+          "en": "Measure admission, queue, useful-output and completion timing alongside usage categories, route exhaustion, retries, rate-limit reasons, pending usage and policy violations. HTTP success alone misses schema/tool failures and quality regressions. Segment by workload and revision while retaining abandoned streams and explicit denominators."
+        },
+        {
+          "vi": "Aliases đổi model/prompt/adapter cần task-specific regression/security suites, load/capacity validation, shadow/canary có privacy controls và rollback triggers. Shadow traffic vẫn tốn tiền và expose data; không execute real tools hai lần. Cheapest advertised per-token price không quyết định self-hosted TCO: utilization, hardware, staff, warm capacity và redundancy đều ảnh hưởng. Build/adopt dựa trên actual required policies/integration/operations thay vì một câu “tự build linh hoạt hơn”.",
+          "en": "Model, prompt and adapter changes require task-specific evaluations, capacity validation, bounded rollout and rollback. Shadowing still incurs cost and data exposure and must prevent duplicate effects. Self-hosting economics include utilization, staffing, warm capacity and redundancy. Build or adopt according to measured policy, integration and operational needs."
+        }
+      ]
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "17. Luyện quyết định LLM Gateway",
+        "en": "17. Practice LLM Gateway decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Primary trả 429 ở peak, làm gì trước?",
+            "en": "What should happen when a primary returns 429 at peak?"
+          },
+          "answer": [
+            {
+              "vi": "Classify scope/reason, respect available Retry-After, bound attempts/jitter/deadline và protect priority shares. Chọn only qualified fallback nếu remaining budget/capacity/data rules cho phép. Không retry spend/entitlement hard cap vô hạn hoặc để SDK×gateway retries nhân load.",
+              "en": "Classify the limiting scope, respect retry guidance and protect priorities under bounded deadlines and attempts. Use qualified fallbacks with available capacity and policy approval, avoiding retry multiplication or retries against hard caps."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Timeout trước first token có chắc replay safe?",
+            "en": "Is a timeout before the first token necessarily replay-safe?"
+          },
+          "answer": [
+            {
+              "vi": "Không: upstream có thể generate hoặc execute tool dù response mất. Pure generation replay cần policy cho phép duplicate work/cost; side effects cần sink idempotency/recovery. Exposed stream state chỉ là một trong các boundaries.",
+              "en": "No. Upstream work can occur without a delivered response. Generation replay needs explicit duplicate-work policy; side effects need cooperating recovery and idempotency."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao dedup usage chỉ theo request ID sai?",
+            "en": "Why is request-only usage deduplication insufficient?"
+          },
+          "answer": [
+            {
+              "vi": "Một request có nhiều billable attempts. Dedup duplicate reports trong từng attempt và hiểu cumulative revisions; giữ parent attribution riêng. Request-only có thể undercount A2, còn no dedup có thể cộng lại A1.",
+              "en": "Requests can contain multiple billable attempts. Deduplicate attempt evidence and cumulative revisions while retaining parent attribution; request-only keys can undercount and missing dedup can overcount."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Client disconnect mà final usage mất thì refund hết?",
+            "en": "Should all holds be refunded when a client disconnects without final usage?"
+          },
+          "answer": [
+            {
+              "vi": "Không mặc định usage=0. Persist pending state/known lower evidence, reconcile late reports và apply explicit expiry/risk policy. Cancellation không chứng minh upstream billing stopped. Bound outstanding liabilities để outage không thành uncontrolled overspend.",
+              "en": "Do not assume zero usage. Retain pending evidence, reconcile reports and apply explicit risk/expiry policies. Cancellation does not establish zero billing; bound unresolved liabilities."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Quota store down thì fail-open có tốt không?",
+            "en": "Is failing open a good universal quota-outage policy?"
+          },
+          "answer": [
+            {
+              "vi": "Không universal. Hard caps/data policy có thể require fail closed; local preallocated allowances có bounded risk nếu issuance/epoch/recovery đúng. Chọn trước theo tenant risk và availability contract, không unbounded eventual counters.",
+              "en": "No. Hard caps can require rejection, while preallocated local allowances can bound selected risks. Choose policies and recovery rules in advance."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Cache temperature 0 và tenant key có safe không?",
+            "en": "Are temperature-zero caches with tenant keys necessarily safe?"
+          },
+          "answer": [
+            {
+              "vi": "Không đủ: generation có thể nondeterministic; users cùng tenant có permissions khác; context/model/tool/dependency versions và freshness matters. Reuse eligibility/current access checks phải explicit.",
+              "en": "Not necessarily. Determinism, user permissions, dependency freshness and tool semantics require explicit eligibility and current checks."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Alias fast đổi provider mà API giống, cần eval lại?",
+            "en": "Does changing a fast alias need evaluation if the API shape stays the same?"
+          },
+          "answer": [
+            {
+              "vi": "Có: capability/quality/error/usage/tool/schema semantics có thể khác. Qualify task slices, pin versions, canary và rollback compatible config. Stable alias name không là behavior guarantee.",
+              "en": "Yes. Quality, tools, schemas, errors and usage can differ despite matching shapes. Qualify tasks and versions with controlled rollout and rollback."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tính concurrent streams từ QPS như nào?",
+            "en": "How would you estimate concurrent streams from QPS?"
+          },
+          "answer": [
+            {
+              "vi": "Trong cùng boundary và stable window, average concurrency≈arrival rate×mean residence time; ví dụ1736.11/s×8s≈13889. Tail/slow-consumer buffers/load distribution vẫn cần đo và capacity headroom; không sum/multiply arbitrary percentiles thành guarantee.",
+              "en": "Use compatible average arrival rates and mean residence times in stable windows. Validate tails, slow consumers and resource headroom with measurements rather than arbitrary percentile arithmetic."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

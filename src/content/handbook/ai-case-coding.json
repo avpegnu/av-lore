@@ -1,0 +1,1298 @@
+{
+  "id": "ai-case-coding",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Coding Assistant: snapshots, context và patch có evidence",
+    "en": "Coding Assistant: snapshots, context and evidence-bound patches"
+  },
+  "summary": {
+    "vi": "Tách inline completion khỏi chat/agent; thiết kế request validity/cancellation, FIM/context packing, repo overlays, scoped prefix cache, isolated execution và patch apply. Đánh giá correctness cùng acceptance/retention, latency và privacy.",
+    "en": "Separate completions from agents with snapshot validity, cancellation, infilling/context, overlays, caches, isolated execution and evidence-bound edits. Evaluate correctness alongside adoption, timing and privacy."
+  },
+  "prerequisites": [
+    "ai-agents",
+    "ai-evals",
+    "ai-safety",
+    "ai-production"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "react",
+    "testing",
+    "security",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Inline completion và chat/agent có latency/interaction budgets khác nhau; cả hai vẫn cần correctness, privacy và bounded work.",
+      "en": "Completions and agents have different interaction budgets while sharing correctness, privacy and bounded-work requirements."
+    },
+    {
+      "vi": "Debounce/cancel không thay document/range/request validity checks cho late responses.",
+      "en": "Debouncing and cancellation do not replace snapshot checks on late responses."
+    },
+    {
+      "vi": "Context budget phải tính cả required content/format overhead; exclusions áp trước collect/store/send theo policy.",
+      "en": "Context budgets include required content and formatting, with exclusions enforced before exposure."
+    },
+    {
+      "vi": "Prefix reuse cần exact compatible identity và capacity; sticky routing/small models/speculation không có universal speedup.",
+      "en": "Prefix reuse needs compatible identity and capacity; routing/model choices have no universal speedup."
+    },
+    {
+      "vi": "Patch phải bind current base, tested artifact/environment và required review policy; apply không blind overwrite concurrent edits.",
+      "en": "Bind patches to current bases, evidence and required decisions, preserving concurrent edits."
+    },
+    {
+      "vi": "Accepted/retained code là product signals, không ground truth correctness/security hay causal productivity.",
+      "en": "Acceptance and retention are product signals rather than truth or causal productivity proof."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ editor snapshot đến reviewable result",
+      "en": "From editor snapshots to reviewable results"
+    },
+    "caption": {
+      "vi": "Không coi generated text là edit được phép apply lên bất kỳ workspace nào.",
+      "en": "Generated text is not authority to edit arbitrary workspace states."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Capture / scope",
+          "en": "Capture / scope"
+        },
+        "detail": {
+          "vi": "Document version, caret/ranges, org/repo policy.",
+          "en": "Capture revisions, ranges and scope."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Select context",
+          "en": "Select context"
+        },
+        "detail": {
+          "vi": "Allowed current evidence trong actual token budget.",
+          "en": "Select allowed current evidence within budgets."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Generate",
+          "en": "Generate"
+        },
+        "detail": {
+          "vi": "Bound request profile, streaming và cancellation.",
+          "en": "Bound generation, streaming and cancellation."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Validate / test",
+          "en": "Validate / test"
+        },
+        "detail": {
+          "vi": "Snapshot validity hoặc isolated patch checks.",
+          "en": "Check snapshot validity or isolated artifacts."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Show / apply",
+          "en": "Show / apply"
+        },
+        "detail": {
+          "vi": "Current preconditions, review policy và outcome evidence.",
+          "en": "Enforce current conditions and retain outcome evidence."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Hai interaction paths, cùng product boundaries",
+        "en": "1. Separate interactions while preserving product boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Inline completion tạo ghost text/suggestion gắn với current cursor; chat giúp hiểu codebase hoặc đề xuất edits; agent có thể search/edit/build/test trong allowed scope. Inline cần hữu ích khi developer còn chờ, còn agent task có thể dài hơn nhưng phải bounded và reviewable. Không biến “nhanh” thành lý do bỏ quality/security, hoặc coi mọi response tới sau một ngưỡng chung đều vô dụng cho mọi task.",
+          "en": "Inline suggestions bind to cursors, chat explains or proposes changes, and agents perform scoped work. Inline timing follows developer interaction, while longer tasks need bounded reviewable execution. Latency goals do not excuse security or universal usefulness assumptions."
+        },
+        {
+          "vi": "Requirements gồm allowed languages/editors/repos, completion/chat/task APIs, excluded content, approved model/data endpoints, execution permissions và degradation khi service down. Normal editing không được block vào model dependency. Training/retention/residency options là product policies cần enforce và verify ở connectors/providers/storage, không chỉ lời hứa trên UI.",
+          "en": "Define supported editors/languages, scope, endpoints, execution and degradation. Ordinary editing must survive model outages. Data/training/retention policies need real enforcement rather than interface promises."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Inline completion",
+            "en": "Inline completion"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Short usefulness window, snapshot/caret validity và cancellation.",
+              "en": "Respect short windows, snapshots and cancellation."
+            },
+            {
+              "vi": "Bounded output; editor vẫn responsive khi unavailable.",
+              "en": "Bound output and preserve editor responsiveness."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Chat / agent",
+            "en": "Chat / agent"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Repo understanding hoặc multi-file task với explicit goal.",
+              "en": "Support repository understanding and explicit tasks."
+            },
+            {
+              "vi": "Bounded search/edit/test và concrete artifact evidence.",
+              "en": "Bound execution and preserve artifact evidence."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Shared constraints",
+            "en": "Shared constraints"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Code privacy, permissions, exclusions và approved routes.",
+              "en": "Enforce privacy, permissions, exclusions and routes."
+            },
+            {
+              "vi": "Correctness/security/quality cùng latency và cost.",
+              "en": "Evaluate correctness and security alongside economics."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Capacity planning: requests khác useful suggestions",
+        "en": "2. Plan requests separately from useful suggestions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Planning fixture: 100000 active developers, 150 admitted completion requests/ngày sau debounce, peak bằng 4× average. Mỗi admitted completion giả định 1500 input +24 output tokens. Chat/agent có 6 turns/developer/ngày, mỗi turn 7800 input +200 output. Đây là explicit hypothetical workload, không throughput hoặc price benchmark.",
+          "en": "Assume 100000 active developers, 150 admitted completions/day after debounce and a 4× peak. Each completion uses 1500 input/24 output tokens; six chat/agent turns use 7800 input/200 output each. These are hypothetical workload inputs rather than throughput or prices."
+        },
+        {
+          "vi": "15M completions/ngày≈173,61 average QPS và 694,44 peak. Prompt volume lớn không tự chứng minh prefill dominates billed cost hoặc GPU occupancy: cached-input rates, context lengths, batching, output length, hardware và task mix đều quan trọng. Canceled requests vẫn có thể đã tiêu work/bill; capacity model cần measured arrival/service/cancellation distributions và headroom.",
+          "en": "Fifteen million daily completions average 173.61 QPS and peak at 694.44. High input volume does not alone establish cost/compute dominance; caching, lengths, batching, hardware and cancellation evidence matter."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Inventory",
+            "en": "Inventory"
+          },
+          {
+            "vi": "Arithmetic",
+            "en": "Arithmetic"
+          },
+          {
+            "vi": "Result",
+            "en": "Result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Completion requests/day",
+              "en": "Completion requests/day"
+            },
+            {
+              "vi": "100000×150",
+              "en": "100000×150"
+            },
+            {
+              "vi": "15M",
+              "en": "15M"
+            }
+          ],
+          [
+            {
+              "vi": "Completion peak QPS",
+              "en": "Completion peak QPS"
+            },
+            {
+              "vi": "15M/86400×4",
+              "en": "15M/86400×4"
+            },
+            {
+              "vi": "≈694.44",
+              "en": "≈694.44"
+            }
+          ],
+          [
+            {
+              "vi": "Completion input/output tokens/day",
+              "en": "Completion input/output tokens/day"
+            },
+            {
+              "vi": "15M×1500 / 15M×24",
+              "en": "15M×1500 / 15M×24"
+            },
+            {
+              "vi": "22.5B input / 360M output",
+              "en": "22.5B input / 360M output"
+            }
+          ],
+          [
+            {
+              "vi": "Chat/agent turns/day",
+              "en": "Chat/agent turns/day"
+            },
+            {
+              "vi": "100000×6",
+              "en": "100000×6"
+            },
+            {
+              "vi": "600000",
+              "en": "600000"
+            }
+          ],
+          [
+            {
+              "vi": "Chat/agent input/output tokens/day",
+              "en": "Chat/agent input/output tokens/day"
+            },
+            {
+              "vi": "600000×7800 / ×200",
+              "en": "600000×7800 / ×200"
+            },
+            {
+              "vi": "4.68B input / 120M output",
+              "en": "4.68B input / 120M output"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "apis",
+      "title": {
+        "vi": "3. APIs phải mang snapshot và artifact identity",
+        "en": "3. Bind API contracts to snapshots and artifacts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Completion response cần request/document/caret generation metadata để client loại stale proposal. Chat references và agent task bind workspace/base revisions; principal/repo authorization lấy từ trusted session, không model-picked repo ID. Event telemetry phải phân biệt generated, shown, accepted, dismissed, obsolete và canceled theo definitions nhất quán.",
+          "en": "Responses need identities that let clients discard obsolete proposals. Bind chat/tasks to workspace revisions and trusted authorization. Distinguish generation, display, adoption, obsolescence and cancellation in telemetry."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/code-completions",
+          "description": {
+            "vi": "Tạo cancellable inline proposal cho exact snapshot.",
+            "en": "Create cancellable proposals for specific snapshots."
+          },
+          "request": "{ requestId, documentId, documentVersion, range, prefixRef, suffixRef, contextManifest, deadlineMs }",
+          "response": "stream { requestId, documentVersion, proposalId, text, finishReason }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/code-chat",
+          "description": {
+            "vi": "Chat với allowed references và current overlay.",
+            "en": "Chat with authorized references and overlays."
+          },
+          "request": "{ conversationId?, workspaceRevision, messages, references }",
+          "response": "text/event-stream { generationId, text, references, finishReason }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/code-tasks",
+          "description": {
+            "vi": "Bắt đầu bounded task trên workspace snapshot.",
+            "en": "Start bounded tasks against workspace snapshots."
+          },
+          "request": "{ taskKey, goal, baseRevision, allowedPathProfile, toolProfile, budgetProfile }",
+          "response": "202 { taskId, workspaceSnapshotId, progressUrl }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/code-proposals/{proposalId}/apply",
+          "description": {
+            "vi": "Apply theo exact reviewed artifact và current preconditions.",
+            "en": "Apply exact artifacts under current conditions."
+          },
+          "request": "{ expectedBaseRevision, expectedPatchHash, evidenceManifestRef, reviewDecisionRef? }",
+          "response": "200 { applyReceipt, resultingRevision } OR 409 { conflict, noBlindOverwrite: true }",
+          "notes": [
+            {
+              "vi": "Teaching API không thực hiện edits hoặc điều khiển editor thật.",
+              "en": "Teaching APIs do not edit real workspaces."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Completion path và agent path tách compute/control",
+        "en": "4. Separate completion and agent compute/control paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "IDE/local context service sở hữu current buffers/ranges và exclusion policy. Gateway chọn approved route với capacity/data constraints; completion service optimize short requests, chat/agent orchestrates longer bounded tasks. Repo index giữ revisions/staleness; isolated runner tạo tested artifacts, còn apply gate kiểm workspace hiện tại. Không cần một large model hoặc one-size timeout cho cả hai paths.",
+          "en": "Local components own buffers and exclusions, gateways choose qualified routes, and specialized services handle short versus long tasks. Index revisions, isolated evidence and current-version application remain distinct responsibilities."
+        }
+      ],
+      "diagram": {
+        "id": "coding-assistant-snapshot-evidence-paths",
+        "title": {
+          "vi": "Inline suggestions và agent patches có validity boundaries khác nhau",
+          "en": "Inline suggestions and agent patches have different validity boundaries"
+        },
+        "caption": {
+          "vi": "Trace inline request, repository context, stale-response cancellation, sandbox edits hoặc patch apply. Model output chỉ là proposal cho một document/workspace snapshot cụ thể.",
+          "en": "Trace completions, context, stale-response handling, sandbox edits and patch application. Outputs remain proposals bound to document/workspace snapshots."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "editor",
+            "label": {
+              "vi": "IDE / local workspace",
+              "en": "IDE / local workspace"
+            },
+            "detail": {
+              "vi": "Current buffers, document versions, caret/ranges, exclusions và review UI.",
+              "en": "Own current buffers, revisions, ranges, exclusions and review."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "local",
+            "label": {
+              "vi": "Local context / LSP",
+              "en": "Local context / LSP"
+            },
+            "detail": {
+              "vi": "Prefix/suffix, symbols, unsaved overlays và permission-aware context selection.",
+              "en": "Resolve cursor context, symbols and unsaved overlays under policy."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "edge",
+            "label": {
+              "vi": "Scoped gateway",
+              "en": "Scoped gateway"
+            },
+            "detail": {
+              "vi": "Trusted org/repo identity, approved endpoints, budgets và request generations.",
+              "en": "Bind organizations/repos, approved endpoints, budgets and generations."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "completion",
+            "label": {
+              "vi": "Completion service",
+              "en": "Completion service"
+            },
+            "detail": {
+              "vi": "Supported FIM profile, short deadline, cache identity và bounded output.",
+              "en": "Use supported infilling profiles, deadlines, cache identities and outputs."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "index",
+            "label": {
+              "vi": "Repo index / overlay",
+              "en": "Repo index / overlay"
+            },
+            "detail": {
+              "vi": "Commit/workspace revisions, symbols/chunks, scope và stale indicators.",
+              "en": "Track commit/workspace revisions, symbols, scope and staleness."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "fim",
+            "label": {
+              "vi": "Completion model pool",
+              "en": "Completion model pool"
+            },
+            "detail": {
+              "vi": "Compatible model/tokenizer/template, capacity và prefix-cache residency.",
+              "en": "Match profiles, capacity and prefix-cache residency."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "agent",
+            "label": {
+              "vi": "Chat / agent runtime",
+              "en": "Chat / agent runtime"
+            },
+            "detail": {
+              "vi": "Bounded search/edit/test plan, tool scope, snapshots và cancellation.",
+              "en": "Bound search/edit/test plans, tools, snapshots and cancellation."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "sandbox",
+            "label": {
+              "vi": "Isolated build/test runner",
+              "en": "Isolated build/test runner"
+            },
+            "detail": {
+              "vi": "No production secrets, controlled dependencies/network và resource limits.",
+              "en": "Isolate secrets, dependencies, networks and resources."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "manifest",
+            "label": {
+              "vi": "Patch evidence manifest",
+              "en": "Patch evidence manifest"
+            },
+            "detail": {
+              "vi": "Base/patch/environment IDs, tests, limitations và approvals.",
+              "en": "Bind bases, patches, environments, tests, limitations and decisions."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "apply",
+            "label": {
+              "vi": "Editor / merge gate",
+              "en": "Editor / merge gate"
+            },
+            "detail": {
+              "vi": "Current-version compare, path scope, reviewed payload và conflict handling.",
+              "en": "Check current revisions, scope, reviewed payloads and conflicts."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "metrics",
+            "label": {
+              "vi": "Scoped telemetry / evals",
+              "en": "Scoped telemetry / evals"
+            },
+            "detail": {
+              "vi": "Shown/accepted/retained signals, correctness/security, latency và cost.",
+              "en": "Combine adoption signals, correctness, timing and cost."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "control",
+            "label": {
+              "vi": "Policy / rollout control",
+              "en": "Policy / rollout control"
+            },
+            "detail": {
+              "vi": "Exclusions, allowed capabilities, degradation và versioned release gates.",
+              "en": "Govern exclusions, capabilities, degradation and releases."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "inline",
+            "label": {
+              "vi": "Inline completion theo snapshot",
+              "en": "Complete an editor snapshot"
+            },
+            "steps": [
+              {
+                "from": "editor",
+                "to": "local",
+                "description": {
+                  "vi": "Debounce typing và capture current document/caret snapshot.",
+                  "en": "Debounce and capture current document/range snapshots."
+                }
+              },
+              {
+                "from": "local",
+                "to": "edge",
+                "description": {
+                  "vi": "Filter excluded/sensitive context trước network; bind request generation.",
+                  "en": "Filter context before networking and bind generations."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "completion",
+                "description": {
+                  "vi": "Admit bounded task/region/model profile.",
+                  "en": "Admit bounded tasks under approved profiles."
+                }
+              },
+              {
+                "from": "completion",
+                "to": "fim",
+                "description": {
+                  "vi": "Use compatible FIM prompt và bounded generation.",
+                  "en": "Generate under compatible infilling profiles."
+                }
+              },
+              {
+                "from": "fim",
+                "to": "editor",
+                "description": {
+                  "vi": "Show only valid current-snapshot suggestion theo usefulness deadline.",
+                  "en": "Show current valid suggestions within task deadlines."
+                }
+              }
+            ]
+          },
+          {
+            "id": "context",
+            "label": {
+              "vi": "Context có local overlay",
+              "en": "Retrieve versioned repository context"
+            },
+            "steps": [
+              {
+                "from": "editor",
+                "to": "local",
+                "description": {
+                  "vi": "Resolve open/recent buffers và current symbols.",
+                  "en": "Resolve current buffers and symbols."
+                }
+              },
+              {
+                "from": "local",
+                "to": "index",
+                "description": {
+                  "vi": "Retrieve scoped snippets với commit/buffer revision metadata.",
+                  "en": "Retrieve scoped snippets with revision metadata."
+                }
+              },
+              {
+                "from": "index",
+                "to": "local",
+                "description": {
+                  "vi": "Apply unsaved overlay/freshness rules, dedup và token budget.",
+                  "en": "Apply overlay/freshness, deduplication and budgets."
+                }
+              },
+              {
+                "from": "local",
+                "to": "completion",
+                "description": {
+                  "vi": "Pack permitted compatible evidence, không block editor chờ optional slow context.",
+                  "en": "Pack permitted context without blocking on optional slow evidence."
+                }
+              }
+            ]
+          },
+          {
+            "id": "obsolete",
+            "label": {
+              "vi": "Superseded requests và late responses",
+              "en": "Handle supersession and late responses"
+            },
+            "steps": [
+              {
+                "from": "editor",
+                "to": "edge",
+                "description": {
+                  "vi": "Cancel prior request khi snapshot đổi; tag newer generation.",
+                  "en": "Cancel superseded work and identify newer generations."
+                }
+              },
+              {
+                "from": "edge",
+                "to": "fim",
+                "description": {
+                  "vi": "Propagate supported cancellation, không assume mọi compute đã stop.",
+                  "en": "Propagate supported cancellation without assuming all work stopped."
+                }
+              },
+              {
+                "from": "fim",
+                "to": "editor",
+                "description": {
+                  "vi": "Late replies vẫn phải check document/range/request validity.",
+                  "en": "Late responses still need snapshot and request checks."
+                }
+              },
+              {
+                "from": "editor",
+                "to": "metrics",
+                "description": {
+                  "vi": "Record shown vs obsolete/cancelled/late bằng denominators riêng.",
+                  "en": "Distinguish shown, obsolete, cancelled and late outcomes."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "agent",
+            "label": {
+              "vi": "Agent edits trong isolated workspace",
+              "en": "Edit in isolated workspaces"
+            },
+            "steps": [
+              {
+                "from": "editor",
+                "to": "agent",
+                "description": {
+                  "vi": "Bind authorized goal và immutable workspace/base revision.",
+                  "en": "Bind authorized goals to workspace/base revisions."
+                }
+              },
+              {
+                "from": "agent",
+                "to": "index",
+                "description": {
+                  "vi": "Search relevant current context, treat repo text là data.",
+                  "en": "Retrieve relevant context while treating repository text as data."
+                }
+              },
+              {
+                "from": "agent",
+                "to": "sandbox",
+                "description": {
+                  "vi": "Apply proposed edits/build/tests dưới tool/resource policy.",
+                  "en": "Propose edits and run bounded builds/tests."
+                }
+              },
+              {
+                "from": "sandbox",
+                "to": "manifest",
+                "description": {
+                  "vi": "Record exact patch/base/environment và test outcomes/limitations.",
+                  "en": "Record exact artifacts and verification evidence."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "apply",
+            "label": {
+              "vi": "Review và apply đúng artifact",
+              "en": "Review and apply exact artifacts"
+            },
+            "steps": [
+              {
+                "from": "manifest",
+                "to": "editor",
+                "description": {
+                  "vi": "Present concrete diff, checks, scope và unresolved risks.",
+                  "en": "Present concrete diffs, checks, scope and limitations."
+                }
+              },
+              {
+                "from": "editor",
+                "to": "apply",
+                "description": {
+                  "vi": "Authorize theo current user/product review policy, bind exact payload.",
+                  "en": "Bind current authorization/review decisions to exact payloads."
+                }
+              },
+              {
+                "from": "apply",
+                "to": "manifest",
+                "description": {
+                  "vi": "Verify base/test/review identity và current commit preconditions.",
+                  "en": "Verify artifact evidence and current-version conditions."
+                }
+              },
+              {
+                "from": "apply",
+                "to": "editor",
+                "description": {
+                  "vi": "Apply under supported atomic/conflict contract; không overwrite user edits blind.",
+                  "en": "Apply under explicit conflict/atomicity contracts."
+                }
+              },
+              {
+                "from": "apply",
+                "to": "metrics",
+                "description": {
+                  "vi": "Record task outcome/cost và review result theo privacy policy.",
+                  "en": "Record scoped outcomes, costs and reviews."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "race",
+      "title": {
+        "vi": "5. Document versions, superseded requests và late replies",
+        "en": "5. Handle versions, supersession and late replies"
+      },
+      "paragraphs": [
+        {
+          "vi": "Debounce giảm request count khi typing liên tục, nhưng thêm delay vào useful window. Khi document/caret đổi, invalidate prior proposals và request cancel theo supported contract. Response tới muộn vẫn phải match request epoch, document version/content, replace range và relevant prefix/suffix preconditions; một completion hợp lệ cho v7 không tự hợp lệ cho v8 chỉ vì cùng file path.",
+          "en": "Debouncing trades fewer calls for delay. Invalidate proposals and request cancellation on edits, while checking response epochs, versions, ranges and context preconditions. The same file path does not establish snapshot validity."
+        },
+        {
+          "vi": "Versioned editor/LSP contracts giúp kiểm document state; position encoding và range semantics phải theo client protocol, không tự coi byte offset là character position. Cancel có thể chưa propagate hoặc provider vẫn hoàn thành work; drop stale replies ở client/server là correctness boundary riêng với resource savings. Undo/redo, tab changes, branch switch và unsaved overlays cũng cần test.",
+          "en": "Respect client version, position and range contracts. Cancellation may not stop work; validity gates are separate correctness controls. Test undo/redo, tabs, branches and unsaved overlays."
+        }
+      ],
+      "experiment": "coding-race"
+    },
+    {
+      "id": "latency",
+      "title": {
+        "vi": "6. Đo latency budget theo actual critical path",
+        "en": "6. Measure the actual latency critical path"
+      },
+      "paragraphs": [
+        {
+          "vi": "Break down debounce, local context, network, queue/admission, prefill, decode, response buffering và render. Một số stages parallel/optional nên không luôn cộng mọi duration; end-to-end tail không bằng tổng p95 của từng stage. Measure time-to-useful-suggestion và rate hợp lệ còn trong pause window theo language/task/device, cùng correctness và acceptance signals.",
+          "en": "Break down preparation, network, queues, generation and rendering, accounting for overlap and optional work. Stage percentiles do not sum into end-to-end percentiles. Measure useful timely valid suggestions alongside correctness and adoption."
+        },
+        {
+          "vi": "Model nhỏ/FIM-specialized, prefix reuse, speculative decoding, regional routing và short outputs có thể giúp under measured conditions. Không có fixed “nhỏ hơn nhanh X lần” hoặc speculation speedup constant cho mọi batch/hardware/acceptance. Sticky routing cần balance cache locality với saturation/hotspots/failover, và approved residency có thể giới hạn region choice. Optional repo context miss deadline thì skip/degrade rõ thay block editor.",
+          "en": "Model specialization, caching, speculation, placement and bounded outputs can help under measured conditions. Speedups depend on hardware, batching and acceptance. Balance locality with saturation and policy; optional context must not indefinitely block editing."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Optimize theo measured bottleneck",
+          "en": "Optimize measured bottlenecks"
+        },
+        "caption": {
+          "vi": "Mỗi optimization cần latency và task-quality evidence.",
+          "en": "Qualify optimizations on timing and task quality."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Capture",
+              "en": "Capture"
+            },
+            "detail": {
+              "vi": "Debounce/context extraction và allowed snapshot.",
+              "en": "Capture scoped context and timing."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Admit",
+              "en": "Admit"
+            },
+            "detail": {
+              "vi": "Queue/concurrency, deadline và cache locality.",
+              "en": "Bound admission and inspect locality."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Generate",
+              "en": "Generate"
+            },
+            "detail": {
+              "vi": "Compatible profile, prefill/decode và output bounds.",
+              "en": "Use compatible bounded generation."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Render / discard",
+              "en": "Render / discard"
+            },
+            "detail": {
+              "vi": "Show useful current proposal hoặc drop stale/late.",
+              "en": "Show current useful results or discard them."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "context",
+      "title": {
+        "vi": "7. FIM và bounded context assembly",
+        "en": "7. Build bounded infilling context"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fill-in-the-middle conditioning dùng code trước/sau insertion point để generate middle theo model/template hỗ trợ; special tokens/order không universal giữa models. Include necessary local prefix/suffix, relevant definitions/types/tests và suitable repo snippets theo actual token budget. Larger context không tự better quality; stale/irrelevant hoặc malicious context có thể làm tệ hơn. Local data tránh một network lookup nhưng vẫn có CPU/extraction/privacy và input-token costs.",
+          "en": "Infilling conditions on surrounding code under a supported profile; token formats differ. Choose necessary local context and relevant definitions/tests under actual budgets. More context can be stale, irrelevant or hostile, and local extraction is not cost-free."
+        },
+        {
+          "vi": "Count required pieces, templates, tool schemas và reserved output/context headroom. Nếu required content vượt budget, shrink/reframe/decline theo policy hoặc alternate mode, không use required=true để bypass limit. Enforce exclusions trước collection/storage/indexing/embedding/network theo scope; server-side policy cũng cần kiểm nhưng không thể undo secret đã gửi.",
+          "en": "Count required content and formatting/headroom. Oversized required input needs deliberate reframing rather than budget bypass. Enforce exclusions before exposure; later server checks cannot undo prior transmission."
+        }
+      ],
+      "experiment": "coding-context"
+    },
+    {
+      "id": "index",
+      "title": {
+        "vi": "8. Repo retrieval phải hiểu commits và unsaved overlays",
+        "en": "8. Retrieve repository context with commits and unsaved overlays"
+      },
+      "paragraphs": [
+        {
+          "vi": "Index code theo repository/branch/commit generation, file content hashes và parser/symbol/embedding profiles. Definitions/references giúp context nhưng language server có capabilities, update lag và parse errors khi code đang gõ dở. Combine lexical/symbol/semantic retrieval theo evals thay assume vector search đủ mọi exact API name hoặc dependency version.",
+          "en": "Version repository indexes by commits, hashes and processing profiles. Symbols can help while language services lag or parse incomplete code. Evaluate lexical, symbol and semantic retrieval rather than expecting one method to cover all cases."
+        },
+        {
+          "vi": "Current open buffer có thể mới hơn disk/index; overlay local edits và mark stale snippets để không mix inconsistent workspace assumptions. Rewrites, generated files, symlinks/path canonicalization, branch changes và excluded paths cần policy. Không đem unrestricted repo-wide snippets tới model chỉ vì index trả similarity cao.",
+          "en": "Open buffers can be newer than indexed commits. Apply overlays and staleness rules, with deliberate handling for paths, generated files, branches and exclusions. Retrieval similarity does not authorize arbitrary repository content."
+        }
+      ]
+    },
+    {
+      "id": "cache",
+      "title": {
+        "vi": "9. Prefix/KV reuse và suggestion cache identity",
+        "en": "9. Scope prefix and suggestion caches"
+      },
+      "paragraphs": [
+        {
+          "vi": "KV/prefix reuse phụ thuộc exact compatible token prefix, model/weights/tokenizer/template/attention settings, tenant/session isolation và residency. Changing suffix/context order hoặc model profile có thể đổi shareable prefix; sticky sessions chỉ giúp khi cache tồn tại và capacity tốt. Không reuse arbitrary similar code như identical KV state.",
+          "en": "Prefix reuse needs compatible token/model settings, isolation and residency. Layout and profile changes affect reuse, and stickiness only helps available healthy caches. Similar code is not identical model state."
+        },
+        {
+          "vi": "Suggestion response cache cần bind document/range/prefix/suffix, model/settings, scope và policy versions; backspace/retype có thể hit khi preconditions thật sự match. Cache hit không bypass current document validity/exclusions. Track logical input, cache reads/writes, output tokens và actual provider usage để estimate cost; no universal prefill dominance chỉ từ prompt length.",
+          "en": "Response caches bind snapshots, context, settings, scope and policy. Retyping may reuse eligible suggestions without bypassing current validity. Measure actual input/cache/output usage rather than inferring universal cost dominance."
+        }
+      ]
+    },
+    {
+      "id": "agent",
+      "title": {
+        "vi": "10. Agentic edits: task scope, bounded loop và evidence",
+        "en": "10. Scope and bound agentic edits"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bind goal và base/workspace snapshot, allow specific paths/tools và preserve user changes. Agent có thể inspect, propose edits và run relevant checks, nhưng stop conditions gồm completed goal, budgets, errors, blocked permissions và unresolved conflicts. “Loop tới khi tests xanh” không đủ: deleting tests hoặc changing expected output để che bug không là task success.",
+          "en": "Bind goals and workspace snapshots, scope tools/paths and preserve user changes. Stop on meaningful completion or declared limits/conflicts. Green tests achieved by removing coverage or altering expectations do not establish success."
+        },
+        {
+          "vi": "Keep test/eval oracles và execution policies appropriately controlled; review production behavior, test modifications và diff scope. Tool results/repo comments/issues đều untrusted data, không cấp permission cho network/push/credential access. Policy có thể preauthorize reversible local edits trong requested scope và require concrete review cho risky/external steps; không cần tự phát tạo confirmation sau từng low-risk edit đã được delegate.",
+          "en": "Control evaluation oracles and review behavior, tests and scope. Repository content cannot grant credentials or external authority. Respect delegated local autonomy and concrete risk-based review rather than inventing prompts for every authorized change."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một vòng edit có evidence",
+          "en": "An edit loop with evidence"
+        },
+        "caption": {
+          "vi": "Outcome là task behavior trên exact artifact, không chỉ model narrative.",
+          "en": "Outcomes depend on exact artifacts and behavior, not completion claims."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Inspect / plan",
+              "en": "Inspect / plan"
+            },
+            "detail": {
+              "vi": "Goal, base, path/tool scope và relevant checks.",
+              "en": "Define goals, bases, scope and checks."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Propose edits",
+              "en": "Propose edits"
+            },
+            "detail": {
+              "vi": "Concrete diff trong isolated snapshot.",
+              "en": "Propose concrete isolated changes."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Verify",
+              "en": "Verify"
+            },
+            "detail": {
+              "vi": "Run tests/checks, record environment/artifact IDs.",
+              "en": "Record checks and artifact/environment identities."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Review / apply",
+              "en": "Review / apply"
+            },
+            "detail": {
+              "vi": "Current preconditions, authority và conflict handling.",
+              "en": "Apply under current conditions and authority."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sandbox",
+      "title": {
+        "vi": "11. Sandbox cho code và build/test scripts",
+        "en": "11. Isolate generated code and repository scripts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Repo build/tests/dependency install có thể execute arbitrary code, kể cả model không sinh một shell payload trực tiếp. Dùng isolated ephemeral workspace/VM/container phù hợp risk, không production credentials, bounded CPU/memory/time/process/filesystem và reviewed network/dependency policy. Container label không tự chứng minh isolation nếu mount host secrets hoặc privileged sockets.",
+          "en": "Builds, tests and dependencies can execute arbitrary repository code. Choose appropriate isolation with secret, resource, filesystem and network controls. Containers with host privileges or secret mounts do not automatically establish isolation."
+        },
+        {
+          "vi": "Dependencies có thể cần network; dùng approved mirrors/caches/allowance thay blanket assume mọi task build offline được. Network access vẫn cần destination/data rules và supply-chain review. Test artifacts/logs có thể leak code/secrets, nên minimize, scope và retain theo policy. Bounded execution failure phải return useful diagnostics thay retry/runaway install vô hạn.",
+          "en": "Provide controlled dependency access where needed, with destination and supply-chain policies. Scope and minimize artifacts/logs. Return bounded useful failures instead of unending installs or retries."
+        }
+      ]
+    },
+    {
+      "id": "patch",
+      "title": {
+        "vi": "12. Test/review evidence phải bind exact patch và base",
+        "en": "12. Bind test and review evidence to exact artifacts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Record base content/workspace revision, proposed patch hash, touched paths, test commands/results, environment/dependency versions và required review decision. Nếu patch hoặc base đổi sau tests/review, evidence có thể không còn áp dụng; rebase/retest/review theo risk thay carry forward green badge tự động. Tests passing chỉ bao phủ checks thực sự chạy, không proof mọi behavior đúng.",
+          "en": "Record bases, patch identities, paths, checks, environments and required decisions. Artifact changes can invalidate evidence, requiring appropriate requalification rather than inherited green badges. Tests establish only exercised properties."
+        },
+        {
+          "vi": "Validate current state tại apply/commit boundary bằng supported compare-and-swap/conflict contract; precheck rồi user edit trước write là TOCTOU. Multi-file editor/workspace operations không luôn transaction như database; define atomicity, partial failure/rollback và conflict reporting theo client capabilities. Không blind overwrite user changes để “apply succeeded”.",
+          "en": "Check current revisions at commit, preventing precheck/write races. Multi-file operations have client-specific transaction and recovery semantics. Preserve conflicts and user changes rather than forcing apparent success."
+        }
+      ],
+      "experiment": "coding-patch"
+    },
+    {
+      "id": "offline",
+      "title": {
+        "vi": "13. Offline evals: functional correctness, repo tasks và pass@k",
+        "en": "13. Evaluate functions, repository tasks and pass@k"
+      },
+      "paragraphs": [
+        {
+          "vi": "Function-level generated-code tests, typecheck/lint, security checks và repository-level issue tasks đo những scopes khác nhau. Use held-out recent/representative code có permission, languages/framework slices và controlled environments; inspect contamination, dependency drift và flaky tests. A suite pass không chứng minh code secure hoặc satisfies every product requirement.",
+          "en": "Function tests, static checks, security review and repository tasks cover different scopes. Use authorized representative holdouts and controlled environments, addressing contamination, drift and flaky tests. Passing does not establish all requirements or security."
+        },
+        {
+          "vi": "Pass@k đo xác suất/estimated success khi có budget k candidate samples và ít nhất một candidate qua defined tests; không là acceptance rate hoặc quality của first shown completion. Với n≥k samples và c passes, một estimator dùng 1−C(n−c,k)/C(n,k); ví dụ n=10,c=2,k=2 cho 17/45≈37,8%. Sampling assumptions và test coverage vẫn quan trọng; compare models với same harness, sampling/budget và uncertainty.",
+          "en": "Pass@k assesses success with multiple candidates under defined tests, not first-suggestion adoption. An estimator for n≥k samples and c passes is 1−C(n−c,k)/C(n,k); n=10,c=2,k=2 gives about 37.8%. Compare matched harnesses, sampling, budgets and uncertainty."
+        }
+      ]
+    },
+    {
+      "id": "online",
+      "title": {
+        "vi": "14. Acceptance và retained code là signals, không ground truth",
+        "en": "14. Adoption and retention are signals rather than truth"
+      },
+      "paragraphs": [
+        {
+          "vi": "Track generated→eligible→shown→accepted/dismissed→retained/reverted với clear denominators. Acceptance của shown suggestions bị selection bởi latency, suggestion length, UI và task difficulty; retained chars không chứng minh semantic correctness hoặc long-term productivity. User có thể accept insecure code hoặc later delete good code vì design đổi. Combine signals với task outcomes, review burden, security/regressions và developer research.",
+          "en": "Track the proposal funnel with explicit denominators. Adoption is selected by timing, length, interface and difficulty; retained characters do not prove correctness or productivity. Combine behavioral signals with outcomes, review burden, security and research."
+        },
+        {
+          "vi": "Online experiments cần appropriate assignment unit, duration, guardrails và clustering theo developer/repo; workload/learning effects có thể bias naive comparisons. Measure latency tails/cancellation/cost với quality, không chỉ optimize acceptance của very short trivial snippets. Telemetry pseudonymous IDs vẫn có privacy implications; không gọi hash là automatic anonymization.",
+          "en": "Experiments need suitable units, duration and guardrails, accounting for developer/repository dependence. Do not optimize trivial adoption at the expense of useful quality. Pseudonymous telemetry still carries privacy implications."
+        }
+      ]
+    },
+    {
+      "id": "privacy",
+      "title": {
+        "vi": "15. Exclusions, data residency và policy propagation",
+        "en": "15. Propagate exclusions and data policies"
+      },
+      "paragraphs": [
+        {
+          "vi": "Org/user exclusion policy phải apply cho local extraction, LSP/context snippets, indexing/embeddings, remote generation, caches và diagnostics theo scope. Gitignore không tự là privacy policy; symlinks, case sensitivity, renamed files, pasted secrets và context from generated artifacts cần handling. Secret detection có false negatives/positives; least exposure và narrow permissions vẫn cần.",
+          "en": "Apply exclusions across extraction, indexing, generation, caches and diagnostics. Git ignore rules are not automatically privacy controls, and paths/pasted data need deliberate treatment. Detectors have errors; minimize exposure and privileges."
+        },
+        {
+          "vi": "Allowed endpoints/regions, training usage và retention phải phù hợp actual vendor/self-hosted contracts/configuration. Code content không cần được stored trong normal telemetry để count outcomes, nhưng metadata/path/timing cũng có thể sensitive. Data-policy changes cần propagate/invalidate caches/queued work phù hợp; server filtering không unsend prior client uploads.",
+          "en": "Qualify actual endpoint, retention and training contracts. Outcome telemetry can avoid raw code while still containing sensitive metadata. Propagate policy changes to caches and queued work; later filtering cannot undo prior uploads."
+        }
+      ]
+    },
+    {
+      "id": "degradation",
+      "title": {
+        "vi": "16. Graceful degradation giữ editor hoạt động",
+        "en": "16. Degrade without blocking normal editing"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi capacity hoặc latency xấu, có thể shorten output, skip optional remote context, route tới qualified profile hoặc pause completions; lựa chọn phải preserve policy/quality expectations và clear UI state. Agent tasks có thể queue bounded, checkpoint hoặc stop với report. Không áp một ladder universal nếu task nhỏ hơn context lại làm unsafe edits.",
+          "en": "Under pressure, shorten output, omit optional context, use qualified alternatives or pause suggestions while preserving expectations. Longer tasks can queue, checkpoint or stop with evidence. Degradation choices remain task-dependent."
+        },
+        {
+          "vi": "Prioritize current requests và fair per-org/developer quotas; stale cancellation giúp nếu supported nhưng không nên giả định fixed queue saving. Session stickiness có fallback/load escape; autoscaling cần warmup/cache behavior và measured peak distributions. Product SLA nên gồm editor responsiveness và task quality, không chỉ model endpoint uptime.",
+          "en": "Prioritize current work fairly, with measured cancellation and warmup behavior. Balance stickiness with load escape. Product service levels should include editor responsiveness and task quality as well as endpoint availability."
+        }
+      ]
+    },
+    {
+      "id": "manifest",
+      "title": {
+        "vi": "17. Artifact/telemetry data model và release controls",
+        "en": "17. Model artifacts, telemetry and release controls"
+      },
+      "paragraphs": [
+        {
+          "vi": "Artifact manifest giữ proposal/base/patch/environment identities, commands/check outcomes, scope, dependency/model/profile revisions và authorized decision refs. Completion telemetry giữ request/document generation IDs, model/profile revision, timings, usage, shown/adoption state và scoped aggregate retention metrics; raw source absent by default không tự làm metadata public.",
+          "en": "Manifests bind artifacts, environments, checks, scope, models and decisions. Telemetry binds requests, generations, timings, usage and adoption under privacy policy; absent raw code does not make metadata public."
+        },
+        {
+          "vi": "Model/template/context/index changes cần offline correctness/security/repo suites, latency/load checks và controlled online rollout. Review end-to-end effects của context exclusions, suffix processing, stale proposals và patch apply races. Keep rollback compatible profiles và retain enough minimized evidence để diagnosis, không chỉ model version string.",
+          "en": "Qualify model, prompt, context and index releases across correctness, security, load and controlled rollout. Preserve compatible rollback profiles and minimized diagnostic evidence for actual end-to-end failures."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Decision / artifact",
+            "en": "Decision / artifact"
+          },
+          {
+            "vi": "Bind / measure",
+            "en": "Bind / measure"
+          },
+          {
+            "vi": "Không suy tự động",
+            "en": "Do not infer automatically"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Inline response",
+              "en": "Inline response"
+            },
+            {
+              "vi": "Request/document/range/context generation",
+              "en": "Request/document/range/context generation"
+            },
+            {
+              "vi": "Same path = same valid insertion",
+              "en": "Same paths imply valid insertions"
+            }
+          ],
+          [
+            {
+              "vi": "Test evidence",
+              "en": "Test evidence"
+            },
+            {
+              "vi": "Exact base/patch/environment/checks",
+              "en": "Exact bases, patches, environments and checks"
+            },
+            {
+              "vi": "Green tests = all requirements correct",
+              "en": "Green tests prove every requirement"
+            }
+          ],
+          [
+            {
+              "vi": "Review decision",
+              "en": "Review decision"
+            },
+            {
+              "vi": "Current authority, exact payload và scope",
+              "en": "Current authority, exact payload and scope"
+            },
+            {
+              "vi": "Prior approval covers changed patch",
+              "en": "Prior review covers changed patches"
+            }
+          ],
+          [
+            {
+              "vi": "Adoption telemetry",
+              "en": "Adoption telemetry"
+            },
+            {
+              "vi": "Shown/adopted/retained denominators và task slices",
+              "en": "Funnel denominators and task slices"
+            },
+            {
+              "vi": "Acceptance = secure/correct/productive",
+              "en": "Adoption establishes security or productivity"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "18. Luyện giải thích Coding Assistant",
+        "en": "18. Practice Coding Assistant decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Giữ completion nhanh ở peak bằng cách nào?",
+            "en": "How would you keep completions useful under peak load?"
+          },
+          "answer": [
+            {
+              "vi": "Đo critical path và time-to-useful-current-suggestion theo workload, bound queue/output/context, debounce và cancel supported work. Evaluate FIM/model/cache/locality choices cùng quality/privacy; skip optional context hoặc pause khi cần. Không hứa speedup fixed chỉ từ parameter count.",
+              "en": "Measure useful valid timing, bound work and qualify model/cache choices with quality and privacy. Degrade deliberately without fixed speedup promises."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "R1 về sau R3 nhưng cùng file, có show được không?",
+            "en": "Can R1 be shown after R3 because it is the same file?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu document/range/request snapshot không còn match. Cancel không bảo đảm response biến mất; current version/content/preconditions gate phải drop obsolete result. Check undo/redo/tab/caret/branch scenarios.",
+              "en": "Not without matching current snapshots and preconditions. Cancellation does not erase responses; enforce validity across editing changes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Required prefix/suffix quá budget thì sao?",
+            "en": "What if required surrounding code exceeds budget?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự vượt limit bằng required=true. Count template/schema/output headroom, shrink/reframe theo policy hoặc alternate mode/decline. Required context và exclusion policies đều là constraints, không override nhau bằng model claim.",
+              "en": "Do not bypass limits. Count overhead, reframe or decline under policy while preserving exclusions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tests đã xanh nhưng user đổi workspace trước apply?",
+            "en": "What if the workspace changes after tests pass?"
+          },
+          "answer": [
+            {
+              "vi": "Bind evidence với exact base/patch/environment và validate current version tại commit boundary. Nếu conflict, report/rebase/requalify phù hợp; không overwrite user edits để force success. Multi-file atomicity phải theo supported client contract.",
+              "en": "Bind evidence and check current state at commit, handling conflicts and requalification without blind overwrites."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Model acceptance tăng có chắc tốt hơn không?",
+            "en": "Does higher acceptance prove a better model?"
+          },
+          "answer": [
+            {
+              "vi": "Không: shown-selection, latency, length/UI và task mix có thể đổi. Acceptance/retention là signals, combine với correctness/security, task outcomes, review burden và suitable controlled experiments.",
+              "en": "No: selection, timing, length and task mix can shift. Combine adoption with correctness, security and controlled outcome evidence."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sticky routing có luôn giữ được prefix cache không?",
+            "en": "Does sticky routing always preserve prefix reuse?"
+          },
+          "answer": [
+            {
+              "vi": "Không khi cache evicted, model/profile/token-prefix đổi, replica unhealthy hoặc locality gây queue hotspot. Scope exact compatible identity, monitor hits/latency/cost và có load escape/rollback.",
+              "en": "No: eviction, profiles, exact tokens and load affect reuse. Monitor compatibility and capacity with escape paths."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Agent chạy tests trên laptop có đủ sandbox không?",
+            "en": "Is running tests on a laptop sufficient isolation?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự đủ: repo scripts/dependencies là executable code và có thể truy cập host secrets/network. Dùng appropriate isolated workspace/resources/credentials và controlled dependency/network policy; container cũng cần review privileges/mounts.",
+              "en": "No: scripts can access host capabilities. Use suitable isolation and reviewed credentials, resources and networking."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Pass@k cao có nghĩa first suggestion tốt không?",
+            "en": "Does high pass@k establish good first suggestions?"
+          },
+          "answer": [
+            {
+              "vi": "Không: k-candidate test success khác first shown/accepted outcome và có budget/harness/test coverage assumptions. Compare matched sampling và evaluate product latency/adoption/correctness riêng.",
+              "en": "No: multi-candidate success differs from first-suggestion behavior and depends on sampling and tests. Evaluate product behavior separately."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
