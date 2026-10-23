@@ -46,6 +46,7 @@ export function buildReviewDeck(): ReviewCard[] {
           id: `handbook:${lesson.id}:${s.id}:${hash(q.question.vi)}`,
           revision: hash([q.question, q.answer, q.followup]),
           followUp: q.followup?.vi,
+          legacyKey: `q/handbook/${lesson.id}/${s.id}/${hash(q.question.vi)}`,
           source: 'handbook',
           title: lesson.title.vi,
           question: q.question.vi,
