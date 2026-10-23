@@ -28,9 +28,13 @@ try {
     await expect(e).toHaveAttribute('open', '');
   await expect(page.locator('.breadcrumb')).toContainText('Case Studies');
   await expect(page.locator('.breadcrumb')).not.toContainText('Notes & Interview');
-  await expect(page.locator('.sidebar [data-nav-id=system-design-ai] [data-nav-id=system-design-cases]')).toHaveCount(1);
+  await expect(
+    page.locator('.sidebar [data-nav-id=system-design-ai] [data-nav-id=system-design-cases]'),
+  ).toHaveCount(1);
   await expect(page.locator('[data-nav-id=handbook]')).not.toHaveAttribute('open');
-  await expect(page.locator('.breadcrumb li').last()).toHaveText(JSON.parse(fs.readFileSync('src/content/handbook/url-shortener.json','utf8')).title.vi);
+  await expect(page.locator('.breadcrumb li').last()).toHaveText(
+    JSON.parse(fs.readFileSync('src/content/handbook/url-shortener.json', 'utf8')).title.vi,
+  );
   await page.locator('[data-nav-id=system-design-cases]>summary').click();
   await expect(page.locator('[data-nav-id=system-design-cases]')).not.toHaveAttribute('open');
   await page.reload();
@@ -52,6 +56,45 @@ try {
   report.checks.push(
     'System Design & AI case branch, dedicated bilingual catalog, breadcrumb and fold persistence',
   );
+  for (const locale of ['', 'en/']) {
+    await page.goto(origin + '/' + locale + 'handbook/system-design/news-feed/');
+    if (locale)
+      await page.waitForFunction(() => document.documentElement.dataset.languageReady === 'true');
+    await page.addStyleTag({ content: '* { scroll-behavior:auto!important; }' });
+    const activeToc = page.locator('.page-toc nav a.current');
+    await page.locator('#interview').evaluate((el) => el.scrollIntoView({ behavior: 'instant' }));
+    await expect(activeToc).toHaveAttribute('href', '#interview');
+    await page.locator('.feed-publication').evaluate((el) =>
+      window.scrollTo({
+        top: el.getBoundingClientRect().top + scrollY - 100,
+        behavior: 'instant',
+      }),
+    );
+    await expect(activeToc).toHaveAttribute('href', '#capacity');
+    await expect(activeToc).toHaveAttribute('aria-current', 'location');
+    await page.locator('.architecture-heading h3').evaluate((el) =>
+      window.scrollTo({
+        top: el.getBoundingClientRect().top + scrollY - 108,
+        behavior: 'instant',
+      }),
+    );
+    await expect(activeToc).toHaveAttribute('href', '#architecture');
+    await page.locator('.page-toc nav a[href="#fanout"]').click();
+    await expect(activeToc).toHaveAttribute('href', '#fanout');
+    await expect(page).toHaveURL(/#fanout$/);
+    await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
+    await expect(activeToc).toHaveAttribute('href', '#mental-model');
+    await page.evaluate(() =>
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' }),
+    );
+    await expect(activeToc).toHaveAttribute('href', '#interview');
+    await page.goto(origin + '/' + locale + 'handbook/system-design/news-feed/#privacy');
+    await expect(activeToc).toHaveAttribute('href', '#privacy');
+  }
+  report.checks.push(
+    'Long-section reverse jumps, unlisted headings, anchors and hash restoration in both locales',
+  );
+  await page.goto(origin + '/handbook/system-design/url-shortener/', { waitUntil: 'networkidle' });
   for (const theme of themeIds) {
     await page.locator('#theme-toggle').click();
     await page.locator(`[data-theme-choice=${theme}]`).click();

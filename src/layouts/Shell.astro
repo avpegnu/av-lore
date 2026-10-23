@@ -248,22 +248,73 @@ const {
         });
       initStudy();
       // Keep the table of contents in sync with reading position.
-      const headings = [...document.querySelectorAll('main h2[id],main h3[id]')];
-      if ('IntersectionObserver' in window) {
-        const observer = new IntersectionObserver(
-          (entries) => {
-            for (const e of entries)
-              if (e.isIntersecting) {
-                document
-                  .querySelectorAll('.page-toc a')
-                  .forEach((a) =>
-                    a.classList.toggle('current', a.getAttribute('href') === '#' + e.target.id),
-                  );
-              }
-          },
-          { rootMargin: '-15% 0px -65% 0px' },
-        );
-        headings.forEach((h) => observer.observe(h));
+      const tocEntries = [
+        ...document.querySelectorAll<HTMLAnchorElement>('.page-toc nav a'),
+      ].flatMap((link) => {
+        const fragment = link.getAttribute('href')?.slice(1) || '';
+        let heading = document.getElementById(fragment);
+        if (!heading) {
+          try {
+            heading = document.getElementById(decodeURIComponent(fragment));
+          } catch {}
+        }
+        return heading ? [{ link, heading }] : [];
+      });
+      if (tocEntries.length) {
+        let scheduled = false;
+        let currentLink: HTMLAnchorElement | undefined;
+        function updateReadingPosition() {
+          scheduled = false;
+          const headerBottom =
+            document.querySelector('.topbar')?.getBoundingClientRect().bottom || 0;
+          // Native anchor alignment adds the root scroll padding to the target margin.
+          const scrollPadding =
+            Number.parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) || 0;
+          const targetMargin = Math.max(
+            ...tocEntries.map(
+              ({ heading }) => Number.parseFloat(getComputedStyle(heading).scrollMarginTop) || 0,
+            ),
+          );
+          const readingLine = Math.max(headerBottom + 24, scrollPadding + targetMargin) + 2;
+          let active = tocEntries[0];
+          let closestAbove = -Infinity;
+          for (const entry of tocEntries) {
+            const top = entry.heading.getBoundingClientRect().top;
+            if (top <= readingLine && top >= closestAbove) {
+              closestAbove = top;
+              active = entry;
+            }
+          }
+          // A short final section may never reach the reading line before the page ends.
+          const last = tocEntries[tocEntries.length - 1];
+          if (
+            window.scrollY > 0 &&
+            window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2 &&
+            last.heading.getBoundingClientRect().top < window.innerHeight
+          )
+            active = last;
+          if (active.link === currentLink) return;
+          currentLink = active.link;
+          for (const { link } of tocEntries) {
+            const selected = link === currentLink;
+            link.classList.toggle('current', selected);
+            if (selected) link.setAttribute('aria-current', 'location');
+            else link.removeAttribute('aria-current');
+          }
+        }
+        function scheduleReadingPosition() {
+          if (scheduled) return;
+          scheduled = true;
+          requestAnimationFrame(updateReadingPosition);
+        }
+        window.addEventListener('scroll', scheduleReadingPosition, { passive: true });
+        window.addEventListener('resize', scheduleReadingPosition);
+        window.addEventListener('hashchange', scheduleReadingPosition);
+        window.addEventListener('pageshow', scheduleReadingPosition);
+        const main = document.querySelector('main');
+        if (main && 'ResizeObserver' in window)
+          new ResizeObserver(scheduleReadingPosition).observe(main);
+        scheduleReadingPosition();
       }
     </script>
   </body>

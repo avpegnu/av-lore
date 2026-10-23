@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { feedCapacity, kvCapacity } from '../lib/handbook-models';
 import { useIslandReady } from '../lib/use-island-ready';
+import FeedTradeoff from './FeedTradeoff';
 
 export default function HandbookExperiment({ kind }: { kind: 'feed-fanout' | 'kv-budget' }) {
   const ref = useIslandReady();
@@ -31,6 +32,7 @@ export default function HandbookExperiment({ kind }: { kind: 'feed-fanout' | 'kv
       </dl>
       <p>Giảm push làm giảm số lần chèn timeline; số post và kích thước timeline giả định vẫn giữ nguyên. Chi phí merge khi đọc chưa được mô phỏng. Đây là tỷ lệ cạnh follower, không phải tỷ lệ tác giả.</p>
       <code>inserts/s = DAU × posts/day ÷ 86400 × followers × pushFraction</code>
+      <FeedTradeoff />
     </> : <>
       <h3>Tính ngân sách KV cache</h3>
       <p>Model giả định có 32 layers, 8 KV heads, head dimension 128, KV dùng 2 byte mỗi phần tử. Ngân sách 40 GB đã dành riêng cho KV; weights và workspace dùng ngân sách khác.</p>

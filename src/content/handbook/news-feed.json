@@ -1,7 +1,7 @@
 {
   "id": "news-feed",
   "group": "case",
-  "status": "review",
+  "status": "complete",
   "title": {
     "vi": "Thiết kế News Feed: từ một post đến hàng triệu timeline",
     "en": "Designing a News Feed: from one post to millions of timelines"
@@ -128,8 +128,8 @@
               "en": "One logical publish creates at most one post"
             },
             {
-              "vi": "Idempotency key gắn với user và fingerprint request; replay trả lại cùng post ID.",
-              "en": "Bind the idempotency key to the user and request fingerprint; replays return the same post ID."
+              "vi": "Idempotency key gắn với user và fingerprint request; replay hợp lệ trong retry window trả cùng post ID.",
+              "en": "Bind the idempotency key to the user and request fingerprint; valid replays within the retry window return the same post ID."
             }
           ],
           [
@@ -200,6 +200,10 @@
         {
           "vi": "Timeline giữ 500 candidate ID, mỗi entry giả định 16 byte payload gồm post ID và sort metadata nhỏ. 240 GB dưới đây chỉ là payload. Redis object overhead, allocator, index, replication, fragmentation, failover headroom và bản thân nội dung post đều nằm ngoài con số này; phải benchmark representation thực tế rồi mới sizing cluster.",
           "en": "Each timeline keeps 500 candidate IDs at an assumed 16 bytes of payload per entry, covering a post ID and small sort metadata. The 240 GB below is payload only. Redis object overhead, allocation, indexes, replication, fragmentation, failover headroom and post contents are excluded; benchmark the actual representation before sizing a cluster."
+        },
+        {
+          "vi": "Nếu tăng lên 300 triệu DAU nhưng giữ nguyên các assumption, các tổng này tăng 10 lần: khoảng 1.736 post writes/s, 34.722 feed reads/s, peak đọc giả định 104.167/s, full-push inserts 347.222/s và timeline payload 2,4 TB. Đây vẫn chỉ là tuyến tính theo input đã giữ cố định, không chứng minh cluster Redis đủ memory hay p99 giữ nguyên; follower skew, batching, hot shard và overhead cần đo lại.",
+          "en": "At 300 million DAU with unchanged assumptions, these totals grow tenfold: about 1,736 post writes/s, 34,722 feed reads/s, assumed peak reads of 104,167/s, 347,222 full-push inserts/s and 2.4 TB of timeline payload. This is linear scaling of fixed inputs, not proof of Redis memory sufficiency or unchanged p99; remeasure skew, batching, hot shards and overhead."
         }
       ],
       "table": {
@@ -224,7 +228,7 @@
               "en": "Average post writes"
             },
             {
-              "vi": "30M × 0.5 / 86,400",
+              "vi": "30M × 0,5 / 86.400",
               "en": "30M × 0.5 / 86,400"
             },
             {
@@ -238,11 +242,11 @@
               "en": "Average feed reads"
             },
             {
-              "vi": "30M × 10 / 86,400",
+              "vi": "30M × 10 / 86.400",
               "en": "30M × 10 / 86,400"
             },
             {
-              "vi": "≈ 3,472 / s",
+              "vi": "≈ 3.472 / s",
               "en": "≈ 3,472 / s"
             }
           ],
@@ -252,11 +256,11 @@
               "en": "Assumed peak feed reads"
             },
             {
-              "vi": "3,472 × 3",
-              "en": "3,472 × 3"
+              "vi": "(30M × 10 / 86.400) × 3",
+              "en": "(30M × 10 / 86,400) × 3"
             },
             {
-              "vi": "≈ 10,417 / s",
+              "vi": "≈ 10.417 / s",
               "en": "≈ 10,417 / s"
             }
           ],
@@ -266,11 +270,11 @@
               "en": "Timeline inserts with full push"
             },
             {
-              "vi": "174 × 200",
-              "en": "174 × 200"
+              "vi": "(30M × 0,5 × 200) / 86.400",
+              "en": "(30M × 0.5 × 200) / 86,400"
             },
             {
-              "vi": "≈ 34,722 / s",
+              "vi": "≈ 34.722 / s",
               "en": "≈ 34,722 / s"
             }
           ],
@@ -294,15 +298,19 @@
               "en": "One year of post payload"
             },
             {
-              "vi": "15M/day × 365 × 1 KB",
+              "vi": "15M/ngày × 365 × 1 KB",
               "en": "15M/day × 365 × 1 KB"
             },
             {
-              "vi": "≈ 5.475 TB trước replicas/media",
+              "vi": "≈ 5,475 TB trước replicas/media",
               "en": "≈ 5.475 TB before replicas/media"
             }
           ]
-        ]
+        ],
+        "caption": {
+          "vi": "Giữ độ chính xác trong phép tính rồi mới làm tròn kết quả. KB/TB ở bảng là đơn vị thập phân; các số liệu loại trừ media, engine overhead và headroom.",
+          "en": "Retain precision until the final displayed result. KB/TB use decimal units; media, engine overhead and headroom are excluded."
+        }
       },
       "experiment": "feed-fanout"
     },
@@ -534,6 +542,10 @@
         {
           "vi": "Tách đường ghi bền vững khỏi công việc mở rộng theo số follower. Publish không chờ ghi vào mọi timeline; nếu chờ, một shard chậm hoặc một tài khoản lớn sẽ kéo dài latency của toàn request. Tác giả có thể xem post vừa đăng từ author feed hoặc overlay đọc của chính mình trước khi fan-out hoàn tất.",
           "en": "Separate durable publishing from work that grows with follower count. Publishing does not wait for every timeline insertion: otherwise one slow shard or a large account extends the whole request. Authors can see their own new posts through the author feed or a read overlay before fan-out finishes."
+        },
+        {
+          "vi": "Trace publish chọn một thứ tự minh họa để chỉ rõ ACK của client không đợi fan-out. Trên thực tế relay có thể phát event trước hoặc sau khi HTTP response tới client, miễn chỉ phát từ outbox đã commit. Durable post/outbox commit là điều kiện bắt buộc; HTTP response delivery không phải trigger đáng tin cậy cho công việc cần phục hồi.",
+          "en": "The publication trace chooses one execution order to show that client acknowledgement does not wait for fan-out. A relay may emit before or after the HTTP response reaches the client, provided it reads committed outbox entries. Durable post/outbox commit is required; HTTP response delivery is not a reliable trigger for recoverable work."
         }
       ],
       "diagram": {
@@ -546,8 +558,8 @@
           "vi": "Chọn đường ghi, đọc, celebrity hoặc xóa; bấm từng component để xem owner và điểm cần xử lý lỗi. Mũi tên nét đứt là công việc bất đồng bộ.",
           "en": "Select publishing, reading, celebrity or deletion; select a component to inspect ownership and failure handling. Dashed arrows represent asynchronous work."
         },
-        "width": 1080,
-        "height": 570,
+        "width": 760,
+        "height": 640,
         "nodes": [
           {
             "id": "client",
@@ -556,7 +568,7 @@
               "en": "App"
             },
             "kind": "client",
-            "x": 110,
+            "x": 95,
             "y": 100,
             "detail": {
               "vi": "Giữ idempotency key cho một publish logic và cursor cho một feed session. Retry mạng không được tự tạo key mới.",
@@ -570,7 +582,7 @@
               "en": "API / Auth"
             },
             "kind": "edge",
-            "x": 360,
+            "x": 285,
             "y": 100,
             "detail": {
               "vi": "Xác thực actor, áp quota và validate request. Tách deadline đọc và ghi; timeout không chứng minh transaction đã rollback.",
@@ -584,7 +596,7 @@
               "en": "Post + Outbox"
             },
             "kind": "store",
-            "x": 650,
+            "x": 475,
             "y": 100,
             "detail": {
               "vi": "Nguồn sự thật của post, tombstone và event chưa phát. Commit atomic giải quyết khoảng trống giữa DB write và publish event.",
@@ -598,7 +610,7 @@
               "en": "Event log"
             },
             "kind": "queue",
-            "x": 950,
+            "x": 665,
             "y": 100,
             "detail": {
               "vi": "Lưu event cho replay và phân phối. Ordering chỉ trong partition theo key đã chọn; không có global ordering miễn phí.",
@@ -612,8 +624,8 @@
               "en": "Follow / Policy"
             },
             "kind": "store",
-            "x": 110,
-            "y": 290,
+            "x": 95,
+            "y": 310,
             "detail": {
               "vi": "Quản lý follows, blocks và audience. Reverse index giúp fan-out; đường đọc cần kiểm tra trạng thái có hiệu lực hiện tại.",
               "en": "Owns follows, blocks and audience rules. Reverse indexes support fan-out; reads must check currently effective state."
@@ -626,8 +638,8 @@
               "en": "Feed / Hydrate"
             },
             "kind": "service",
-            "x": 360,
-            "y": 290,
+            "x": 285,
+            "y": 310,
             "detail": {
               "vi": "Merge candidate, dedup, rank và hydrate bằng batch lookup. Loại post không được phép xem trước khi response.",
               "en": "Merges, deduplicates, ranks and hydrates candidates using batch lookups. Filters unauthorized posts before returning the response."
@@ -640,8 +652,8 @@
               "en": "Timeline cache"
             },
             "kind": "store",
-            "x": 650,
-            "y": 290,
+            "x": 475,
+            "y": 310,
             "detail": {
               "vi": "Giữ candidate IDs theo recipient. Cache có giới hạn, rebuild được; không được coi candidate tồn tại là quyền truy cập.",
               "en": "Stores bounded candidate IDs by recipient. It is rebuildable; candidate membership is not authorization."
@@ -654,8 +666,8 @@
               "en": "Fan-out workers"
             },
             "kind": "worker",
-            "x": 950,
-            "y": 290,
+            "x": 665,
+            "y": 310,
             "detail": {
               "vi": "Quét followers bằng cursor, checkpoint theo chunk và upsert recipient/post. Backpressure khi timeline shard chậm.",
               "en": "Scans followers with cursors, checkpoints chunks and upserts recipient/post. Applies backpressure when timeline shards slow down."
@@ -664,12 +676,12 @@
           {
             "id": "author",
             "label": {
-              "vi": "Author recent posts",
-              "en": "Author recent posts"
+              "vi": "Author posts",
+              "en": "Author posts"
             },
             "kind": "store",
-            "x": 650,
-            "y": 490,
+            "x": 475,
+            "y": 540,
             "detail": {
               "vi": "Nguồn pull của tác giả có fan-out lớn. Merge theo timestamp/postId hoặc score đã định nghĩa. Không fetch vô hạn mọi lịch sử.",
               "en": "Pull source for high-fan-out authors. Merge by timestamp/postId or a defined score. Do not fetch unbounded history."
@@ -696,8 +708,24 @@
                 "from": "api",
                 "to": "posts",
                 "description": {
-                  "vi": "Commit post và outbox cùng transaction, rồi trả ACK có postId.",
-                  "en": "Commit the post and outbox in one transaction, then acknowledge with postId."
+                  "vi": "Ghi post và outbox trong cùng transaction, chờ kết quả commit theo durability contract.",
+                  "en": "Write the post and outbox in one transaction and await the contractual durable commit."
+                }
+              },
+              {
+                "from": "posts",
+                "to": "api",
+                "description": {
+                  "vi": "Database xác nhận commit; API giữ cùng postId cho retry idempotent.",
+                  "en": "The database confirms commit; idempotent retries retain the same postId."
+                }
+              },
+              {
+                "from": "api",
+                "to": "client",
+                "description": {
+                  "vi": "Trả ACK publish với postId trước khi phải fan-out tới mọi follower.",
+                  "en": "Acknowledge publication with postId without waiting for all follower fan-out."
                 }
               },
               {
@@ -916,6 +944,14 @@
         {
           "vi": "Hybrid giữ push cho tác giả thường và pull cho tác giả lớn. Khi chuyển chế độ, dùng mode_version và khoảng chồng lấp để không bỏ bài: cho phép cả push và pull trong thời gian chuyển, dedup bằng postId, rồi ngừng nguồn cũ sau watermark an toàn. Nếu chuyển tức thời mà không quan tâm in-flight jobs, feed có thể thiếu hoặc lặp bài.",
           "en": "A hybrid pushes ordinary authors and pulls large ones. During a mode switch, use mode_version and an overlap window to avoid gaps: allow both push and pull temporarily, deduplicate by postId, then retire the old source after a safe watermark. Instant switching without accounting for in-flight jobs can create missing or duplicated entries."
+        },
+        {
+          "vi": "Thí nghiệm bổ sung xét một author và một reader giả định follow author đó. Push tạo candidate cho số follower eligible đã chọn, làm tròn về integer; pull không thêm timeline candidate của post này mà đọc author source lúc tải feed. Hybrid dùng điều kiện followers > threshold cho author đang xét; số author pull khác của reader là input độc lập. Nó không mô phỏng phân phối follower toàn hệ thống, privacy, ranking hay chuyển mode qua nhiều phiên.",
+          "en": "The added experiment examines one author and a hypothetical reader who follows them. Push inserts candidates for the chosen eligible follower count, rounded to an integer; pull adds no timeline candidate for this post and reads the author source on demand. Hybrid uses followers > threshold for the selected author; other pulled authors followed by the reader are a separate input. It does not simulate global follower distributions, privacy, ranking or cross-session mode migration."
+        },
+        {
+          "vi": "Ví dụ author có 20 triệu follower eligible: push thêm 20 triệu timeline inserts, tức 320 MB payload ID theo assumption 16 B/entry. Nếu riêng job được dùng trọn 1 triệu inserts/s và tải đều, thời gian drain lý tưởng là 20 giây, chưa có queue/retry/I/O; đây không phải freshness SLO dự báo. Với reader follow 300 author, pure pull xét 300 nguồn author; hybrid giữ một timeline và 8 author pull khác cộng author đang xét nếu ở pull mode. Các nguồn có thể được batch/cache nên không đổi số nguồn trực tiếp thành RPC hoặc millisecond.",
+          "en": "For twenty million eligible followers, push adds twenty million timeline inserts, or 320 MB of ID payload at sixteen bytes/entry. An uncontended job using a full one-million-insert/s budget would have an ideal twenty-second drain, excluding queues/retries/I/O; this is not a freshness SLO forecast. A reader following three hundred authors pulls three hundred author sources under pure pull. Hybrid reads one timeline, eight other pulled authors and the selected author when pulled. Batching/caching means source counts are not directly RPC counts or milliseconds."
         }
       ],
       "table": {
@@ -997,14 +1033,18 @@
         {
           "vi": "Một pipeline hợp lý là candidate retrieval → lọc các điều kiện rẻ → scoring → diversity/dedup → hydrate/kiểm tra quyền cuối → response. Nếu scoring cần text hoặc feature thì hydrate một phần trước đó. Luôn giữ kiểm tra quyền cuối vì trạng thái có thể đổi sau khi snapshot được tạo. Không chạy N+1 query theo từng post; batch post và user profile lookup, cache feature với version phù hợp.",
           "en": "A useful pipeline is candidate retrieval → cheap eligibility filters → scoring → diversity/deduplication → final hydration/authorization → response. Scoring that requires text or features may need partial hydration earlier. Retain the final authorization check because state can change after a snapshot is created. Avoid N+1 queries: batch post and user-profile lookups and version feature caches appropriately."
+        },
+        {
+          "vi": "Watermark của sort key không đóng băng tập candidate. Fan-out đến trễ hoặc backfill có thể chèn một bài cũ xuống dưới cursor đã đi qua, nên phiên cuộn hiện tại có thể không thấy bài đó. Muốn cam kết snapshot đầy đủ tại một mốc cần snapshot membership hoặc protocol watermark/delivery barrier tương ứng; tuple cursor một mình không cung cấp điều đó. Mọi snapshot vẫn phải lọc lại delete/quyền hiện tại theo contract, thay vì đóng băng authorization cùng danh sách.",
+          "en": "A sort-key watermark does not freeze candidate membership. Late fan-out/backfill can insert an older post below a cursor already traversed, so that scrolling session may miss it. Promising a complete point-in-time snapshot requires membership snapshots or a suitable delivery/watermark barrier; a tuple cursor alone is insufficient. Snapshots must still recheck current deletion/authorization rather than freeze permissions with the list."
         }
       ],
       "code": {
         "language": "sql",
-        "content": "SELECT post_id, sort_key\nFROM timeline\nWHERE recipient_id = :reader\n  AND (sort_key, post_id) < (:last_sort_key, :last_post_id)\n  AND sort_key <= :session_watermark\nORDER BY sort_key DESC, post_id DESC\nLIMIT :bounded_candidate_limit;",
+        "content": "SELECT post_id, sort_key\nFROM timeline\nWHERE recipient_id = :reader\n  AND (sort_key, post_id) < (:last_sort_key, :last_post_id)\n  AND (sort_key, post_id) <= (:upper_sort_key, :upper_post_id)\nORDER BY sort_key DESC, post_id DESC\nLIMIT :bounded_candidate_limit;",
         "caption": {
-          "vi": "Minh họa keyset cho chronological feed. Cú pháp tuple và index support phụ thuộc database; cursor phải được xác minh trước khi bind các tham số.",
-          "en": "Illustrative keyset pagination for a chronological feed. Tuple syntax and index support depend on the database; verify the cursor before binding parameters."
+          "vi": "Keyset minh họa cho trang sau của chronological feed, với upper tuple cố định từ trang đầu. Tuple/index support phụ thuộc database; verify cursor trước khi bind. Upper tuple giữ biên sắp xếp, không phải snapshot membership hoặc hàng rào quyền.",
+          "en": "Illustrative subsequent chronological page with an upper tuple fixed from the first page. Tuple/index support depends on the database; verify the cursor before binding. The upper tuple bounds ordering, not membership snapshots or authorization."
         }
       }
     },
@@ -1045,8 +1085,12 @@
           "en": "A timeline cache may retain invalid candidates; distinguish suggestion data from authorization data. During reads, post hydration checks tombstones and current audience, while policy checks blocks/follows through an authoritative source or a versioned/invalidation cache that meets the promised revocation window. If a private post’s authorization cannot be established, fail closed and return fewer items."
         },
         {
-          "vi": "Để cam kết delete có hiệu lực ngay sau ACK, cần post-state cache invalidation có thứ tự hoặc read barrier/version check chống cache cũ. Chỉ gửi best-effort invalidation rồi vẫn đọc replica trễ không đáp ứng cam kết đó. Một lựa chọn thực tế là đọc deletion deny-set nhất quán trên read path trong cửa sổ replica/cache có thể trễ, sau đó compact khi tombstone đã lan truyền an toàn. Chi phí availability và latency phải được tính vào quyết định.",
-          "en": "To promise deletion immediately after acknowledgement, use ordered post-state invalidation or a read barrier/version check that rejects stale cache entries. Best-effort invalidation followed by reading a lagging replica cannot meet that promise. One possible approach checks a consistent deletion deny-set during the replica/cache lag window, then compacts it after tombstones propagate safely. Include availability and latency costs in the decision."
+          "vi": "Nếu cam kết delete có hiệu lực với read bắt đầu sau ACK, cần một hàng rào đủ mới trên mọi đường đọc được bảo vệ: read barrier/version gate hoặc authoritative tombstone/deny-set phù hợp. Invalidation có thứ tự giúp chống cache-fill/event cũ nhưng vẫn chưa đủ nếu nó chưa tới reader trước ACK.",
+          "en": "To apply deletion to reads beginning after its acknowledgement, every protected read path needs sufficiently current authority, such as a read barrier/version gate or authoritative tombstone/deny-set. Ordered invalidation rejects stale fills/events but is insufficient if it has not reached readers before acknowledgement."
+        },
+        {
+          "vi": "Khi chọn chờ invalidation, phải định nghĩa các cache được ACK, fencing reader cũ và fail mode; không chỉ gửi event rồi tuyên bố revoke hoàn tất. Một lựa chọn là kiểm deny-set nhất quán ở mỗi protected read trong cửa sổ replica/cache có thể trễ, không reuse một cache kết quả “không bị xóa” đã cũ; compact sau khi tombstone lan truyền an toàn. Tính cả latency/availability và dữ liệu đã gửi cho client trước đó không thể bị thu hồi chỉ bằng xóa metadata.",
+          "en": "Waiting for invalidation requires defined cache acknowledgements, stale-reader fencing and failure behavior, not merely emitting an event. One option consistently checks a deny-set on every protected read during replica/cache lag, without reusing stale cached “not deleted” results, then compacts after safe tombstone propagation. Account for latency/availability; metadata deletion cannot recall data already sent to clients."
         },
         {
           "vi": "Unfollow không nhất thiết xóa post public khỏi mọi màn hình, nhưng home feed cần semantics rõ: loại author khỏi candidate sau unfollow, còn profile public có thể vẫn đọc được. Với tài khoản private, thay đổi follow/approval còn thay đổi quyền nội dung. Cleanup timeline và CDN object là các tác vụ riêng; signed URL dài hạn có thể tiếp tục truy cập media dù API đã ngừng trả post.",
