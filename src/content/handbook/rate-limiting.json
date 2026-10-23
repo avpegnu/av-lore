@@ -1,7 +1,7 @@
 {
   "id": "rate-limiting",
   "group": "building",
-  "status": "review",
+  "status": "complete",
   "title": {
     "vi": "Rate Limiting: contract, thuật toán và failure",
     "en": "Rate Limiting: Contracts, Algorithms and Failure"
@@ -164,6 +164,10 @@
         {
           "vi": "Leaky bucket có nhiều biến thể. Bài này dùng bounded queue với output đều, có thể gây chờ; một meter không queue có semantics khác. Sliding log đếm timestamp của các request được nhận trong rolling window; những request đó vẫn có thể đến cùng một instant nếu budget còn, nên “exact rolling limit” không đồng nghĩa “không có burst”.",
           "en": "Leaky buckets have several variants. Here a bounded queue smooths output and adds delay; a queue-free meter differs. A sliding log counts admitted timestamps in a rolling window. Those admissions can still arrive together, so an exact rolling limit does not mean burst-free traffic."
+        },
+        {
+          "vi": "Trong lab, Arrival giữ thời điểm request tới; Release là thời điểm đơn vị công việc rời mô hình phục vụ. Các limiter không queue cho Release trùng Arrival; leaky queue thêm thời gian phục vụ 1/r cho mỗi unit, và capacity gồm cả unit đang phục vụ. Đây là mô hình service time xác định, không hứa latency của server thật. Mọi lane dùng chung thang thời gian, kể cả khi queue kéo dài hơn traffic đầu vào.",
+          "en": "In the lab, Arrival is request arrival and Release is departure from the service model. Non-queueing limiters release immediately; the leaky queue adds 1/r service time per unit and includes in-service work in capacity. This deterministic service model is not a real-server latency guarantee. Every lane uses one time scale, including queue drainage after arrivals end."
         }
       ],
       "experiment": "rate-race",
@@ -292,10 +296,10 @@
           "en": "Layered admission"
         },
         "caption": {
-          "vi": "Allowed path đi hết; quota reject quay lại qua gateway và edge. Không coi counter ACK là bằng chứng backend còn capacity.",
-          "en": "The allowed path reaches the resource; quota rejection returns through gateway and edge. Counter approval does not prove backend capacity."
+          "vi": "Hai request trace giữ decision trước side effect. Trace policy riêng minh họa config refresh ngoài critical path; counter decision phải áp đúng version/usage semantics, còn backend vẫn cần resource admission.",
+          "en": "Both request traces place decisions before side effects. A separate policy trace illustrates off-path refresh; counters must honor policy-version/usage semantics and backends retain resource admission."
         },
-        "width": 1000,
+        "width": 760,
         "height": 460,
         "nodes": [
           {
@@ -305,7 +309,7 @@
               "en": "Client"
             },
             "kind": "client",
-            "x": 110,
+            "x": 95,
             "y": 200,
             "detail": {
               "vi": "Caller có thể retry và đổi network identity.",
@@ -319,7 +323,7 @@
               "en": "Edge / WAF"
             },
             "kind": "edge",
-            "x": 355,
+            "x": 285,
             "y": 200,
             "detail": {
               "vi": "Coarse admission trước origin, không phải toàn bộ abuse defense.",
@@ -333,7 +337,7 @@
               "en": "API gateway"
             },
             "kind": "service",
-            "x": 610,
+            "x": 475,
             "y": 200,
             "detail": {
               "vi": "Áp identity/tenant rule và budget trước công việc đắt.",
@@ -347,7 +351,7 @@
               "en": "Counter shard"
             },
             "kind": "store",
-            "x": 610,
+            "x": 475,
             "y": 65,
             "detail": {
               "vi": "Decision atomic cho state/rule trong shard; có deadline.",
@@ -361,7 +365,7 @@
               "en": "Service"
             },
             "kind": "service",
-            "x": 865,
+            "x": 665,
             "y": 200,
             "detail": {
               "vi": "Concurrency cap, deadline và load shedding.",
@@ -375,11 +379,25 @@
               "en": "Database"
             },
             "kind": "store",
-            "x": 865,
+            "x": 665,
             "y": 365,
             "detail": {
               "vi": "Resource cuối cần được bảo vệ ngay cả khi limiter suy giảm.",
               "en": "The final resource needs protection during limiter degradation."
+            }
+          },
+          {
+            "id": "rules",
+            "label": {
+              "vi": "Policy config",
+              "en": "Policy config"
+            },
+            "kind": "store",
+            "x": 285,
+            "y": 65,
+            "detail": {
+              "vi": "Policy có version, owner và rollout. Gateway giữ snapshot hợp lệ; failure khi refresh theo contract, không gọi config store bắt buộc cho mọi request.",
+              "en": "Versioned policies have owners and rollout. Gateways retain valid snapshots and handle refresh failures under contract instead of fetching configuration on every request."
             }
           }
         ],
@@ -529,6 +547,33 @@
                 }
               }
             ]
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Refresh policy ngoài request",
+              "en": "Refresh policy off the request path"
+            },
+            "steps": [
+              {
+                "from": "gateway",
+                "to": "rules",
+                "description": {
+                  "vi": "Gateway poll/subscribe policy có version theo cơ chế quản trị; đây là control path riêng.",
+                  "en": "A gateway polls/subscribes to versioned policies through a separate control path."
+                },
+                "async": true
+              },
+              {
+                "from": "rules",
+                "to": "gateway",
+                "description": {
+                  "vi": "Validate và cài snapshot policy; rollout xác định limit mới giữ usage hay reset budget. Không reset ngầm khi reload.",
+                  "en": "Validate and install the policy snapshot; rollout defines retained usage versus budget resets. Reloading must not silently reset allowance."
+                },
+                "async": true
+              }
+            ]
           }
         ]
       }
@@ -653,6 +698,24 @@
               "en": "Set timeouts and recovery paths rather than hanging requests."
             }
           ]
+        },
+        {
+          "title": {
+            "vi": "Local fallback có budget",
+            "en": "Budgeted local fallback"
+          },
+          "icon": "gauge",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Allowance phải được cấp phát, hạch toán và fence theo failure contract.",
+              "en": "Allocate, account for and fence allowance under the failure contract."
+            },
+            {
+              "vi": "Node hot có thể hết phần được cấp dù tổng hệ thống còn quota.",
+              "en": "A hot node can exhaust its allocation while global quota remains."
+            }
+          ]
         }
       ]
     },
@@ -671,7 +734,63 @@
           "vi": "Weighted cost phân biệt search đắt với GET nhỏ, nhưng estimate cần kiểm chứng và có maximum. Concurrency limiter giới hạn in-flight work nên bổ sung rate limit khi service time thay đổi. Fair queue, tenant isolation và adaptive admission có thể giảm noisy neighbor; controller cần stability và observability, không tăng giảm theo mọi spike ngắn.",
           "en": "Weighted costs distinguish expensive searches from small GETs, but estimates need validation and caps. Concurrency limits complement rates when service time changes. Fair queues, tenant isolation and adaptive admission reduce noisy neighbors; controllers need stability and observability rather than reacting to every brief spike."
         }
-      ]
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một request đi qua nhiều rule",
+          "en": "One request passes several rules"
+        },
+        "caption": {
+          "vi": "Đây là thứ tự đánh giá minh họa, không phải một transaction cross-shard. Nếu bước sau reject, consumption/refund của bước trước phải theo contract; quota tính tiền còn cần durable metering riêng.",
+          "en": "This is an evaluation sequence, not a cross-shard transaction. Later rejection requires explicit earlier-consumption/refund semantics; paid quotas also need durable metering."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Burst",
+              "en": "Burst"
+            },
+            "detail": {
+              "vi": "Cho spike ngắn trong capacity đã định.",
+              "en": "Allow short spikes within defined capacity."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Sustained rate",
+              "en": "Sustained rate"
+            },
+            "detail": {
+              "vi": "Giữ rate theo window/refill rõ ràng.",
+              "en": "Enforce explicit windows/refill rates."
+            },
+            "icon": "chart"
+          },
+          {
+            "title": {
+              "vi": "Quota theo kỳ",
+              "en": "Period quota"
+            },
+            "detail": {
+              "vi": "Hạch toán cost và reset theo contract.",
+              "en": "Account for costs and contractual resets."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Resource admission",
+              "en": "Resource admission"
+            },
+            "detail": {
+              "vi": "Giữ concurrency/deadline gần resource.",
+              "en": "Protect concurrency/deadlines near resources."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
     },
     {
       "id": "multiregion",
@@ -687,8 +806,86 @@
         {
           "vi": "Exact global budget cần coordination hoặc phân bổ authority an toàn giữa region, gây latency/availability trade-off. Regional budgets có thể cho caller nhận tổng allowance bằng tổng các vùng nếu chúng không được trừ từ cùng pool. Nêu overshoot bound từ credits đang lưu hành, không chỉ nói “eventually sync nên sai một chút”.",
           "en": "Exact global budgets require coordination or safely partitioned authority across regions, creating latency/availability trade-offs. Uncoordinated regional budgets may grant the sum of all allowances. Derive overshoot bounds from outstanding credits instead of saying eventual sync is only slightly inaccurate."
+        },
+        {
+          "vi": "Ví dụ một quota fixed-period 1.000 unit, authority đã ghi nhận spend 920, ba gateway còn giữ credit chưa dùng 20, 10 và 15: allowance chưa tiêu đang lưu hành là 45, pool chưa cấp chỉ còn 35. Nếu authority chỉ nhìn 920 rồi cấp lại 80 trong khi credit cũ vẫn được dùng, tổng có thể lên 1.045: overshoot 45. Đây là bound của đúng ví dụ này với số lần cấp thêm hữu hạn, không phải bound cho mọi hệ thống local-sync.",
+          "en": "For a 1,000-unit fixed-period quota, suppose the authority records 920 spent and three gateways retain 20, 10 and 15 unspent credits. Outstanding allowance is 45, leaving only 35 unallocated. If the authority looks only at 920 and grants another 80 while old credits remain spendable, total spending can reach 1,045: an overshoot of 45. This bound applies to this finite-grant example, not every local-sync design."
         }
-      ]
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Hạch toán ví dụ",
+            "en": "Example accounting"
+          },
+          {
+            "vi": "Unit",
+            "en": "Units"
+          },
+          {
+            "vi": "Điều kiện hạch toán",
+            "en": "Condition"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Quota / đã spend",
+              "en": "Quota / already spent"
+            },
+            {
+              "vi": "1.000 / 920",
+              "en": "1,000 / 920"
+            },
+            {
+              "vi": "Cùng một fixed period, cost unit và policy.",
+              "en": "One fixed period, cost unit and policy."
+            }
+          ],
+          [
+            {
+              "vi": "Credit chưa dùng đã cấp",
+              "en": "Outstanding unspent credits"
+            },
+            {
+              "vi": "20 + 10 + 15 = 45",
+              "en": "20 + 10 + 15 = 45"
+            },
+            {
+              "vi": "Vẫn có thể được dùng; chưa được cấp lại.",
+              "en": "Still spendable and cannot be reissued."
+            }
+          ],
+          [
+            {
+              "vi": "Có thể cấp mới an toàn",
+              "en": "Safe additional allocation"
+            },
+            {
+              "vi": "1.000 − 920 − 45 = 35",
+              "en": "1,000 − 920 − 45 = 35"
+            },
+            {
+              "vi": "Authority nguyên tử hạch toán grant và spend, không grant trùng.",
+              "en": "Authority atomically accounts for grants/spending without duplicate grants."
+            }
+          ],
+          [
+            {
+              "vi": "Reclaim credit cũ",
+              "en": "Reclaiming old credits"
+            },
+            {
+              "vi": "Không chỉ dựa trên mất kết nối",
+              "en": "Not just on disconnection"
+            },
+            {
+              "vi": "Cần protocol chứng minh grant cũ không còn authority: fencing/expiry được thực thi tại điểm spend hoặc revoke/ack phù hợp.",
+              "en": "Prove old grants are no longer authoritative through fencing/enforced expiry at spending or an appropriate revoke/ack protocol."
+            }
+          ]
+        ]
+      }
     },
     {
       "id": "operations",
@@ -724,6 +921,18 @@
             {
               "vi": "Hỏi fixed, rolling hay burst/refill; subject, cost và fail policy. Sau đó chọn state chung atomic hoặc credit allocation có bound, identity đã xác minh, 429/retry guidance và resource concurrency cap. Không chia 100/50 rồi coi đó là exact global rule dưới mọi phân bố traffic.",
               "en": "Clarify fixed/rolling/burst-refill semantics, subject, cost and failure policy. Then choose atomic shared state or bounded credit allocation, verified identity, retry guidance and resource concurrency protection. Dividing 100 by 50 is not an exact global rule under arbitrary traffic distribution."
+            },
+            {
+              "vi": "Giả sử đã thống nhất token bucket refill 100 unit/phút, burst capacity 20 và mỗi request cost 1: một caller idle chỉ tích tối đa 20, không phải 100 ngay lập tức. Tốc độ refill là 5/3 unit/s; từ bucket rỗng, cost 1 cần ít nhất 0,6 giây trước khi cạnh tranh với request khác. Nếu API chỉ dùng Retry-After delay-seconds nguyên, làm tròn lên thành 1 giây; đó không phải chỗ đặt trước. Nếu yêu cầu thực là tối đa 100 ở bất kỳ 60 giây thì chọn rolling-log/semantics tương ứng thay vì đổi tên token bucket.",
+              "en": "Assume a bucket refilling 100 units/minute, capacity 20 and unit-cost requests. Idle callers accumulate at most twenty, not one hundred immediately. Refill is 5/3 units/s; an empty bucket needs at least 0.6 seconds for one unit before contention. An integer Retry-After delay rounds up to one second and does not reserve admission. A strict 100-in-any-sixty-seconds contract instead needs a rolling log or equivalent semantics."
+            },
+            {
+              "vi": "Route key đã xác minh tới state authority phù hợp và atomic check/refill/spend trên boundary hỗ trợ; policy cache có version, counter state không bị reset khi config reload. Với 50 gateway, quota tĩnh 2/phút mỗi node làm một caller hot chỉ nhận được 2 khi luôn tới một node, dù 49 node còn rảnh. Khi counter store mất, chọn fail mode theo từng mục đích; local credit chỉ được dùng trong allowance còn authority, không nhận lại full budget sau restart.",
+              "en": "Route verified keys to an appropriate state authority with supported atomic check/refill/spend. Version policy caches and avoid resetting counter state on reload. Across fifty gateways, a static two-per-minute allocation can leave a caller on one gateway limited to two despite forty-nine idle nodes. Select failure modes by purpose; local credits must remain authoritative and restarts must not recreate full allowance."
+            },
+            {
+              "vi": "Kiểm tra boundary burst, replay của limiter call khi response mất, failover counter, cost lớn hơn bucket capacity, policy change giữa window và cardinality attack. Limit call bị retry không mặc định được refund hoặc idempotent; chọn metering attempts hay logical operations rồi thiết kế decision ID/receipt nếu cần. Đo p99 decision, throttle theo policy class, store failure và downstream concurrency; chỉ đưa ID tenant vào log/trace có kiểm soát thay vì metric label vô hạn.",
+              "en": "Test boundary bursts, limiter-call retries after lost responses, counter failover, costs exceeding capacity, mid-window policy changes and cardinality attacks. Retried limit calls are not automatically refunded or idempotent; choose attempt versus logical-operation metering and decision receipts where needed. Measure decision p99, throttles by bounded policy class, store failures and downstream concurrency; use controlled logs/traces rather than unbounded tenant metric labels."
             }
           ]
         },

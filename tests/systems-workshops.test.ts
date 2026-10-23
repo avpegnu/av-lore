@@ -17,6 +17,23 @@ test('rolling log bounds every admitted window while fixed windows admit a bound
  const leaky=rateReplay('leaky',rateStreams.boundary,6,6).events.filter(e=>e.accepted);for(let i=1;i<leaky.length;i++)assert.ok(leaky[i].releaseAt-leaky[i-1].releaseAt>=1000/6-1e-7);
  assert.equal(counterRace(8,false).allowed,8);assert.equal(counterRace(8,true).allowed,1);
 });
+test('limiter time scaling preserves decisions, queue spacing and rolling-window boundaries',()=>{
+ const times=[0,0,1,999,1000,1000,1001,2100,9000];
+ for(const algorithm of ['token','leaky','fixed','log','counter'] as const){
+  const original=rateReplay(algorithm,times,3,4,1000);
+  for(const scale of [1.5,3,5]){
+   const scaled=rateReplay(algorithm,times.map(t=>t*scale),3,4,1000*scale);
+   assert.deepEqual(scaled.events.map(e=>e.accepted),original.events.map(e=>e.accepted));
+   assert.equal(scaled.peakWindow,original.peakWindow);
+   scaled.events.forEach((event,i)=>assert.ok(Math.abs(event.releaseAt-original.events[i].releaseAt*scale)<1e-7));
+  }
+ }
+ assert.equal(rateReplay('log',[0,999,1000],1,1,1000).allowed,2);
+ const queue=rateReplay('leaky',[0,0,0],2,2,4000);
+ assert.deepEqual(queue.events.map(e=>e.accepted),[true,true,false]);
+ assert.deepEqual(queue.events.filter(e=>e.accepted).map(e=>e.releaseAt),[2000,4000]);
+ for(const window of [0,-1,Infinity,NaN])assert.throws(()=>rateReplay('token',times,3,3,window),RangeError);
+});
 test('63-bit IDs round trip without Number coercion and leaf replays conserve sorted unique keys',()=>{
  const l=snowflakeLayout(10,12);assert.equal(l.timeBits,41);assert.equal(l.perMillisecond,4096);assert.equal(l.workers,1024);
  for(const [w,s] of [[4,4],[10,12],[14,18]]){const id=packId(100000000n,7n,3n,w,s);assert.deepEqual(unpackId(id,w,s),{time:100000000n,worker:7n,sequence:3n});assert.ok(id<1n<<63n);}
