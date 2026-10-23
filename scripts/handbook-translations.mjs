@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-const directory = path.resolve(import.meta.dirname, '../src/content/handbook');
+const directories = ['handbook','glossary'].map(name=>path.resolve(import.meta.dirname, '../src/content/'+name));
 export function handbookTranslations({runtime=false}={}) {
   const dictionary = {};
   function add(key,value){
@@ -21,7 +21,7 @@ export function handbookTranslations({runtime=false}={}) {
     }
     for (const child of Object.values(value)) visit(child);
   }
-  if (fs.existsSync(directory))
+  for (const directory of directories) if (fs.existsSync(directory))
     for (const file of fs.readdirSync(directory).filter((f) => f.endsWith('.json')))
       visit(JSON.parse(fs.readFileSync(path.join(directory, file), 'utf8')));
   return dictionary;

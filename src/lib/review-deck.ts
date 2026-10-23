@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { topics } from './content';
+import { glossaryEntries } from './glossary';
 import { handbookLessons, handbookPath } from './handbook';
 import type { HandbookLesson } from './handbook';
 export type ReviewCard = {
@@ -66,6 +67,24 @@ export function buildReviewDeck(): ReviewCard[] {
         flow: lesson.overview,
       });
   }
+  for (const entry of glossaryEntries)
+    cards.push({
+      id: `term:${entry.id}`,
+      revision: hash([entry.definition, entry.example, entry.pitfall]),
+      source: 'term',
+      title: 'Thuật ngữ',
+      question: entry.term,
+      answer: [entry.definition.vi, entry.example.vi, entry.pitfall.vi],
+      subjects: [
+        ...new Set([
+          ...entry.relatedTopics,
+          ...entry.relatedLessons.flatMap(
+            (id) => handbookLessons.find((l) => l.id === id)?.relatedTopics || [],
+          ),
+        ]),
+      ],
+      href: '/system-design/glossary/#term-' + entry.id,
+    });
   const unique = new Map<string, ReviewCard>();
   for (const c of cards) {
     if (unique.has(c.id)) throw Error('Duplicate recall identity ' + c.id);
