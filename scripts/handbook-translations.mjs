@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-const directories = ['handbook','glossary'].map(name=>path.resolve(import.meta.dirname, '../src/content/'+name));
+const directories = ['handbook','glossary','quiz'].map(name=>path.resolve(import.meta.dirname, '../src/content/'+name));
 export function handbookTranslations({runtime=false}={}) {
   const dictionary = {};
   function add(key,value){
