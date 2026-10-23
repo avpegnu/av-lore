@@ -8,6 +8,8 @@ Thương hiệu hiển thị của repo này luôn là AV Lore, gồm giao diệ
 
 Các khối minh họa của lộ trình học dùng `src/styles/course-visuals.css`, giới hạn bởi `.legacy-prose[data-course-track]`. Khi sửa nội dung, giữ các class và số đo bố cục của bảng, biểu đồ, sơ đồ; kiểm tra cả Việt/English và mobile. Chạy `node scripts/course-visuals-check.mjs` trên bản preview để phát hiện mất bố cục hoặc tràn ngang.
 
+Khi tiếp tục đợt hoàn thiện handbook, đọc phần cuối [docs/HANDBOOK_PROGRESS.md](docs/HANDBOOK_PROGRESS.md) để biết checkpoint, bài đã review và việc còn lại; không chạy lại các authoring helper cũ để dựng lại nội dung.
+
 Nội dung chuyên sâu ở `src/content/handbook/*.json` là bản chuẩn, gồm cặp `vi/en` được biên tập cho cả prose, sơ đồ, stages và câu hỏi. Không dùng lại các script author tạm ngoài repo để ghi đè bài đã chỉnh. `src/lib/handbook-catalog.json` ghi phạm vi 73 bài/công cụ; `npm run content:audit` báo phần còn thiếu và chờ review. Chỉ dùng trạng thái `complete` sau khi đã kiểm tra độ phủ, kiến thức, công thức, bản Anh và tương tác; không lấy số section hoặc build thành công làm bằng chứng nội dung đầy đủ. `npm run content:audit -- --require-complete` chỉ qua khi toàn bộ phạm vi đã hoàn tất.
 
 Sơ đồ/worksheet dùng mô hình minh họa có giả định rõ, không trình bày ceiling lý thuyết thành benchmark. Chạy `node scripts/handbook-browser-check.mjs` với `PREVIEW_URL` khi cần kiểm tra trace, keyboard, responsive và dịch động. Đồng bộ prose tương ứng sang HTML của IT Basic bằng công cụ `tools/sync-handbook.py` ở repo đó; không chép React hoặc tạo lab giả cho bản HTML.
