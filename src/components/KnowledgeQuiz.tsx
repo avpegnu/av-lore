@@ -6,7 +6,7 @@ import {
   pausePractice,
   resumePractice,
   type PracticeClock,
-} from '../lib/mock-interview-models';
+} from '../lib/practice-clock';
 import {
   buildQuizSession,
   resolveQuizItem,

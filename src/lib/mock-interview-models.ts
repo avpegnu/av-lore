@@ -113,30 +113,8 @@ export const emptyMock = (): MockStore => ({ version: 1, current: null, history:
 export function validateMock(raw: unknown): MockStore {
   return mockStoreSchema.parse(raw);
 }
-export type PracticeClock = { elapsedMs: number; anchor: number | null };
-export function practiceElapsed(clock: PracticeClock, now: number, budgetMs: number) {
-  if (
-    !Number.isFinite(now) ||
-    !Number.isFinite(budgetMs) ||
-    budgetMs <= 0 ||
-    !Number.isFinite(clock.elapsedMs) ||
-    clock.elapsedMs < 0 ||
-    (clock.anchor !== null && !Number.isFinite(clock.anchor))
-  )
-    throw Error('INVALID_CLOCK');
-  return Math.min(
-    budgetMs,
-    clock.elapsedMs + (clock.anchor === null ? 0 : Math.max(0, now - clock.anchor)),
-  );
-}
-export function pausePractice(clock: PracticeClock, now: number, budgetMs: number): PracticeClock {
-  return { elapsedMs: practiceElapsed(clock, now, budgetMs), anchor: null };
-}
-export function resumePractice(clock: PracticeClock, now: number, budgetMs: number): PracticeClock {
-  const elapsedMs = practiceElapsed(clock, now, budgetMs);
-  if (elapsedMs >= budgetMs) return { elapsedMs: budgetMs, anchor: null };
-  return clock.anchor === null ? { elapsedMs, anchor: now } : clock;
-}
+export { practiceElapsed, pausePractice, resumePractice } from './practice-clock';
+export type { PracticeClock } from './practice-clock';
 export function mockPhaseBounds(minutes: 30 | 45 | 60) {
   let cursor = 0;
   return [5, 4, 6, 10, 15, 5].map((weight, i) => {
