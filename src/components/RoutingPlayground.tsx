@@ -20,7 +20,7 @@ export default function RoutingPlayground({kind}:{kind:'balancer'|'hash-ring'}){
     {kind==='balancer'?<>
       <h3 id={uid}>Phân phối request có chi phí khác nhau</h3>
       <p>30 request đến cách nhau 40 ms; mỗi node có một worker tuần tự, job dài xuất hiện theo lịch cố định. Least outstanding đếm cả job đang chạy và đang đợi. Mô hình không đo connection pooling hoặc latency mạng.</p>
-      <div className="worksheet-choices">{([['round-robin','Round robin'],['least-outstanding','Least outstanding'],['two-choices','Power of two choices']] as const).map(([id,label])=><button type="button" className="secondary" aria-pressed={algorithm===id} key={id} onClick={()=>setAlgorithm(id)}>{label}</button>)}</div>
+      <div className="worksheet-choices">{([['round-robin','Round robin'],['random','Ngẫu nhiên có seed'],['least-outstanding','Least outstanding'],['two-choices','Power of two choices']] as const).map(([id,label])=><button type="button" className="secondary" aria-pressed={algorithm===id} key={id} onClick={()=>setAlgorithm(id)}>{label}</button>)}</div>
       <label className="routing-toggle"><input type="checkbox" checked={slow} onChange={e=>setSlow(e.target.checked)}/>Node B xử lý chậm gấp đôi</label>
       <div className="routing-chart" role="region" tabIndex={0} aria-label="Timeline xử lý request của ba node">
         <svg viewBox="0 0 800 240" role="img" aria-label="Các thanh biểu diễn thời gian bắt đầu và kết thúc từng job">
@@ -31,6 +31,7 @@ export default function RoutingPlayground({kind}:{kind:'balancer'|'hash-ring'}){
       </div>
       <dl className="worksheet-results" aria-live="polite"><div><dt>Mean response / ms</dt><dd>{schedule.mean.toFixed(0)}</dd></div><div><dt>p95 response / ms</dt><dd>{schedule.p95}</dd></div></dl>
       <p>Số request bằng nhau chưa chắc lượng công việc bằng nhau. Thuật toán dựa số outstanding cũng không biết trước duration của job mới; kết quả tốt hơn ở một lịch tải không chứng minh luôn tốt hơn mọi workload.</p>
+      <p>Lựa chọn ngẫu nhiên dùng seed cố định để phát lại cùng kết quả; đây là một sample minh họa, không phải phân phối của mọi lần chạy.</p>
     </>:<>
       <h3 id={uid}>Consistent hashing và key movement</h3>
       <p>400 key giả định được hash vào vòng 32-bit. Mỗi node có nhiều virtual token; key đi theo chiều kim đồng hồ tới token đầu tiên. So với baseline ba node có cùng số virtual token.</p>

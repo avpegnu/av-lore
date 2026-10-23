@@ -36,7 +36,7 @@
     {
       "id": "purpose",
       "title": {
-        "vi": "1. Cache để loại loại công việc nào?",
+        "vi": "1. Cache giúp loại bỏ công việc nào?",
         "en": "1. Which work does the cache remove?"
       },
       "paragraphs": [
@@ -252,6 +252,379 @@
             }
           ]
         ]
+      },
+      "diagram": {
+        "id": "cache-pattern-contracts",
+        "title": {
+          "vi": "Năm policy cache và thời điểm ACK",
+          "en": "Five cache policies and acknowledgement points"
+        },
+        "caption": {
+          "vi": "Đây là các đường policy riêng trên cùng hình logic. Write-through không tự atomic hai store; write-behind chỉ bền ở mốc ACK nếu buffer và protocol thực sự đáp ứng contract. Nhánh race chi tiết ở phần sau.",
+          "en": "These are separate policy paths on one logical map. Write-through does not make two stores atomic; write-behind is durable at acknowledgement only if its buffer and protocol satisfy the contract. The later section traces the stale-fill race."
+        },
+        "width": 760,
+        "height": 480,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client",
+              "en": "Client"
+            },
+            "kind": "client",
+            "x": 95,
+            "y": 240,
+            "detail": {
+              "vi": "Retry cùng intent khi có side effect; response phải mô tả đúng trạng thái đã durable.",
+              "en": "Retry side effects with the same intent; responses must describe the actually durable state."
+            }
+          },
+          {
+            "id": "app",
+            "label": {
+              "vi": "Application",
+              "en": "Application"
+            },
+            "kind": "service",
+            "x": 285,
+            "y": 240,
+            "detail": {
+              "vi": "Authorize, chọn scoped key, giữ deadline và thực thi policy đã chọn.",
+              "en": "Authorizes, chooses scoped keys, retains deadlines and implements the selected policy."
+            }
+          },
+          {
+            "id": "cache",
+            "label": {
+              "vi": "Cache layer",
+              "en": "Cache layer"
+            },
+            "kind": "store",
+            "x": 475,
+            "y": 240,
+            "detail": {
+              "vi": "Có thể là storage cache hoặc abstraction điều phối loader/writer; không mặc định atomic với source.",
+              "en": "May be cache storage or a loading/writing abstraction; not automatically atomic with the source."
+            }
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Backing source",
+              "en": "Backing source"
+            },
+            "kind": "store",
+            "x": 665,
+            "y": 360,
+            "detail": {
+              "vi": "Nguồn dữ liệu và invariant theo policy; write-behind có thể chưa cập nhật tại lúc ACK.",
+              "en": "Owns source data and invariants; write-behind may not have updated it at acknowledgement."
+            }
+          },
+          {
+            "id": "buffer",
+            "label": {
+              "vi": "Durable buffer",
+              "en": "Durable buffer"
+            },
+            "kind": "queue",
+            "x": 665,
+            "y": 100,
+            "detail": {
+              "vi": "Trong ví dụ write-behind này, intent phải bền vững trước ACK; cần replay, dedup và ordering.",
+              "en": "This write-behind example requires durable intent before acknowledgement, with replay, deduplication and ordering."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "aside",
+            "label": {
+              "vi": "Cache-aside: app xử lý miss",
+              "en": "Cache-aside: app loads a miss"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "app",
+                "description": {
+                  "vi": "Nhận yêu cầu đọc đã kiểm tra quyền và có freshness contract.",
+                  "en": "An authorized read declares its freshness contract."
+                }
+              },
+              {
+                "from": "app",
+                "to": "cache",
+                "description": {
+                  "vi": "Tra scoped key; luồng này giả định cache miss.",
+                  "en": "Look up a scoped key; this path assumes a miss."
+                }
+              },
+              {
+                "from": "app",
+                "to": "db",
+                "description": {
+                  "vi": "App đọc source trong giới hạn concurrency và deadline.",
+                  "en": "The app loads the source within concurrency/deadline budgets."
+                }
+              },
+              {
+                "from": "db",
+                "to": "app",
+                "description": {
+                  "vi": "Nhận value và version từ source phù hợp.",
+                  "en": "Return a value/version from the appropriate source."
+                }
+              },
+              {
+                "from": "app",
+                "to": "cache",
+                "description": {
+                  "vi": "Nạp cache có TTL và hàng rào chống stale publication khi cần.",
+                  "en": "Fill with TTL and required stale-publication barriers."
+                }
+              },
+              {
+                "from": "app",
+                "to": "client",
+                "description": {
+                  "vi": "Trả kết quả theo read policy; không hứa mọi bản cache luôn mới nhất.",
+                  "en": "Return under the read policy without promising universal cache freshness."
+                }
+              }
+            ]
+          },
+          {
+            "id": "through-read",
+            "label": {
+              "vi": "Read-through: lớp cache tự nạp",
+              "en": "Read-through: abstraction loads"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "app",
+                "description": {
+                  "vi": "App nhận yêu cầu đọc và kiểm tra quyền.",
+                  "en": "The read enters the application and is authorized."
+                }
+              },
+              {
+                "from": "app",
+                "to": "cache",
+                "description": {
+                  "vi": "App gọi lớp read-through thay vì tự viết miss loader.",
+                  "en": "The app calls a read-through abstraction."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "db",
+                "description": {
+                  "vi": "Lớp cache tự nạp dữ liệu khi miss, giữ deadline và ngữ cảnh quyền.",
+                  "en": "The abstraction loads misses with deadline/permission context."
+                }
+              },
+              {
+                "from": "db",
+                "to": "cache",
+                "description": {
+                  "vi": "Nhận value/version rồi áp fill policy.",
+                  "en": "Receive value/version and apply fill policy."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "app",
+                "description": {
+                  "vi": "Trả dữ liệu cho caller.",
+                  "en": "Return data to the caller."
+                }
+              },
+              {
+                "from": "app",
+                "to": "client",
+                "description": {
+                  "vi": "Trả response đã được kiểm tra theo contract.",
+                  "en": "Return the contractually validated response."
+                }
+              }
+            ]
+          },
+          {
+            "id": "through-write",
+            "label": {
+              "vi": "Write-through: ghi source trước ACK",
+              "en": "Write-through: source before ACK"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "app",
+                "description": {
+                  "vi": "Nhận mutation có identity và quyền phù hợp.",
+                  "en": "Receive an identified and authorized mutation."
+                }
+              },
+              {
+                "from": "app",
+                "to": "cache",
+                "description": {
+                  "vi": "Gọi writer qua lớp cache.",
+                  "en": "Call the writer through the cache abstraction."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "db",
+                "description": {
+                  "vi": "Ghi source đồng bộ, giữ invariant và durability contract.",
+                  "en": "Synchronously write the source under its invariant and durability contract."
+                }
+              },
+              {
+                "from": "db",
+                "to": "cache",
+                "description": {
+                  "vi": "Sau commit, cập nhật hoặc invalidate cache; vẫn phải xử lý partial failure.",
+                  "en": "After commit, update/invalidate under policy; partial failure still needs handling."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "app",
+                "description": {
+                  "vi": "Chỉ báo thành công sau khi đáp ứng ACK contract.",
+                  "en": "Report success only after the acknowledgement contract is met."
+                }
+              },
+              {
+                "from": "app",
+                "to": "client",
+                "description": {
+                  "vi": "Trả outcome; timeout vẫn có thể để lại kết quả chưa xác định.",
+                  "en": "Return the outcome; a timeout may remain ambiguous."
+                }
+              }
+            ]
+          },
+          {
+            "id": "behind",
+            "label": {
+              "vi": "Write-behind: lưu intent trước ACK",
+              "en": "Write-behind: durable intent first"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "app",
+                "description": {
+                  "vi": "Gửi yêu cầu ghi với logical intent ID.",
+                  "en": "Submit a write with a logical intent identity."
+                }
+              },
+              {
+                "from": "app",
+                "to": "cache",
+                "description": {
+                  "vi": "Lớp cache nhận write và xác định ordering scope.",
+                  "en": "The abstraction accepts the write and defines ordering scope."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "buffer",
+                "description": {
+                  "vi": "Lưu bền intent theo durability contract trước khi ACK.",
+                  "en": "Persist intent under the durability contract before acknowledgement."
+                }
+              },
+              {
+                "from": "buffer",
+                "to": "cache",
+                "description": {
+                  "vi": "Xác nhận intent đã durable; backing source có thể vẫn chưa theo kịp.",
+                  "en": "Confirm durable intent while the backing source may still lag."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "app",
+                "description": {
+                  "vi": "Báo accepted theo contract; không hứa mọi projection đã hoàn tất.",
+                  "en": "Report acceptance without claiming every projection has finished."
+                }
+              },
+              {
+                "from": "app",
+                "to": "client",
+                "description": {
+                  "vi": "ACK đúng mốc đã hứa; cung cấp status/completion nếu cần.",
+                  "en": "Acknowledge the promised milestone, with completion/status where needed."
+                }
+              },
+              {
+                "from": "buffer",
+                "to": "db",
+                "description": {
+                  "vi": "Flush hoặc replay sau, kèm dedup và version/ordering.",
+                  "en": "Flush/replay later with deduplication and version/ordering."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "around",
+            "label": {
+              "vi": "Write-around: không nạp khi ghi",
+              "en": "Write-around: no write-time population"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "app",
+                "description": {
+                  "vi": "Nhận yêu cầu ghi có quyền và identity.",
+                  "en": "Receive an authorized, identified write."
+                }
+              },
+              {
+                "from": "app",
+                "to": "db",
+                "description": {
+                  "vi": "Ghi thẳng source, giữ business invariant.",
+                  "en": "Write directly to the source under its invariant."
+                }
+              },
+              {
+                "from": "db",
+                "to": "app",
+                "description": {
+                  "vi": "Nhận kết quả commit theo contract.",
+                  "en": "Return the committed outcome under the contract."
+                }
+              },
+              {
+                "from": "app",
+                "to": "cache",
+                "description": {
+                  "vi": "Invalidate bản cũ khi cần; không nạp value mới vào cache trên write path.",
+                  "en": "Invalidate old copies where needed without populating the new write value."
+                }
+              },
+              {
+                "from": "app",
+                "to": "client",
+                "description": {
+                  "vi": "Trả kết quả; xử lý lỗi invalidation theo failure policy đã chốt.",
+                  "en": "Return the outcome under an explicit invalidation-failure policy."
+                }
+              }
+            ]
+          }
+        ]
       }
     },
     {
@@ -266,12 +639,16 @@
           "en": "Eviction reclaims memory, expiration stops reuse after TTL and invalidation removes copies after source/policy changes. LRU uses recency, LFU frequency and FIFO insertion age. No policy wins every trace: scans can evict hot LRU working sets, while LFU without decay may preserve obsolete popularity."
         },
         {
-          "vi": "Capacity thực theo bytes và object overhead, không chỉ số key. Một object 20 MB có chi phí khác 20 byte; admission policy có thể từ chối cache object quá lớn hoặc ít reuse. Cache theo byte/cost có thể cần policy khác toy ba key dưới đây. Đo memory fragmentation và eviction rate để không nhầm cache churn với nguồn dữ liệu chậm.",
-          "en": "Real capacity depends on bytes/object overhead, not just key counts. A 20 MB object differs from a 20-byte object; admission can reject oversized or low-reuse objects. Byte/cost-aware policies differ from the three-key toy below. Measure fragmentation/eviction to distinguish churn from a slow source."
+          "vi": "Capacity thực theo bytes và object overhead, không chỉ số key. Một object 20 MB có chi phí khác 20 byte; admission policy có thể từ chối cache object quá lớn hoặc ít reuse. Cache theo byte/cost có thể cần policy khác mô hình các key cùng kích thước dưới đây. Đo memory fragmentation và eviction rate để không nhầm cache churn với nguồn dữ liệu chậm.",
+          "en": "Real capacity depends on bytes/object overhead, not just key counts. A 20 MB object differs from a 20-byte object; admission can reject oversized or low-reuse objects. Byte/cost-aware policies differ from the equal-size-key model below. Measure fragmentation/eviction to distinguish churn from a slow source."
         },
         {
           "vi": "Production thường dùng approximation để giảm bookkeeping: sampled recency/frequency thay vì cập nhật một global list ở mọi read. Admission như TinyLFU ước lượng tần suất để quyết định item mới có đáng thay resident item không; kết hợp recency window có thể chống scan pollution. Cần hiểu implementation cụ thể và memory/CPU cost, không suy từ toy LRU exact sang mọi cache product.",
           "en": "Production often approximates recency/frequency to reduce bookkeeping instead of updating a global list on every read. TinyLFU-style admission estimates frequency to decide whether a newcomer should replace a resident; a recency window can help resist scans. Understand implementation and memory/CPU costs rather than generalizing exact toy LRU to every cache."
+        },
+        {
+          "vi": "Mô phỏng có ba workload: hỗn hợp, quét qua nhiều key và thay nhóm key nóng. Với sức chứa ba key, LFU không aging có thể giữ A/B lâu sau khi chúng hết được truy cập; LRU phản ứng tốt hơn ở trace chuyển popularity này. Ở trace scan, frequency có thể giúp giữ một phần working set cũ. Thay sức chứa và so cùng prefix của cả ba policy; đây là các ví dụ phản chứng cho một thứ hạng cố định, không phải benchmark production.",
+          "en": "The model includes mixed, scan and hot-set-shift workloads. With three slots, LFU without aging can retain A/B long after their accesses stop; LRU adapts better on this shift trace. Frequency can retain part of the old working set during the scan trace. Vary capacity and compare identical prefixes across all policies. These are counterexamples to universal rankings, not production benchmarks."
         }
       ],
       "experiment": "cache-eviction"
@@ -714,6 +1091,42 @@
               "en": "Jitter does not coalesce duplicate misses for one key or remove all long-term work."
             }
           ]
+        },
+        {
+          "title": {
+            "vi": "Hỏi key không tồn tại",
+            "en": "Repeated absent-key requests"
+          },
+          "icon": "scope",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Negative cache ngắn hạn cho not-found thật; không biến timeout thành dữ liệu không tồn tại.",
+              "en": "Use short negative caching for true absence, not timeouts."
+            },
+            {
+              "vi": "Validate input, rate-limit; Bloom filter phải cập nhật đúng và không thay authorization.",
+              "en": "Validate and rate-limit; a Bloom filter needs correct updates and does not replace authorization."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Một key chiếm phần lớn traffic",
+            "en": "One key dominates traffic"
+          },
+          "icon": "gauge",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Đo per-key class/tenant skew với cardinality có giới hạn; nhiều shard không tự chia một key.",
+              "en": "Measure bounded key-class/tenant skew; more shards do not split one key."
+            },
+            {
+              "vi": "Local cache hoặc read replicas chỉ phù hợp khi freshness và quyền truy cập được giữ.",
+              "en": "Local caches or read replicas must preserve freshness and authorization."
+            }
+          ]
         }
       ]
     },
@@ -765,6 +1178,10 @@
         {
           "vi": "Một waiter hết deadline không nên tự hủy work đang được nhiều request dùng chung; loader có internal deadline riêng. Cache fill thất bại không bắt buộc làm mất source result nếu freshness contract cho phép, nhưng phải được đo. publishIfNotOlderThanWatermark là yêu cầu phối hợp version với invalidation, không phải một thao tác atomic có sẵn ở mọi cache.",
           "en": "One waiter’s deadline should not cancel work shared by others; loaders have internal deadlines. Fill failure need not discard a valid source result where the freshness contract permits it, but must be measured. publishIfNotOlderThanWatermark requires version/invalidation coordination; it is not a universal built-in atomic cache operation."
+        },
+        {
+          "vi": "Mốc 150 ms trong snippet chỉ áp cho origin loader; adapter lookup và publish cũng phải có timeout/budget riêng để không giữ permit vô hạn. Error từ cache lookup không được biến thành unlimited fallback: chọn fail, bounded fallback hoặc stale response theo contract. Một cache fill thành công không tự chứng minh authorization hoặc source version vẫn hợp lệ; publish adapter phải phối hợp watermark/version như đã mô tả.",
+          "en": "The snippet’s 150 ms applies only to the origin loader; lookup and publication adapters also need their own timeouts/budgets so a permit cannot be retained indefinitely. A lookup error must not become unlimited fallback: choose failure, bounded fallback or permitted stale data under the contract. Successful publication alone does not prove current authorization or source versions; the adapter needs the stated watermark/version coordination."
         }
       ],
       "code": {
@@ -872,6 +1289,26 @@
               "en": "Rapid popularity changes can leave historically frequent keys resident without current reuse, especially without decay/aging. LRU reacts to recency but is vulnerable to scans. Choose using representative traces, byte costs and admission rather than a universal ranking."
             }
           ]
+        },
+        {
+          "question": {
+            "vi": "Cache hit 95% rồi cluster restart: tại sao DB có thể sập ngay sau đó?",
+            "en": "Why can a database fail immediately after a 95%-hit cache restarts?"
+          },
+          "answer": [
+            {
+              "vi": "Giả định mọi miss tạo một query có chi phí tương đương và incoming read rate không đổi. Bình thường DB nhận 5% traffic; cache lạnh có thể đưa 100% xuống DB, tức 20× tải bình thường trước retries. Ví dụ 20.000 reads/s làm nguồn nhận 1.000/s trước lỗi nhưng có thể nhận 20.000/s sau lỗi. Hit theo byte hoặc query cost khác nhau thì phải tính lại; 95% không tự cho một hệ số chính xác cho mọi workload.",
+              "en": "Assume equal-cost one-query misses and unchanged incoming reads. The database normally sees five percent of traffic; a cold cache can send all reads, twenty times normal load before retries. At 20,000 reads/s this is 1,000 origin queries/s before the failure and potentially 20,000 afterward. Byte hits or unequal query costs require a different calculation; 95% is not a universal amplification factor."
+            },
+            {
+              "vi": "Pool/IO cạn làm latency tăng; caller retry có thể khuếch đại thêm. Bảo vệ nguồn bằng aggregate concurrency/admission budget, single-flight theo key, load shedding, retry budget và warm-up theo ưu tiên. Jitter TTL giãn expiry của nhiều key nhưng không cứu được lúc cả cache đã trống. Chỉ serve stale nếu data class cho phép; staging drill phải kiểm tra cache timeout/mất cả cluster, correctness, origin load và thời gian hồi phục.",
+              "en": "Pool/IO exhaustion raises latency and retries can amplify it. Protect the source with aggregate admission/concurrency budgets, per-key single-flight, shedding, retry budgets and prioritized warming. TTL jitter spreads expirations but cannot restore an already empty cache. Serve stale only for permitted data classes; drills must test cache timeouts or total loss, correctness, origin load and recovery time."
+            }
+          ],
+          "followup": {
+            "vi": "Nếu 1% miss còn lại đều là query rất nặng, request hit ratio có đủ để sizing DB không?",
+            "en": "If the remaining one-percent misses are expensive queries, is request hit ratio enough to size the database?"
+          }
         }
       ]
     },

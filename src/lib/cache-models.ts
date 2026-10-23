@@ -1,12 +1,17 @@
 import {stableHash} from './routing-models';
 export type EvictionPolicy='lru'|'lfu'|'fifo';
 export const cacheTrace=['A','B','A','C','A','B','D','C','E','A','B','D','A','F','B','A'];
-export function evictionReplay(policy:EvictionPolicy,steps:number,capacity=3){
-  if(!Number.isInteger(steps)||steps<0||steps>cacheTrace.length||!Number.isInteger(capacity)||capacity<1)throw new RangeError('Invalid replay bounds');
+export const evictionWorkloads = {
+  mixed: cacheTrace,
+  scan: ['A','B','C','A','B','C','A','B','C','A','B','C','D','E','F','G','H','I','A','B','C','A','B','C','A','B','C'],
+  shift: ['A','A','A','A','A','A','B','B','B','B','B','B','C','D','C','D','C','D','C','D','C','D','C','D'],
+};
+export function evictionReplay(policy:EvictionPolicy,steps:number,capacity=3,trace:readonly string[]=cacheTrace){
+  if(!Number.isInteger(steps)||steps<0||steps>trace.length||!Number.isInteger(capacity)||capacity<1)throw new RangeError('Invalid replay bounds');
   const entries=new Map<string,{key:string;inserted:number;last:number;frequency:number}>();
   const events:{key:string;hit:boolean;evicted:string|null}[]=[];
   for(let tick=0;tick<steps;tick++){
-    const key=cacheTrace[tick],entry=entries.get(key);let evicted:string|null=null;
+    const key=trace[tick],entry=entries.get(key);let evicted:string|null=null;
     if(entry){entry.last=tick;entry.frequency++;}
     else{
       if(entries.size>=capacity){

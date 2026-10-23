@@ -15,7 +15,7 @@ export function ringOwner(ring:RingToken[],key:string){
   while(low<high){const middle=(low+high)>>>1;if(ring[middle].hash<hash)low=middle+1;else high=middle;}
   return ring[low%ring.length];
 }
-export type BalancerAlgorithm='round-robin'|'least-outstanding'|'two-choices';
+export type BalancerAlgorithm='round-robin'|'random'|'least-outstanding'|'two-choices';
 export function balanceRequests(algorithm:BalancerAlgorithm,slowNode:boolean){
   const jobs:{id:number;server:number;arrival:number;start:number;finish:number;duration:number}[]=[];
   const available=[0,0,0];
@@ -23,6 +23,7 @@ export function balanceRequests(algorithm:BalancerAlgorithm,slowNode:boolean){
     const arrival=id*40;
     const outstanding=(server:number)=>jobs.filter(j=>j.server===server&&j.finish>arrival).length;
     let server=id%3;
+    if(algorithm==='random')server=stableHash('random:'+id)%3;
     if(algorithm==='least-outstanding')server=[0,1,2].sort((a,b)=>outstanding(a)-outstanding(b)||a-b)[0];
     if(algorithm==='two-choices'){
       const a=stableHash('first:'+id)%3,b=(a+1+stableHash('second:'+id)%2)%3;

@@ -165,6 +165,10 @@
         {
           "vi": "Power of two choices chọn hai candidate rồi lấy candidate có load metric thấp hơn. Nó tránh phải quét toàn pool, nhưng sample, tie-break, weight và metric freshness ảnh hưởng kết quả. Adaptive latency policy có thể phản ứng với node chậm, song cần smoothing/slow-start để không đổ dồn request vào một node vừa hồi phục hoặc tạo feedback oscillation.",
           "en": "Power of two choices samples two candidates and chooses the lower-load metric. It avoids scanning the whole pool, while sampling, tie-breaking, weights and metric freshness affect results. Adaptive latency policies can react to slow nodes but need smoothing/slow start to avoid recovery floods and feedback oscillation."
+        },
+        {
+          "vi": "EWMA (exponentially weighted moving average) làm mượt các phép đo latency gần đây để điều chỉnh lựa chọn; cần nêu rõ sample đo service time hay cả queue/network wait. Metric cũ, thiếu sample ở node mới và feedback giữa nhiều proxy có thể làm policy sai lệch. P2C dùng ít thông tin hơn quét toàn pool, nhưng các bảo đảm trong mô hình balls-and-bins không tự áp cho weighted requests, service time có tail và metric trễ của hệ thật.",
+          "en": "An exponentially weighted moving average smooths recent latency samples for adaptive choices. State whether samples include service, queue and network time. Stale metrics, sparse new-node samples and interacting proxies can bias decisions. P2C uses less information than a full scan, but balls-and-bins guarantees do not automatically describe weighted requests, heavy-tailed service times and delayed production metrics."
         }
       ],
       "experiment": "balancer",
@@ -279,7 +283,63 @@
           "vi": "Sticky session tăng locality hoặc giữ session tạm ở node, nhưng khi node chết user vẫn cần phục hồi state. IP affinity dễ lệch khi nhiều user chung NAT và có thể đổi khi user chuyển mạng. Tốt hơn là externalize state cần bền vững; chỉ dùng affinity khi lợi ích cache/locality được đo và có failover semantics rõ.",
           "en": "Sticky sessions improve locality or retain temporary sessions, but node loss still requires state recovery. IP affinity skews users behind NAT and changes with network switching. Externalize durable state and use affinity where measured locality benefits justify explicit failover semantics."
         }
-      ]
+      ],
+      "flow": {
+        "title": {
+          "vi": "Thay node mà vẫn giữ ngân sách phục vụ",
+          "en": "Replace a node while preserving service capacity"
+        },
+        "caption": {
+          "vi": "Node bị ejection do lỗi có thể phục hồi; draining khi deploy là một quyết định khác. Đây là quy trình deploy, không phải mọi lifecycle đều đi qua một chuỗi trạng thái bắt buộc.",
+          "en": "Fault ejection can recover; deployment draining is a different decision. This is a deployment process, not one mandatory sequence for every lifecycle."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Ngừng nhận việc mới",
+              "en": "Stop new admissions"
+            },
+            "detail": {
+              "vi": "Gỡ khỏi pool ready; tính cả propagation delay.",
+              "en": "Remove readiness and allow for propagation delay."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Drain trong deadline",
+              "en": "Drain within a deadline"
+            },
+            "detail": {
+              "vi": "Hoàn tất inflight; stream reconnect có jitter.",
+              "en": "Finish in-flight work; jitter stream reconnects."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Warm node thay thế",
+              "en": "Warm the replacement"
+            },
+            "detail": {
+              "vi": "Kiểm tra readiness, JIT, cache và pool.",
+              "en": "Check readiness, JIT, caches and pools."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Tăng weight có kiểm soát",
+              "en": "Ramp weight deliberately"
+            },
+            "detail": {
+              "vi": "Quan sát SLO, retries và capacity còn lại.",
+              "en": "Observe SLOs, retries and remaining capacity."
+            },
+            "icon": "chart"
+          }
+        ]
+      }
     },
     {
       "id": "global",
@@ -296,7 +356,190 @@
           "vi": "Latency routing không được vượt data residency hoặc write ownership. Failover read sang region khác có thể thấy replication lag; failover write cần fencing owner cũ và kiểm tra replication position. LB không thể tự giải quyết split brain chỉ bằng chuyển traffic. Đo RTO thực tế với DNS/client caches và reconnect storm, không chỉ thời gian controller phát lệnh.",
           "en": "Latency routing must respect residency and write ownership. Read failover can expose replication lag; write failover needs old-owner fencing and replication-position checks. Traffic switching alone cannot resolve split brain. Measure recovery including client/DNS caches and reconnect storms, not merely controller command time."
         }
-      ]
+      ],
+      "diagram": {
+        "id": "global-routing-tiers",
+        "title": {
+          "vi": "DNS chọn đích; L4 và L7 xử lý traffic",
+          "en": "DNS resolves a destination; L4 and L7 handle traffic"
+        },
+        "caption": {
+          "vi": "Các hộp là tầng logic, không phải cấu hình HA hoàn chỉnh. Anycast là lựa chọn routing khác DNS, không bảo đảm điểm địa lý gần nhất hay application còn khỏe.",
+          "en": "Boxes are logical tiers, not a complete HA deployment. Anycast is a routing alternative to DNS, without guaranteed geographic proximity or application health."
+        },
+        "width": 760,
+        "height": 480,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client",
+              "en": "Client"
+            },
+            "kind": "client",
+            "x": 95,
+            "y": 240,
+            "detail": {
+              "vi": "Resolver trả địa chỉ; client tự mở connection tới đích phù hợp.",
+              "en": "A resolver returns addresses; the client opens its own connection to an eligible destination."
+            }
+          },
+          {
+            "id": "dns",
+            "label": {
+              "vi": "DNS resolver",
+              "en": "DNS resolver"
+            },
+            "kind": "edge",
+            "x": 285,
+            "y": 70,
+            "detail": {
+              "vi": "Áp cache/TTL; lựa chọn region phải tôn trọng health, residency và ownership policy.",
+              "en": "Uses caches/TTLs; regional selection must respect health, residency and ownership policies."
+            }
+          },
+          {
+            "id": "l4",
+            "label": {
+              "vi": "Regional L4",
+              "en": "Regional L4"
+            },
+            "kind": "edge",
+            "x": 285,
+            "y": 240,
+            "detail": {
+              "vi": "Chọn transport flow tới proxy theo implementation; connection dài có thể tạo skew.",
+              "en": "Selects a flow destination under the implementation; long connections can create skew."
+            }
+          },
+          {
+            "id": "l7",
+            "label": {
+              "vi": "L7 proxy",
+              "en": "L7 proxy"
+            },
+            "kind": "service",
+            "x": 475,
+            "y": 240,
+            "detail": {
+              "vi": "Hiểu HTTP sau TLS termination phù hợp; route host/path và giữ request budget.",
+              "en": "Understands HTTP after suitable TLS termination; routes by host/path within request budgets."
+            }
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "API pool",
+              "en": "API pool"
+            },
+            "kind": "service",
+            "x": 665,
+            "y": 120,
+            "detail": {
+              "vi": "Chọn instance ready; kiểm tra identity và resource authorization.",
+              "en": "Selects ready instances and checks identity/resource authorization."
+            }
+          },
+          {
+            "id": "media",
+            "label": {
+              "vi": "Media pool",
+              "en": "Media pool"
+            },
+            "kind": "service",
+            "x": 665,
+            "y": 360,
+            "detail": {
+              "vi": "Phục vụ media theo cache/access contract riêng; không mặc định bypass quyền.",
+              "en": "Serves media under its own cache/access contract without bypassing permissions."
+            }
+          }
+        ],
+        "traces": [
+          {
+            "id": "api",
+            "label": {
+              "vi": "Resolve rồi gọi API",
+              "en": "Resolve, then call the API"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "dns",
+                "description": {
+                  "vi": "Tra DNS nếu chưa có đáp án dùng được trong cache.",
+                  "en": "Resolve DNS if no usable cached answer exists."
+                }
+              },
+              {
+                "from": "dns",
+                "to": "client",
+                "description": {
+                  "vi": "Trả record; đây không phải proxy chuyển tiếp HTTP.",
+                  "en": "Return records; DNS does not proxy the HTTP request."
+                }
+              },
+              {
+                "from": "client",
+                "to": "l4",
+                "description": {
+                  "vi": "Client tạo hoặc reuse connection tới regional entry.",
+                  "en": "The client opens or reuses a connection to the regional entry."
+                }
+              },
+              {
+                "from": "l4",
+                "to": "l7",
+                "description": {
+                  "vi": "Route flow tới proxy; tầng transport chưa chọn HTTP resource.",
+                  "en": "Route the flow to a proxy; transport routing has not selected an HTTP resource."
+                }
+              },
+              {
+                "from": "l7",
+                "to": "api",
+                "description": {
+                  "vi": "Route API request theo host/path, readiness và budget.",
+                  "en": "Route the API request by host/path, readiness and budget."
+                }
+              }
+            ]
+          },
+          {
+            "id": "media",
+            "label": {
+              "vi": "Request media",
+              "en": "Media request"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "l4",
+                "description": {
+                  "vi": "Đã có địa chỉ/connection phù hợp; không phải resolve lại mỗi request.",
+                  "en": "An eligible address/connection exists; not every request resolves again."
+                }
+              },
+              {
+                "from": "l4",
+                "to": "l7",
+                "description": {
+                  "vi": "Giữ flow tới proxy phù hợp.",
+                  "en": "Keep the flow routed to an eligible proxy."
+                }
+              },
+              {
+                "from": "l7",
+                "to": "media",
+                "description": {
+                  "vi": "Route representation media sau kiểm tra access/cache policy.",
+                  "en": "Route the media representation under access/cache policy."
+                }
+              }
+            ]
+          }
+        ]
+      }
     },
     {
       "id": "ring",
@@ -319,6 +562,119 @@
         }
       ],
       "experiment": "hash-ring"
+    },
+    {
+      "id": "placement-options",
+      "title": {
+        "vi": "7a. Ring, rendezvous, jump hash và bảng lookup",
+        "en": "7a. Rings, rendezvous, jump hash and lookup tables"
+      },
+      "paragraphs": [
+        {
+          "vi": "So cơ chế theo contract membership, độ tốn memory/lookup và phạm vi remapping, không chỉ tên thuật toán. Với ring cân bằng và giữ token cũ, thêm node thứ N+1 có kỳ vọng nhận khoảng 1/(N+1) key; gỡ một trong N node làm khoảng 1/N key đổi owner. Key thực, weight và phân phối hash làm sample khác kỳ vọng; đổi salt/token của các node cũ có thể làm nhiều key khác đổi owner.",
+          "en": "Compare membership contracts, lookup/memory cost and remapping scope rather than names alone. With balanced rings and preserved old tokens, adding node N+1 is expected to move roughly 1/(N+1) of keys, while removing one of N moves roughly 1/N. Samples vary with keys, weights and hashing; changing old salts/tokens can remap additional keys."
+        },
+        {
+          "vi": "Bounded-load placement thường giới hạn số item hoặc một load metric được mô hình hóa. Một key có 90% requests vẫn có thể làm owner nóng dù số key mỗi node đã cân bằng. Muốn chia work của một key cần request routing tới nhiều bản sao được phép hoặc split/aggregate theo invariant; không tự đổi owner của durable write để né overload mà bỏ fencing.",
+          "en": "Bounded-load placement constrains item counts or the modeled load metric. One key receiving 90% of requests can still overload its owner despite balanced key counts. Spreading that key’s work requires eligible replicas or invariant-compatible splitting/aggregation, not unsafe durable-write rerouting that bypasses fencing."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Cơ chế placement",
+            "en": "Placement mechanism"
+          },
+          {
+            "vi": "Cách tìm owner",
+            "en": "How an owner is found"
+          },
+          {
+            "vi": "Giới hạn cần nhớ",
+            "en": "Limit to remember"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Ring + virtual tokens",
+              "en": "Ring + virtual tokens"
+            },
+            {
+              "vi": "Successor trong dãy token đã sắp xếp; binary search O(log V), V là tổng token.",
+              "en": "Successor in sorted tokens; O(log V) binary search for V total tokens."
+            },
+            {
+              "vi": "Giữ token/membership nhất quán; cần storage cho token và migration riêng.",
+              "en": "Preserve token/membership agreement; token storage and separate migration are needed."
+            }
+          ],
+          [
+            {
+              "vi": "Rendezvous / HRW",
+              "en": "Rendezvous / HRW"
+            },
+            {
+              "vi": "Tính score hash(key,node), lấy node cao nhất; bản đơn giản quét N node.",
+              "en": "Score hash(key,node) and choose the maximum; the simple form scans N nodes."
+            },
+            {
+              "vi": "Tốn tính score khi pool lớn; weights và chọn replicas phải có quy tắc xác định.",
+              "en": "Scoring costs grow with the pool; weights and replicas need deterministic rules."
+            }
+          ],
+          [
+            {
+              "vi": "Jump consistent hash",
+              "en": "Jump consistent hash"
+            },
+            {
+              "vi": "Map key tới bucket đánh số liên tiếp, không cần giữ vòng token.",
+              "en": "Map a key to sequentially numbered buckets without a stored token ring."
+            },
+            {
+              "vi": "Thay đổi bucket count theo contract liên tiếp; node tùy ý rời cần thêm indirection/mapping.",
+              "en": "Sequential bucket-count semantics require extra mapping/indirection for arbitrary departures."
+            }
+          ],
+          [
+            {
+              "vi": "Maglev-style lookup",
+              "en": "Maglev-style lookup"
+            },
+            {
+              "vi": "Dựng bảng từ membership để tra destination nhanh theo flow hash.",
+              "en": "Build a membership-dependent table for fast flow-hash destination lookup."
+            },
+            {
+              "vi": "Cần memory cho bảng, rebuild và handling established connections; không phải storage migration.",
+              "en": "Requires table memory, rebuilding and established-connection handling, not storage migration."
+            }
+          ],
+          [
+            {
+              "vi": "Bounded-load placement",
+              "en": "Bounded-load placement"
+            },
+            {
+              "vi": "Giữ capacity bound theo metric và chuyển overflow theo policy.",
+              "en": "Enforce a metric-specific capacity bound and place overflow under policy."
+            },
+            {
+              "vi": "State/load tracking và extra movement; không tự phân tán mọi hot key.",
+              "en": "Load/state tracking and extra movement do not automatically split every hot key."
+            }
+          ]
+        ]
+      },
+      "code": {
+        "language": "typescript",
+        "content": "type Token = { point: number; owner: string };\n// A shared immutable membership snapshot sorts points and resolves ties deterministically.\nfunction successor(tokens: readonly Token[], point: number): string {\n  if (tokens.length === 0) throw new Error(\"NO_OWNER\");\n  let lo = 0, hi = tokens.length;\n  while (lo < hi) {\n    const mid = lo + Math.floor((hi - lo) / 2);\n    if (tokens[mid].point < point) lo = mid + 1;\n    else hi = mid;\n  }\n  return tokens[lo === tokens.length ? 0 : lo].owner;\n}",
+        "caption": {
+          "vi": "Chỉ minh họa successor lookup. Hash encoding, token collisions, membership epoch, replica policy và data transfer là các contract riêng; không phải một distributed store hoàn chỉnh.",
+          "en": "This only illustrates successor lookup. Hash encoding, token collisions, membership epochs, replica policy and data transfer are separate contracts, not a complete distributed store."
+        }
+      }
     },
     {
       "id": "migration",
@@ -619,6 +975,26 @@
               "en": "Drain small batches with spare capacity and jittered/backoff reconnects, using application event resumption where supported. Set controlled connection-age/migration policies, watch connection/authentication load and avoid closing all nodes together. Both SSE and WebSockets require connection lifecycle management."
             }
           ]
+        },
+        {
+          "question": {
+            "vi": "gRPC có 20 pods nhưng hai pod chịu gần hết tải: bạn kiểm tra và sửa thế nào?",
+            "en": "A gRPC service has twenty pods but two receive most load: how do you diagnose and fix it?"
+          },
+          "answer": [
+            {
+              "vi": "Xác nhận per-pod active streams, requests/s, CPU, pool wait và request mix trước; CPU lệch cũng có thể do payload hoặc hot tenant. Nếu ít client giữ HTTP/2 connections lâu qua L4, mọi stream của một connection có thể gắn vào một backend. Pod mới thêm không tự nhận một phần các connection đã tồn tại. Least connections cũng có thể nhìn sai work khi mỗi connection có số stream khác nhau.",
+              "en": "Compare per-pod active streams, request rates, CPU, pool waits and request mix; payloads or hot tenants can also explain skew. With a few long-lived HTTP/2 connections through L4, one backend may receive every stream of a connection. New pods do not inherit existing connections. Least connections can misread work when connections carry different stream counts."
+            },
+            {
+              "vi": "Thử L7 request/stream-aware balancing hoặc client-side balancing có discovery, readiness và policy phù hợp. Connection-age/drain policy có thể giúp tái phân phối khi reconnect, nhưng phải dùng jitter, spare capacity và tránh cắt stream đang chạy không có resume. Slow-start node mới để cache/JIT/pool kịp warm; đo lại tail latency, lỗi, retries và per-pod work sau rollout nhỏ. Không đổi policy chỉ vì dashboard CPU chưa đều.",
+              "en": "Evaluate L7 request/stream-aware balancing or client balancing with discovery, readiness and suitable policy. Connection-age/draining policies can rebalance reconnects but need jitter, spare capacity and protection for unresumable streams. Ramp new nodes while caches, JITs and pools warm; validate tail latency, errors, retries and per-pod work in a small rollout. Even CPU charts alone are not the goal."
+            }
+          ],
+          "followup": {
+            "vi": "Nếu một tenant chiếm phần lớn work nhưng affinity bắt về một owner, đổi L4 sang L7 có đủ không?",
+            "en": "If one tenant dominates work and affinity targets one owner, is changing L4 to L7 sufficient?"
+          }
         }
       ]
     },
@@ -638,16 +1014,16 @@
         {
           "question": {
             "vi": "L4 và L7 load balancing khác nhau ở decision boundary nào?",
-            "en": "What decision boundary distinguishes L 4 from L 7 load balancing?"
+            "en": "What decision boundary distinguishes L4 from L7 load balancing?"
           },
           "answer": [
             {
               "vi": "L4 chủ yếu route theo transport/network connection và metadata nhìn thấy ở tầng đó; không tự hiểu HTTP path hoặc authenticated application identity. L7 hiểu protocol/application fields khi được terminate/inspect đúng cách, nên có thể route theo host/path, apply request-aware policies và quan sát per-request work. TLS passthrough/termination, proxy chaining và HTTP multiplexing ảnh hưởng visibility và failure behavior.",
-              "en": "L 4 routing primarily uses transport or network connections and visible metadata rather than HTTP paths or authenticated application identities. L 7 proxies understand applicable application fields, enabling host/path routing, request-aware policies and per-request observation. TLS handling, proxy chains and multiplexing change visibility and failure behavior."
+              "en": "L4 routing primarily uses transport or network connections and visible metadata rather than HTTP paths or authenticated application identities. L7 proxies understand applicable application fields, enabling host/path routing, request-aware policies and per-request observation. TLS handling, proxy chains and multiplexing change visibility and failure behavior."
             },
             {
               "vi": "L4 có thể phù hợp TCP/UDP workloads và cần ít application parsing; L7 thêm flexibility nhưng có CPU, memory, buffering, certificate và operational costs. Không suy L4 luôn nhanh hơn trong mọi implementation hoặc L7 tự an toàn. Với HTTP/2, cân bằng connections có thể khác cân bằng active streams; health check phải gắn readiness thật, drain giữ in-flight work trong deadline và tránh reconnect storm.",
-              "en": "L 4 can suit transport workloads, while L 7 adds flexibility with parsing, buffering, certificate and operational costs. Neither implies universal performance or security. With HTTP/2, balanced connection counts may hide stream skew. Use meaningful readiness, bounded draining and reconnect controls rather than treating a listening port as full service health."
+              "en": "L4 can suit transport workloads, while L7 adds flexibility with parsing, buffering, certificate and operational costs. Neither implies universal performance or security. With HTTP/2, balanced connection counts may hide stream skew. Use meaningful readiness, bounded draining and reconnect controls rather than treating a listening port as full service health."
             }
           ]
         },
