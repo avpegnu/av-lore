@@ -1,7 +1,7 @@
 {
   "id": "chat",
   "group": "case",
-  "status": "review",
+  "status": "complete",
   "title": {
     "vi": "Thiết kế Chat: từ durable message đến mọi device",
     "en": "Designing Chat: from a durable message to every device"
@@ -516,7 +516,63 @@
             }
           ]
         }
-      ]
+      ],
+      "flow": {
+        "title": {
+          "vi": "Đóng khe hở giữa history và live stream",
+          "en": "Close the gap between history and the live stream"
+        },
+        "caption": {
+          "vi": "Ví dụ cùng một conversation: local cursor 100, committed high-water mark H=104. Với bus có thể mất event, vẫn phải có watermark/catch-up hoặc delivery retry sau khi chuyển live.",
+          "en": "One conversation: local cursor 100 and committed high-water mark H=104. A lossy bus still requires watermarks/catch-up or delivery retries after switching to live mode."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Subscribe rồi buffer",
+              "en": "Subscribe and buffer"
+            },
+            "detail": {
+              "vi": "Xác nhận subscription ở tầng app đã active; giữ frame mới trong bounded buffer. Socket mở một mình chưa đủ.",
+              "en": "Confirm an active application-level subscription and retain new frames in a bounded buffer; an open socket alone is insufficient."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Chốt H, đọc tới H",
+              "en": "Capture H and read through it"
+            },
+            "detail": {
+              "vi": "Server chốt H=104 sau khi subscription active. Fetch 101–104 có paging/quyền; chỉ advance phần đã xử lý.",
+              "en": "Capture H=104 after activating the subscription. Fetch 101–104 with paging/authorization and advance only through fully processed entries."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Merge và dedup",
+              "en": "Merge and deduplicate"
+            },
+            "detail": {
+              "vi": "Live buffer có 103 và 105: bỏ bản trùng 103, apply history 101–104 rồi 105; cursor thành 105.",
+              "en": "With live 103 and 105 buffered, deduplicate 103, apply history 101–104, then 105; the cursor becomes 105."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Live có recovery",
+              "en": "Live delivery with recovery"
+            },
+            "detail": {
+              "vi": "Frame cuối vẫn có thể mất: kiểm watermark/receipt. Nếu buffer vượt ngưỡng, resync từ cursor bền thay vì bỏ gap.",
+              "en": "A final frame can still be lost: check watermarks/receipts. On buffer overflow, resync from a durable cursor instead of skipping gaps."
+            },
+            "icon": "shield"
+          }
+        ]
+      }
     },
     {
       "id": "architecture",
@@ -532,20 +588,24 @@
         {
           "vi": "Live pub/sub có thể mất message khi subscriber disconnect. Điều này không phá durability nếu history đã commit và client có recovery protocol. Nhưng nó có thể làm trễ delivery vô hạn nếu chỉ sync lúc reconnect mà socket vẫn sống trong khi frame bus bị mất; cần gap detection, periodic watermark/catch-up hoặc delivery retry/receipt policy phù hợp.",
           "en": "Live pub/sub can lose messages when a subscriber disconnects. Durability survives if history is committed and clients have a recovery protocol. Delivery can still stall indefinitely if sync runs only on reconnect while the socket stays open after a lost bus frame. Use gap detection, periodic watermarks/catch-up or an appropriate delivery-retry/receipt policy."
+        },
+        {
+          "vi": "ACK gửi về sender và fanout tới recipient đều chỉ được dựa trên commit đã hoàn tất; giữa hai đường không cần total order. Recipient có thể nhận message trước khi sender thấy ACK nếu đường ACK chậm hoặc mất. Worker đọc committed outbox độc lập việc HTTP/frame ACK có tới client hay chưa; sender retry bằng cùng identity để biết kết quả đã commit.",
+          "en": "The sender ACK and recipient fanout must both depend on a completed commit, but need no total order relative to each other. A recipient can receive a message before the sender observes an ACK if that path is slow or lost. Workers consume committed outbox jobs independently of ACK delivery; senders retry with the same identity to recover the committed result."
         }
       ],
       "diagram": {
         "id": "chat-durable-routing",
         "title": {
-          "vi": "Một message: lưu bền trước, giao tới device sau",
-          "en": "One message: durable acceptance before device delivery"
+          "vi": "Tách durable commit, ACK và device delivery",
+          "en": "Separate durable commit, ACK and device delivery"
         },
         "caption": {
-          "vi": "Trace online và offline tách ACK cho sender khỏi việc giao tới recipient. History vẫn tồn tại nếu gateway hoặc pub/sub mất frame. Đây là thiết kế minh họa, không phải sơ đồ nội bộ của một hãng.",
-          "en": "Online and offline traces separate the sender acknowledgement from recipient delivery. History survives a gateway or pub/sub frame loss. This is a teaching design, not a company’s private architecture."
+          "vi": "Các trace cùng dựa trên committed history. ACK cho sender và delivery tới recipient có thể chạy song song sau commit; không coi thứ tự tab là một total order. History khôi phục live frame bị mất. Đây là thiết kế minh họa, không phải sơ đồ nội bộ của một hãng.",
+          "en": "All traces depend on committed history. Sender acknowledgements and recipient delivery may proceed concurrently after commit; tab order is not a total order. History repairs lost live frames. This is a teaching design, not a company’s private architecture."
         },
-        "width": 1180,
-        "height": 800,
+        "width": 760,
+        "height": 650,
         "nodes": [
           {
             "id": "sender",
@@ -557,8 +617,8 @@
               "vi": "Giữ clientMsgId khi retry; pending cho tới ACK đã commit. Clock client không quyết định thứ tự chung.",
               "en": "Preserves clientMsgId on retry; stays pending until a committed ACK. Client clocks do not decide shared order."
             },
-            "x": 130,
-            "y": 110,
+            "x": 95,
+            "y": 100,
             "kind": "client"
           },
           {
@@ -571,8 +631,8 @@
               "vi": "Giữ socket Alice, kiểm frame size/rate và chuyển command. Connection không tự chuyển sang gateway khác khi scale.",
               "en": "Holds Alice’s socket, limits frame size/rate and forwards commands. Scaling does not automatically move an existing connection."
             },
-            "x": 415,
-            "y": 110,
+            "x": 285,
+            "y": 100,
             "kind": "edge"
           },
           {
@@ -585,8 +645,8 @@
               "vi": "Serialize append theo conversation; kiểm membership, dedup và durable commit trước ACK. Owner được phân tán theo conversation.",
               "en": "Serializes appends within a conversation; checks membership, deduplicates and durably commits before ACK. Ownership is distributed across conversations."
             },
-            "x": 720,
-            "y": 110,
+            "x": 475,
+            "y": 100,
             "kind": "service"
           },
           {
@@ -599,8 +659,8 @@
               "vi": "Cùng transactional boundary trong baseline: message, idempotency result, seq và fanout job. Chọn replication/commit durability theo SLO.",
               "en": "One transactional boundary in the baseline: message, idempotency result, sequence and fanout job. Replication/commit durability follows the SLO."
             },
-            "x": 1040,
-            "y": 110,
+            "x": 665,
+            "y": 100,
             "kind": "store"
           },
           {
@@ -613,8 +673,8 @@
               "vi": "Đọc outbox sau commit, retry an toàn bằng message ID. Publish thành công không chứng minh recipient đã nhận.",
               "en": "Reads the outbox after commit and retries using message IDs. A successful publish does not prove recipient receipt."
             },
-            "x": 1040,
-            "y": 390,
+            "x": 665,
+            "y": 310,
             "kind": "worker"
           },
           {
@@ -627,22 +687,22 @@
               "vi": "user → nhiều (device, gateway, generation). TTL và compare-and-delete hạn chế ghost/stale cleanup; vẫn có thể lag.",
               "en": "Maps a user to multiple (device, gateway, generation) sessions. TTLs and compare-and-delete limit ghosts/stale cleanup; lag remains possible."
             },
-            "x": 720,
-            "y": 390,
+            "x": 475,
+            "y": 540,
             "kind": "store"
           },
           {
             "id": "bus",
             "label": {
-              "vi": "Gateway delivery bus",
-              "en": "Gateway delivery bus"
+              "vi": "Delivery bus",
+              "en": "Delivery bus"
             },
             "detail": {
               "vi": "Route theo gateway. Pub/sub ephemeral chỉ tăng tốc live delivery; offline recovery luôn dựa vào history.",
               "en": "Routes by gateway. Ephemeral pub/sub accelerates live delivery; offline recovery depends on history."
             },
-            "x": 415,
-            "y": 390,
+            "x": 475,
+            "y": 310,
             "kind": "queue"
           },
           {
@@ -655,8 +715,8 @@
               "vi": "Giữ nhiều socket của recipient; kiểm session generation, bounded send buffer và xử lý slow client.",
               "en": "Holds recipient sockets; validates session generations, bounds send buffers and handles slow clients."
             },
-            "x": 415,
-            "y": 680,
+            "x": 285,
+            "y": 310,
             "kind": "edge"
           },
           {
@@ -669,8 +729,8 @@
               "vi": "Apply theo conversation + seq/message ID; giữ cursor bền trên từng device và sync lại sau reconnect.",
               "en": "Applies by conversation + sequence/message ID; persists device cursors and resynchronizes after reconnect."
             },
-            "x": 130,
-            "y": 680,
+            "x": 95,
+            "y": 310,
             "kind": "client"
           },
           {
@@ -683,8 +743,8 @@
               "vi": "Đánh thức/hint có message mới, có thể trễ hoặc trùng. Không là authority của lịch sử hoặc read receipt.",
               "en": "A wake-up/new-message hint that can be delayed or duplicated. It is not authoritative history or a read receipt."
             },
-            "x": 1040,
-            "y": 680,
+            "x": 665,
+            "y": 540,
             "kind": "worker"
           }
         ],
@@ -833,8 +893,8 @@
                 "from": "log",
                 "to": "relay",
                 "description": {
-                  "vi": "Outbox chứa message đã được ACK cho Alice.",
-                  "en": "The outbox contains a message already acknowledged to Alice."
+                  "vi": "Outbox chứa message đã commit; không cần chờ Alice thực sự nhận ACK mới relay.",
+                  "en": "The outbox contains a committed message; relaying need not wait for Alice to observe the ACK."
                 },
                 "async": true
               },
@@ -991,6 +1051,14 @@
         {
           "vi": "Nhận seq 3 khi mới apply seq 1 thì highest received là 3 nhưng contiguous cursor vẫn là 1. Buffer seq 3, fetch phần thiếu, dedup và apply; chỉ advance cursor qua vùng đã xử lý đầy đủ. Edit/delete cũng là event có version hoặc tombstone, không được làm client nghĩ history đã liên tục nếu cần đồng bộ những thay đổi này. Nếu policy filter message theo quyền thì server phải cấp cursor tương thích, tránh gap giả.",
           "en": "After applying sequence 1, receiving sequence 3 makes the highest received value 3 while the contiguous cursor stays 1. Buffer 3, fetch the gap, deduplicate and apply; advance only through fully processed positions. Edits/deletions need versioned events or tombstones so clients can synchronize changes, not just original messages. Permission-filtered history requires compatible server cursor semantics to avoid artificial gaps."
+        },
+        {
+          "vi": "Bài thử hai device bên dưới tách hẳn server history, cursor/delivered/read từng device và account read theo quy tắc “đọc trên bất kỳ device nào”. Ban đầu phone có seq 1–2, desktop offline mới có seq 1. Commit thêm 3–4 rồi giao 4 trước: phone buffer 4, cursor vẫn 2 và bấm đọc chỉ tới 2. Khi giao 3, cursor/delivered lên 4; chỉ thao tác đọc tiếp mới đưa account read lên 4. Desktop reconnect vẫn có cursor 1 cho tới khi sync, dù account read đã là 4.",
+          "en": "The two-device experiment below separates server history, each device’s cursor/delivered/read positions, and an account marker defined as “read on any device.” Initially the phone has sequences 1–2 while the offline desktop has only 1. Commit 3–4 and deliver 4 first: the phone buffers 4, retains cursor 2, and opening the chat marks only through 2 as read. Delivering 3 advances applied/delivered positions to 4; a separate read action advances account read to 4. Reconnecting the desktop still leaves its cursor at 1 until sync, even with account read already at 4."
+        },
+        {
+          "vi": "Fixture coi apply/persist local và receipt delivered được server nhận là một bước tức thì; mạng thật có thể làm mất hoặc trễ receipt nên phải retry idempotently. Nút commit không tự giao message; nút reconnect không tự sync. Sync giả định đọc hết một log liên tiếp của đúng conversation, chưa mô phỏng paging, retention/filter hoặc gap allocator. Giới hạn 20 message chỉ để giao diện dễ quan sát, không phải giới hạn của thiết kế.",
+          "en": "The fixture combines local apply/persistence and server receipt of a delivered acknowledgement into one immediate step. Real receipt loss/delay needs idempotent retries. Commit does not automatically deliver messages, and reconnect does not automatically synchronize. Sync reads a complete contiguous log for one conversation; paging, retention/filtering and allocator holes are not simulated. The 20-message cap keeps the interface readable rather than constraining the design."
         }
       ],
       "experiment": "chat-sync"
@@ -1010,7 +1078,63 @@
           "vi": "Marker monotonic dùng max(current, incoming) dưới điều kiện quyền/bound thích hợp để request cũ không kéo lùi state. Không suy unread count bằng lastSeq − readSeq khi log có system event, tombstone, quyền filter hoặc membership join muộn; cần đếm đúng tập message được xem hoặc chấp nhận approximation đã công bố. Nhóm lớn tránh phát mỗi receipt tới mọi thành viên/device; aggregate hoặc chỉ hiển thị một phần theo nhu cầu UI.",
           "en": "Use max(current, incoming) for monotonic markers subject to permission/bound checks, preventing late requests from rolling state back. lastSeq − readSeq is not a valid unread count when logs include system events, tombstones, permission filters or late membership joins. Count eligible messages or publish an approximation. Large groups should not fan every receipt to every member/device; aggregate or display only what the UI needs."
         }
-      ]
+      ],
+      "flow": {
+        "title": {
+          "vi": "Receipt nói điều gì và chưa nói điều gì?",
+          "en": "What does each receipt establish?"
+        },
+        "caption": {
+          "vi": "Các mốc mô tả guarantee, không mô tả latency. Sau commit, đường ACK về sender và delivery tới device có thể chạy song song.",
+          "en": "These are guarantee milestones, not latency predictions. After commit, the sender ACK and device delivery paths can proceed concurrently."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Committed / accepted",
+              "en": "Committed / accepted"
+            },
+            "detail": {
+              "vi": "Server có message + retry result bền theo contract; recipient có thể vẫn offline.",
+              "en": "The server durably holds the message and retry result under its contract; recipients may remain offline."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Device apply",
+              "en": "Device apply"
+            },
+            "detail": {
+              "vi": "Một device dedup, lấp gap, apply/persist; chưa nói device khác có cùng cursor.",
+              "en": "One device deduplicates, fills gaps and applies/persists; another device can still have a lower cursor."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Delivered receipt",
+              "en": "Delivered receipt"
+            },
+            "detail": {
+              "vi": "Server ghi marker của đúng device; receipt trễ/trùng cần retry monotonic.",
+              "en": "The server records the correct device marker; delayed/duplicated receipts need monotonic retries."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Read theo UI policy",
+              "en": "Read under UI policy"
+            },
+            "detail": {
+              "vi": "Hành vi đọc riêng mới advance read; account read không thay local history cursor.",
+              "en": "A separate reading action advances read state; account read does not replace local history cursors."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
     },
     {
       "id": "groups-presence",
@@ -1071,7 +1195,67 @@
             }
           ]
         }
-      ]
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Kiểu phân phối group",
+            "en": "Group distribution"
+          },
+          {
+            "vi": "Work chính và lợi ích",
+            "en": "Main work and benefit"
+          },
+          {
+            "vi": "Chi phí và điều kiện",
+            "en": "Costs and conditions"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Push event / nhóm nhỏ",
+              "en": "Push events / small groups"
+            },
+            {
+              "vi": "Append một message, batch recipient theo gateway có session đủ quyền; live delivery nhanh khi load cho phép.",
+              "en": "Append one message and batch authorized online recipients by gateway; fast live delivery when capacity permits."
+            },
+            {
+              "vi": "Work tăng theo message × recipient device; receipt fanout riêng có thể lớn hơn payload message.",
+              "en": "Work grows with messages × recipient devices; receipt fanout can exceed message-payload work."
+            }
+          ],
+          [
+            {
+              "vi": "Pull log / broadcast lớn",
+              "en": "Pull logs / large broadcasts"
+            },
+            {
+              "vi": "Một authoritative log; push watermark/invalidation tới subscriber rồi fetch page theo cursor.",
+              "en": "One authoritative log; push watermarks/invalidations to subscribers and fetch pages by cursor."
+            },
+            {
+              "vi": "Giảm full push nhưng tăng read/catch-up load; cần cache/page/batch và watermark recovery.",
+              "en": "Reduces full push but increases reads/catch-up load; needs caches/pages/batches and watermark recovery."
+            }
+          ],
+          [
+            {
+              "vi": "Chuyển strategy",
+              "en": "Changing strategy"
+            },
+            {
+              "vi": "Dựa trên message rate, online fraction, device count, receipt volume và backlog đo được.",
+              "en": "Use measured message rates, online fractions, device counts, receipt volume and backlogs."
+            },
+            {
+              "vi": "Giữ cursor/identity và merge/dedup khi chuyển; số member một mình không chứng minh threshold.",
+              "en": "Preserve cursors/identities and merge/deduplicate during migration; membership count alone cannot justify a threshold."
+            }
+          ]
+        ]
+      }
     },
     {
       "id": "data-model",
@@ -1210,6 +1394,10 @@
         {
           "vi": "Deploy dùng drain: ngừng nhận connection mới, duy trì connection cũ trong thời hạn, rồi thông báo reconnect có jitter khi cần. Không hứa zero dropped connections nếu cuối cùng phải terminate socket. Slow client có bounded queue; coalesce ephemeral events, ưu tiên durable message hint rồi disconnect/resync khi vượt ngưỡng. Một buffer vô hạn biến một mobile chậm thành memory leak của gateway.",
           "en": "Deployments drain: stop accepting new connections, retain old ones for a bounded period, then request jittered reconnection when needed. Do not promise zero dropped connections when sockets eventually must terminate. Slow clients need bounded queues: coalesce ephemeral events, prioritize durable-message hints, then disconnect/resync above a threshold. An unbounded buffer turns a slow phone into a gateway memory leak."
+        },
+        {
+          "vi": "Nếu gateway chứa 500.000 socket mất cùng lúc và muốn trải lần thử reconnect đầu trên 30 giây, trung bình đã khoảng 16.667 attempt/s, chưa gồm retry hay catch-up. Ví dụ đây là 500.000 device, mỗi device thiếu 200 message và page size 100 thì cần ít nhất một triệu history-page response để tải đủ, nếu mọi device đều thực sự thiếu như vậy. Trung bình không chặn burst: jitter, admission cap và retry budget vẫn cần thiết. Failure-domain mất nhiều gateway phải dùng tổng socket bị ảnh hưởng, không chỉ một node; spare capacity cần kiểm cả socket slots lẫn TLS/auth/registry/sync throughput.",
+          "en": "If a gateway holding 500,000 sockets fails and first reconnect attempts are spread over 30 seconds, the average alone is about 16,667 attempts/s, excluding retries and catch-up. If these are 500,000 devices each missing 200 messages with 100 messages per page, at least one million history-page responses are needed, conditional on every device actually missing that much. Averages do not bound bursts: jitter, admission caps and retry budgets remain necessary. A failure domain losing several gateways must use the total affected socket count; spare capacity must cover socket slots and TLS/auth/registry/sync throughput."
         }
       ],
       "table": {
@@ -1319,6 +1507,10 @@
         {
           "vi": "Delete/edit cần policy retention, legal hold và propagation trên tất cả device/cache/index/backup phù hợp. Có thể phát tombstone và bỏ plaintext/media theo policy, nhưng không thể bảo đảm thu hồi screenshot hoặc bản sao do recipient đã lưu bên ngoài ứng dụng. Khi history bị compact, giữ cursor/skip semantics để device không chờ một message đã xóa mãi.",
           "en": "Deletion/edits need retention, legal hold and propagation rules for devices, caches, indexes and backups as appropriate. Tombstones can propagate and plaintext/media can be removed under policy, but screenshots or recipient copies outside the app cannot be reliably recalled. Compaction must preserve cursor/skip semantics so devices do not wait forever for deleted messages."
+        },
+        {
+          "vi": "Membership revoke cần mốc hiệu lực rõ: nếu hứa request/history fetch bắt đầu sau leave ACK không thấy message mới, mọi read/live delivery path phải kiểm quyền đủ mới hoặc bị fence/deny theo policy; snapshot member cũ trong queued fanout không đủ. Token còn hạn hay cached allow không tự thỏa lời hứa này. Không thể thu hồi nội dung đã tải về trước revoke; history-before-join và history-after-leave cũng phải chốt riêng.",
+          "en": "Membership revocation needs an effective boundary. If history requests starting after a leave ACK must not expose new messages, every read/live-delivery path needs sufficiently fresh authorization or policy-defined fencing/denial; old membership snapshots in queued fanout are insufficient. Unexpired tokens or cached allows do not establish that promise. Previously downloaded content cannot be recalled, and pre-join/post-leave history rules need separate definitions."
         }
       ]
     },

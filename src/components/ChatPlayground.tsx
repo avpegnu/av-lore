@@ -1,6 +1,7 @@
 import { useId, useState } from 'react';
 import { useIslandReady } from '../lib/use-island-ready';
 import { chatArrivals, replayChat, routeChat } from '../lib/chat-models';
+import ChatDevices from './ChatDevices';
 export default function ChatPlayground({ kind }: { kind: 'chat-routing' | 'chat-sync' }) {
   const ref = useIslandReady(),
     id = 'chat-lab-' + useId().replace(/:/g, '');
@@ -176,6 +177,7 @@ export default function ChatPlayground({ kind }: { kind: 'chat-routing' | 'chat-
             allocator thực tế để lại hole, server cần cursor/skip marker hoặc log offset có
             semantics phù hợp, không chờ một seq sẽ không bao giờ tồn tại.
           </p>
+          <ChatDevices />
         </>
       )}
     </section>
