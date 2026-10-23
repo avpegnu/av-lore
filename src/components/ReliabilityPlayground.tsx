@@ -1,5 +1,6 @@
 import {useId,useState} from 'react';import {useIslandReady} from '../lib/use-island-ready';
 import {dependencyAvailability,retryAmplification,retrySchedule,breakerReplay,type BreakerEvent} from '../lib/reliability-models';
+import DependencyComposer from './DependencyComposer';
 export default function ReliabilityPlayground({kind}:{kind:'dependency-availability'|'retry-storm'|'circuit-breaker'}){
  const ref=useIslandReady(),id='reliability-'+useId().replace(/:/g,'');const [count,setCount]=useState(3),[replicas,setReplicas]=useState(2),[shared,setShared]=useState(false),[layers,setLayers]=useState(3),[attempts,setAttempts]=useState(3),[jitter,setJitter]=useState(false),[budget,setBudget]=useState(2),[threshold,setThreshold]=useState(3),[events,setEvents]=useState<BreakerEvent[]>(['failure','failure','failure']);
  const availability=dependencyAvailability(.999,count,replicas,shared?.01:0),retry=retrySchedule(jitter,budget),breaker=breakerReplay(events,threshold);
@@ -10,6 +11,7 @@ export default function ReliabilityPlayground({kind}:{kind:'dependency-availabil
  <label className="routing-toggle"><input type="checkbox" checked={shared} onChange={e=>setShared(e.target.checked)}/>Lỗi chung có xác suất 1% làm mất cả nhóm redundant</label>
  <div className="dependency-chain">{Array.from({length:count},(_,i)=><span key={i}>D{i+1} · 99.9%</span>)}</div>
  <dl className="worksheet-results" aria-live="polite"><div><dt>Serial chain / %</dt><dd>{(availability.series*100).toFixed(5)}</dd></div><div><dt>Redundant group / %</dt><dd>{(availability.redundant*100).toFixed(5)}</dd></div></dl><p>Phép nhân chain giả định độc lập. Nhóm redundant giả định replica độc lập khi không có lỗi chung; thêm replica không vượt được trần availability của common cause. Đây là xác suất minh họa, không phải SLO dự báo từ marketing.</p>
+ <DependencyComposer commonFailure={shared?.01:0}/>
  </>}
  {kind==='retry-storm'&&<>
  <h3 id={id}>Retry nhân tải; jitter chỉ trải thời điểm</h3><p>Worst case: mỗi layer gọi layer dưới tối đa số attempts đã chọn, tính cả lần đầu. Biểu đồ riêng mô phỏng 24 request cùng thất bại, tối đa ba attempts ở một retry layer, backoff 100/200 ms; mỗi cột gom retry trong 50 ms.</p>
