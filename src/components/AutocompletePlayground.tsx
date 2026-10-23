@@ -1,5 +1,6 @@
 import { useId, useState } from 'react';
 import { useIslandReady } from '../lib/use-island-ready';
+import PrefixTree from './PrefixTree';
 import {
   suggestionLookup,
   suggestionCorpus,
@@ -74,6 +75,7 @@ export default function AutocompletePlayground({
               </button>
             ))}
           </div>
+          <PrefixTree query={query} fold={fold} mode={mode} choose={setQuery} />
           <ol className="prefix-walk">
             {result.path.map((step, i) => (
               <li key={i}>
