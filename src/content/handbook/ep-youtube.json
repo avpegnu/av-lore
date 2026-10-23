@@ -1,0 +1,3487 @@
+{
+  "id": "ep-youtube",
+  "group": "episode",
+  "title": {
+    "vi": "Xây dựng Creator Video Platform: upload, discovery và delivery",
+    "en": "Building a Creator Video Platform: upload, discovery and delivery"
+  },
+  "summary": {
+    "vi": "Thiết kế catalog user uploads với long tail, generation-safe processing, rights gates, sharded metadata, retrieval/ranking, codec economics và short-video prefetch; đi qua 13 giai đoạn và ba mô phỏng.",
+    "en": "Design a user-uploaded catalog with long-tail delivery, generation-safe processing, rights gates, sharded metadata, retrieval/ranking, codec economics and short-video prefetch across thirteen stages and three experiments."
+  },
+  "prerequisites": [
+    "video-platform",
+    "ep-netflix",
+    "search-engine"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "storage-search",
+    "database",
+    "messaging"
+  ],
+  "status": "review",
+  "takeaways": [
+    {
+      "vi": "Upload hours quyết định source/encode/storage demand; watched seconds và bitrate quyết định media egress.",
+      "en": "Uploaded hours drive source/encoding/storage demand; watched seconds and bitrates drive media egress."
+    },
+    {
+      "vi": "Baseline playable, optional enhancements và policy permission là các readiness states khác nhau.",
+      "en": "Baseline playback, optional enhancements and policy permission are distinct readiness states."
+    },
+    {
+      "vi": "Retrieval misses không được ranker cứu; đo eligible recall từ evidence thay fake recall curve.",
+      "en": "Rankers cannot rescue retrieval misses; measure eligible recall from evidence rather than invented recall curves."
+    },
+    {
+      "vi": "Codec payback phụ thuộc compatible watch duration, quality target và marginal costs, không chỉ view count.",
+      "en": "Codec payback depends on compatible watched duration, matched quality and marginal costs, not view counts alone."
+    },
+    {
+      "vi": "Long-tail caching và short-feed prefetch cần useful-byte/cold-miss budgets, không blind cache mọi thứ.",
+      "en": "Long-tail caching and short-feed prefetch need useful-byte and cold-miss budgets rather than indiscriminate caching."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Bốn câu hỏi cho một catalog mở",
+      "en": "Four questions for an open catalog"
+    },
+    "caption": {
+      "vi": "Theo từng video generation và policy version suốt lifecycle.",
+      "en": "Track media generations and policy versions throughout the lifecycle."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Nhận source",
+          "en": "Accept a source"
+        },
+        "detail": {
+          "vi": "Resume, validate, finalize và giữ accepted identity.",
+          "en": "Resume, validate, finalize and retain accepted identities."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Làm playable",
+          "en": "Make it playable"
+        },
+        "detail": {
+          "vi": "Baseline encode và independent policy gates.",
+          "en": "Baseline encoding and independent policy gates."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Giúp tìm thấy",
+          "en": "Help discovery"
+        },
+        "detail": {
+          "vi": "Retrieve, filter, rank và kiểm visibility khi play.",
+          "en": "Retrieve, filter, rank and check visibility at playback."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Phục vụ đúng bytes",
+          "en": "Serve the right bytes"
+        },
+        "detail": {
+          "vi": "Compatible rendition, local cache và useful prefetch.",
+          "en": "Compatible renditions, local caches and useful prefetch."
+        },
+        "icon": "gauge"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "UGC platform khác catalog được tuyển chọn",
+        "en": "User uploads differ from a curated catalog"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả sử ai có quyền cũng upload clips: số uploads tăng độc lập views, nội dung/codec đầu vào đa dạng và phần lớn catalog có demand thấp. Vì vậy ingest/encode/storage scaling không suy từ watch requests. Bài này là original educational architecture lấy các product pressures làm stages; không claim topology, traffic hoặc algorithms production hiện tại của một công ty.",
+          "en": "Assume authorized users can upload clips independently of viewing demand, with varied source formats and many rarely viewed items. Ingestion, encoding and storage therefore cannot be sized from watch requests alone. This educational architecture follows product pressures without claiming a company’s current private topology, traffic or algorithms."
+        },
+        {
+          "vi": "Bắt đầu bằng upload limits, video duration/resolution caps, privacy modes, processing/first-play target, supported clients, removal/review behavior và retention. Dùng case Video Platform cho ABR/processing DAG nền tảng; episode này mở rộng decisions theo catalog economics, discovery và lifecycle. Không gộp mọi metric thành requests/s.",
+          "en": "Start with upload/duration/resolution limits, privacy modes, processing/first-play targets, clients, removal/review behavior and retention. The Video Platform case covers foundational ABR and processing DAGs; this episode adds catalog economics, discovery and lifecycle decisions. Do not reduce every metric to requests per second."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Creator path",
+            "en": "Creator path"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Resumable bytes, quota, processing status, captions/thumbnails và appeal workflows.",
+              "en": "Resumable bytes, quotas, processing status, captions/thumbnails and review workflows."
+            },
+            {
+              "vi": "Upload completed chưa nghĩa public hoặc all codecs ready.",
+              "en": "Upload completion does not mean public visibility or all codecs ready."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Viewer path",
+            "en": "Viewer path"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Discovery, playback admission, compatible manifest, startup/rebuffer và privacy.",
+              "en": "Discovery, playback admission, compatible manifests, startup/rebuffering and privacy."
+            },
+            {
+              "vi": "Recommendation được trả không cấp quyền truy cập media.",
+              "en": "A recommendation does not grant media access."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Operating path",
+            "en": "Operating path"
+          },
+          "icon": "chart",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Storage generations, task backlogs, replication, policy propagation và deletion evidence.",
+              "en": "Generations, backlogs, replication, policy propagation and deletion evidence."
+            },
+            {
+              "vi": "Hot video và upload flood cần independent admission/failure isolation.",
+              "en": "Hot videos and upload floods need independent admission and isolation."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lifecycle",
+      "title": {
+        "vi": "Đặt lifecycle trước microservices",
+        "en": "Define lifecycle before microservices"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một state machine có thể tách SOURCE_UPLOADING → SOURCE_FINALIZED → BASELINE_READY; policy có PENDING/ALLOW/HOLD/BLOCK riêng. Public publication chỉ tham chiếu generation complete và selected policy/visibility version còn hợp lệ. Optional higher resolutions/codecs có thể xuất hiện sau, thay vì chờ mọi task của video hoàn tất.",
+          "en": "Separate source uploading/finalization/baseline readiness from policy pending/allow/hold/block states. Public publication references a complete generation with a valid current visibility/policy decision. Optional resolutions/codecs can arrive later instead of waiting for every task."
+        },
+        {
+          "vi": "Finalize upload cần verify chunks/offset/source digest theo protocol rồi tạo immutable generation. Có transaction/outbox hoặc reconciler giữa finalized source và task queue; retry một event không spawn unlimited jobs. Mọi worker report giữ sourceGen, profileVersion, attempt identity và expected lifecycle. Delete/private/block có monotonic version/tombstone để old completion không republish.",
+          "en": "Finalization verifies chunks/offsets/digests and creates an immutable generation. Use outboxes/reconciliation between finalized sources and queues, with retries that do not multiply jobs. Workers retain generation/profile/attempt/lifecycle context. Versioned deletion/privacy/blocking prevents stale completions from republishing."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Boundary",
+            "en": "Boundary"
+          },
+          {
+            "vi": "Bằng chứng cần có",
+            "en": "Required evidence"
+          },
+          {
+            "vi": "Không được suy ra",
+            "en": "Invalid inference"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Upload ACK",
+              "en": "Upload ACK"
+            },
+            {
+              "vi": "Stored offset/chunk identity trong scoped upload session",
+              "en": "Stored offsets/chunk identities in a scoped session"
+            },
+            {
+              "vi": "Toàn file đã complete chỉ vì nhận một chunk",
+              "en": "One accepted chunk proves the entire file is complete"
+            }
+          ],
+          [
+            {
+              "vi": "Source finalized",
+              "en": "Source finalized"
+            },
+            {
+              "vi": "Expected size/checksum/generation hợp lệ",
+              "en": "Valid size/checksum/generation"
+            },
+            {
+              "vi": "Input format an toàn hoặc policy cho public",
+              "en": "Input format safety or public permission"
+            }
+          ],
+          [
+            {
+              "vi": "Baseline ready",
+              "en": "Baseline ready"
+            },
+            {
+              "vi": "Complete rendition + dependencies + verified manifest",
+              "en": "A complete rendition, dependencies and verified manifest"
+            },
+            {
+              "vi": "Mọi resolution/codec đã ready",
+              "en": "Every resolution/codec is ready"
+            }
+          ],
+          [
+            {
+              "vi": "Publicly playable",
+              "en": "Publicly playable"
+            },
+            {
+              "vi": "Media ready + current visibility/policy + authorized context",
+              "en": "Ready media, current visibility/policy and authorized context"
+            },
+            {
+              "vi": "Không cần re-check quyền sau đó",
+              "en": "Authorization never needs checking again"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "build",
+      "title": {
+        "vi": "13 giai đoạn theo bottleneck",
+        "en": "Thirteen stages driven by bottlenecks"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi stage có đường đi, problem, decision, trade-off và exit criteria. Không bắt một team nhỏ xây sharding, in-ISP hardware hoặc custom encoder chips ngay. Các bài toán vẫn tồn tại ở quy mô nhỏ: retry identity, public-state gating, bounded queues và removal correctness không phải optional scale feature.",
+          "en": "Each stage exposes paths, problems, decisions, trade-offs and exit criteria. A small team need not build sharding, ISP hardware or custom encoder chips immediately. Retry identities, publication gates, bounded queues and correct removals still matter at small scale."
+        }
+      ],
+      "stages": [
+        {
+          "id": "mvp",
+          "title": {
+            "vi": "Upload tới một playable rendition",
+            "en": "Upload to one playable rendition"
+          },
+          "description": {
+            "vi": "MVP cần resumable upload, source finalize, một encode target, metadata lifecycle và watch page. Không encode trong HTTP request dài. Dù chỉ một app, media bytes nên đọc trực tiếp từ object/static serving path thay buộc API proxy mọi byte.",
+            "en": "The MVP needs resumable uploads, source finalization, one encode target, lifecycle metadata and a watch page. Avoid encoding inside long HTTP requests. Even one application can serve media through a separate object/static path rather than API-proxying every byte."
+          },
+          "problem": {
+            "vi": "Creator cần share một link play được sau processing, không chờ infrastructure hoàn hảo.",
+            "en": "Creators need a playable link after processing, before elaborate infrastructure."
+          },
+          "decision": {
+            "vi": "Modular control app, source storage, durable task và explicit processing states.",
+            "en": "Use a modular control app, source storage, durable tasks and explicit processing states."
+          },
+          "tradeoff": {
+            "vi": "Mỗi accepted upload vẫn cần repair/retry, quota và parser isolation.",
+            "en": "Accepted uploads still need repair/retry, quotas and parser isolation."
+          },
+          "nextPressure": {
+            "vi": "Byte traffic và API traffic tăng khác nhau.",
+            "en": "Byte traffic and API traffic grow differently."
+          },
+          "exitCriteria": {
+            "vi": "Lost connection resume đúng source identity; public link không trả nonexistent asset.",
+            "en": "Resumption preserves source identity and public links never reference missing assets."
+          },
+          "diagram": {
+            "id": "creator-stage-mvp",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "creator",
+                "label": {
+                  "vi": "Creator",
+                  "en": "Creator"
+                },
+                "detail": {
+                  "vi": "Resumable upload, content/visibility settings và processing status.",
+                  "en": "Resumable uploads, visibility settings and processing status."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Control API",
+                  "en": "Control API"
+                },
+                "detail": {
+                  "vi": "Metadata, upload sessions, playback/discovery contracts và idempotency.",
+                  "en": "Metadata, upload sessions, playback/discovery contracts and idempotency."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "raw",
+                "label": {
+                  "vi": "Source uploads",
+                  "en": "Source uploads"
+                },
+                "detail": {
+                  "vi": "Durable finalized source generations, checksums, retention và isolated parsing.",
+                  "en": "Durable finalized sources, checksums, retention and isolated parsing."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "encode",
+                "label": {
+                  "vi": "Transcode workers",
+                  "en": "Transcode workers"
+                },
+                "detail": {
+                  "vi": "Pinned source/profile, chunk alignment, retries và verified outputs.",
+                  "en": "Pinned sources/profiles, chunk alignment, retries and verified outputs."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "worker"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "creator",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại api.",
+                      "en": "Carry context and enforce authorization/version/budget checks at api."
+                    }
+                  },
+                  {
+                    "from": "creator",
+                    "to": "raw",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại raw.",
+                      "en": "Carry context and enforce authorization/version/budget checks at raw."
+                    }
+                  },
+                  {
+                    "from": "raw",
+                    "to": "encode",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại encode.",
+                      "en": "Carry context and enforce authorization/version/budget checks at encode."
+                    }
+                  },
+                  {
+                    "from": "encode",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  },
+                  {
+                    "from": "viewer",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "bytes",
+          "title": {
+            "vi": "Tách bytes khỏi pages",
+            "en": "Separate bytes from pages"
+          },
+          "description": {
+            "vi": "Control API trả metadata/playback config và scoped media references; CDN/cache phục vụ immutable segments. Phân tích hot set theo region, rendition và segment, không chỉ video-level views. Long tail có thể cold-miss nhiều, nhưng “rare thì bỏ CDN luôn rẻ hơn” không là định luật: hợp đồng egress, cache price và origin topology quyết định.",
+            "en": "Control APIs return metadata/configuration and scoped references while caches serve immutable segments. Analyze hot sets by region, rendition and segment. Long-tail misses do not prove that bypassing CDNs is always cheaper; egress contracts, cache prices and origin topology determine costs."
+          },
+          "problem": {
+            "vi": "Large transfers làm web worker/socket pools cạn dù CPU thấp.",
+            "en": "Large transfers exhaust web/socket pools despite modest CPU use."
+          },
+          "decision": {
+            "vi": "Separate media delivery, tiered caching và origin admission/coalescing.",
+            "en": "Separate media delivery with tiered caching and bounded/coalesced origin fetches."
+          },
+          "tradeoff": {
+            "vi": "Cold starts, cache fragmentation và invalidation/deletion policy cần vận hành.",
+            "en": "Cold starts, fragmentation and deletion/cache policies need operations."
+          },
+          "nextPressure": {
+            "vi": "Read-heavy metadata bắt đầu lag hoặc saturate.",
+            "en": "Read-heavy metadata starts lagging or saturating."
+          },
+          "exitCriteria": {
+            "vi": "Media không đi qua app memory; cache miss burst không làm origin collapse.",
+            "en": "Media bypasses application memory and miss bursts do not collapse origins."
+          },
+          "diagram": {
+            "id": "creator-stage-bytes",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Control API",
+                  "en": "Control API"
+                },
+                "detail": {
+                  "vi": "Metadata, upload sessions, playback/discovery contracts và idempotency.",
+                  "en": "Metadata, upload sessions, playback/discovery contracts and idempotency."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "meta",
+                "label": {
+                  "vi": "Metadata authority",
+                  "en": "Metadata authority"
+                },
+                "detail": {
+                  "vi": "Lifecycle, owner, generation và policy versions có transaction boundary.",
+                  "en": "Transactional lifecycle, ownership, generation and policy versions."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media cache / CDN",
+                  "en": "Media cache / CDN"
+                },
+                "detail": {
+                  "vi": "Versioned bytes, request coalescing, negative caching và origin limits.",
+                  "en": "Versioned bytes, request coalescing, negative caching and origin limits."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "viewer",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại api.",
+                      "en": "Carry context and enforce authorization/version/budget checks at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "meta",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại meta.",
+                      "en": "Carry context and enforce authorization/version/budget checks at meta."
+                    }
+                  },
+                  {
+                    "from": "viewer",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại cdn.",
+                      "en": "Carry context and enforce authorization/version/budget checks at cdn."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "replicas",
+          "title": {
+            "vi": "Replica cần freshness contract",
+            "en": "Replicas need freshness contracts"
+          },
+          "description": {
+            "vi": "Tune queries/indexes và connection pools trước; replicas cho safe-stale reads có thể giảm primary load. Creator vừa sửa visibility/title cần read-your-write version hoặc primary routing phù hợp. Playback admission/rights checks không được dùng arbitrary stale replica chỉ vì watch pages đọc nhiều.",
+            "en": "Tune queries/indexes and pools first. Replicas can absorb stale-tolerant reads. Creator read-your-write flows need version-aware reads or appropriate primary routing. Playback/rights admission cannot use arbitrary stale replicas merely because watch pages are read-heavy."
+          },
+          "problem": {
+            "vi": "Browse/watch metadata chiếm read capacity.",
+            "en": "Browsing/watch metadata consumes read capacity."
+          },
+          "decision": {
+            "vi": "Classify reads theo freshness, observe lag và bound failover loss.",
+            "en": "Classify freshness, observe lag and bound failover loss."
+          },
+          "tradeoff": {
+            "vi": "Replicas không tăng write throughput và failover không tự zero-loss.",
+            "en": "Replicas do not scale writes or automatically guarantee lossless failover."
+          },
+          "nextPressure": {
+            "vi": "Thumbnails tạo workload nhiều tiny objects.",
+            "en": "Thumbnails create a high-rate small-object workload."
+          },
+          "exitCriteria": {
+            "vi": "Refresh sau edit hiển thị đúng promised version; stale rights không leak access.",
+            "en": "Post-edit refreshes meet version promises and stale rights do not leak access."
+          },
+          "diagram": {
+            "id": "creator-stage-replicas",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "creator",
+                "label": {
+                  "vi": "Creator",
+                  "en": "Creator"
+                },
+                "detail": {
+                  "vi": "Resumable upload, content/visibility settings và processing status.",
+                  "en": "Resumable uploads, visibility settings and processing status."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Control API",
+                  "en": "Control API"
+                },
+                "detail": {
+                  "vi": "Metadata, upload sessions, playback/discovery contracts và idempotency.",
+                  "en": "Metadata, upload sessions, playback/discovery contracts and idempotency."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "meta",
+                "label": {
+                  "vi": "Metadata authority",
+                  "en": "Metadata authority"
+                },
+                "detail": {
+                  "vi": "Lifecycle, owner, generation và policy versions có transaction boundary.",
+                  "en": "Transactional lifecycle, ownership, generation and policy versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "creator",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại api.",
+                      "en": "Carry context and enforce authorization/version/budget checks at api."
+                    }
+                  },
+                  {
+                    "from": "viewer",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại api.",
+                      "en": "Carry context and enforce authorization/version/budget checks at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "meta",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại meta.",
+                      "en": "Carry context and enforce authorization/version/budget checks at meta."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "thumbnails",
+          "title": {
+            "vi": "Tối ưu tiny objects",
+            "en": "Optimize tiny objects"
+          },
+          "description": {
+            "vi": "Một browse page có nhiều images khác cỡ. Tạo thumbnail variants có version/quality/format keys, CDN cache và bounded generation. Small-object storage có thể dùng object service, packed blocks hoặc KV store tùy measurements; không nhất thiết một file mỗi image trên local filesystem hay bắt buộc một database cụ thể.",
+            "en": "A browse page requests many image sizes. Version thumbnail formats/qualities and cache them with bounded generation. Object services, packed blocks or key-value stores can fit measured workloads; neither per-image local files nor one particular database is mandatory."
+          },
+          "problem": {
+            "vi": "Metadata/IO overhead của millions tiny files hoặc on-demand transforms vượt byte volume.",
+            "en": "Small-file metadata/IO and transformation overhead exceed the apparent byte volume."
+          },
+          "decision": {
+            "vi": "Predefined variants, cache/negative-cache và isolated generation queues.",
+            "en": "Use predefined variants, caching/negative caching and isolated generation queues."
+          },
+          "tradeoff": {
+            "vi": "Variants tăng storage; arbitrary resize endpoints dễ bị abuse.",
+            "en": "Variants add storage and arbitrary resizing can be abused."
+          },
+          "nextPressure": {
+            "vi": "Một primary phải chứa mọi creator writes.",
+            "en": "One primary still receives every creator’s writes."
+          },
+          "exitCriteria": {
+            "vi": "Hot image variants cache được; bad dimensions không spawn unlimited jobs.",
+            "en": "Hot variants cache effectively and invalid dimensions cannot spawn unlimited work."
+          },
+          "diagram": {
+            "id": "creator-stage-thumbnails",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "images",
+                "label": {
+                  "vi": "Thumbnail service",
+                  "en": "Thumbnail service"
+                },
+                "detail": {
+                  "vi": "Versioned image variants, cache policy và small-object efficiency.",
+                  "en": "Versioned variants, cache policy and small-object efficiency."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media cache / CDN",
+                  "en": "Media cache / CDN"
+                },
+                "detail": {
+                  "vi": "Versioned bytes, request coalescing, negative caching và origin limits.",
+                  "en": "Versioned bytes, request coalescing, negative caching and origin limits."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Processing queue",
+                  "en": "Processing queue"
+                },
+                "detail": {
+                  "vi": "Bounded backlog, task identities, fair scheduling, retries và poison handling.",
+                  "en": "Bounded backlogs, task identities, fair scheduling, retries and poison handling."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "queue"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "viewer",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại cdn.",
+                      "en": "Carry context and enforce authorization/version/budget checks at cdn."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "images",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại images.",
+                      "en": "Carry context and enforce authorization/version/budget checks at images."
+                    }
+                  },
+                  {
+                    "from": "images",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  },
+                  {
+                    "from": "images",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại queue.",
+                      "en": "Carry context and enforce authorization/version/budget checks at queue."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "owner-shards",
+          "title": {
+            "vi": "Shard theo access pattern",
+            "en": "Shard by access patterns"
+          },
+          "description": {
+            "vi": "Owner/channel locality có thể giữ upload settings và creator views local; global watch/search/recommendation cần indexes/projections khác. Chọn key theo invariant, không chỉ equal row counts. Hot creator/video và cross-owner interactions cần separate scaling policy.",
+            "en": "Owner/channel locality can colocate upload settings and creator views, while global watch/search/recommendation queries need other indexes/projections. Choose keys by invariants rather than row counts alone, with explicit handling of hot creators/videos and cross-owner interactions."
+          },
+          "problem": {
+            "vi": "Write set và metadata volume vượt một máy.",
+            "en": "Write volume and metadata outgrow one machine."
+          },
+          "decision": {
+            "vi": "Explicit shard map, colocated transactions và searchable read models.",
+            "en": "Use explicit shard maps, colocated transactions and searchable read models."
+          },
+          "tradeoff": {
+            "vi": "Cross-shard counts/joins tăng cost; replication lag không tự biến mất.",
+            "en": "Cross-shard joins/counts cost more and replication lag does not vanish."
+          },
+          "nextPressure": {
+            "vi": "Rights matching/review phải theo kịp uploads.",
+            "en": "Rights matching/review must keep up with uploads."
+          },
+          "exitCriteria": {
+            "vi": "Routing misses không gửi write sang hai authorities; hot keys có guard.",
+            "en": "Routing failures cannot produce dual-authority writes and hot keys are guarded."
+          },
+          "diagram": {
+            "id": "creator-stage-owner-shards",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "creator",
+                "label": {
+                  "vi": "Creator",
+                  "en": "Creator"
+                },
+                "detail": {
+                  "vi": "Resumable upload, content/visibility settings và processing status.",
+                  "en": "Resumable uploads, visibility settings and processing status."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Control API",
+                  "en": "Control API"
+                },
+                "detail": {
+                  "vi": "Metadata, upload sessions, playback/discovery contracts và idempotency.",
+                  "en": "Metadata, upload sessions, playback/discovery contracts and idempotency."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "proxy",
+                "label": {
+                  "vi": "SQL routing layer",
+                  "en": "SQL routing layer"
+                },
+                "detail": {
+                  "vi": "Key-aware routes, query/pool budgets và fenced resharding.",
+                  "en": "Key-aware routing, query/pool budgets and fenced resharding."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "meta",
+                "label": {
+                  "vi": "Metadata authority",
+                  "en": "Metadata authority"
+                },
+                "detail": {
+                  "vi": "Lifecycle, owner, generation và policy versions có transaction boundary.",
+                  "en": "Transactional lifecycle, ownership, generation and policy versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "retrieve",
+                "label": {
+                  "vi": "Candidate retrieval",
+                  "en": "Candidate retrieval"
+                },
+                "detail": {
+                  "vi": "Multi-source candidates, dedup, eligibility và model/index context.",
+                  "en": "Multiple candidate sources, deduplication, eligibility and model/index context."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "creator",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại api.",
+                      "en": "Carry context and enforce authorization/version/budget checks at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "proxy",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại proxy.",
+                      "en": "Carry context and enforce authorization/version/budget checks at proxy."
+                    }
+                  },
+                  {
+                    "from": "proxy",
+                    "to": "meta",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại meta.",
+                      "en": "Carry context and enforce authorization/version/budget checks at meta."
+                    }
+                  },
+                  {
+                    "from": "meta",
+                    "to": "retrieve",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại retrieve.",
+                      "en": "Carry context and enforce authorization/version/budget checks at retrieve."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "rights",
+          "title": {
+            "vi": "Rights/safety là versioned lifecycle",
+            "en": "Rights/safety as a versioned lifecycle"
+          },
+          "description": {
+            "vi": "Fingerprint match tạo evidence/claim cho policy, không tự là legal truth hay nhận diện mọi infringement. Version decisions, territorial settings, disputed claims, review/appeal và reversal. Thiết kế học tập có public-publication gate tách encode readiness khỏi authorization/policy readiness; product policy cụ thể cần được định nghĩa riêng.",
+            "en": "Fingerprint matches provide evidence/claims for policy, not universal legal truth or complete infringement detection. Version decisions, territories, disputes, review and reversals. This design separates public-publication gates from encoding readiness; specific product policies require explicit definition."
+          },
+          "problem": {
+            "vi": "Upload hợp lệ về bytes chưa chắc được public/monetize ở mọi nơi.",
+            "en": "Valid bytes do not imply permission to publish or monetize everywhere."
+          },
+          "decision": {
+            "vi": "Independent technical readiness, policy decision và generation-bound publication.",
+            "en": "Separate technical readiness, policy decisions and generation-bound publication."
+          },
+          "tradeoff": {
+            "vi": "False positives, pending review và changes sau publish cần UX/recovery.",
+            "en": "False positives, pending reviews and post-publication changes require user workflows and repair."
+          },
+          "nextPressure": {
+            "vi": "Shard routing/pool control rải trong app code khó thay đổi.",
+            "en": "Scattered application shard/pool logic becomes difficult to change."
+          },
+          "exitCriteria": {
+            "vi": "Late worker không republish deleted/blocked generation; changed policy có propagation.",
+            "en": "Late workers cannot republish deleted/blocked generations and policy changes propagate."
+          },
+          "diagram": {
+            "id": "creator-stage-rights",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "raw",
+                "label": {
+                  "vi": "Source uploads",
+                  "en": "Source uploads"
+                },
+                "detail": {
+                  "vi": "Durable finalized source generations, checksums, retention và isolated parsing.",
+                  "en": "Durable finalized sources, checksums, retention and isolated parsing."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "encode",
+                "label": {
+                  "vi": "Transcode workers",
+                  "en": "Transcode workers"
+                },
+                "detail": {
+                  "vi": "Pinned source/profile, chunk alignment, retries và verified outputs.",
+                  "en": "Pinned sources/profiles, chunk alignment, retries and verified outputs."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Rights / safety decisions",
+                  "en": "Rights / safety decisions"
+                },
+                "detail": {
+                  "vi": "Versioned decisions, holds, appeals/review và regional policy context.",
+                  "en": "Versioned decisions, holds, review/appeals and regional policy context."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "meta",
+                "label": {
+                  "vi": "Metadata authority",
+                  "en": "Metadata authority"
+                },
+                "detail": {
+                  "vi": "Lifecycle, owner, generation và policy versions có transaction boundary.",
+                  "en": "Transactional lifecycle, ownership, generation and policy versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "raw",
+                    "to": "encode",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại encode.",
+                      "en": "Carry context and enforce authorization/version/budget checks at encode."
+                    }
+                  },
+                  {
+                    "from": "raw",
+                    "to": "policy",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại policy.",
+                      "en": "Carry context and enforce authorization/version/budget checks at policy."
+                    }
+                  },
+                  {
+                    "from": "encode",
+                    "to": "meta",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại meta.",
+                      "en": "Carry context and enforce authorization/version/budget checks at meta."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "meta",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại meta.",
+                      "en": "Carry context and enforce authorization/version/budget checks at meta."
+                    }
+                  },
+                  {
+                    "from": "meta",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "router",
+          "title": {
+            "vi": "Tập trung SQL routing và query budgets",
+            "en": "Centralize SQL routing and query budgets"
+          },
+          "description": {
+            "vi": "Một layer như Vitess minh họa cách giữ MySQL nhưng route/query-plan theo keyspace, pool connections và vận hành resharding. Nó không chỉ là TCP proxy và không xóa mọi distributed SQL constraint. Define supported query/transaction semantics, scatter fan-out, schema changes và topology availability.",
+            "en": "A layer such as Vitess illustrates retaining MySQL with keyspace-aware routing/planning, pooling and resharding operations. It is more than a TCP proxy and does not remove distributed SQL constraints. Define supported queries/transactions, scatter limits, schema rollout and topology availability."
+          },
+          "problem": {
+            "vi": "Mỗi service tự hiểu shards và mở quá nhiều database connections.",
+            "en": "Services each understand shards and open excessive connections."
+          },
+          "decision": {
+            "vi": "Shared routing policy, bounded pools và staged/fenced shard migration.",
+            "en": "Share routing policy, bound pools and stage fenced shard migrations."
+          },
+          "tradeoff": {
+            "vi": "Critical routing layer cần HA, observability và failover drills.",
+            "en": "The critical routing layer needs availability, observability and drills."
+          },
+          "nextPressure": {
+            "vi": "Creators muốn live streaming ngoài batch uploads.",
+            "en": "Creators want live streams alongside batch uploads."
+          },
+          "exitCriteria": {
+            "vi": "Reshard giữ writes/reads đúng ownership; global query có deadline và budget.",
+            "en": "Resharding preserves ownership and global queries have deadlines and budgets."
+          },
+          "diagram": {
+            "id": "creator-stage-router",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Control API",
+                  "en": "Control API"
+                },
+                "detail": {
+                  "vi": "Metadata, upload sessions, playback/discovery contracts và idempotency.",
+                  "en": "Metadata, upload sessions, playback/discovery contracts and idempotency."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "proxy",
+                "label": {
+                  "vi": "SQL routing layer",
+                  "en": "SQL routing layer"
+                },
+                "detail": {
+                  "vi": "Key-aware routes, query/pool budgets và fenced resharding.",
+                  "en": "Key-aware routing, query/pool budgets and fenced resharding."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "meta",
+                "label": {
+                  "vi": "Metadata authority",
+                  "en": "Metadata authority"
+                },
+                "detail": {
+                  "vi": "Lifecycle, owner, generation và policy versions có transaction boundary.",
+                  "en": "Transactional lifecycle, ownership, generation and policy versions."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "viewer",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại api.",
+                      "en": "Carry context and enforce authorization/version/budget checks at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "proxy",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại proxy.",
+                      "en": "Carry context and enforce authorization/version/budget checks at proxy."
+                    }
+                  },
+                  {
+                    "from": "proxy",
+                    "to": "meta",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại meta.",
+                      "en": "Carry context and enforce authorization/version/budget checks at meta."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "live",
+          "title": {
+            "vi": "Live là deadline pipeline",
+            "en": "Live is a deadline-driven pipeline"
+          },
+          "description": {
+            "vi": "Live ingest nhận stream liên tục, transcode/package aligned media chunks rồi publish sliding manifest. Latency là tổng capture/encode/ingest/transcode/packaging/network/player buffer; giảm segment duration chỉ đổi một phần. Reconnect, timestamp discontinuity, codec changes và stream end đều có protocol.",
+            "en": "Live ingest continuously transcodes/packages aligned chunks and publishes sliding manifests. Latency includes capture, encoding, ingestion, processing, packaging, delivery and player buffers; segment duration is only one part. Reconnects, timestamp discontinuities, codec changes and ending streams need explicit protocols."
+          },
+          "problem": {
+            "vi": "Một batch encode hoàn tất sau nhiều phút không dùng được cho live.",
+            "en": "A batch encode finishing minutes later cannot serve live viewers."
+          },
+          "decision": {
+            "vi": "Streaming DAG có per-stage deadlines, priority và shared-segment coalescing.",
+            "en": "Use streaming DAGs with stage deadlines, priorities and shared-segment coalescing."
+          },
+          "tradeoff": {
+            "vi": "Lower latency giảm retry/buffer margin; latest segment có herd risk.",
+            "en": "Lower latency leaves less retry/buffer margin and recent segments attract herds."
+          },
+          "nextPressure": {
+            "vi": "Encoding nhiều codecs/renditions làm compute cost tăng.",
+            "en": "Additional codecs/renditions increase compute cost."
+          },
+          "exitCriteria": {
+            "vi": "Mất ingest/retry không đảo timeline hoặc publish partial media; backpressure có policy.",
+            "en": "Ingest failures/retries preserve timelines and never publish partial media, with explicit backpressure."
+          },
+          "diagram": {
+            "id": "creator-stage-live",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "creator",
+                "label": {
+                  "vi": "Creator",
+                  "en": "Creator"
+                },
+                "detail": {
+                  "vi": "Resumable upload, content/visibility settings và processing status.",
+                  "en": "Resumable uploads, visibility settings and processing status."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "live",
+                "label": {
+                  "vi": "Live ingest / packager",
+                  "en": "Live ingest / packager"
+                },
+                "detail": {
+                  "vi": "Bounded latency, chunk/segment timeline, discontinuities và reconnect.",
+                  "en": "Bounded latency, media timelines, discontinuities and reconnects."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "encode",
+                "label": {
+                  "vi": "Transcode workers",
+                  "en": "Transcode workers"
+                },
+                "detail": {
+                  "vi": "Pinned source/profile, chunk alignment, retries và verified outputs.",
+                  "en": "Pinned sources/profiles, chunk alignment, retries and verified outputs."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media cache / CDN",
+                  "en": "Media cache / CDN"
+                },
+                "detail": {
+                  "vi": "Versioned bytes, request coalescing, negative caching và origin limits.",
+                  "en": "Versioned bytes, request coalescing, negative caching and origin limits."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 820,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "creator",
+                    "to": "live",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại live.",
+                      "en": "Carry context and enforce authorization/version/budget checks at live."
+                    }
+                  },
+                  {
+                    "from": "live",
+                    "to": "encode",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại encode.",
+                      "en": "Carry context and enforce authorization/version/budget checks at encode."
+                    }
+                  },
+                  {
+                    "from": "encode",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  },
+                  {
+                    "from": "media",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại cdn.",
+                      "en": "Carry context and enforce authorization/version/budget checks at cdn."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "viewer",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại viewer.",
+                      "en": "Carry context and enforce authorization/version/budget checks at viewer."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "codecs",
+          "title": {
+            "vi": "Encode thêm khi có payback",
+            "en": "Encode more when it pays back"
+          },
+          "description": {
+            "vi": "Compare codec ladders theo matched perceptual target, compatible device share, expected watched seconds và egress/storage/compute costs. Làm baseline playable sớm, expensive profiles theo priority/demand/forecast. Không dự đoán mọi video sẽ hot và không lấy một published chip benchmark làm constant cho fleet của mình.",
+            "en": "Compare codec ladders at matched perceptual targets using device compatibility, watched seconds and egress/storage/compute costs. Publish a baseline early and prioritize expensive profiles by demand/forecasts. Do not assume every upload becomes popular or apply one published chip benchmark to your fleet."
+          },
+          "problem": {
+            "vi": "Long-tail uploads trả encode/storage cost dù gần như không có views.",
+            "en": "Long-tail uploads incur encoding/storage costs even with few views."
+          },
+          "decision": {
+            "vi": "Tiered readiness và incremental codec investment với threshold/uncertainty.",
+            "en": "Use tiered readiness and incremental codec investment with thresholds and uncertainty."
+          },
+          "tradeoff": {
+            "vi": "More codecs tăng test matrix, storage và decoder/battery concerns.",
+            "en": "Additional codecs expand testing, storage and decoding/battery concerns."
+          },
+          "nextPressure": {
+            "vi": "Một catalog lớn cần discovery hiệu quả.",
+            "en": "A large catalog needs effective discovery."
+          },
+          "exitCriteria": {
+            "vi": "Quality/device compatibility verified; extra encode có cost/benefit assumptions explicit.",
+            "en": "Verify quality/device support and make encoding cost/benefit assumptions explicit."
+          },
+          "diagram": {
+            "id": "creator-stage-codecs",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Processing queue",
+                  "en": "Processing queue"
+                },
+                "detail": {
+                  "vi": "Bounded backlog, task identities, fair scheduling, retries và poison handling.",
+                  "en": "Bounded backlogs, task identities, fair scheduling, retries and poison handling."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "fleet",
+                "label": {
+                  "vi": "Heterogeneous encode fleet",
+                  "en": "Heterogeneous encode fleet"
+                },
+                "detail": {
+                  "vi": "CPU/accelerator scheduling, compatibility, capacity và fallbacks.",
+                  "en": "CPU/accelerator scheduling, compatibility, capacity and fallbacks."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "encode",
+                "label": {
+                  "vi": "Transcode workers",
+                  "en": "Transcode workers"
+                },
+                "detail": {
+                  "vi": "Pinned source/profile, chunk alignment, retries và verified outputs.",
+                  "en": "Pinned sources/profiles, chunk alignment, retries and verified outputs."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "queue",
+                    "to": "fleet",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại fleet.",
+                      "en": "Carry context and enforce authorization/version/budget checks at fleet."
+                    }
+                  },
+                  {
+                    "from": "fleet",
+                    "to": "encode",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại encode.",
+                      "en": "Carry context and enforce authorization/version/budget checks at encode."
+                    }
+                  },
+                  {
+                    "from": "encode",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  },
+                  {
+                    "from": "viewer",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "recommendations",
+          "title": {
+            "vi": "Retrieve rồi rank với recall evidence",
+            "en": "Retrieve then rank with recall evidence"
+          },
+          "description": {
+            "vi": "Candidate sources có thể subscriptions, search/content similarity, collaborative signals và exploration. Dedup/filter/score trong budget; ranker nặng chỉ nhìn retained candidates. Utility/quality/safety/diversity objectives không gói gọn clicks hoặc raw watch time; define suitable offline/online evaluations và privacy boundaries.",
+            "en": "Candidate sources can include subscriptions, similarity, collaborative signals and exploration. Deduplicate/filter/score within a budget; expensive ranking sees only retained candidates. Quality, safety and diversity are not captured by clicks or raw watch time alone; define evaluations and privacy boundaries."
+          },
+          "problem": {
+            "vi": "Scoring mọi item với expensive ranker không phù hợp latency/cost target.",
+            "en": "Scoring every item with an expensive ranker exceeds latency/cost targets."
+          },
+          "decision": {
+            "vi": "Multi-source retrieval, bounded ranking và observable candidate/eligibility coverage.",
+            "en": "Use multi-source retrieval, bounded ranking and observable eligibility/coverage."
+          },
+          "tradeoff": {
+            "vi": "Missed candidates không được rank; feature/model/index skew và feedback bias cần đo.",
+            "en": "Missing candidates cannot be ranked; measure feature/model/index skew and feedback bias."
+          },
+          "nextPressure": {
+            "vi": "Viewers ở nhiều networks cần local cache placement.",
+            "en": "Viewers across networks need local cache placement."
+          },
+          "exitCriteria": {
+            "vi": "Oracle/sampled recall audit tách khỏi ranking metrics; filters không leak private/blocked items.",
+            "en": "Separate retrieval recall audits from ranking metrics and prevent blocked/private item leakage."
+          },
+          "diagram": {
+            "id": "creator-stage-recommendations",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Control API",
+                  "en": "Control API"
+                },
+                "detail": {
+                  "vi": "Metadata, upload sessions, playback/discovery contracts và idempotency.",
+                  "en": "Metadata, upload sessions, playback/discovery contracts and idempotency."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "retrieve",
+                "label": {
+                  "vi": "Candidate retrieval",
+                  "en": "Candidate retrieval"
+                },
+                "detail": {
+                  "vi": "Multi-source candidates, dedup, eligibility và model/index context.",
+                  "en": "Multiple candidate sources, deduplication, eligibility and model/index context."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "rank",
+                "label": {
+                  "vi": "Ranking / selection",
+                  "en": "Ranking / selection"
+                },
+                "detail": {
+                  "vi": "Bounded expensive scoring, policy checks, diversity và feedback context.",
+                  "en": "Bounded scoring, policy checks, diversity and feedback context."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "model"
+              },
+              {
+                "id": "meta",
+                "label": {
+                  "vi": "Metadata authority",
+                  "en": "Metadata authority"
+                },
+                "detail": {
+                  "vi": "Lifecycle, owner, generation và policy versions có transaction boundary.",
+                  "en": "Transactional lifecycle, ownership, generation and policy versions."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "viewer",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại api.",
+                      "en": "Carry context and enforce authorization/version/budget checks at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "retrieve",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại retrieve.",
+                      "en": "Carry context and enforce authorization/version/budget checks at retrieve."
+                    }
+                  },
+                  {
+                    "from": "retrieve",
+                    "to": "rank",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại rank.",
+                      "en": "Carry context and enforce authorization/version/budget checks at rank."
+                    }
+                  },
+                  {
+                    "from": "rank",
+                    "to": "meta",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại meta.",
+                      "en": "Carry context and enforce authorization/version/budget checks at meta."
+                    }
+                  },
+                  {
+                    "from": "rank",
+                    "to": "viewer",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại viewer.",
+                      "en": "Carry context and enforce authorization/version/budget checks at viewer."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "local-cache",
+          "title": {
+            "vi": "Đặt hot bytes gần demand",
+            "en": "Place hot bytes near demand"
+          },
+          "description": {
+            "vi": "Regional/ISP caches có thể giảm external traffic cho cacheable hot set; hiệu quả tùy geography, format, popularity và peering. Không suy một typical hit ratio thành toàn bộ egress savings hay guaranteed availability. Origin shielding, request collapse, route readiness và failure reserve vẫn cần khi cache node/network mất.",
+            "en": "Regional/ISP caches can reduce external traffic for cacheable hot sets, depending on geography, formats, popularity and peering. Typical hit ratios are neither total egress savings nor availability guarantees. Origin shielding, coalescing, routing readiness and failure reserves still matter during cache/network loss."
+          },
+          "problem": {
+            "vi": "Peering/transit và last-mile congestion cản QoE dù datacenter còn capacity.",
+            "en": "Peering/transit and last-mile congestion hurt QoE despite datacenter capacity."
+          },
+          "decision": {
+            "vi": "Place hot media theo local evidence, maintain tiered fallback và bounded fills.",
+            "en": "Place hot media using local evidence with tiered fallback and bounded fills."
+          },
+          "tradeoff": {
+            "vi": "Remote hardware/partners, fragmented cache và correlated failover load tăng complexity.",
+            "en": "Remote hardware, partners, fragmentation and correlated failover load add complexity."
+          },
+          "nextPressure": {
+            "vi": "Short feeds cần startup cho nhiều clips liên tiếp.",
+            "en": "Short feeds need rapid startups across successive clips."
+          },
+          "exitCriteria": {
+            "vi": "Cache outage không overload upstream; bytes hit/request hit đo riêng.",
+            "en": "Cache outages do not overload upstream and byte/request hit rates are measured separately."
+          },
+          "diagram": {
+            "id": "creator-stage-local-cache",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "Regional / ISP cache",
+                  "en": "Regional / ISP cache"
+                },
+                "detail": {
+                  "vi": "Local hot set, placement/capacity và safe upstream fallback.",
+                  "en": "Local hot sets, placement/capacity and safe upstream fallback."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media cache / CDN",
+                  "en": "Media cache / CDN"
+                },
+                "detail": {
+                  "vi": "Versioned bytes, request coalescing, negative caching và origin limits.",
+                  "en": "Versioned bytes, request coalescing, negative caching and origin limits."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "viewer",
+                    "to": "edge",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại edge.",
+                      "en": "Carry context and enforce authorization/version/budget checks at edge."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại cdn.",
+                      "en": "Carry context and enforce authorization/version/budget checks at cdn."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "shorts",
+          "title": {
+            "vi": "Feed sessions và bounded prefetch",
+            "en": "Feed sessions and bounded prefetch"
+          },
+          "description": {
+            "vi": "Short-video UX quyết định vài prefix tải trước thay tải full hàng loạt clips. Network/data-saver/battery, current playback priority và prediction confidence giới hạn depth. Telemetry tách impression, startup, watched intervals, swipe, loop/replay và prefetch bytes; retries không nhân event và loops không tự là independent high-quality engagement.",
+            "en": "Short-video feeds prefetch selected prefixes rather than many full clips. Bound depth by network/data settings, current playback priority and prediction confidence. Distinguish impressions, starts, watched intervals, swipes, loops and prefetch bytes; retries do not multiply events and loops are not automatically independent high-quality engagement."
+          },
+          "problem": {
+            "vi": "Cold startup mỗi swipe tạo nhiều chờ đợi; blind prefetch lãng phí data.",
+            "en": "Cold starts delay every swipe while blind prefetch wastes data."
+          },
+          "decision": {
+            "vi": "Session-aware feed, partial-prefix cache, cancellation và useful-byte telemetry.",
+            "en": "Use session-aware feeds, prefix caches, cancellation and useful-byte telemetry."
+          },
+          "tradeoff": {
+            "vi": "Predictions sai và rapid swipes tăng waste; personalization còn cần privacy/access checks.",
+            "en": "Wrong predictions and rapid swipes waste bytes; personalization still needs privacy/access checks."
+          },
+          "nextPressure": {
+            "vi": "Encode compute thành recurring fleet bottleneck.",
+            "en": "Encoding becomes a recurring fleet bottleneck."
+          },
+          "exitCriteria": {
+            "vi": "More depth không làm current playback starve; startup/waste đo theo actual path.",
+            "en": "Additional depth cannot starve current playback and startup/waste follow actual paths."
+          },
+          "diagram": {
+            "id": "creator-stage-shorts",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "viewer",
+                "label": {
+                  "vi": "Viewer / player",
+                  "en": "Viewer / player"
+                },
+                "detail": {
+                  "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+                  "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "feed",
+                "label": {
+                  "vi": "Short-video feed",
+                  "en": "Short-video feed"
+                },
+                "detail": {
+                  "vi": "Session-aware ordering, bounded prefetch và interpretable events.",
+                  "en": "Session-aware ordering, bounded prefetch and interpretable events."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "retrieve",
+                "label": {
+                  "vi": "Candidate retrieval",
+                  "en": "Candidate retrieval"
+                },
+                "detail": {
+                  "vi": "Multi-source candidates, dedup, eligibility và model/index context.",
+                  "en": "Multiple candidate sources, deduplication, eligibility and model/index context."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "Media cache / CDN",
+                  "en": "Media cache / CDN"
+                },
+                "detail": {
+                  "vi": "Versioned bytes, request coalescing, negative caching và origin limits.",
+                  "en": "Versioned bytes, request coalescing, negative caching and origin limits."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "edge"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "viewer",
+                    "to": "feed",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại feed.",
+                      "en": "Carry context and enforce authorization/version/budget checks at feed."
+                    }
+                  },
+                  {
+                    "from": "feed",
+                    "to": "retrieve",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại retrieve.",
+                      "en": "Carry context and enforce authorization/version/budget checks at retrieve."
+                    }
+                  },
+                  {
+                    "from": "viewer",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại cdn.",
+                      "en": "Carry context and enforce authorization/version/budget checks at cdn."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "accelerators",
+          "title": {
+            "vi": "Accelerate workload, không bỏ system design",
+            "en": "Accelerate workloads without skipping system design"
+          },
+          "description": {
+            "vi": "Khi encode workload đủ lớn/ổn định, compare CPU/GPU/VCU options theo throughput, latency, quality và total operating cost. Fixed-function silicon cần capacity scheduling, unsupported-format fallback, software/firmware compatibility, observability và multi-generation rollout. Custom hardware có lead time/design risk, không là bước mặc định của startup.",
+            "en": "For sufficiently large, stable workloads, compare CPU/GPU/video accelerators by throughput, latency, quality and total cost. Fixed-function hardware still needs scheduling, fallback, compatibility, observability and generation rollouts. Custom hardware has lead-time/design risks and is not a default startup step."
+          },
+          "problem": {
+            "vi": "New codecs và upload volume làm general compute đắt.",
+            "en": "New codecs and upload volume make general compute expensive."
+          },
+          "decision": {
+            "vi": "Heterogeneous fleet với fair priority, fallback và measured end-to-end economics.",
+            "en": "Use heterogeneous fleets with fair priorities, fallbacks and measured economics."
+          },
+          "tradeoff": {
+            "vi": "Hardware failure, queue placement và scarce device capacity thành reliability concerns.",
+            "en": "Hardware failures, placement and scarce capacity become reliability concerns."
+          },
+          "nextPressure": {
+            "vi": "Liên tục cải thiện quality/cost/safety mà giữ upload/play contracts.",
+            "en": "Improve quality, cost and safety without breaking upload/play contracts."
+          },
+          "exitCriteria": {
+            "vi": "Benchmark matched quality/workload, có failure recovery và cost includes idle/design/operations.",
+            "en": "Benchmark matched quality/workloads, recover from failures and include idle/design/operating costs."
+          },
+          "diagram": {
+            "id": "creator-stage-accelerators",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Thiết kế minh họa; node mô tả responsibilities, không là sơ đồ private production.",
+              "en": "Educational responsibilities, not a private production diagram."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Processing queue",
+                  "en": "Processing queue"
+                },
+                "detail": {
+                  "vi": "Bounded backlog, task identities, fair scheduling, retries và poison handling.",
+                  "en": "Bounded backlogs, task identities, fair scheduling, retries and poison handling."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "queue"
+              },
+              {
+                "id": "fleet",
+                "label": {
+                  "vi": "Heterogeneous encode fleet",
+                  "en": "Heterogeneous encode fleet"
+                },
+                "detail": {
+                  "vi": "CPU/accelerator scheduling, compatibility, capacity và fallbacks.",
+                  "en": "CPU/accelerator scheduling, compatibility, capacity and fallbacks."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "encode",
+                "label": {
+                  "vi": "Transcode workers",
+                  "en": "Transcode workers"
+                },
+                "detail": {
+                  "vi": "Pinned source/profile, chunk alignment, retries và verified outputs.",
+                  "en": "Pinned sources/profiles, chunk alignment, retries and verified outputs."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "media",
+                "label": {
+                  "vi": "Published media",
+                  "en": "Published media"
+                },
+                "detail": {
+                  "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+                  "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "policy",
+                "label": {
+                  "vi": "Rights / safety decisions",
+                  "en": "Rights / safety decisions"
+                },
+                "detail": {
+                  "vi": "Versioned decisions, holds, appeals/review và regional policy context.",
+                  "en": "Versioned decisions, holds, review/appeals and regional policy context."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "queue",
+                    "to": "fleet",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại fleet.",
+                      "en": "Carry context and enforce authorization/version/budget checks at fleet."
+                    }
+                  },
+                  {
+                    "from": "fleet",
+                    "to": "encode",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại encode.",
+                      "en": "Carry context and enforce authorization/version/budget checks at encode."
+                    }
+                  },
+                  {
+                    "from": "encode",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  },
+                  {
+                    "from": "policy",
+                    "to": "media",
+                    "description": {
+                      "vi": "Chuyển context, kiểm tra quyền/version và giới hạn tại media.",
+                      "en": "Carry context and enforce authorization/version/budget checks at media."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "Tính theo giờ upload và giây xem",
+        "en": "Size uploaded hours and watched seconds"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixture: 20 source hours/minute, average source bitrate 12 Mbps; baseline ladder tổng 8 Mbps và optional enhanced ladder 4 Mbps chỉ cho 25% uploaded duration. Giữ mọi rate constant trong ngày chỉ để tính. Storage là decimal GB/PB; chưa replication, erasure overhead, audio/captions/thumbnails hoặc retained old generations.",
+          "en": "Assume 20 source hours per minute at 12 Mbps; a baseline ladder totals 8 Mbps and an optional 4 Mbps ladder covers 25% of uploaded duration. Rates are held constant for teaching. Decimal storage excludes replication, erasure overhead, audio/captions/thumbnails and old generations."
+        },
+        {
+          "vi": "Encode work không bằng output bytes: codec/preset/complexity/parallel chunks quyết định cost và deadline. Viewer egress tính theo actual watched seconds ở actual bitrate; cache hit giảm upstream transfer theo topology, không xóa bytes ở edge tới viewer. Average và peak/burst phải có headroom riêng.",
+          "en": "Encoding work is not output bytes: codec, presets, complexity and chunk parallelism affect costs/deadlines. Viewer egress follows watched seconds and actual bitrates. Caches reduce upstream transfers under the topology but do not eliminate edge-to-viewer bytes. Peaks/bursts need separate headroom."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng",
+            "en": "Quantity"
+          },
+          {
+            "vi": "Phép tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Kết quả",
+            "en": "Result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Uploaded hours/day",
+              "en": "Uploaded hours/day"
+            },
+            {
+              "vi": "20 × 60 × 24",
+              "en": "20 × 60 × 24"
+            },
+            {
+              "vi": "28,800 h",
+              "en": "28,800 h"
+            }
+          ],
+          [
+            {
+              "vi": "Source bytes/hour",
+              "en": "Source bytes/hour"
+            },
+            {
+              "vi": "12 Mbps × 3,600 / 8",
+              "en": "12 Mbps × 3,600 / 8"
+            },
+            {
+              "vi": "5.4 GB/h",
+              "en": "5.4 GB/h"
+            }
+          ],
+          [
+            {
+              "vi": "New source bytes/day",
+              "en": "New source bytes/day"
+            },
+            {
+              "vi": "28,800 × 5.4",
+              "en": "28,800 × 5.4"
+            },
+            {
+              "vi": "155,520 GB ≈155.52 TB",
+              "en": "155,520 GB, about155.52 TB"
+            }
+          ],
+          [
+            {
+              "vi": "Ladder bytes/source hour",
+              "en": "Ladder bytes/source hour"
+            },
+            {
+              "vi": "(8 + 0.25×4) ×3,600 /8",
+              "en": "(8 + 0.25×4) ×3,600 /8"
+            },
+            {
+              "vi": "4.05 GB/h",
+              "en": "4.05 GB/h"
+            }
+          ],
+          [
+            {
+              "vi": "New encoded bytes/day",
+              "en": "New encoded bytes/day"
+            },
+            {
+              "vi": "28,800 ×4.05",
+              "en": "28,800 ×4.05"
+            },
+            {
+              "vi": "116,640 GB, chưa source/overhead",
+              "en": "116,640 GB, excluding sources/overhead"
+            }
+          ],
+          [
+            {
+              "vi": "Watch egress example",
+              "en": "Watch egress example"
+            },
+            {
+              "vi": "1,000,000 views ×180s ×2Mbps /8",
+              "en": "1,000,000 views ×180s ×2Mbps /8"
+            },
+            {
+              "vi": "45,000 GB ≈45 TB",
+              "en": "45,000 GB, about45 TB"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "API minh họa có context và trạng thái rõ",
+        "en": "Educational APIs with explicit context and state"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các endpoint dưới là contract thiết kế của bài, không copy public API của sản phẩm nào. Validate ownership/quota/visibility, size/content-type bounds và retry payload consistency. Signed URLs có scope/expiry; offset query không được dùng để dò session của người khác. Rate-limit cả control requests lẫn allocated bytes/encode work.",
+          "en": "These are the lesson’s contracts rather than copies of a product’s public API. Validate ownership, quotas, visibility, size/type limits and retry payload consistency. Scope/expire URLs and prevent cross-user session probing. Limit control requests, allocated bytes and encoding work."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/upload-sessions",
+          "description": {
+            "vi": "Tạo resumable session theo creator/quota.",
+            "en": "Create a creator/quota-scoped resumable session."
+          },
+          "request": "{ uploadId, sizeBytes, contentType, checksum?, visibility }",
+          "response": "201 { sessionId, uploadUrl, expiresAt, acceptedOffset: 0 }"
+        },
+        {
+          "method": "PUT",
+          "path": "/v1/upload-sessions/{sessionId}/bytes",
+          "description": {
+            "vi": "Chunk/offset upload có checksum/bounds và status query riêng.",
+            "en": "Upload bounded chunks/offsets with integrity checks and separate status queries."
+          },
+          "request": "Content-Range + bytes",
+          "response": "{ acceptedOffset, finalized: false } | 409 { acceptedOffset }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/upload-sessions/{sessionId}/finalize",
+          "description": {
+            "vi": "Finalize nguồn đã complete, enqueue processing recoverably.",
+            "en": "Finalize a complete source and enqueue recoverable processing."
+          },
+          "request": "{ expectedSize, checksum, finalizeId }",
+          "response": "202 { videoId, sourceGeneration, status: PROCESSING }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/videos/{videoId}/playback",
+          "description": {
+            "vi": "Authorize current context rồi trả playable generation.",
+            "en": "Authorize current context and return a playable generation."
+          },
+          "request": "?deviceProfile=...",
+          "response": "200 { generation, manifestUrl, policyVersion, expiry } | PROCESSING | UNAVAILABLE"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/recommendations",
+          "description": {
+            "vi": "Bounded session/context request, không cấp playback permission.",
+            "en": "Request bounded session/context recommendations without granting playback access."
+          },
+          "request": "{ sessionId, context, cursor?, limit }",
+          "response": "200 { items, nextCursor, modelVersion, experimentContext }"
+        },
+        {
+          "method": "PATCH",
+          "path": "/v1/videos/{videoId}/visibility",
+          "description": {
+            "vi": "Versioned mutation có discovery/cache propagation policy.",
+            "en": "A versioned mutation with discovery/cache propagation policy."
+          },
+          "request": "{ expectedVersion, visibility, mutationId }",
+          "response": "200 { version, visibility, propagationState }"
+        }
+      ]
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "Theo dõi năm đường đi",
+        "en": "Trace five paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Upload và Watch gặp nhau ở immutable published media, không phải ở một app server giữ mọi byte. Publication cần kết quả encode và policy/visibility còn current. Recommendations là gợi ý IDs, không thay access checks tại watch/media path. Removal phải chặn future access theo policy ngay cả khi discovery projections chưa kịp update.",
+          "en": "Upload and Watch meet at immutable published media, not an application server holding every byte. Publication needs current encoding and policy/visibility evidence. Recommendations suggest identities rather than replace access checks. Removal must govern future access even while discovery projections catch up."
+        }
+      ],
+      "diagram": {
+        "id": "creator-upload-discovery",
+        "title": {
+          "vi": "Upload, publication, discovery và playback",
+          "en": "Upload, publication, discovery and playback"
+        },
+        "caption": {
+          "vi": "Media generation/policy readiness gặp nhau ở publication; recommendations không thay playback authorization.",
+          "en": "Media generation and policy readiness meet at publication; recommendations do not replace playback authorization."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "creator",
+            "label": {
+              "vi": "Creator",
+              "en": "Creator"
+            },
+            "detail": {
+              "vi": "Resumable upload, content/visibility settings và processing status.",
+              "en": "Resumable uploads, visibility settings and processing status."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Control API",
+              "en": "Control API"
+            },
+            "detail": {
+              "vi": "Metadata, upload sessions, playback/discovery contracts và idempotency.",
+              "en": "Metadata, upload sessions, playback/discovery contracts and idempotency."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "raw",
+            "label": {
+              "vi": "Source uploads",
+              "en": "Source uploads"
+            },
+            "detail": {
+              "vi": "Durable finalized source generations, checksums, retention và isolated parsing.",
+              "en": "Durable finalized sources, checksums, retention and isolated parsing."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "queue",
+            "label": {
+              "vi": "Processing queue",
+              "en": "Processing queue"
+            },
+            "detail": {
+              "vi": "Bounded backlog, task identities, fair scheduling, retries và poison handling.",
+              "en": "Bounded backlogs, task identities, fair scheduling, retries and poison handling."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "queue"
+          },
+          {
+            "id": "encode",
+            "label": {
+              "vi": "Transcode workers",
+              "en": "Transcode workers"
+            },
+            "detail": {
+              "vi": "Pinned source/profile, chunk alignment, retries và verified outputs.",
+              "en": "Pinned sources/profiles, chunk alignment, retries and verified outputs."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Rights / safety decisions",
+              "en": "Rights / safety decisions"
+            },
+            "detail": {
+              "vi": "Versioned decisions, holds, appeals/review và regional policy context.",
+              "en": "Versioned decisions, holds, review/appeals and regional policy context."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "meta",
+            "label": {
+              "vi": "Metadata authority",
+              "en": "Metadata authority"
+            },
+            "detail": {
+              "vi": "Lifecycle, owner, generation và policy versions có transaction boundary.",
+              "en": "Transactional lifecycle, ownership, generation and policy versions."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "media",
+            "label": {
+              "vi": "Published media",
+              "en": "Published media"
+            },
+            "detail": {
+              "vi": "Immutable complete renditions/manifests; reader retention và deletion propagation.",
+              "en": "Complete immutable renditions/manifests, reader retention and deletion propagation."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "viewer",
+            "label": {
+              "vi": "Viewer / player",
+              "en": "Viewer / player"
+            },
+            "detail": {
+              "vi": "Capabilities, authorization, buffer/ABR và consented QoE signals.",
+              "en": "Capabilities, authorization, buffers/ABR and consented QoE signals."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "client"
+          },
+          {
+            "id": "retrieve",
+            "label": {
+              "vi": "Candidate retrieval",
+              "en": "Candidate retrieval"
+            },
+            "detail": {
+              "vi": "Multi-source candidates, dedup, eligibility và model/index context.",
+              "en": "Multiple candidate sources, deduplication, eligibility and model/index context."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "rank",
+            "label": {
+              "vi": "Ranking / selection",
+              "en": "Ranking / selection"
+            },
+            "detail": {
+              "vi": "Bounded expensive scoring, policy checks, diversity và feedback context.",
+              "en": "Bounded scoring, policy checks, diversity and feedback context."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "model"
+          },
+          {
+            "id": "cdn",
+            "label": {
+              "vi": "Media cache / CDN",
+              "en": "Media cache / CDN"
+            },
+            "detail": {
+              "vi": "Versioned bytes, request coalescing, negative caching và origin limits.",
+              "en": "Versioned bytes, request coalescing, negative caching and origin limits."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "edge"
+          }
+        ],
+        "traces": [
+          {
+            "id": "upload",
+            "label": {
+              "vi": "Upload và xử lý",
+              "en": "Upload and process"
+            },
+            "steps": [
+              {
+                "from": "creator",
+                "to": "api",
+                "description": {
+                  "vi": "Tạo scoped resumable session và declared limits.",
+                  "en": "Create a scoped resumable session with declared limits."
+                }
+              },
+              {
+                "from": "creator",
+                "to": "raw",
+                "description": {
+                  "vi": "Upload chunks, query offset và finalize verified generation.",
+                  "en": "Upload chunks, query offsets and finalize a verified generation."
+                }
+              },
+              {
+                "from": "raw",
+                "to": "queue",
+                "description": {
+                  "vi": "Outbox/reconciler enqueue source-generation task idempotently.",
+                  "en": "An outbox/reconciler enqueues source-generation tasks idempotently."
+                },
+                "async": true
+              },
+              {
+                "from": "queue",
+                "to": "encode",
+                "description": {
+                  "vi": "Claim task với retry identity, profile và resource budget.",
+                  "en": "Claim tasks with retry identities, profiles and resource budgets."
+                },
+                "async": true
+              },
+              {
+                "from": "encode",
+                "to": "media",
+                "description": {
+                  "vi": "Write immutable outputs; verify manifests/dependencies before readiness.",
+                  "en": "Write immutable outputs and verify dependencies before readiness."
+                }
+              }
+            ]
+          },
+          {
+            "id": "publish",
+            "label": {
+              "vi": "Policy và publication",
+              "en": "Policy and publication"
+            },
+            "steps": [
+              {
+                "from": "raw",
+                "to": "policy",
+                "description": {
+                  "vi": "Inspect source/evidence theo versioned rules và scope.",
+                  "en": "Inspect sources/evidence under versioned rules and scope."
+                },
+                "async": true
+              },
+              {
+                "from": "policy",
+                "to": "meta",
+                "description": {
+                  "vi": "Commit selected policy decision/hold/review version.",
+                  "en": "Commit the selected policy decision/hold/review version."
+                }
+              },
+              {
+                "from": "encode",
+                "to": "meta",
+                "description": {
+                  "vi": "Report complete baseline generation và integrity evidence.",
+                  "en": "Report a complete baseline generation and integrity evidence."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "media",
+                "description": {
+                  "vi": "Publication CAS kiểm lifecycle/visibility/generation/policy; late worker không resurrect delete.",
+                  "en": "Publication checks lifecycle/visibility/generation/policy and cannot resurrect deletion."
+                }
+              }
+            ]
+          },
+          {
+            "id": "watch",
+            "label": {
+              "vi": "Watch page và media bytes",
+              "en": "Watch page and media bytes"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "api",
+                "description": {
+                  "vi": "Yêu cầu watch context, device và relevant region/identity.",
+                  "en": "Request watch context with device and relevant region/identity."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Check visibility, policy và playable generation/freshness.",
+                  "en": "Check visibility, policy, generation and freshness."
+                }
+              },
+              {
+                "from": "api",
+                "to": "viewer",
+                "description": {
+                  "vi": "Return playback config/manifest scope; không proxy media bytes.",
+                  "en": "Return playback configuration/scoped manifests without proxying media."
+                }
+              },
+              {
+                "from": "viewer",
+                "to": "cdn",
+                "description": {
+                  "vi": "Fetch compatible segments; ABR theo buffer/network.",
+                  "en": "Fetch compatible segments with buffer/network-aware ABR."
+                }
+              },
+              {
+                "from": "cdn",
+                "to": "media",
+                "description": {
+                  "vi": "Miss dùng tiered/coalesced upstream và origin budgets.",
+                  "en": "Misses use tiered/coalesced upstream fetches and origin budgets."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recommend",
+            "label": {
+              "vi": "Retrieve, filter, rank",
+              "en": "Retrieve, filter, rank"
+            },
+            "steps": [
+              {
+                "from": "viewer",
+                "to": "api",
+                "description": {
+                  "vi": "Gửi session/consented context có freshness và limits.",
+                  "en": "Send bounded session/consented context."
+                }
+              },
+              {
+                "from": "api",
+                "to": "retrieve",
+                "description": {
+                  "vi": "Query multiple sources với known model/index versions.",
+                  "en": "Query sources with known model/index versions."
+                }
+              },
+              {
+                "from": "retrieve",
+                "to": "rank",
+                "description": {
+                  "vi": "Dedup/eligibility và bounded candidate pool.",
+                  "en": "Deduplicate/check eligibility and bound the pool."
+                }
+              },
+              {
+                "from": "rank",
+                "to": "viewer",
+                "description": {
+                  "vi": "Apply policy/diversity and return ranked IDs; playback reauthorizes.",
+                  "en": "Apply policy/diversity and return IDs; playback authorizes again."
+                }
+              }
+            ]
+          },
+          {
+            "id": "remove",
+            "label": {
+              "vi": "Delete hoặc visibility đổi",
+              "en": "Delete or change visibility"
+            },
+            "steps": [
+              {
+                "from": "creator",
+                "to": "api",
+                "description": {
+                  "vi": "Authenticated delete/private request có expected lifecycle version.",
+                  "en": "Submit an authorized versioned deletion/privacy request."
+                }
+              },
+              {
+                "from": "api",
+                "to": "meta",
+                "description": {
+                  "vi": "Commit tombstone/current visibility; retain retry outcome.",
+                  "en": "Commit tombstones/current visibility and retain retry outcomes."
+                }
+              },
+              {
+                "from": "meta",
+                "to": "rank",
+                "description": {
+                  "vi": "Remove/invalidate discovery projections có bounded repair.",
+                  "en": "Invalidate discovery projections with bounded repair."
+                },
+                "async": true
+              },
+              {
+                "from": "meta",
+                "to": "cdn",
+                "description": {
+                  "vi": "Apply denial/access expiry và purge theo declared policy.",
+                  "en": "Apply denial/expiry and purging under declared policies."
+                },
+                "async": true
+              },
+              {
+                "from": "meta",
+                "to": "queue",
+                "description": {
+                  "vi": "Cancel/ignore stale publication attempts bằng generation checks.",
+                  "en": "Cancel or ignore stale publication attempts using generation checks."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "processing",
+      "title": {
+        "vi": "Processing DAG có fairness và generation safety",
+        "en": "Processing DAGs need fairness and generation safety"
+      },
+      "paragraphs": [
+        {
+          "vi": "Probe/parse input trong isolated resource budget; untrusted media có thể malformed/decompression bomb hoặc cực tốn CPU. Source duration/resolution/codec caps và task deadlines trước khi chia chunks. Bound per-creator concurrency để một bulk uploader không chiếm mọi encoder; fair scheduling giữa new baseline, enhancements, retries và live.",
+          "en": "Probe untrusted media within isolation and resource budgets; malformed inputs can exhaust CPU or memory. Apply duration/resolution/codec caps and deadlines before chunking. Bound creator concurrency and balance new baselines, enhancements, retries and live work."
+        },
+        {
+          "vi": "Parallel encoding cần decodable/aligned boundaries, timestamp continuity, codec configuration và audio/video sync; không cắt bytes tùy ý. Worker writes immutable attempt outputs rồi verified result/publish CAS chọn generation; retries có thể làm duplicate compute nhưng không được overwrite current generation hoặc resurrect deleted content. Reconciler tìm finalized sources thiếu tasks và stuck tasks thiếu results.",
+          "en": "Parallel encoding requires decodable aligned boundaries, timestamp continuity, codec configuration and AV synchronization, not arbitrary byte cuts. Immutable attempt outputs and verified publication decisions prevent retries from overwriting current generations or resurrecting removals. Reconcile finalized sources without tasks and stuck tasks without results."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Baseline sớm, enhancements sau",
+          "en": "Baseline early, enhancements later"
+        },
+        "caption": {
+          "vi": "Technical readiness vẫn tách publication permission.",
+          "en": "Technical readiness remains separate from permission to publish."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Verify source",
+              "en": "Verify the source"
+            },
+            "detail": {
+              "vi": "Integrity, limits và safe probe.",
+              "en": "Check integrity, limits and safe probing."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Schedule baseline",
+              "en": "Schedule a baseline"
+            },
+            "detail": {
+              "vi": "Fair queue và pinned profile/source.",
+              "en": "Use fair queues and pinned profiles/sources."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Publish eligible generation",
+              "en": "Publish an eligible generation"
+            },
+            "detail": {
+              "vi": "Complete dependencies và current policy/lifecycle.",
+              "en": "Require complete dependencies and current policy/lifecycle."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Enhance selectively",
+              "en": "Enhance selectively"
+            },
+            "detail": {
+              "vi": "Higher codecs/quality theo demand và budget.",
+              "en": "Add codecs/quality by demand and budgets."
+            },
+            "icon": "chart"
+          }
+        ]
+      }
+    },
+    {
+      "id": "delivery",
+      "title": {
+        "vi": "Long-tail delivery, thumbnails và metadata",
+        "en": "Long-tail delivery, thumbnails and metadata"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một viral clip tạo hot segments; nhiều unique cold clips tạo origin-read pressure khác. Đo byte hit, request hit, miss latency, fill duplication và regional capacity riêng. Cache key pin content generation/rendition/segment và relevant access context; signed tokens không nên phá sharing vô ích hoặc làm private bytes public. Negative caching cho missing processing outputs phải có bounded expiry.",
+          "en": "Viral segments and many unique cold clips stress different resources. Measure byte hits, request hits, miss latency, duplicate fills and regional capacity separately. Keys pin generations/renditions/segments and relevant access context. Scope tokens without unnecessary fragmentation or private-data leakage, and bound negative caching for missing outputs."
+        },
+        {
+          "vi": "Thumbnails/images thường nhiều requests nhưng ít bytes, nên metadata lookup, variants và transform admission quan trọng. Sharded SQL giữ creator metadata; browse/search projections có freshness/removal behavior riêng. Replica lag và cache invalidation phải theo promised version, không dùng blanket “eventual” để bỏ privacy constraints.",
+          "en": "Thumbnails generate many small requests, making lookups, variants and transform admission important. Sharded SQL stores creator metadata while browse/search projections have their own freshness/removal behavior. Replica lag and caching follow version promises rather than using eventual consistency to dismiss privacy constraints."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Hot set",
+            "en": "Hot set"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Local popularity và rendition distribution quyết định placement.",
+              "en": "Local popularity and rendition distribution guide placement."
+            },
+            {
+              "vi": "Coalesce misses và reserve upstream capacity khi edge fail.",
+              "en": "Coalesce misses and reserve upstream capacity for edge failures."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Cold catalog",
+            "en": "Cold catalog"
+          },
+          "icon": "scope",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Retain reliable origin và costed storage tiers; không preload toàn catalog.",
+              "en": "Retain reliable origins and costed tiers rather than preloading everything."
+            },
+            {
+              "vi": "Rare traffic vẫn cần good first-play, auth và recoverable assets.",
+              "en": "Rarely viewed items still need good first play, authorization and recoverable assets."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Metadata video",
+            "en": "Video metadata"
+          },
+          "icon": "decision",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Shard locality + query budgets; global read models không tự exact/fresh.",
+              "en": "Use shard locality/query budgets; global projections are not automatically exact or fresh."
+            },
+            {
+              "vi": "Thumbnail variants và metadata versions không dùng chung arbitrary cache key.",
+              "en": "Thumbnail variants and metadata versions need deliberate cache keys."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "retrieval",
+      "title": {
+        "vi": "Retrieval recall có bằng chứng",
+        "en": "Retrieval recall needs evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một ranker không nhìn video ngoài candidate pool. Increase K có thể tăng recall nhưng cũng thêm feature fetch/rank batches, chưa chắc tăng satisfaction. Thêm sources giúp exploration/cold start, nhưng dedup và policy eligibility cần rõ; một video blocked có utility giả lập cao vẫn không được show. Filter placement cần budget và safety ở cả pre/post-rank, playback còn reauthorize.",
+          "en": "Rankers cannot inspect videos outside the candidate pool. Larger pools can improve recall but add feature/ranking work without guaranteeing satisfaction. Additional sources aid exploration/cold starts but need deduplication and policy eligibility. Blocked items remain ineligible even with high utility; filter budgets and playback authorization still apply."
+        },
+        {
+          "vi": "Offline evaluation dùng held-out/judged eligible items hoặc expensive sampled audits để ước lượng candidate recall; labels dễ selection bias từ lịch sử chỉ thấy items đã shown. Monitor model/index freshness, delayed labels, new creators và groups/regions; không claim một logarithmic ANN latency formula giữ nguyên khi corpus tăng 10×.",
+          "en": "Evaluate recall with eligible judged/held-out items or costly sampled audits. Historical exposure creates selection bias. Monitor freshness, delayed labels, new creators and regions/groups rather than assuming a logarithmic ANN formula remains accurate as the corpus grows."
+        }
+      ],
+      "experiment": "creator-retrieval"
+    },
+    {
+      "id": "codecs",
+      "title": {
+        "vi": "Codec economics theo viewed seconds",
+        "en": "Codec economics follows viewed seconds"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một codec tiết kiệm bitrate ở matched quality chưa chắc rẻ nếu video ít views, devices không hỗ trợ hoặc extra ladder giữ nhiều tháng. Expected benefits dùng eligible watched duration, không upload duration hoặc impression count. Chọn marginal egress price theo cache/origin topology thực; cost encode/storage cần cùng currency/time horizon.",
+          "en": "Bitrate savings at matched quality may not repay extra encoding if views are sparse, devices incompatible or storage long-lived. Benefits depend on eligible watched duration rather than upload duration or impressions. Use marginal delivery costs for the actual topology and align currencies/time horizons."
+        },
+        {
+          "vi": "Không coi encode presets có perceptual quality ngang nhau chỉ vì cùng resolution. Benchmark codec/accelerator trên content mix, target quality, audio, playback capability và power. Canaries/rollback cho rendition manifests cần giữ baseline fallback; unsupported codec không được biến playable video thành unsupported.",
+          "en": "Equal resolution does not prove equal perceptual quality. Benchmark codecs/accelerators against content mixes, quality targets, audio, capabilities and power. Canary manifests with baseline fallbacks so enhanced codecs cannot make existing videos unplayable."
+        }
+      ],
+      "experiment": "creator-codec"
+    },
+    {
+      "id": "shorts",
+      "title": {
+        "vi": "Short-feed prefetch và feedback đúng nghĩa",
+        "en": "Short-feed prefetch and meaningful feedback"
+      },
+      "paragraphs": [
+        {
+          "vi": "Prefetch phải ưu tiên current playback, respect data-saver/consent và cancel theo session. Prefix đã tải có thể dùng lại nếu URL/generation/range/integrity/context còn đúng; changing signed tokens không nên làm mất cache vô ích. Prediction depth tăng nhưng link budget không đổi có thể chỉ tải cùng clip 1 và thêm wasted partial bytes.",
+          "en": "Prioritize current playback, respect data settings/consent and cancel by session. Reuse prefixes only under matching generation/range/integrity/access context. Deeper predictions under fixed bandwidth may warm the same first clip while adding wasted partial bytes."
+        },
+        {
+          "vi": "Tách exposure, visible interval, actual play, buffered bytes, watch duration, swipe và replay/loop. Một retry event dùng stable identity; trusted server-side aggregates vẫn cần semantic dedup và late corrections. Session feedback có recency nhưng không được dùng client clock như ordering authority hay log private viewing context quá mức.",
+          "en": "Distinguish exposure, visible intervals, playback, buffering, watched duration, swipes and loops. Stable event identities prevent transport duplicates while semantic aggregation still needs deduplication and corrections. Preserve recency without trusting client clocks as authority or over-logging private viewing context."
+        }
+      ],
+      "experiment": "creator-prefetch"
+    },
+    {
+      "id": "live-hardware",
+      "title": {
+        "vi": "Live và hardware giữ nguyên correctness contracts",
+        "en": "Live and hardware preserve correctness contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Live chia budget theo ingest, encode, package, cache và player; thêm captions/chat/ad decisions không được cản segment deadlines vô hạn. Shared segments giúp coalescing nhưng personalized manifests/auth còn per-session work. Backpressure có thể giảm rendition/quality hoặc reject new sessions theo policy, không unbounded queue làm latency tăng mãi.",
+          "en": "Allocate live budgets across ingestion, encoding, packaging, caching and players. Captions/chat/ad work must not block segment deadlines indefinitely. Shared segments allow coalescing while personalized manifests/auth retain per-session work. Backpressure can reduce renditions or reject load rather than letting latency grow in unbounded queues."
+        },
+        {
+          "vi": "Accelerators giảm cost một compute path nhưng không sửa missing source integrity, stale policy, bad manifests hay unfair scheduling. Đếm utilization/idle power, batch efficiency, failure replacement, unsupported content fallback và design/operations horizon. Throughput gain đo trên workload/quality cụ thể, không copy universal multiplier từ marketing hoặc một bài benchmark.",
+          "en": "Accelerators improve a compute path but cannot fix integrity, stale policies, manifests or fairness. Count utilization, idle power, batching, replacement, unsupported-format fallback and design/operating horizons. Throughput gains depend on measured workloads and quality rather than universal published multipliers."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Quyết định",
+            "en": "Decision"
+          },
+          {
+            "vi": "Điều kiện áp dụng cho video",
+            "en": "Use when"
+          },
+          {
+            "vi": "Điều phải kiểm chứng",
+            "en": "Evidence required"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Low-latency chunks",
+              "en": "Low-latency chunks"
+            },
+            {
+              "vi": "Live delay quan trọng",
+              "en": "Live delay matters"
+            },
+            {
+              "vi": "Timeline/decoder alignment, retry margin và end-to-end delay",
+              "en": "Timelines, decoder alignment, retry margins and end-to-end delay"
+            }
+          ],
+          [
+            {
+              "vi": "Expensive codec ladder",
+              "en": "Expensive codec ladder"
+            },
+            {
+              "vi": "Compatible watch savings đủ lớn",
+              "en": "Compatible viewing savings are large enough"
+            },
+            {
+              "vi": "Matched quality, payback assumptions và fallback",
+              "en": "Matched quality, payback assumptions and fallback"
+            }
+          ],
+          [
+            {
+              "vi": "Dedicated video accelerator",
+              "en": "Dedicated video accelerator"
+            },
+            {
+              "vi": "Large/stable workload trả được integration/operations",
+              "en": "Large/stable workloads justify integration/operations"
+            },
+            {
+              "vi": "Fleet efficiency, capacity scheduling và real failure paths",
+              "en": "Fleet efficiency, scheduling and actual failure paths"
+            }
+          ],
+          [
+            {
+              "vi": "Cache inside/near ISP",
+              "en": "Cache inside/near ISP"
+            },
+            {
+              "vi": "Local hot traffic và partnership phù hợp",
+              "en": "Local demand and partnerships fit"
+            },
+            {
+              "vi": "Actual byte hit, congestion, failover reserve và costs",
+              "en": "Actual byte hits, congestion, failover reserves and costs"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "rights-operations",
+      "title": {
+        "vi": "Rights, removal và operating evidence",
+        "en": "Rights, removal and operational evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fingerprinting/ML classifiers là evidence chứ không tự xác định mọi rights/safety outcome. Version policy scope, review/appeal, regional restrictions và revenue/account effects; corrections cần replayable audit. Không khẳng định mọi clip match đều vi phạm hay no match nghĩa safe. Chosen public gate ở bài là một design policy; partial/private previews có thể dùng policy khác nếu được xác định.",
+          "en": "Fingerprinting/classifiers provide evidence rather than universally deciding rights/safety. Version scopes, reviews/appeals, regional restrictions and account/revenue effects with replayable audit. Matches do not establish every violation and missing matches do not establish safety. Public gates here are a design choice; defined private/preview policies may differ."
+        },
+        {
+          "vi": "Track upload completion/resume failures, baseline readiness tails, queue age/fairness, policy pending age, publication conflicts, removed-item access, QoE by network/device/codec và useful/wasted prefetch bytes. Correlate generation/task/session IDs; hạn chế raw viewing history/PII trong logs và giữ retention/access controls.",
+          "en": "Track resumability, readiness tails, queue age/fairness, policy delays, publication conflicts, removed-item access, QoE by network/device/codec and useful/wasted prefetch bytes. Correlate generation/task/session identities while limiting raw viewing histories/PII in logs and governing access/retention."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure",
+            "en": "Failure"
+          },
+          {
+            "vi": "Cam kết của video pipeline",
+            "en": "Boundary to preserve"
+          },
+          {
+            "vi": "Recovery/đo lường",
+            "en": "Recovery/evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Finalize succeeds, enqueue fails",
+              "en": "Finalize succeeds, enqueue fails"
+            },
+            {
+              "vi": "Accepted source có recoverable processing obligation",
+              "en": "Accepted sources have recoverable processing obligations"
+            },
+            {
+              "vi": "Outbox/reconciler theo source generation, backlog-age alerts",
+              "en": "Generation-aware outboxes/reconciliation and backlog-age alerts"
+            }
+          ],
+          [
+            {
+              "vi": "Delete races late encode",
+              "en": "Delete races late encode"
+            },
+            {
+              "vi": "No stale republish",
+              "en": "No stale republish"
+            },
+            {
+              "vi": "Lifecycle/generation CAS, tombstone và orphan GC",
+              "en": "Lifecycle/generation checks, tombstones and orphan collection"
+            }
+          ],
+          [
+            {
+              "vi": "Cold cache after regional loss",
+              "en": "Cold cache after regional loss"
+            },
+            {
+              "vi": "Origin capacity và valid access",
+              "en": "Origin capacity and valid access"
+            },
+            {
+              "vi": "Admission, shield/coalescing, warmup và capacity drills",
+              "en": "Admission, shielding/coalescing, warmup and capacity drills"
+            }
+          ],
+          [
+            {
+              "vi": "Index/policy projection stale",
+              "en": "Index/policy projection stale"
+            },
+            {
+              "vi": "Playback authority không dựa mỗi discovery result",
+              "en": "Playback authority is independent of discovery"
+            },
+            {
+              "vi": "Reauthorize, invalidate/repair projections, measure stale denial/allow",
+              "en": "Reauthorize, repair projections and measure stale denials/permissions"
+            }
+          ],
+          [
+            {
+              "vi": "Ranker/feature service timeout",
+              "en": "Ranker/feature service timeout"
+            },
+            {
+              "vi": "Bounded latency và safe eligibility",
+              "en": "Bounded latency and safe eligibility"
+            },
+            {
+              "vi": "Deadline-aware fallbacks, no unsafe private cache reuse",
+              "en": "Deadline-aware fallbacks without unsafe private-cache reuse"
+            }
+          ],
+          [
+            {
+              "vi": "Huge/malformed upload",
+              "en": "Huge/malformed upload"
+            },
+            {
+              "vi": "Resource budgets và tenant isolation",
+              "en": "Resource budgets and tenant isolation"
+            },
+            {
+              "vi": "Quota/probe isolation/poison handling, no infinite retries",
+              "en": "Quotas, isolated probing and poison handling without infinite retries"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "Câu hỏi luyện decisions và failure paths",
+        "en": "Questions on decisions and failure paths"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Upload hoàn tất nhưng chưa playable: giải thích và thiết kế UX thế nào?",
+            "en": "An upload completes but is not playable: what does that mean?"
+          },
+          "answer": [
+            {
+              "vi": "Bytes complete chỉ xác nhận source generation; baseline encode, manifest/dependencies và selected policy/visibility còn có thể pending. Show processing states và retry/error evidence cụ thể; không trả link public hỏng. Publish baseline sớm nếu đủ điều kiện, optional enhancements cập nhật sau bằng versioned manifest. Retry finalize/enqueue giữ stable identity và reconciler lấp missing tasks.",
+              "en": "Complete bytes establish a source generation while baseline encoding, manifests and policy/visibility may still be pending. Show specific progress/errors instead of broken public links. Publish eligible baselines early and add enhancements through versioned manifests. Stable finalization/enqueue identities and reconciliation cover missing tasks."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có nên đưa toàn catalog vào cache không?",
+            "en": "Should the entire catalog be cached?"
+          },
+          "answer": [
+            {
+              "vi": "Không quyết định chỉ bằng tổng video count. Local demand, generation/rendition mix, byte/request hit, cache capacity/fill cost và origin miss latency mới quyết định hot set. Long tail vẫn có authoritative origin và tiered fallback; direct-origin hay CDN cho rare objects phải compare real contracts/topology. Cache outage cần reserve capacity, không đẩy mọi cold misses vào origin vô hạn.",
+              "en": "Choose from local demand, rendition mixes, byte/request hits, capacity, fill cost and miss latency rather than total item count. Retain reliable origins and tiered fallback for the tail. Compare actual topology/contracts for rare items and reserve capacity for cache failures instead of forwarding unlimited misses."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tăng candidates có luôn tốt hơn không?",
+            "en": "Are more candidates always better?"
+          },
+          "answer": [
+            {
+              "vi": "Có thể tăng eligible recall nhưng thêm feature/rank batches và latency; larger noisy pool còn tăng burden cho selection/diversity. Đo recall với held-out/judged eligible targets hoặc sampled audits, rồi online satisfaction/cost. Trong fixture count = 4 single-source recall = 0, multi-source có thể lấy relevant videos dù ranker không đổi. Không fake curve guarantee recall tăng theo một công thức cho mọi corpus.",
+              "en": "Larger pools can improve eligible recall but add ranking/feature work and selection burden. Measure recall with eligible judged/held-out targets or sampled audits, then online satisfaction and cost. The fixture shows discovery sources recovering useful candidates without changing the ranker. No universal candidate-count formula guarantees recall."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một video20.000 views có nên encode thêm codec không?",
+            "en": "Should a video with 20,000 views get an extra codec?"
+          },
+          "answer": [
+            {
+              "vi": "Cần compatible watched seconds, matched quality, bitrate saving và marginal prices. Với fixture3 phút,1 Mbps saving, $0.04/GB,100% compatible,20.000 views tiết kiệm450GB=$18; extra encode $12+1 tháng storage $3 cho net $3. Nếu compatible 50%, savings $9 và net −$6. Đây là assumptions để tính, chưa battery/forecast/failed compute, không universal threshold.",
+              "en": "Use compatible watched duration, matched quality, bitrate savings and marginal prices. In the fixture, three minutes, 1 Mbps saved, $0.04/GB and full compatibility yield 450 GB/$18 at 20,000 views. A $12 encode plus $3 storage leaves $3; 50% compatibility leaves a $6 loss. Other costs and uncertainty remain excluded."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Prefetch depth = 5 vì sao vẫn không warm clip thứ5?",
+            "en": "Why might depth five still leave the fifth clip cold?"
+          },
+          "answer": [
+            {
+              "vi": "Depth là maximum intent, link/window mới giới hạn bytes thật. Trong fixture3.2 Mbps trừ1.2 Mbps current playback còn 2 Mbps; 2 giây chỉ 0.5 MB, đủ 0.3 MB clip 1 và 0.2 MB clip 2. Clip 5 vẫn 0. Startup cho nó cold, trong khi những bytes đã tải có thể waste. Tăng prediction depth không tạo bandwidth; reserve current playback và measure useful bytes.",
+              "en": "Depth expresses intent, while link capacity and time bound actual bytes. A 3.2 Mbps link reserving 1.2 Mbps leaves 2 Mbps, or 0.5 MB over two seconds: one 0.3 MB prefix and part of the second. Clip five stays cold. Deeper predictions do not create bandwidth; reserve playback and measure useful bytes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Sharding/proxy có làm hết replication lag không?",
+            "en": "Does sharding or adding a proxy eliminate replica lag?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Sharding có thể giảm per-shard load nếu phân bố phù hợp, nhưng replication vẫn có backlog/failure conditions. Proxy route/query-plan/pool và resharding tools không tự cấp zero-loss failover hoặc mọi cross-shard transaction. Read-your-write, rights freshness, hot key handling và migration fencing vẫn phải thiết kế.",
+              "en": "No. Sharding may reduce load but replication can still lag or fail. Routing/planning/pooling and resharding tools do not automatically provide lossless failover or arbitrary cross-shard transactions. Read-your-write, rights freshness, hotspots and fenced migration remain design work."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Fingerprint match có đủ để auto public/block mọi clip?",
+            "en": "Is fingerprint matching sufficient for every publication decision?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Match là evidence theo reference/policy scope và có false positives/disputes; no match không chứng minh safe/allowed. Tách technical readiness khỏi policy lifecycle có versions, reviews/appeals và region/account effects. Playback/current visibility checks và propagation/removal policy cần rõ. Đây là system workflow, không suy legal conclusion từ một hash.",
+              "en": "No. Matches are scoped evidence with disputes and false positives; missing matches do not prove safety or permission. Separate technical readiness from versioned policy/review workflows and regional/account effects. Keep current playback checks and explicit propagation/removal policies rather than deriving legal conclusions from fingerprints."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao dedicated video chips chưa phải bước đầu tiên?",
+            "en": "Why are dedicated video chips not the first step?"
+          },
+          "answer": [
+            {
+              "vi": "Cần stable workload đủ lớn trả được design/integration/operations và lead time. Trước đó optimize DAG, priority, codec selection và measured general hardware. Accelerator vẫn cần aligned valid outputs, fairness, retry/fallback, spare capacity và deployment compatibility. Benchmark cùng quality/content; throughput gain của một setup không là multiplier cho mọi workload.",
+              "en": "A stable workload must justify design, integration, operations and lead time. First optimize DAGs, priorities, codec selection and measured general hardware. Accelerators still need valid outputs, fairness, retries/fallbacks, reserves and compatibility. Benchmark matched quality/content rather than applying one setup’s gains universally."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

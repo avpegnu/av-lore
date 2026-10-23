@@ -1,0 +1,3184 @@
+{
+  "id": "ep-figma",
+  "group": "episode",
+  "title": {
+    "vi": "Xây dựng Design Canvas: rendering, multiplayer và metadata",
+    "en": "Building a Design Canvas: rendering, multiplayer and metadata"
+  },
+  "summary": {
+    "vi": "Theo một vector editor từ local canvas tới ordered edits, durable recovery, plugin isolation và live metadata được shard; có mô phỏng property conflicts, journal gaps và cache races.",
+    "en": "Follow a vector editor from a local canvas to ordered edits, durable recovery, isolated plugins and sharded live metadata, with property-conflict, journal-gap and cache-race experiments."
+  },
+  "prerequisites": [
+    "collaborative-editor",
+    "consistency",
+    "databases",
+    "caching"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "rendering",
+    "database",
+    "security"
+  ],
+  "status": "review",
+  "takeaways": [
+    {
+      "vi": "Tách local feedback, authoritative ordering và durable acknowledgement. Một edit thấy trên màn hình chưa chắc đã saved.",
+      "en": "Separate local feedback, authoritative ordering and durable acknowledgement; visible does not necessarily mean saved."
+    },
+    {
+      "vi": "Property-level conflict policy giữ unrelated edits, nhưng convergence không đồng nghĩa mọi user intent được giữ.",
+      "en": "Property-level conflicts preserve unrelated edits, but convergence does not imply preservation of every user’s intent."
+    },
+    {
+      "vi": "Snapshot phải khớp sequence và journal phải còn contiguous suffix; max sequence không chứng minh recovery đúng.",
+      "en": "Snapshots must match their sequence and journals must retain contiguous suffixes; maximum sequence numbers do not prove correct recovery."
+    },
+    {
+      "vi": "Canvas, ephemeral presence và relational metadata có load/freshness/security contracts khác nhau.",
+      "en": "Canvas state, ephemeral presence and relational metadata have different load, freshness and security contracts."
+    },
+    {
+      "vi": "Sandbox capability surface, cache generation và shard ownership đều là correctness boundaries cần kiểm thử.",
+      "en": "Sandbox capabilities, cache generations and shard ownership are correctness boundaries that need testing."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ input tới shared state an toàn",
+      "en": "From input to safe shared state"
+    },
+    "caption": {
+      "vi": "Lần lượt hỏi: user thấy gì, ai quyết định, lưu ở đâu và phục hồi thế nào.",
+      "en": "Ask what users see, who decides, where state persists and how it recovers."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Phản hồi local",
+          "en": "Local feedback"
+        },
+        "detail": {
+          "vi": "Document model và renderer phản hồi ngay, đánh dấu pending.",
+          "en": "The model and renderer respond immediately while marking edits pending."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Sắp thứ tự",
+          "en": "Order edits"
+        },
+        "detail": {
+          "vi": "File owner validate và quyết định property values.",
+          "en": "The file owner validates edits and decides property values."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Lưu và khôi phục",
+          "en": "Persist and recover"
+        },
+        "detail": {
+          "vi": "Journal/checkpoint có boundary rõ và replay kiểm chứng.",
+          "en": "Journals and checkpoints have explicit boundaries and verified replay."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Mở rộng từng plane",
+          "en": "Scale each plane"
+        },
+        "detail": {
+          "vi": "Metadata shards và subscriptions không dùng chung mọi canvas mechanism.",
+          "en": "Metadata shards and subscriptions do not share every canvas mechanism."
+        },
+        "icon": "chart"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "Ba loại state, ba hợp đồng",
+        "en": "Three kinds of state, three contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả sử xây vector editor nhiều người: shapes, text labels, layers, comments, team permissions và plugins. Bài này đi từ MVP đến thiết kế lớn theo áp lực kỹ thuật; các stages không phải bản sao timeline nội bộ hay mô tả production hiện tại. Chọn file-scoped authority để giải thích order; một thiết kế CRDT hoặc decentralized khác vẫn có thể hợp lý nếu yêu cầu offline/merge khác.",
+          "en": "Assume a collaborative vector editor with shapes, text labels, layers, comments, team permissions and plugins. Stages follow engineering pressures rather than a private company timeline. We choose file-scoped authority to explain ordering; decentralized or CRDT designs may fit different offline and merge requirements."
+        },
+        {
+          "vi": "Đừng nhầm diagram canvas của người dùng với sơ đồ kiến trúc trong bài: canvas chứa document objects, còn kiến trúc giải thích nơi xử lý/lưu chúng. Trước scale, thống nhất số editors/file, largest file, offline behavior, saved semantics, quyền bị thu hồi, supported devices và mức mất dữ liệu cho phép.",
+          "en": "The user’s drawing canvas contains document objects; architecture diagrams explain where those objects are processed and stored. Before scaling, agree on editors per file, maximum file size, offline behavior, save semantics, revocations, supported devices and acceptable data loss."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Canvas document",
+            "en": "Canvas document"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Shapes/layers/property edits cần order, validation, undo và recovery.",
+              "en": "Shapes, layers and property edits require ordering, validation, undo and recovery."
+            },
+            {
+              "vi": "Large document và hot file là hai loại giới hạn khác nhau.",
+              "en": "Large documents and busy documents impose different limits."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Presence",
+            "en": "Presence"
+          },
+          "icon": "users",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Cursor, selection, viewport thường ephemeral, TTL và coalescing được.",
+              "en": "Cursors, selections and viewports are often ephemeral and can use TTLs/coalescing."
+            },
+            {
+              "vi": "Không journal mọi mouse movement chỉ để hiển thị cursor.",
+              "en": "Do not journal every mouse movement just to display cursors."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Metadata",
+            "en": "Metadata"
+          },
+          "icon": "scope",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "File names, memberships, comments và permissions có relational invariants.",
+              "en": "Names, memberships, comments and permissions have relational invariants."
+            },
+            {
+              "vi": "Live view phải đúng authorization/freshness, không chỉ có socket.",
+              "en": "Live views need correct authorization and freshness, not merely sockets."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "data",
+      "title": {
+        "vi": "Document model quyết định sync model",
+        "en": "The document model determines synchronization"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách stable object identity khỏi vị trí trong array. Một property set nên mang fileId, objectId, property, value, schemaVersion, client/session identity và opId. Server sequence biểu diễn order đã chấp nhận; client wall clock không được tự thắng quyền hoặc thứ tự. Property names/values cần schema và bounds, không cho arbitrary prototype mutation qua JSON path.",
+          "en": "Separate object identity from array position. A property set carries file/object identities, property/value, schema version, client/session identity and operation identity. Server sequences represent accepted order; client clocks do not override authority. Validate property schemas and bounds rather than exposing arbitrary prototype paths."
+        },
+        {
+          "vi": "Một drag có hàng chục intermediate positions nhưng undo thường là một user action. Có thể coalesce unsent positions của cùng property khi chỉ final position có nghĩa; không bỏ create/delete/relative operations hay positions đã cần cho downstream constraints. Coalescing không được làm opId ACK nhầm pending mới hơn.",
+          "en": "A drag produces many intermediate positions but undo often treats it as one action. Coalesce unsent positions only when final positions are sufficient; do not discard structural or relative operations that carry meaning. Coalescing must preserve operation identities so acknowledgements cannot retire newer edits."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Dữ liệu",
+            "en": "Data"
+          },
+          {
+            "vi": "Identity/context",
+            "en": "Identity/context"
+          },
+          {
+            "vi": "Quy tắc quan trọng",
+            "en": "Important rule"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Object",
+              "en": "Object"
+            },
+            {
+              "vi": "fileId + objectId",
+              "en": "fileId + objectId"
+            },
+            {
+              "vi": "Create/delete explicit; unknown target không tự hồi sinh object.",
+              "en": "Explicit creation/deletion; unknown targets do not implicitly resurrect objects."
+            }
+          ],
+          [
+            {
+              "vi": "Property",
+              "en": "Property"
+            },
+            {
+              "vi": "objectId + property + opId",
+              "en": "objectId + property + opId"
+            },
+            {
+              "vi": "Patch hẹp; cùng property dùng chosen conflict policy.",
+              "en": "Narrow patches; same-property writes follow the chosen conflict policy."
+            }
+          ],
+          [
+            {
+              "vi": "Tree edge",
+              "en": "Tree edge"
+            },
+            {
+              "vi": "parentId + orderKey + version",
+              "en": "parentId + orderKey + version"
+            },
+            {
+              "vi": "No cycle, compatible parent type và stable tie-break khi cùng order key.",
+              "en": "No cycles, compatible parent types and stable tie-breaks for equal ordering keys."
+            }
+          ],
+          [
+            {
+              "vi": "Checkpoint",
+              "en": "Checkpoint"
+            },
+            {
+              "vi": "fileId + sequence + schema + checksum",
+              "en": "fileId + sequence + schema + checksum"
+            },
+            {
+              "vi": "Bytes phải đúng state tại sequence đã công bố.",
+              "en": "Bytes must represent the advertised sequence."
+            }
+          ],
+          [
+            {
+              "vi": "Subscription",
+              "en": "Subscription"
+            },
+            {
+              "vi": "principal + tenant + query + cursor",
+              "en": "principal + tenant + query + cursor"
+            },
+            {
+              "vi": "Re-check access và gap recovery; không chia sẻ private result bằng query text đơn thuần.",
+              "en": "Check access and gaps; query text alone is insufficient for sharing private results."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "build",
+      "title": {
+        "vi": "12 giai đoạn: thay kiến trúc khi có áp lực",
+        "en": "Twelve stages: change architecture under pressure"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn stage để xem đường đi, responsibility của mỗi node, lý do quyết định và điều kiện chuyển tiếp. Một modular design nhỏ có thể đủ lâu; không cần đạt stage cuối để sản phẩm đúng. Mỗi lần tách service/storage đều phải giữ existing protocol và durable-state contracts.",
+          "en": "Select stages to inspect paths, responsibilities, decisions and exit criteria. A small modular design may remain sufficient; reaching the last stage is not a correctness requirement. Every service/storage split must preserve existing protocol and durable-state contracts."
+        }
+      ],
+      "stages": [
+        {
+          "id": "renderer",
+          "title": {
+            "vi": "Canvas chạy trong browser",
+            "en": "A canvas inside the browser"
+          },
+          "description": {
+            "vi": "Bắt đầu từ một file nhỏ mở được, chọn/move shape, zoom và save. UI shell có thể dùng DOM còn canvas dùng rendering engine riêng khi đo thấy cần. Đây là thiết kế học tập cho vector editor, không mô tả chính xác production hiện tại của một công ty.",
+            "en": "Start with a small file that opens, selects and moves shapes, zooms and saves. A DOM shell can coexist with a custom canvas renderer when measurements justify it. This is an educational vector-editor design, not a claim about current private production systems."
+          },
+          "problem": {
+            "vi": "Một tool dùng cả ngày cần tương tác nhanh, text/layout đúng và file không hỏng.",
+            "en": "A daily-use tool needs responsive input, correct text/layout and intact files."
+          },
+          "decision": {
+            "vi": "Tách document model khỏi renderer; version file format và giữ save/load round-trip tests.",
+            "en": "Separate document models from rendering; version file formats and verify save/load round trips."
+          },
+          "tradeoff": {
+            "vi": "Custom GPU rendering tăng công việc cho fonts, hit testing, accessibility và export.",
+            "en": "Custom GPU rendering adds font, hit-testing, accessibility and export work."
+          },
+          "nextPressure": {
+            "vi": "Chia sẻ link dẫn tới nhiều người sửa một file.",
+            "en": "Link sharing introduces simultaneous editors."
+          },
+          "exitCriteria": {
+            "vi": "Mở/save cùng file giữ IDs, geometry và schema; frame time có đo trên thiết bị mục tiêu.",
+            "en": "Opening and saving preserves IDs, geometry and schema, with frame timings measured on target devices."
+          },
+          "diagram": {
+            "id": "design-stage-renderer",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Metadata API",
+                  "en": "Metadata API"
+                },
+                "detail": {
+                  "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+                  "en": "Permissions, teams, names and comments have separate transactions and authorization."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "snapshot",
+                "label": {
+                  "vi": "Immutable checkpoints",
+                  "en": "Immutable checkpoints"
+                },
+                "detail": {
+                  "vi": "Snapshot chứa file/schema/sequence/checksum; publish manifest sau khi object hoàn tất.",
+                  "en": "Snapshots pin file/schema/sequence/checksum; publish manifests only after complete objects."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại api.",
+                      "en": "Pass context and enforce the boundary at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "snapshot",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại snapshot.",
+                      "en": "Pass context and enforce the boundary at snapshot."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "multiplayer",
+          "title": {
+            "vi": "Một authority cho từng file",
+            "en": "An authority per file"
+          },
+          "description": {
+            "vi": "Chọn một active owner cho mỗi file; client route qua gateway, owner validate và sắp thứ tự updates. Owner là logical role, không nhất thiết một OS process cho mọi thiết kế. Directory cache chỉ giúp tìm owner; sink/activation fencing mới chặn old owner sau failover.",
+            "en": "Choose one active owner per file. Gateways route updates to it for validation and ordering. Ownership is a logical role, not necessarily an OS process in every implementation. Directory caches locate owners; activation and sink fencing exclude stale owners."
+          },
+          "problem": {
+            "vi": "Nhiều sockets có thể gửi edits cùng lúc và reconnect vào máy khác.",
+            "en": "Concurrent sockets send edits and may reconnect to different machines."
+          },
+          "decision": {
+            "vi": "File-scoped ordered stream, ownership epoch và stable operation identity.",
+            "en": "Use file-scoped ordering, ownership epochs and stable operation identities."
+          },
+          "tradeoff": {
+            "vi": "Hot file vẫn bị giới hạn bởi owner; failover cần recovery và admission.",
+            "en": "Hot files remain owner-bound; failover needs recovery and admission control."
+          },
+          "nextPressure": {
+            "vi": "Đơn vị conflict quá lớn làm mất unrelated edits.",
+            "en": "Coarse conflict boundaries lose unrelated edits."
+          },
+          "exitCriteria": {
+            "vi": "Hai gateway không tạo hai active writers cho cùng file epoch.",
+            "en": "Two gateways cannot create two active writers for one file epoch."
+          },
+          "diagram": {
+            "id": "design-stage-multiplayer",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Socket gateway",
+                  "en": "Socket gateway"
+                },
+                "detail": {
+                  "vi": "Auth, protocol bounds, backpressure và routing tới đúng file owner.",
+                  "en": "Authentication, protocol limits, backpressure and file-owner routing."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Document owner",
+                  "en": "Document owner"
+                },
+                "detail": {
+                  "vi": "Exclusive owner epoch, validation và thứ tự edits theo từng file.",
+                  "en": "Exclusive ownership epochs, validation and per-file edit ordering."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "peer",
+                "label": {
+                  "vi": "Collaborator",
+                  "en": "Collaborator"
+                },
+                "detail": {
+                  "vi": "Remote document view và pending edits riêng; cursor không phải commit.",
+                  "en": "Remote document views and independent pending edits; cursors are not commits."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "client"
+              },
+              {
+                "id": "snapshot",
+                "label": {
+                  "vi": "Immutable checkpoints",
+                  "en": "Immutable checkpoints"
+                },
+                "detail": {
+                  "vi": "Snapshot chứa file/schema/sequence/checksum; publish manifest sau khi object hoàn tất.",
+                  "en": "Snapshots pin file/schema/sequence/checksum; publish manifests only after complete objects."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại gateway.",
+                      "en": "Pass context and enforce the boundary at gateway."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "owner",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại owner.",
+                      "en": "Pass context and enforce the boundary at owner."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "peer",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại peer.",
+                      "en": "Pass context and enforce the boundary at peer."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "snapshot",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại snapshot.",
+                      "en": "Pass context and enforce the boundary at snapshot."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "properties",
+          "title": {
+            "vi": "Đồng bộ theo property",
+            "en": "Synchronize properties"
+          },
+          "description": {
+            "vi": "Object có stable ID và các property độc lập. Set x không gửi lại fill/name cũ. Hai writes cùng property theo server order vẫn có một giá trị thắng; đó là conflict policy, không tự merge ý định hay text của cả hai người. Client giữ latest pending identity trên từng property.",
+            "en": "Objects have stable identities and independent properties. Setting x must not resend stale fill/name values. Server order still chooses one value for concurrent writes to the same property; this does not merge both users’ intent or text. Clients track the latest pending identity per property."
+          },
+          "problem": {
+            "vi": "A kéo shape trong khi B đổi màu; whole-object writes xóa thay đổi của B.",
+            "en": "A drags a shape while B changes its color; whole-object writes erase B’s change."
+          },
+          "decision": {
+            "vi": "Property patches, ordered echoes và matching-operation ACK guard.",
+            "en": "Use property patches, ordered echoes and matching-operation acknowledgement guards."
+          },
+          "tradeoff": {
+            "vi": "Text string replace không bảo toàn concurrent character edits; undo cần context.",
+            "en": "String replacement does not preserve concurrent character edits; undo needs context."
+          },
+          "nextPressure": {
+            "vi": "Load/startup và file size bắt đầu ảnh hưởng UX.",
+            "en": "Startup and file size begin to constrain usability."
+          },
+          "exitCriteria": {
+            "vi": "Older echo A1 không clear pending A2; clients hội tụ và giữ unrelated fill.",
+            "en": "An A1 echo cannot clear pending A2; clients converge while retaining unrelated fill."
+          },
+          "diagram": {
+            "id": "design-stage-properties",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Document owner",
+                  "en": "Document owner"
+                },
+                "detail": {
+                  "vi": "Exclusive owner epoch, validation và thứ tự edits theo từng file.",
+                  "en": "Exclusive ownership epochs, validation and per-file edit ordering."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "peer",
+                "label": {
+                  "vi": "Collaborator",
+                  "en": "Collaborator"
+                },
+                "detail": {
+                  "vi": "Remote document view và pending edits riêng; cursor không phải commit.",
+                  "en": "Remote document views and independent pending edits; cursors are not commits."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "owner",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại owner.",
+                      "en": "Pass context and enforce the boundary at owner."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "peer",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại peer.",
+                      "en": "Pass context and enforce the boundary at peer."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "editor",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại editor.",
+                      "en": "Pass context and enforce the boundary at editor."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "wasm",
+          "title": {
+            "vi": "Đo startup trước khi đổi runtime",
+            "en": "Measure startup before changing runtimes"
+          },
+          "description": {
+            "vi": "Nếu parsing/init là bottleneck, thử binary engine như WebAssembly cùng streaming compilation và caching thích hợp. Tách download, compile, instantiate, deserialize file, fonts và first interactive frame. Wasm không tự làm mọi workload nhanh hơn hay loại toàn bộ allocations/GPU stalls.",
+            "en": "If parsing or initialization is limiting, evaluate a binary engine such as WebAssembly with suitable compilation and caching. Measure downloading, compiling, instantiating, deserialization, fonts and first interaction separately. Wasm does not automatically accelerate every workload or eliminate allocations and GPU stalls."
+          },
+          "problem": {
+            "vi": "Blank screen lâu dù network có vẻ đủ nhanh.",
+            "en": "The screen stays blank despite apparently adequate networking."
+          },
+          "decision": {
+            "vi": "Profile cold/warm starts và tối ưu đúng critical path; giữ format/browser compatibility.",
+            "en": "Profile cold and warm starts and optimize their critical paths while preserving compatibility."
+          },
+          "tradeoff": {
+            "vi": "Toolchain, debug symbols, binary delivery và browser differences tăng chi phí.",
+            "en": "Toolchains, debugging, binary delivery and browser variation add cost."
+          },
+          "nextPressure": {
+            "vi": "Server-side document work có tail latency và noisy neighbors.",
+            "en": "Server-side document work develops tail latency and noisy neighbors."
+          },
+          "exitCriteria": {
+            "vi": "Benchmark cùng file/device/network; không lấy tốc độ parse thành end-to-end speedup.",
+            "en": "Compare the same files, devices and networks; parsing gains are not end-to-end gains."
+          },
+          "diagram": {
+            "id": "design-stage-wasm",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Metadata API",
+                  "en": "Metadata API"
+                },
+                "detail": {
+                  "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+                  "en": "Permissions, teams, names and comments have separate transactions and authorization."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "snapshot",
+                "label": {
+                  "vi": "Immutable checkpoints",
+                  "en": "Immutable checkpoints"
+                },
+                "detail": {
+                  "vi": "Snapshot chứa file/schema/sequence/checksum; publish manifest sau khi object hoàn tất.",
+                  "en": "Snapshots pin file/schema/sequence/checksum; publish manifests only after complete objects."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại api.",
+                      "en": "Pass context and enforce the boundary at api."
+                    }
+                  },
+                  {
+                    "from": "editor",
+                    "to": "snapshot",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại snapshot.",
+                      "en": "Pass context and enforce the boundary at snapshot."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "workers",
+          "title": {
+            "vi": "Cô lập document work",
+            "en": "Isolate document work"
+          },
+          "description": {
+            "vi": "Tách networking khỏi CPU-heavy serialization/layout/model work khi profiles chứng minh cần. Process/worker boundary cho phép supervise, cap memory và giảm blast radius; IPC serialization và queues cần backpressure. Rust/native worker là một lựa chọn, không bằng chứng một file luôn nhanh hoặc không thể leak memory.",
+            "en": "Separate networking from CPU-heavy model work when profiles justify it. Worker or process boundaries allow supervision, memory caps and smaller failure domains; IPC and queues still need backpressure. A native worker is one option, not proof of universal speed or memory safety at every boundary."
+          },
+          "problem": {
+            "vi": "Một file lớn chặn event loop và kéo latency của file khác.",
+            "en": "A large file blocks shared work and raises other files’ latency."
+          },
+          "decision": {
+            "vi": "Bounded worker queues, resource quotas và per-file crash/restart paths.",
+            "en": "Use bounded queues, resource quotas and per-file restart paths."
+          },
+          "tradeoff": {
+            "vi": "More processes tăng memory baseline; IPC và deploy compatibility phải được vận hành.",
+            "en": "Additional processes consume baseline memory and add IPC/deployment contracts."
+          },
+          "nextPressure": {
+            "vi": "Third-party extensions cần document access an toàn.",
+            "en": "Third-party extensions need controlled document access."
+          },
+          "exitCriteria": {
+            "vi": "Kill worker không mất acknowledged state ngoài contract; gateway không OOM vì backlog.",
+            "en": "Worker death respects acknowledged-state guarantees and gateways remain bounded under backlog."
+          },
+          "diagram": {
+            "id": "design-stage-workers",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "gateway",
+                "label": {
+                  "vi": "Socket gateway",
+                  "en": "Socket gateway"
+                },
+                "detail": {
+                  "vi": "Auth, protocol bounds, backpressure và routing tới đúng file owner.",
+                  "en": "Authentication, protocol limits, backpressure and file-owner routing."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "edge"
+              },
+              {
+                "id": "worker",
+                "label": {
+                  "vi": "Isolated document worker",
+                  "en": "Isolated document worker"
+                },
+                "detail": {
+                  "vi": "Bounded memory/CPU, IPC queue, crash supervision và drain.",
+                  "en": "Bounded memory/CPU, IPC queues, crash supervision and draining."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "worker"
+              },
+              {
+                "id": "journal",
+                "label": {
+                  "vi": "Ordered journal",
+                  "en": "Ordered journal"
+                },
+                "detail": {
+                  "vi": "Durable batches, sequence coverage, retry identity và retention boundary.",
+                  "en": "Durable batches, sequence coverage, retry identities and retention boundaries."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "snapshot",
+                "label": {
+                  "vi": "Immutable checkpoints",
+                  "en": "Immutable checkpoints"
+                },
+                "detail": {
+                  "vi": "Snapshot chứa file/schema/sequence/checksum; publish manifest sau khi object hoàn tất.",
+                  "en": "Snapshots pin file/schema/sequence/checksum; publish manifests only after complete objects."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "gateway",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại gateway.",
+                      "en": "Pass context and enforce the boundary at gateway."
+                    }
+                  },
+                  {
+                    "from": "gateway",
+                    "to": "worker",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại worker.",
+                      "en": "Pass context and enforce the boundary at worker."
+                    }
+                  },
+                  {
+                    "from": "worker",
+                    "to": "journal",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại journal.",
+                      "en": "Pass context and enforce the boundary at journal."
+                    }
+                  },
+                  {
+                    "from": "worker",
+                    "to": "snapshot",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại snapshot.",
+                      "en": "Pass context and enforce the boundary at snapshot."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "plugins",
+          "title": {
+            "vi": "Plugin là capability boundary",
+            "en": "Plugins are capability boundaries"
+          },
+          "description": {
+            "vi": "Không eval untrusted code trong app origin. Chạy logic qua isolation/interpreter phù hợp và expose document capabilities nhỏ, có validation/quotas; UI ở isolated frame với message validation. Một Realms-style shim từng được dùng trong thiết kế lịch sử rồi thay sau security issues; không xem mô tả cũ là khuyến nghị sandbox hiện tại.",
+            "en": "Do not evaluate untrusted code in the application origin. Isolate or interpret plugin logic and expose narrow, validated document capabilities with quotas. Isolate UI frames and validate messages. Historical Realms-style shims were replaced after security issues; old designs are not current sandbox recommendations."
+          },
+          "problem": {
+            "vi": "Plugin muốn sửa hàng nghìn nodes nhưng không được lấy ambient application authority.",
+            "en": "Plugins need bulk edits without inheriting ambient application authority."
+          },
+          "decision": {
+            "vi": "Explicit user action, scoped host API, bounded batches và independently enforced server authorization.",
+            "en": "Require user activation, scoped host APIs, bounded batches and independent server authorization."
+          },
+          "tradeoff": {
+            "vi": "Sandbox không ngăn exfiltration nếu policy vẫn cho plugin đọc document và gọi network.",
+            "en": "A sandbox does not prevent exfiltration when policy permits both document reads and network access."
+          },
+          "nextPressure": {
+            "vi": "Teams/files/comments tạo metadata load ngoài canvas.",
+            "en": "Teams, files and comments create separate metadata load."
+          },
+          "exitCriteria": {
+            "vi": "Forbidden capability tests, budget termination và audit/version/revocation controls hoạt động.",
+            "en": "Forbidden-capability tests, budget termination and version/revocation controls work."
+          },
+          "diagram": {
+            "id": "design-stage-plugins",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "plugin",
+                "label": {
+                  "vi": "Plugin sandbox",
+                  "en": "Plugin sandbox"
+                },
+                "detail": {
+                  "vi": "Interpreter/isolation boundary chỉ expose scoped capabilities được kiểm tra.",
+                  "en": "Interpreter/isolation boundaries expose only checked, scoped capabilities."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Document owner",
+                  "en": "Document owner"
+                },
+                "detail": {
+                  "vi": "Exclusive owner epoch, validation và thứ tự edits theo từng file.",
+                  "en": "Exclusive ownership epochs, validation and per-file edit ordering."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Metadata API",
+                  "en": "Metadata API"
+                },
+                "detail": {
+                  "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+                  "en": "Permissions, teams, names and comments have separate transactions and authorization."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "plugin",
+                    "to": "editor",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại editor.",
+                      "en": "Pass context and enforce the boundary at editor."
+                    }
+                  },
+                  {
+                    "from": "editor",
+                    "to": "owner",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại owner.",
+                      "en": "Pass context and enforce the boundary at owner."
+                    }
+                  },
+                  {
+                    "from": "editor",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại api.",
+                      "en": "Pass context and enforce the boundary at api."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "relief",
+          "title": {
+            "vi": "Mua thời gian cho metadata",
+            "en": "Buy metadata capacity deliberately"
+          },
+          "description": {
+            "vi": "Đo query plans, indexes, connection churn, locks và write/read mix trước. Tuning, pooling, caching, vertical scale và replicas có thể đủ; chỉ route stale-tolerant reads sang replicas. Permissions và read-your-write flows cần freshness policy rõ, không mặc định replica luôn mới.",
+            "en": "Measure plans, indexes, connection churn, locks and read/write mix first. Tuning, pooling, caching, larger instances and replicas may suffice. Route only stale-tolerant reads to replicas and define freshness for permissions and read-your-write flows."
+          },
+          "problem": {
+            "vi": "Một relational database phục vụ nhiều metadata domains gần saturation.",
+            "en": "One relational database serves multiple domains near saturation."
+          },
+          "decision": {
+            "vi": "Tối ưu theo bottleneck, bound connection pools và shed work trước overload.",
+            "en": "Optimize measured bottlenecks, bound pools and shed work before overload."
+          },
+          "tradeoff": {
+            "vi": "Replicas không nhân write capacity và có lag; larger node vẫn có ceiling.",
+            "en": "Replicas do not multiply write capacity and can lag; larger nodes still have limits."
+          },
+          "nextPressure": {
+            "vi": "Các table groups độc lập cần ownership riêng.",
+            "en": "Independent table groups need separate ownership."
+          },
+          "exitCriteria": {
+            "vi": "Load test giữ latency/headroom; mỗi read path có stale/fresh semantics.",
+            "en": "Load tests preserve latency/headroom and every read path has a freshness contract."
+          },
+          "diagram": {
+            "id": "design-stage-relief",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Metadata API",
+                  "en": "Metadata API"
+                },
+                "detail": {
+                  "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+                  "en": "Permissions, teams, names and comments have separate transactions and authorization."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Relational metadata",
+                  "en": "Relational metadata"
+                },
+                "detail": {
+                  "vi": "Authoritative rows, constraints, replication và backup theo contract.",
+                  "en": "Authoritative rows, constraints, replication and backups under explicit contracts."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Query cache",
+                  "en": "Query cache"
+                },
+                "detail": {
+                  "vi": "Tenant/principal/query context, invalidation generation và bounded freshness.",
+                  "en": "Tenant/principal/query contexts, invalidation generations and bounded freshness."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại api.",
+                      "en": "Pass context and enforce the boundary at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại cache.",
+                      "en": "Pass context and enforce the boundary at cache."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "db",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại db.",
+                      "en": "Pass context and enforce the boundary at db."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "vertical",
+          "title": {
+            "vi": "Tách table groups có chủ đích",
+            "en": "Partition table groups deliberately"
+          },
+          "description": {
+            "vi": "Chuyển một metadata domain sang database khác bằng consistent backfill/CDC, parity checks và cutover barrier. Cross-domain joins/transactions không còn tự local. Routing switch phải xử lý clients cũ, writes in-flight và rollback sau khi đích đã nhận writes; đừng chỉ flip config rồi xóa source.",
+            "en": "Move a metadata domain with consistent backfill/CDC, parity checks and a cutover barrier. Cross-domain joins and transactions stop being automatically local. Routing switches must handle old clients, in-flight writes and rollback after destination writes, not merely flip configuration and delete the source."
+          },
+          "problem": {
+            "vi": "Khác table groups tranh CPU/IO và release ownership.",
+            "en": "Different table groups compete for resources and ownership."
+          },
+          "decision": {
+            "vi": "Partition theo domain và locality, giữ atomic invariants cùng authority.",
+            "en": "Partition by domain/locality while colocating atomic invariants."
+          },
+          "tradeoff": {
+            "vi": "New network boundaries và recovery procedures; single huge table vẫn chưa scale-out.",
+            "en": "New network and recovery boundaries do not yet scale out one huge table."
+          },
+          "nextPressure": {
+            "vi": "Non-canvas views cần realtime updates.",
+            "en": "Non-canvas views need real-time updates."
+          },
+          "exitCriteria": {
+            "vi": "Cutover có fence, known catch-up point và kiểm count/content/constraints.",
+            "en": "Cutovers have fencing, known catch-up positions and count/content/constraint checks."
+          },
+          "diagram": {
+            "id": "design-stage-vertical",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Metadata API",
+                  "en": "Metadata API"
+                },
+                "detail": {
+                  "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+                  "en": "Permissions, teams, names and comments have separate transactions and authorization."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "proxy",
+                "label": {
+                  "vi": "Metadata router",
+                  "en": "Metadata router"
+                },
+                "detail": {
+                  "vi": "Shard key, ownership epoch, colocation và query admission.",
+                  "en": "Shard keys, ownership epochs, colocation and query admission."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Relational metadata",
+                  "en": "Relational metadata"
+                },
+                "detail": {
+                  "vi": "Authoritative rows, constraints, replication và backup theo contract.",
+                  "en": "Authoritative rows, constraints, replication and backups under explicit contracts."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại api.",
+                      "en": "Pass context and enforce the boundary at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "proxy",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại proxy.",
+                      "en": "Pass context and enforce the boundary at proxy."
+                    }
+                  },
+                  {
+                    "from": "proxy",
+                    "to": "db",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại db.",
+                      "en": "Pass context and enforce the boundary at db."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "live",
+          "title": {
+            "vi": "Subscriptions cho metadata",
+            "en": "Subscribe to metadata views"
+          },
+          "description": {
+            "vi": "Database commit được CDC đọc, service xác định affected subscriptions rồi gửi versioned patch/invalidation. Đây là data plane khác canvas. Consistent initial snapshot và stream handoff tránh lost update; reconnect cần cursor/replay hoặc resnapshot. CDC có thể replay sau crash, không hứa transport exactly-once.",
+            "en": "CDC observes commits and a service identifies affected subscriptions for versioned patches or invalidations. This differs from the canvas plane. Consistent initial snapshots and stream handoffs avoid lost updates; reconnects need replay or resnapshot. CDC may replay after crashes and is not exactly-once transport."
+          },
+          "problem": {
+            "vi": "Polling file lists/comments từ mọi client làm nhiều reads lặp lại.",
+            "en": "Polling file lists and comments repeats work across clients."
+          },
+          "decision": {
+            "vi": "Query-scoped subscription state, authorization và bounded update delivery.",
+            "en": "Use query-scoped subscription state, authorization and bounded delivery."
+          },
+          "tradeoff": {
+            "vi": "Slow subscribers, permission revocation và CDC lag trở thành operational state.",
+            "en": "Slow subscribers, revocations and CDC lag become operational state."
+          },
+          "nextPressure": {
+            "vi": "Volatile canvas ACK cần durability contract rõ hơn.",
+            "en": "Volatile canvas acknowledgements need clearer durability contracts."
+          },
+          "exitCriteria": {
+            "vi": "Mutation giữa snapshot/subscribe không biến mất; revoked access không nhận thêm data.",
+            "en": "Mutations during subscription setup remain visible and revocations stop unauthorized data."
+          },
+          "diagram": {
+            "id": "design-stage-live",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Metadata API",
+                  "en": "Metadata API"
+                },
+                "detail": {
+                  "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+                  "en": "Permissions, teams, names and comments have separate transactions and authorization."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Relational metadata",
+                  "en": "Relational metadata"
+                },
+                "detail": {
+                  "vi": "Authoritative rows, constraints, replication và backup theo contract.",
+                  "en": "Authoritative rows, constraints, replication and backups under explicit contracts."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "live",
+                "label": {
+                  "vi": "Live query service",
+                  "en": "Live query service"
+                },
+                "detail": {
+                  "vi": "Subscription context, versioned invalidations, repair và bounded fan-out.",
+                  "en": "Subscription contexts, versioned invalidations, repair and bounded fan-out."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "service"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Query cache",
+                  "en": "Query cache"
+                },
+                "detail": {
+                  "vi": "Tenant/principal/query context, invalidation generation và bounded freshness.",
+                  "en": "Tenant/principal/query contexts, invalidation generations and bounded freshness."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "store"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại api.",
+                      "en": "Pass context and enforce the boundary at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "db",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại db.",
+                      "en": "Pass context and enforce the boundary at db."
+                    }
+                  },
+                  {
+                    "from": "db",
+                    "to": "live",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại live.",
+                      "en": "Pass context and enforce the boundary at live."
+                    }
+                  },
+                  {
+                    "from": "live",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại cache.",
+                      "en": "Pass context and enforce the boundary at cache."
+                    }
+                  },
+                  {
+                    "from": "live",
+                    "to": "editor",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại editor.",
+                      "en": "Pass context and enforce the boundary at editor."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "journal",
+          "title": {
+            "vi": "Journal nhỏ và checkpoint đúng boundary",
+            "en": "Small journal entries and coherent checkpoints"
+          },
+          "description": {
+            "vi": "Append sequenced validated changes rồi theo dõi durable prefix riêng applied/accepted prefix. Một thiết kế có thể broadcast trước journal để nhanh, nhưng UI phải phân biệt syncing với saved. Snapshot pin đúng state tại sequence s; recovery đọc snapshot rồi contiguous suffix. Publish snapshot pointer chỉ sau durable object/manifest.",
+            "en": "Append sequenced validated changes and track durable prefixes separately from accepted/applied prefixes. Broadcasting before persistence can reduce latency but requires distinct syncing/saved states. Snapshots pin state at sequence s; recovery replays the contiguous suffix and publishes pointers only after durable objects/manifests."
+          },
+          "problem": {
+            "vi": "Periodic snapshot để lại cửa sổ unsaved work và deploy spikes.",
+            "en": "Periodic snapshots leave unsaved work windows and deployment spikes."
+          },
+          "decision": {
+            "vi": "Small batched journal, explicit durable ACK, coherent checkpoint và tested replay.",
+            "en": "Use batched journals, explicit durable acknowledgements, coherent checkpoints and tested replay."
+          },
+          "tradeoff": {
+            "vi": "Batch delay, storage cost, retention và replay time phải cân đối; p95 không worst-case bound.",
+            "en": "Balance batching delay, storage cost, retention and replay time; p95 is not a worst-case bound."
+          },
+          "nextPressure": {
+            "vi": "Một metadata table vượt capacity của một máy.",
+            "en": "A metadata table outgrows one machine."
+          },
+          "exitCriteria": {
+            "vi": "Crash ở mọi boundary không báo saved cho edit thiếu durable evidence.",
+            "en": "Crashes at each boundary cannot label edits saved without durable evidence."
+          },
+          "diagram": {
+            "id": "design-stage-journal",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Document owner",
+                  "en": "Document owner"
+                },
+                "detail": {
+                  "vi": "Exclusive owner epoch, validation và thứ tự edits theo từng file.",
+                  "en": "Exclusive ownership epochs, validation and per-file edit ordering."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "journal",
+                "label": {
+                  "vi": "Ordered journal",
+                  "en": "Ordered journal"
+                },
+                "detail": {
+                  "vi": "Durable batches, sequence coverage, retry identity và retention boundary.",
+                  "en": "Durable batches, sequence coverage, retry identities and retention boundaries."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "snapshot",
+                "label": {
+                  "vi": "Immutable checkpoints",
+                  "en": "Immutable checkpoints"
+                },
+                "detail": {
+                  "vi": "Snapshot chứa file/schema/sequence/checksum; publish manifest sau khi object hoàn tất.",
+                  "en": "Snapshots pin file/schema/sequence/checksum; publish manifests only after complete objects."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "peer",
+                "label": {
+                  "vi": "Collaborator",
+                  "en": "Collaborator"
+                },
+                "detail": {
+                  "vi": "Remote document view và pending edits riêng; cursor không phải commit.",
+                  "en": "Remote document views and independent pending edits; cursors are not commits."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "client"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "owner",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại owner.",
+                      "en": "Pass context and enforce the boundary at owner."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "journal",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại journal.",
+                      "en": "Pass context and enforce the boundary at journal."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "peer",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại peer.",
+                      "en": "Pass context and enforce the boundary at peer."
+                    }
+                  },
+                  {
+                    "from": "owner",
+                    "to": "snapshot",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại snapshot.",
+                      "en": "Pass context and enforce the boundary at snapshot."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "shards",
+          "title": {
+            "vi": "Shard metadata theo locality",
+            "en": "Shard metadata by locality"
+          },
+          "description": {
+            "vi": "Tách logical partition khỏi physical placement; route bằng shard key/ownership version. Group tables cùng key để giữ common transactions local. Scatter-gather cần limit, deadline, partial/error semantics và pool budgets. Một routing proxy không biến SQL tùy ý thành distributed transaction miễn phí.",
+            "en": "Separate logical partitions from physical placement and route by shard key/ownership version. Colocate tables to keep common transactions local. Bound scatter-gather with deadlines, failure semantics and pool budgets. A proxy does not turn arbitrary SQL into free distributed transactions."
+          },
+          "problem": {
+            "vi": "Vertical partitioning không còn đủ cho largest table hoặc tenant.",
+            "en": "Vertical partitioning no longer fits the largest table or tenant."
+          },
+          "decision": {
+            "vi": "Key-aware router, colocated invariants và staged logical/physical migration.",
+            "en": "Use key-aware routing, colocated invariants and staged logical/physical migration."
+          },
+          "tradeoff": {
+            "vi": "Hot tenants, cross-shard joins, sequences và schema rollout cần explicit support.",
+            "en": "Hot tenants, cross-shard joins, sequences and schema rollouts need explicit support."
+          },
+          "nextPressure": {
+            "vi": "Subscriptions/cache phải theo topology và invalidation scale.",
+            "en": "Subscriptions and caches must follow topology and invalidation scale."
+          },
+          "exitCriteria": {
+            "vi": "Stale routing không tạo dual writers; global query cost được admit/observe.",
+            "en": "Stale routing cannot create dual writers and global queries have admitted, observable costs."
+          },
+          "diagram": {
+            "id": "design-stage-shards",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Metadata API",
+                  "en": "Metadata API"
+                },
+                "detail": {
+                  "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+                  "en": "Permissions, teams, names and comments have separate transactions and authorization."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "proxy",
+                "label": {
+                  "vi": "Metadata router",
+                  "en": "Metadata router"
+                },
+                "detail": {
+                  "vi": "Shard key, ownership epoch, colocation và query admission.",
+                  "en": "Shard keys, ownership epochs, colocation and query admission."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Relational metadata",
+                  "en": "Relational metadata"
+                },
+                "detail": {
+                  "vi": "Authoritative rows, constraints, replication và backup theo contract.",
+                  "en": "Authoritative rows, constraints, replication and backups under explicit contracts."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "live",
+                "label": {
+                  "vi": "Live query service",
+                  "en": "Live query service"
+                },
+                "detail": {
+                  "vi": "Subscription context, versioned invalidations, repair và bounded fan-out.",
+                  "en": "Subscription contexts, versioned invalidations, repair and bounded fan-out."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "api",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại api.",
+                      "en": "Pass context and enforce the boundary at api."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "proxy",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại proxy.",
+                      "en": "Pass context and enforce the boundary at proxy."
+                    }
+                  },
+                  {
+                    "from": "proxy",
+                    "to": "db",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại db.",
+                      "en": "Pass context and enforce the boundary at db."
+                    }
+                  },
+                  {
+                    "from": "db",
+                    "to": "live",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại live.",
+                      "en": "Pass context and enforce the boundary at live."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "subscriptions",
+          "title": {
+            "vi": "Mở rộng live views mà không nhân mọi query",
+            "en": "Scale live views without multiplying every query"
+          },
+          "description": {
+            "vi": "Tách session edge, shared query cache và per-database change readers khi đo thấy cần. Cache hash và DB shard map là hai cách partition khác nhau. Invalidation cho phép re-fetch thay patch mọi result nhưng cần generation-safe fills, dedup, replay/gap recovery và scope đúng principal. Whiteboard/components/developer handoff là domain mới dùng contracts chung, không chỉ copy canvas schema.",
+            "en": "Separate session edges, shared query caches and per-database change readers when justified. Cache hashing and database routing partition different work. Invalidation permits refetching instead of patching every result but needs generation-safe fills, replay/gap recovery and principal scope. Whiteboards, components and developer handoff add domains, not merely copies of a canvas schema."
+          },
+          "problem": {
+            "vi": "Sessions, shared metadata views và DB shards tăng độc lập.",
+            "en": "Sessions, shared views and database shards grow independently."
+          },
+          "decision": {
+            "vi": "Layer-specific partitioning, scoped caches và versioned repair protocols.",
+            "en": "Partition each layer appropriately with scoped caches and versioned repair."
+          },
+          "tradeoff": {
+            "vi": "Invalidation storms và fan-out có thể làm reads tăng; monitor useful updates thay chỉ socket count.",
+            "en": "Invalidation storms can amplify reads; measure useful updates rather than socket counts alone."
+          },
+          "nextPressure": {
+            "vi": "Mỗi new surface cần performance, safety và compatibility review.",
+            "en": "Each new surface needs performance, safety and compatibility review."
+          },
+          "exitCriteria": {
+            "vi": "Lost invalidation/refill races/topology changes có bounded repair thay silent stale forever.",
+            "en": "Lost invalidations, refill races and topology changes have bounded repair paths."
+          },
+          "diagram": {
+            "id": "design-stage-subscriptions",
+            "title": {
+              "vi": "Luồng ở giai đoạn này",
+              "en": "Path at this stage"
+            },
+            "caption": {
+              "vi": "Sơ đồ thiết kế minh họa; mở node để xem trách nhiệm.",
+              "en": "Educational architecture; open nodes to inspect responsibilities."
+            },
+            "width": 960,
+            "height": 470,
+            "nodes": [
+              {
+                "id": "editor",
+                "label": {
+                  "vi": "Browser editor",
+                  "en": "Browser editor"
+                },
+                "detail": {
+                  "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+                  "en": "Local document, pending operations, renderer and explicit save state."
+                },
+                "x": 140,
+                "y": 100,
+                "kind": "client"
+              },
+              {
+                "id": "live",
+                "label": {
+                  "vi": "Live query service",
+                  "en": "Live query service"
+                },
+                "detail": {
+                  "vi": "Subscription context, versioned invalidations, repair và bounded fan-out.",
+                  "en": "Subscription contexts, versioned invalidations, repair and bounded fan-out."
+                },
+                "x": 480,
+                "y": 100,
+                "kind": "service"
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Query cache",
+                  "en": "Query cache"
+                },
+                "detail": {
+                  "vi": "Tenant/principal/query context, invalidation generation và bounded freshness.",
+                  "en": "Tenant/principal/query contexts, invalidation generations and bounded freshness."
+                },
+                "x": 820,
+                "y": 100,
+                "kind": "store"
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Relational metadata",
+                  "en": "Relational metadata"
+                },
+                "detail": {
+                  "vi": "Authoritative rows, constraints, replication và backup theo contract.",
+                  "en": "Authoritative rows, constraints, replication and backups under explicit contracts."
+                },
+                "x": 140,
+                "y": 370,
+                "kind": "store"
+              },
+              {
+                "id": "proxy",
+                "label": {
+                  "vi": "Metadata router",
+                  "en": "Metadata router"
+                },
+                "detail": {
+                  "vi": "Shard key, ownership epoch, colocation và query admission.",
+                  "en": "Shard keys, ownership epochs, colocation and query admission."
+                },
+                "x": 480,
+                "y": 370,
+                "kind": "service"
+              }
+            ],
+            "traces": [
+              {
+                "id": "main",
+                "label": {
+                  "vi": "Theo dõi luồng chính",
+                  "en": "Trace the main path"
+                },
+                "steps": [
+                  {
+                    "from": "editor",
+                    "to": "live",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại live.",
+                      "en": "Pass context and enforce the boundary at live."
+                    }
+                  },
+                  {
+                    "from": "live",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại cache.",
+                      "en": "Pass context and enforce the boundary at cache."
+                    }
+                  },
+                  {
+                    "from": "db",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại cache.",
+                      "en": "Pass context and enforce the boundary at cache."
+                    }
+                  },
+                  {
+                    "from": "cache",
+                    "to": "live",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại live.",
+                      "en": "Pass context and enforce the boundary at live."
+                    }
+                  },
+                  {
+                    "from": "live",
+                    "to": "editor",
+                    "description": {
+                      "vi": "Chuyển context và kiểm tra boundary tại editor.",
+                      "en": "Pass context and enforce the boundary at editor."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sizing",
+      "title": {
+        "vi": "Ước lượng từ hoạt động cụ thể",
+        "en": "Estimate concrete activity"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixture giả định 2.000 active files, trung bình 6 connected editors/file; 10% đang drag và gửi 20 accepted property updates/s. Đây là số để luyện tính, không là traffic hoặc benchmark của một sản phẩm. Rate trung bình không đủ: một file 500 viewers có fan-out khác 500 file một viewer.",
+          "en": "Assume 2,000 active files with six connected editors each; 10% are dragging at 20 accepted property updates/second. These are teaching assumptions, not product traffic or benchmarks. Averages hide the difference between one file with 500 viewers and 500 files with one viewer."
+        },
+        {
+          "vi": "Một update 160 bytes là payload giả định, chưa tính transport headers, encoding, auth, journal metadata hay replicas. Egress phải theo audience thực và subscriptions, không lấy số update nhân toàn bộ online users. CPU cho text/layout và size của checkpoint cần đo riêng; hệ thống có thể CPU-bound trước khi network đầy.",
+          "en": "The assumed 160-byte update excludes transport, encoding, authorization, journal metadata and replicas. Egress depends on actual audiences and subscriptions rather than all online users. Measure layout work and checkpoint sizes separately; CPU can saturate before network links."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng",
+            "en": "Quantity"
+          },
+          {
+            "vi": "Phép tính",
+            "en": "Calculation"
+          },
+          {
+            "vi": "Kết quả/giới hạn",
+            "en": "Result/limit"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Open sockets",
+              "en": "Open sockets"
+            },
+            {
+              "vi": "2,000 × 6",
+              "en": "2,000 × 6"
+            },
+            {
+              "vi": "12,000, chưa tính viewers riêng",
+              "en": "12,000 before additional viewers"
+            }
+          ],
+          [
+            {
+              "vi": "Accepted edits",
+              "en": "Accepted edits"
+            },
+            {
+              "vi": "12,000 × 0.10 × 20",
+              "en": "12,000 × 0.10 × 20"
+            },
+            {
+              "vi": "24,000/s, workload giả định",
+              "en": "24,000/s, assumed workload"
+            }
+          ],
+          [
+            {
+              "vi": "Peer deliveries",
+              "en": "Peer deliveries"
+            },
+            {
+              "vi": "24,000 × 5",
+              "en": "24,000 × 5"
+            },
+            {
+              "vi": "120,000/s nếu mỗi file có đúng6editors",
+              "en": "120,000/s if each file has exactly six editors"
+            }
+          ],
+          [
+            {
+              "vi": "Payload egress",
+              "en": "Payload egress"
+            },
+            {
+              "vi": "120,000 × 160 B",
+              "en": "120,000 × 160 B"
+            },
+            {
+              "vi": "19.2 MB/s, chưa overhead",
+              "en": "19.2 MB/s before overhead"
+            }
+          ],
+          [
+            {
+              "vi": "Journal raw payload",
+              "en": "Journal raw payload"
+            },
+            {
+              "vi": "24,000 × 160 × 86,400",
+              "en": "24,000 × 160 × 86,400"
+            },
+            {
+              "vi": "331.776 GB/day nếu rate giữ cả ngày; retention/replicas tính riêng",
+              "en": "331.776 GB/day at constant rate; retention/replicas are separate"
+            }
+          ],
+          [
+            {
+              "vi": "Frame budget",
+              "en": "Frame budget"
+            },
+            {
+              "vi": "1,000 ms / 60",
+              "en": "1,000 ms / 60"
+            },
+            {
+              "vi": "≈16.67 ms/frame, không phải network RTT budget",
+              "en": "About 16.67 ms/frame, not a network RTT budget"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "API contracts tách open, edits và metadata",
+        "en": "Separate opening, editing and metadata contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Endpoints minh họa cho hệ thống học tập. Server validate resource access trước khi trả snapshot URL, mở subscription hay chấp nhận edit. Signed URL/cursor có expiry/scope không thay thế revocation policy; opId dedup phải có retention/retry-horizon rõ và cùng identity nhưng payload khác cần conflict.",
+          "en": "These are educational endpoints. Validate access before issuing snapshot URLs, opening subscriptions or accepting edits. Scoped expiring URLs/cursors still need revocation policies; operation deduplication needs explicit retry horizons and rejects identity reuse with different payloads."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/files/{fileId}/open",
+          "description": {
+            "vi": "Authorize file và lấy coherent snapshot/live handoff.",
+            "en": "Authorize the file and obtain a coherent snapshot/live handoff."
+          },
+          "request": "{ clientSchema, sessionId, resumeCursor? }",
+          "response": "200 { snapshot: { url, sequence, schema, checksum }, ownerEpoch, resumeToken, permissionsVersion }"
+        },
+        {
+          "method": "WS",
+          "path": "/v1/files/{fileId}/edits",
+          "description": {
+            "vi": "File-scoped stream có ordered results và durable prefix riêng.",
+            "en": "A file-scoped stream with ordered results and a separate durable prefix."
+          },
+          "request": "{ ownerEpoch, sessionId, opId, baseSequence, kind, objectId, property?, value? }",
+          "response": "{ opId, acceptedSequence, durableThrough, result, rejectionReason? }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/files/{fileId}/reconnect",
+          "description": {
+            "vi": "Reauthorize và reconcile pending edits sau offline/crash.",
+            "en": "Reauthorize and reconcile pending edits after offline periods or crashes."
+          },
+          "request": "{ sessionId, lastApplied, pendingOpIds, knownSnapshot }",
+          "response": "200 { mode: replay | snapshot, ownerEpoch, cursor, retainedResults }"
+        },
+        {
+          "method": "PATCH",
+          "path": "/v1/files/{fileId}/metadata",
+          "description": {
+            "vi": "Metadata mutation có expected version.",
+            "en": "A metadata mutation with an expected version."
+          },
+          "request": "{ expectedVersion, name, mutationId }",
+          "response": "200 { version, name } | 409 { currentVersion }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/subscriptions",
+          "description": {
+            "vi": "Đăng ký view theo principal và cursor có scope.",
+            "en": "Subscribe to a principal-scoped view and cursor."
+          },
+          "request": "{ viewId, parameters, cursor? }",
+          "response": "200 { snapshot, version, subscriptionId, cursor } | 410 { resnapshot: true }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/files/{fileId}/exports",
+          "description": {
+            "vi": "Async export pin file sequence, fonts/assets và permissions.",
+            "en": "An asynchronous export pins file sequence, fonts/assets and permissions."
+          },
+          "request": "{ sequence, format, selection, exportId }",
+          "response": "202 { jobId, pinnedSequence }"
+        }
+      ]
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "Theo dõi edit, open, recovery và plugin",
+        "en": "Trace edits, opening, recovery and plugins"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng trace Edit để phân biệt local action với journal durable ACK. Chuyển sang Rename để thấy metadata commit/CDC/subscription là đường khác. Trace Open và Recovery nêu snapshot/stream handoff và owner fencing; đây thường là nơi demo happy path bỏ sót.",
+          "en": "Use Edit to distinguish local actions from durable journal acknowledgements. Rename follows a separate metadata/CDC/subscription path. Open and Recovery expose snapshot/stream handoffs and ownership fencing, which happy-path demos often omit."
+        }
+      ],
+      "diagram": {
+        "id": "design-edit-boundaries",
+        "title": {
+          "vi": "Một edit, hai data planes",
+          "en": "One edit, two data planes"
+        },
+        "caption": {
+          "vi": "Canvas order/durability tách khỏi relational metadata và subscription freshness. Chọn từng trace để xem boundary.",
+          "en": "Canvas ordering/durability differ from relational metadata and subscription freshness. Select a trace to inspect each boundary."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "editor",
+            "label": {
+              "vi": "Browser editor",
+              "en": "Browser editor"
+            },
+            "detail": {
+              "vi": "Local document, pending operations, renderer và trạng thái saved rõ ràng.",
+              "en": "Local document, pending operations, renderer and explicit save state."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Socket gateway",
+              "en": "Socket gateway"
+            },
+            "detail": {
+              "vi": "Auth, protocol bounds, backpressure và routing tới đúng file owner.",
+              "en": "Authentication, protocol limits, backpressure and file-owner routing."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "owner",
+            "label": {
+              "vi": "Document owner",
+              "en": "Document owner"
+            },
+            "detail": {
+              "vi": "Exclusive owner epoch, validation và thứ tự edits theo từng file.",
+              "en": "Exclusive ownership epochs, validation and per-file edit ordering."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "journal",
+            "label": {
+              "vi": "Ordered journal",
+              "en": "Ordered journal"
+            },
+            "detail": {
+              "vi": "Durable batches, sequence coverage, retry identity và retention boundary.",
+              "en": "Durable batches, sequence coverage, retry identities and retention boundaries."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "peer",
+            "label": {
+              "vi": "Collaborator",
+              "en": "Collaborator"
+            },
+            "detail": {
+              "vi": "Remote document view và pending edits riêng; cursor không phải commit.",
+              "en": "Remote document views and independent pending edits; cursors are not commits."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "client"
+          },
+          {
+            "id": "snapshot",
+            "label": {
+              "vi": "Immutable checkpoints",
+              "en": "Immutable checkpoints"
+            },
+            "detail": {
+              "vi": "Snapshot chứa file/schema/sequence/checksum; publish manifest sau khi object hoàn tất.",
+              "en": "Snapshots pin file/schema/sequence/checksum; publish manifests only after complete objects."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "api",
+            "label": {
+              "vi": "Metadata API",
+              "en": "Metadata API"
+            },
+            "detail": {
+              "vi": "Permissions, teams, names và comments có transaction/authorization riêng.",
+              "en": "Permissions, teams, names and comments have separate transactions and authorization."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "db",
+            "label": {
+              "vi": "Relational metadata",
+              "en": "Relational metadata"
+            },
+            "detail": {
+              "vi": "Authoritative rows, constraints, replication và backup theo contract.",
+              "en": "Authoritative rows, constraints, replication and backups under explicit contracts."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "live",
+            "label": {
+              "vi": "Live query service",
+              "en": "Live query service"
+            },
+            "detail": {
+              "vi": "Subscription context, versioned invalidations, repair và bounded fan-out.",
+              "en": "Subscription contexts, versioned invalidations, repair and bounded fan-out."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "plugin",
+            "label": {
+              "vi": "Plugin sandbox",
+              "en": "Plugin sandbox"
+            },
+            "detail": {
+              "vi": "Interpreter/isolation boundary chỉ expose scoped capabilities được kiểm tra.",
+              "en": "Interpreter/isolation boundaries expose only checked, scoped capabilities."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "client"
+          }
+        ],
+        "traces": [
+          {
+            "id": "edit",
+            "label": {
+              "vi": "Edit và durable ACK",
+              "en": "Edit and durable acknowledgement"
+            },
+            "steps": [
+              {
+                "from": "editor",
+                "to": "gateway",
+                "description": {
+                  "vi": "Gửi file/ownerEpoch/opId/property patch với auth context.",
+                  "en": "Send file/ownerEpoch/opId/property patches with authorization context."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "owner",
+                "description": {
+                  "vi": "Route owner hiện tại; validate schema, quyền và bounds.",
+                  "en": "Route to the current owner and validate schema, permissions and limits."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "journal",
+                "description": {
+                  "vi": "Append batch và chờ durable boundary đã chọn.",
+                  "en": "Append the batch and await the chosen durable boundary."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "peer",
+                "description": {
+                  "vi": "Broadcast ordered changes; delivery có cursor và backpressure.",
+                  "en": "Broadcast ordered changes with cursors and backpressure."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "editor",
+                "description": {
+                  "vi": "ACK operation identity/prefix và saved state đúng nghĩa.",
+                  "en": "Acknowledge operation identities/prefixes with precise save state."
+                }
+              }
+            ]
+          },
+          {
+            "id": "open",
+            "label": {
+              "vi": "Mở file và stream handoff",
+              "en": "Open a file and hand off to its stream"
+            },
+            "steps": [
+              {
+                "from": "editor",
+                "to": "api",
+                "description": {
+                  "vi": "Authorize access tới file generation.",
+                  "en": "Authorize access to the file generation."
+                }
+              },
+              {
+                "from": "editor",
+                "to": "snapshot",
+                "description": {
+                  "vi": "Đọc immutable snapshot pin seq/schema/checksum.",
+                  "en": "Read an immutable snapshot pinned to sequence/schema/checksum."
+                }
+              },
+              {
+                "from": "editor",
+                "to": "gateway",
+                "description": {
+                  "vi": "Đăng ký suffix từ snapshot sequence, chống hở snapshot/live.",
+                  "en": "Subscribe from the snapshot sequence without a snapshot/live gap."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "owner",
+                "description": {
+                  "vi": "Replay suffix rồi live updates theo cùng file context.",
+                  "en": "Replay the suffix then stream updates in the same file context."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recover",
+            "label": {
+              "vi": "Crash và phục hồi file",
+              "en": "Recover a file after a crash"
+            },
+            "steps": [
+              {
+                "from": "snapshot",
+                "to": "owner",
+                "description": {
+                  "vi": "Owner mới fenced đọc snapshot nhất quán tại s.",
+                  "en": "A fenced replacement owner loads a coherent snapshot at s."
+                }
+              },
+              {
+                "from": "journal",
+                "to": "owner",
+                "description": {
+                  "vi": "Replay s+1..durable prefix, phát hiện gap/duplicate và schema mismatch.",
+                  "en": "Replay the contiguous suffix, detecting gaps, duplicates and schema mismatches."
+                }
+              },
+              {
+                "from": "owner",
+                "to": "gateway",
+                "description": {
+                  "vi": "Chỉ advertise ready sau recovery; nhận reconnect có identity/cursor.",
+                  "en": "Advertise readiness after recovery and accept contextual reconnects."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "editor",
+                "description": {
+                  "vi": "Client rebase/retry pending trên authoritative state với quyền hiện tại.",
+                  "en": "Rebase or retry pending edits against authoritative state and current permissions."
+                }
+              }
+            ]
+          },
+          {
+            "id": "metadata",
+            "label": {
+              "vi": "Đổi tên file ngoài canvas",
+              "en": "Rename a file outside the canvas"
+            },
+            "steps": [
+              {
+                "from": "editor",
+                "to": "api",
+                "description": {
+                  "vi": "Rename với expected version/idempotency tùy contract.",
+                  "en": "Rename with the contract’s version/idempotency context."
+                }
+              },
+              {
+                "from": "api",
+                "to": "db",
+                "description": {
+                  "vi": "Commit row và constraint trong relational authority.",
+                  "en": "Commit the row and constraints in the relational authority."
+                }
+              },
+              {
+                "from": "db",
+                "to": "live",
+                "description": {
+                  "vi": "CDC mang commit cursor; consumer có thể gặp replay.",
+                  "en": "CDC carries commit cursors and may replay to consumers."
+                },
+                "async": true
+              },
+              {
+                "from": "live",
+                "to": "peer",
+                "description": {
+                  "vi": "Push scoped invalidation/result; re-check access và generation.",
+                  "en": "Push scoped invalidations/results with access and generation checks."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "plugin",
+            "label": {
+              "vi": "Plugin sửa document qua host API",
+              "en": "Plugin edits through the host API"
+            },
+            "steps": [
+              {
+                "from": "plugin",
+                "to": "editor",
+                "description": {
+                  "vi": "Validated capability call không có ambient cookies/origin authority.",
+                  "en": "Validated capability calls do not inherit ambient origin authority."
+                }
+              },
+              {
+                "from": "editor",
+                "to": "gateway",
+                "description": {
+                  "vi": "Edits đi qua cùng normal protocol/quotas.",
+                  "en": "Edits use the normal protocol and quotas."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "owner",
+                "description": {
+                  "vi": "Server vẫn kiểm quyền, schema và resource bounds độc lập.",
+                  "en": "The server independently checks permissions, schema and resource bounds."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "properties",
+      "title": {
+        "vi": "Property merge và pending guard",
+        "en": "Property merging and pending guards"
+      },
+      "paragraphs": [
+        {
+          "vi": "Hai người đổi x và fill không cần ghi đè nhau. Nếu cả hai đổi x, chosen server order quyết định x cuối; nếu cả hai thay toàn bộ string, không tự tạo một chuỗi giữ cả hai phần gõ. Với collaborative text thực sự, đánh giá sequence semantics/OT/CRDT theo yêu cầu; đừng suy từ shape coordinates rằng mọi dữ liệu dùng LWW đều đủ.",
+          "en": "Changing x and fill need not cause mutual overwrites. Concurrent x writes follow server order; replacing a whole string does not merge both users’ typing. Evaluate sequence semantics, OT or CRDTs for genuine collaborative text rather than generalizing coordinate behavior to every data type."
+        },
+        {
+          "vi": "Guard phải biết ACK của operation nào. A1 và A2 cùng x, ACK A1 chỉ xác nhận A1; x của A vẫn pending A2. Ordered delivery/reconnect protocol là giả định quan trọng: nếu broadcast có thể đảo thứ tự, client còn cần sequence/version checks thay chỉ guard. Khi quiescent, client phải reconcile với authority; guard không được giữ pending vĩnh viễn.",
+          "en": "The guard must identify the acknowledged operation. An A1 acknowledgement does not retire a later A2 on the same property. Ordered delivery and reconnect protocols matter; reordered broadcasts also need version checks. Once updates settle, clients reconcile with authority rather than retaining pending state forever."
+        }
+      ],
+      "experiment": "design-properties"
+    },
+    {
+      "id": "structure",
+      "title": {
+        "vi": "Tree, ordering và undo không chỉ là set property",
+        "en": "Trees, ordering and undo need more than property sets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Reparent A dưới B rồi B dưới A phải bị reject hoặc resolve theo một thuật toán đã chứng minh giữ acyclic tree. Với central authority có thể validate parent existence/type và ancestor relation trong cùng serialized decision; không để hai handlers check trên state cũ rồi cùng commit. Đây là một lựa chọn thiết kế, không tuyên bố mọi sản phẩm dùng cùng cách.",
+          "en": "Reparenting A under B and then B under A must be rejected or resolved by a tree-preserving algorithm. A central authority can validate existence, types and ancestry in one serialized decision rather than allowing two stale checks to commit. This is a design option, not a claim about every product."
+        },
+        {
+          "vi": "Fractional order keys giảm renumbering khi insert giữa siblings, nhưng không dùng float64 midpoint mãi mãi: khoảng trống hữu hạn, concurrent equal keys và key growth cần tie-break/reindex protocol. Delete/create phải explicit; replay một stale property không được tự resurrect node. Undo local nên ghi action/context và kiểm thay đổi của người khác, không blind restore toàn bộ old document.",
+          "en": "Fractional ordering reduces sibling renumbering, but repeated float midpoints eventually exhaust precision. Equal concurrent keys and key growth need tie-break and reindex protocols. Creation/deletion are explicit, and stale property writes must not resurrect nodes. Undo records action/context and considers others’ changes rather than restoring an entire old document."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một structural mutation an toàn",
+          "en": "A safe structural mutation"
+        },
+        "caption": {
+          "vi": "Cùng decision boundary giữ tree invariants.",
+          "en": "One decision boundary protects tree invariants."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Validate context",
+              "en": "Validate context"
+            },
+            "detail": {
+              "vi": "Principal, file/epoch, object existence và schema.",
+              "en": "Check principal, file/epoch, object existence and schema."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Kiểm tra invariant",
+              "en": "Check invariants"
+            },
+            "detail": {
+              "vi": "Parent type, cycle, order key và concurrent version.",
+              "en": "Check parent type, cycles, order keys and versions."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Commit result",
+              "en": "Commit the result"
+            },
+            "detail": {
+              "vi": "Assign sequence, retain retry result và update model.",
+              "en": "Assign a sequence, retain retry results and update the model."
+            },
+            "icon": "decision"
+          },
+          {
+            "title": {
+              "vi": "Broadcast/reconcile",
+              "en": "Broadcast/reconcile"
+            },
+            "detail": {
+              "vi": "Clients nhận canonical result; rejection có UX để sửa.",
+              "en": "Clients receive canonical results and actionable rejections."
+            },
+            "icon": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recovery",
+      "title": {
+        "vi": "Journal không tự biến accepted thành saved",
+        "en": "A journal does not make accepted mean saved"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn rõ durability contract: ACK sau journal durable tăng latency nhưng bảo vệ ACKed suffix theo storage/failover assumptions; broadcast-before-persist giảm feedback latency nhưng saved indicator chỉ tiến khi durable prefix tiến. Percentile save latency không phải upper bound mất dữ liệu; outage kéo dài có thể làm window lớn hơn. Client pending buffers là recovery aid, không substitute cho server contract hoặc backup.",
+          "en": "Define durability explicitly. Journal-before-ACK adds latency but protects acknowledged suffixes under stated storage/failover assumptions. Broadcasting first improves feedback but save indicators advance only with durable evidence. Save-latency percentiles do not bound worst-case loss; client buffers supplement rather than replace server guarantees and backups."
+        },
+        {
+          "vi": "Snapshot tại s cần đúng logical state sau edit s; copy đang mutate mà chỉ gắn latest sequence có thể tạo bytes trộn hai thời điểm. Dùng immutable/copy-on-write view, pause-boundary hoặc cơ chế tương đương đã kiểm chứng. Manifest switch/GC có reader pins và retained suffix; không xóa journal chỉ vì upload bắt đầu hay pointer mới chưa durable. Recovery kiểm file identity, schema, checksum, gaps và duplicate replay.",
+          "en": "A snapshot at s must encode the logical state after edit s, not a mutable mixture labeled with a recent sequence. Use a verified stable view or boundary. Manifest publication and collection respect readers and retained suffixes; upload initiation is not durability. Recovery validates identities, schemas, checksums, gaps and duplicate replay."
+        }
+      ],
+      "experiment": "design-recovery"
+    },
+    {
+      "id": "rendering",
+      "title": {
+        "vi": "Rendering có nhiều budget hơn FPS",
+        "en": "Rendering has more budgets than FPS"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách input processing, document mutation, dirty-region/layout work, command generation và GPU presentation. Network round trips không nằm trong mỗi local drag frame; optimistic display vẫn cần pending/saved feedback. Profile p95/p99 và long tasks trên mobile, large files, missing fonts và low-memory devices; average FPS tốt có thể che input lag.",
+          "en": "Separate input processing, mutation, dirty-region/layout work, command generation and presentation. Local drag frames should not await network round trips, but still expose pending/save state. Profile tails and long tasks on large files, mobile, missing fonts and low-memory devices; average FPS can hide input lag."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Startup",
+            "en": "Startup"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Download/compile, file decode, fonts và first interactive frame đo riêng.",
+              "en": "Measure delivery/compilation, decoding, fonts and first interaction separately."
+            },
+            {
+              "vi": "Cache binary/assets theo version; không reuse incompatible file schema.",
+              "en": "Version cached binaries/assets and reject incompatible schemas."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Canvas quality",
+            "en": "Canvas quality"
+          },
+          "icon": "target",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Hit testing, text shaping, color, clipping và zoom/pixel ratio đều là correctness.",
+              "en": "Hit testing, shaping, color, clipping and scaling affect correctness."
+            },
+            {
+              "vi": "Virtualize/cull invisible work nhưng export phải giữ fidelity.",
+              "en": "Cull invisible work without compromising exported fidelity."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Inclusive UX",
+            "en": "Inclusive UX"
+          },
+          "icon": "users",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Keyboard navigation, focus, semantic inspector và accessible alternatives cần thiết kế riêng.",
+              "en": "Design keyboard navigation, focus, semantic inspectors and accessible alternatives."
+            },
+            {
+              "vi": "WebGL/Wasm không cung cấp accessibility tree tự động cho shapes.",
+              "en": "WebGL/Wasm do not automatically provide accessible shape semantics."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sandbox",
+      "title": {
+        "vi": "Plugin isolation: authority phải hẹp và cập nhật",
+        "en": "Plugin isolation needs narrow, maintained authority"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một isolation mechanism không thay policy. Nếu plugin được đọc whole file và gọi external network, nó có thể gửi dữ liệu đó đi trong allowed permissions. UI cần cho user/admin biết data access/network scope; enterprise allowlists, signed versions, revocation và audit giảm exposure nhưng không chứng minh mọi plugin an toàn. Server vẫn coi mọi generated edit là untrusted.",
+          "en": "Isolation does not replace policy. A plugin allowed to read a file and contact the network can transmit permitted data. Make data/network scope understandable to users and administrators; allowlists, signed versions, revocation and audit reduce exposure without proving every plugin safe. Servers still treat generated edits as untrusted."
+        },
+        {
+          "vi": "Không copy một old sandbox shim rồi coi security review đã xong. Prototype escape, host objects/prototypes, message validation, cancellation, quotas và dependency updates cần ongoing testing. WebAssembly là execution format; security phụ thuộc imported capabilities/runtime và host boundary, không tự là sandbox cho mọi API được expose.",
+          "en": "Do not reuse an old sandbox shim and assume review is finished. Test escapes, host objects/prototypes, messages, cancellation and quotas continuously. WebAssembly is an execution format; security depends on imports, runtime and host boundaries rather than the format alone."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Lựa chọn isolation",
+            "en": "Option"
+          },
+          {
+            "vi": "Lợi ích",
+            "en": "Benefit"
+          },
+          {
+            "vi": "Phần phải chịu trách nhiệm",
+            "en": "Responsibility"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Direct eval in app origin",
+              "en": "Direct eval in app origin"
+            },
+            {
+              "vi": "Ít integration code",
+              "en": "Little integration code"
+            },
+            {
+              "vi": "Không phù hợp untrusted plugins: ambient DOM/session authority quá rộng.",
+              "en": "Unsuitable for untrusted plugins because ambient DOM/session authority is too broad."
+            }
+          ],
+          [
+            {
+              "vi": "Isolated frame + messages",
+              "en": "Isolated frame + messages"
+            },
+            {
+              "vi": "Browser boundary, UI riêng",
+              "en": "Browser boundary and separate UI"
+            },
+            {
+              "vi": "Validate origin/source/schema; async bridge và bulk operations.",
+              "en": "Validate origin/source/schema and design asynchronous bulk operations."
+            }
+          ],
+          [
+            {
+              "vi": "Interpreter/VM + scoped host API",
+              "en": "Interpreter/VM + scoped host API"
+            },
+            {
+              "vi": "Control exposed capabilities",
+              "en": "Controlled exposed capabilities"
+            },
+            {
+              "vi": "Runtime audit, host escape tests, quotas, cancellation và dependency upkeep.",
+              "en": "Runtime review, host-escape tests, quotas, cancellation and maintenance."
+            }
+          ],
+          [
+            {
+              "vi": "Historical Realms-style shim",
+              "en": "Historical Realms-style shim"
+            },
+            {
+              "vi": "Minh họa trade-off latency/compatibility",
+              "en": "Illustrates latency/compatibility trade-offs"
+            },
+            {
+              "vi": "Một historical approach đã thay sau vulnerabilities; không khuyến nghị dùng lại.",
+              "en": "A historical approach replaced after vulnerabilities; not a recommendation to reuse."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "metadata",
+      "title": {
+        "vi": "Live metadata cần consistent handoff và repair",
+        "en": "Live metadata needs coherent handoffs and repair"
+      },
+      "paragraphs": [
+        {
+          "vi": "Subscribe không phải “SELECT rồi mở socket sau”: mutation giữa hai thao tác có thể mất. Một protocol cần snapshot tại cursor c cùng retained stream suffix sau c, hoặc register/buffer rồi snapshot và reconcile theo versions. CDC checkpoint/consumer state phải đủ để phát hiện replay và gap; mỗi DB stream có order riêng, không có global total order across shards tự nhiên.",
+          "en": "Subscribing is not simply selecting rows and then opening a socket: a mutation can occur between them. Use a snapshot at cursor c plus a retained suffix, or register/buffer before snapshotting and reconcile versions. CDC/consumer checkpoints detect replay and gaps; separate database streams do not automatically share a global total order."
+        },
+        {
+          "vi": "Query result phụ thuộc principal, organization, filters, schema và permission policy; query hash đơn thuần không đủ cache key cho private metadata. Khi quyền đổi, cần invalidate/re-authorize cả initial read lẫn ongoing pushes. Slow subscriber nhận bounded buffer/coalesced invalidations hoặc resnapshot signal, không giữ mọi event trong RAM mãi.",
+          "en": "Query results depend on principals, organizations, filters, schema and permission policy; a query hash alone cannot safely share private results. Revocations affect initial reads and ongoing pushes. Bound slow-subscriber buffers and use coalesced invalidations or resnapshot signals rather than retaining all events in memory."
+        }
+      ],
+      "experiment": "design-refill"
+    },
+    {
+      "id": "sharding",
+      "title": {
+        "vi": "Shard key giữ invariant và query cost",
+        "en": "Shard keys preserve invariants and expose query costs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn key bằng access pattern và atomic invariants: file-scoped comments có thể colocate theo fileId; org policies có authority riêng. Một team rất lớn có thể thành hot shard dù hash nhiều keys đều. Logical buckets giúp đổi physical placement nhưng ownership epoch/cutover vẫn cần fencing. Không suy rằng proxy làm mọi query ứng dụng giữ nguyên semantics.",
+          "en": "Choose keys from access patterns and atomic invariants. File-scoped comments may colocate by file identity while organizational policies have separate authority. A large tenant can remain hot despite balanced hashing. Logical buckets aid placement changes but still need fenced ownership and cutovers. A proxy cannot preserve every query’s semantics automatically."
+        },
+        {
+          "vi": "Giữ join/transaction local khi cần atomicity; cross-shard mutation phải có protocol thực sự hoặc được thiết kế lại. Scatter-gather có deadline/fan-out cap và clear failure semantics: trả partial count cần label partial, không giả vờ exact total. DB stream readers theo topology DB; shared cache có thể hash theo query context; hai maps không phải một.",
+          "en": "Keep atomic joins/transactions local when needed; cross-shard mutations need genuine protocols or redesign. Bound scatter-gather and label partial results rather than presenting approximate counts as exact. Change readers follow database topology while shared caches may hash query contexts; those mappings differ."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Cutover có thể kiểm chứng",
+          "en": "A verifiable cutover"
+        },
+        "caption": {
+          "vi": "Rollback sau writes cần data path, không chỉ config cũ.",
+          "en": "Post-write rollback needs a data path, not merely old configuration."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Copy + changes",
+              "en": "Copy plus changes"
+            },
+            "detail": {
+              "vi": "Consistent backfill và CDC tới known barrier.",
+              "en": "Backfill consistently and stream changes to a known barrier."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Verify",
+              "en": "Verify"
+            },
+            "detail": {
+              "vi": "Counts, sampled content, constraints và load parity.",
+              "en": "Check counts, sampled content, constraints and load behavior."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Fence + switch",
+              "en": "Fence and switch"
+            },
+            "detail": {
+              "vi": "Chặn writer cũ, drain writes và publish ownership mới.",
+              "en": "Fence old writers, drain writes and publish new ownership."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Observe + retain",
+              "en": "Observe and retain"
+            },
+            "detail": {
+              "vi": "Monitor, giữ recovery evidence và rollback protocol đã thử.",
+              "en": "Observe while retaining recovery evidence and tested rollback paths."
+            },
+            "icon": "flag"
+          }
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "Failure review trước khi thêm tính năng",
+        "en": "Review failures before adding features"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo input-to-frame, edit-to-accepted và edit-to-durable riêng; thêm journal lag/holes, recovery duration, owner activation conflicts, per-file fan-out/CPU/memory, subscription staleness và rejected stale fills. Correlate bằng file/session/op/ownerEpoch thay log plaintext document không cần thiết.",
+          "en": "Measure input-to-frame, edit-to-accepted and edit-to-durable separately. Track journal gaps/lag, recovery duration, ownership conflicts, per-file resources, subscription staleness and rejected fills. Correlate file/session/operation/epoch identities without unnecessary document-content logging."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Sự cố",
+            "en": "Failure"
+          },
+          {
+            "vi": "Nguy cơ",
+            "en": "Risk"
+          },
+          {
+            "vi": "Phản ứng",
+            "en": "Response"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Owner crash/restart",
+              "en": "Owner crash/restart"
+            },
+            {
+              "vi": "Volatile edits mất hoặc owner cũ ghi tiếp",
+              "en": "Volatile loss or stale-owner writes"
+            },
+            {
+              "vi": "Fence, replay coherent snapshot/suffix, reconcile pending và show save state thật.",
+              "en": "Fence, replay coherent state, reconcile pending edits and show truthful save state."
+            }
+          ],
+          [
+            {
+              "vi": "Journal gap/corruption",
+              "en": "Journal gap/corruption"
+            },
+            {
+              "vi": "Latest cursor nhìn đúng nhưng model thiếu changes",
+              "en": "A recent cursor masks missing changes"
+            },
+            {
+              "vi": "Stop unsafe activation; repair từ trusted source hoặc explicit failure.",
+              "en": "Stop unsafe activation and repair from trusted evidence or report failure."
+            }
+          ],
+          [
+            {
+              "vi": "Hot file/slow recipient",
+              "en": "Hot file/slow recipient"
+            },
+            {
+              "vi": "Fan-out queues làm owner/gateway OOM",
+              "en": "Fan-out queues exhaust owner/gateway memory"
+            },
+            {
+              "vi": "Bound/coalesce safe work, split presence/viewer delivery và admission policy.",
+              "en": "Bound/coalesce safe work, separate presence/viewers and admit load deliberately."
+            }
+          ],
+          [
+            {
+              "vi": "Offline permission revocation",
+              "en": "Offline permission revocation"
+            },
+            {
+              "vi": "Client cũ replay unauthorized edits",
+              "en": "Old clients replay unauthorized edits"
+            },
+            {
+              "vi": "Reauthorize replay và provide rejected-work/export policy thay silent accept.",
+              "en": "Reauthorize replay and offer explicit rejected-work handling rather than silent acceptance."
+            }
+          ],
+          [
+            {
+              "vi": "Lost CDC invalidation",
+              "en": "Lost CDC invalidation"
+            },
+            {
+              "vi": "View stale vô hạn dù socket connected",
+              "en": "Views remain stale while sockets appear connected"
+            },
+            {
+              "vi": "Cursor coverage, verified barrier/replay hoặc resubscribe; freshness telemetry.",
+              "en": "Use cursor coverage, verified barriers/replay or resubscription with freshness telemetry."
+            }
+          ],
+          [
+            {
+              "vi": "Sandbox escape/resource abuse",
+              "en": "Sandbox escape/resource abuse"
+            },
+            {
+              "vi": "Ambient authority hoặc frozen editor",
+              "en": "Excess authority or a frozen editor"
+            },
+            {
+              "vi": "Patch/revoke, narrow capabilities, quotas và incident containment.",
+              "en": "Patch/revoke, narrow capabilities, enforce quotas and contain incidents."
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "Câu hỏi có lập luận và ví dụ",
+        "en": "Questions with reasoning and examples"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Chọn per-property LWW hay CRDT cho canvas?",
+            "en": "Should a canvas use per-property LWW or a CRDT?"
+          },
+          "answer": [
+            {
+              "vi": "Trước hết hỏi document model, offline semantics và conflict expectations. Với server authority và độc lập x/fill, property patches đơn giản có thể giữ unrelated edits; cùng x dùng chosen order. Nếu collaborative text hoặc offline decentralized merge là trọng tâm, đánh giá sequence/CRDT/OT phù hợp. Convergence một mình không chứng minh giữ ý định, tree validity, undo hay durability.",
+              "en": "Start with the model, offline semantics and expected conflicts. Server-authoritative property patches can preserve independent x/fill edits, while same-property writes follow the chosen order. Evaluate sequence/CRDT/OT approaches for collaborative text or decentralized offline merging. Convergence alone proves neither intent preservation, tree validity, undo correctness nor durability."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao ACK A1 không được clear pending A2?",
+            "en": "Why must an A1 acknowledgement not clear pending A2?"
+          },
+          "answer": [
+            {
+              "vi": "A đã hiển thị x=160 của A2 nhưng server mới echo x=80 của A1. Nếu clear pending theo property name rồi apply echo, UI nhảy lùi dù A2 chưa được xử lý. Track latest pending opId; chỉ matching ACK mới retire nó. Khi A2 accepted và ordered echo tới, client reconcile authority; lost ACK/reconnect còn cần dedup/result retention.",
+              "en": "A displays A2 at x=160 while the server echoes A1 at x=80. Retiring pending state by property name rolls the display back prematurely. Track operation identities and retire only the matching latest operation. Ordered echoes then reconcile authority; lost acknowledgements/reconnects still need retained results and deduplication."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Journal có bảo đảm không mất edit không?",
+            "en": "Does adding a journal guarantee no edit loss?"
+          },
+          "answer": [
+            {
+              "vi": "Không thể kết luận chỉ từ tên component. Cần biết ACK trước/sau durability, storage replication/failover assumptions, retained suffix, coherent checkpoint và recovery code. Async journal có window accepted-not-durable. P95 600ms, nếu đo được, vẫn không là worst-case promise. Backup còn bảo vệ corruption/deletion theo recovery point riêng.",
+              "en": "A component name is insufficient. Check acknowledgement boundaries, storage/failover assumptions, suffix retention, checkpoint coherence and recovery logic. Asynchronous journaling leaves accepted-but-not-durable windows, and a measured percentile is not a worst-case promise. Backups address corruption/deletion under separate recovery points."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Recovery thấy seq5 nhưng thiếu4 thì sao?",
+            "en": "What if recovery sees sequence 5 but cannot find 4?"
+          },
+          "answer": [
+            {
+              "vi": "Đừng nâng cursor lên5 rồi gọi state complete. Trong fixture, edit4 đổi fill blue; edit5 chỉ đổi x. Bỏ4 sẽ giữ fill gray dù cursor5. Stop contiguous replay, tìm retained replica/journal/client evidence theo protocol hoặc báo repair failure; không invent missing operation. Chỉ bỏ gap nếu protocol chứng minh gap đó không chứa required state, không vì max sequence lớn.",
+              "en": "Do not advance to 5 and call recovery complete. In the fixture, edit 4 changes fill while edit 5 changes x; skipping 4 preserves the wrong color. Stop contiguous replay and obtain trusted recovery evidence or report failure. Gaps are skippable only when the protocol proves no required state is missing."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Custom canvas render bằng Wasm có đủ để nhanh không?",
+            "en": "Is a custom Wasm canvas sufficient for performance?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Profile download/compile/init/file decode, input long tasks, layout, text shaping, GPU stalls và memory. DOM shell + custom canvas có thể hợp lý, nhưng accessibility/focus/keyboard cần xây. So cùng file/device/network; giảm parse không đồng nghĩa giảm mọi interaction latency. Bounded worker isolation còn có IPC và baseline memory cost.",
+              "en": "No. Profile delivery, compilation, initialization, decoding, input tasks, layout, shaping, GPU stalls and memory. A DOM shell with a custom canvas can work, but accessibility and keyboard behavior need design. Compare matched workloads; faster parsing does not imply faster every interaction, and worker isolation adds IPC and memory costs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Một plugin sandbox được đọc file thì có bảo mật dữ liệu chưa?",
+            "en": "Does sandboxing a plugin protect document confidentiality?"
+          },
+          "answer": [
+            {
+              "vi": "Sandbox giới hạn authority được expose; policy vẫn quyết định được đọc gì và gửi đi đâu. Nếu cho đọc file và arbitrary network, plugin có thể export nội dung trong allowed capability. Cần consent/admin policy, scoped APIs, current isolation runtime, quotas và server validation; review UI không thay security boundary.",
+              "en": "A sandbox limits exposed authority, while policy decides readable data and permitted destinations. File access plus arbitrary networking can allow content export. Use understandable consent/admin policy, scoped APIs, maintained isolation, quotas and server validation; UI review is not the security boundary."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Invalidation rồi mà cache vẫn stale là do đâu?",
+            "en": "Why can a cache stay stale after invalidation?"
+          },
+          "answer": [
+            {
+              "vi": "Một fetch bắt đầu trước commit có thể hoàn tất sau invalidation và cài old result lại. Capture generation khi fetch; install chỉ nếu generation còn đúng. Nếu invalidation mất hẳn, generation không đổi nên cần replay/gap detection, verified barrier hoặc bounded resnapshot. Cả hai cơ chế đều cần đúng tenant/principal scope.",
+              "en": "An earlier fetch can finish after invalidation and reinstall stale data. Capture the generation and validate it before installation. If invalidation is lost entirely, the generation does not change; replay/gap detection, verified barriers or bounded resnapshotting are needed. Both mechanisms require correct tenant/principal scope."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có nên shard ngay từ MVP không?",
+            "en": "Should the MVP be sharded immediately?"
+          },
+          "answer": [
+            {
+              "vi": "Chọn theo requirement và measured runway. Tuning/index/pooling/scale-up/replicas có thể mua thời gian; vertical partition tách domains, horizontal partition mới chia một table. Chọn key theo locality/invariants, phân biệt logical/physical placement và budget cross-shard work. Migration cần consistent copy, barrier, fencing và rollback sau writes; proxy không làm distributed SQL miễn phí.",
+              "en": "Decide from requirements and measured runway. Tuning, pooling, larger nodes and replicas may buy time. Vertical partitioning separates domains; horizontal partitioning splits a table. Choose keys by locality/invariants, separate logical and physical placement and budget cross-shard work. Migrations need coherent copying, barriers, fencing and post-write rollback; proxies do not make distributed SQL free."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
