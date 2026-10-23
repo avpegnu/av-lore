@@ -1,0 +1,1382 @@
+{
+  "id": "ai-fine-tuning",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Fine-tuning Decisions: chọn adaptation bằng dữ liệu và chi phí",
+    "en": "Fine-tuning Decisions: choose adaptation using evidence and cost"
+  },
+  "summary": {
+    "vi": "So sánh prompting, retrieval, SFT, LoRA/QLoRA, preference tuning và distillation; tính parameter/state budgets, giữ independent evals và quản artifact/serving lifecycle.",
+    "en": "Compare prompts, retrieval, supervised/low-rank adaptation, preferences and distillation while budgeting parameters/state and maintaining independent evaluation and serving lifecycles."
+  },
+  "prerequisites": [
+    "ai-rag",
+    "ai-serving",
+    "ai-prompting"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "testing",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Chọn intervention theo measured gap; prompting, retrieval và weight updates có thể phối hợp, không là mandatory ladder.",
+      "en": "Choose interventions by measured gaps; prompts, retrieval and weight updates can cooperate rather than forming a mandatory ladder."
+    },
+    {
+      "vi": "Fine-tuning có thể học facts/behavior nhưng không tự cung cấp freshness, citations hoặc per-user permission enforcement.",
+      "en": "Weight adaptation can learn facts/behaviors without automatically providing freshness, evidence or access enforcement."
+    },
+    {
+      "vi": "LoRA count phụ thuộc selected matrix shapes và rank; GQA K/V có thể hẹp hơn Q/O.",
+      "en": "Low-rank counts depend on selected shapes/ranks, with GQA K/V potentially narrower than Q/O."
+    },
+    {
+      "vi": "Frozen low-bit base không có nghĩa activations, gradients và toàn training job đều low-bit hoặc chắc fit một GPU.",
+      "en": "Low-bit frozen bases do not make all activations/gradients low-bit or guarantee single-device fit."
+    },
+    {
+      "vi": "DPO/preference learning cần đúng data/reference/evals; teacher outputs và human preferences không là oracle.",
+      "en": "Preference learning needs sound data, references and evaluations; teachers/preferences are not oracles."
+    },
+    {
+      "vi": "Training artifact kéo theo maintenance, compatibility, regressions và total serving cost qua nhiều releases.",
+      "en": "Adapted artifacts carry ongoing compatibility, regression and cost responsibilities across releases."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một vòng adaptation có điểm kiểm",
+      "en": "An adaptation loop with evidence gates"
+    },
+    "caption": {
+      "vi": "Training loss giảm không tự chứng minh product quality hoặc total cost tốt hơn.",
+      "en": "Lower training loss does not establish better product quality or total costs."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Measure gap",
+          "en": "Measure gaps"
+        },
+        "detail": {
+          "vi": "Task slices, baseline, latency/cost và evidence.",
+          "en": "Measure tasks, baselines, latency, cost and evidence."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Choose experiment",
+          "en": "Choose experiments"
+        },
+        "detail": {
+          "vi": "Compare prompt/retrieval/weight changes phù hợp.",
+          "en": "Compare appropriate prompt, retrieval and weight changes."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Train and evaluate",
+          "en": "Train and evaluate"
+        },
+        "detail": {
+          "vi": "Reviewed data, pinned config và independent holdout.",
+          "en": "Use reviewed data, pinned settings and independent holdouts."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Operate artifact",
+          "en": "Operate artifacts"
+        },
+        "detail": {
+          "vi": "Compatible serving, canary/rollback và maintenance.",
+          "en": "Preserve compatibility, canaries, rollback and maintenance."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "interventions",
+      "title": {
+        "vi": "1. Chọn intervention theo failure mode",
+        "en": "1. Match interventions to failure modes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fine-tuning tiếp tục optimize pretrained weights hoặc selected added parameters theo training objective. Nó có thể thay behavior, representation và fact recall, nhưng không là cách tự động giữ wiki hiện tại, chứng minh citation hoặc cấp quyền đọc theo user. RAG đưa external evidence vào query context mà không update weights trong lúc retrieve; tuned generator vẫn có thể dùng RAG, và retrieval quality cũng có thể được tune.",
+          "en": "Adaptation optimizes pretrained weights or selected added parameters. It can change behavior, representations and fact recall without automatically maintaining fresh documents, citations or user permissions. Retrieval supplies evidence without query-time weight updates, and adapted generators/retrievers can work together."
+        },
+        {
+          "vi": "Không có mandatory prompting→RAG→fine-tuning→continued-pretraining ladder hoặc chi phí tăng đều ở mọi rung. Continued pretraining trên domain corpus có thể precede task SFT; retrieval có thể tốn nhiều operations hơn một small specialized model trong workload khác. Đo current gap và compare smallest useful experiments dưới quality/latency/maintenance constraints, thay train chỉ vì có dataset.",
+          "en": "There is no universally mandatory or monotonically priced ladder. Domain continued pretraining can precede task SFT, and some retrieval workloads cost more to operate than small specialized models. Measure gaps and compare useful experiments under quality, latency and maintenance constraints."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Facts và evidence",
+            "en": "Facts and evidence"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Fresh documents, exact records hoặc per-user access thường cần retrieval/tools và policy.",
+              "en": "Fresh documents, records and access need retrieval/tools and policies."
+            },
+            {
+              "vi": "Weight updates không thay source-of-truth lifecycle.",
+              "en": "Weight changes do not replace source-of-truth lifecycles."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Task behavior",
+            "en": "Task behavior"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Prompt/examples/schema hoặc SFT có thể giúp labels/style/tool behavior.",
+              "en": "Prompts, examples, schemas or SFT can improve task behavior."
+            },
+            {
+              "vi": "Chọn bằng representative task evals.",
+              "en": "Choose using representative evaluations."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Economics và domain",
+            "en": "Economics and domains"
+          },
+          "icon": "compare",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Existing small model, routing, caching, distillation hoặc CPT là candidates khác nhau.",
+              "en": "Small models, routing, caching, distillation and CPT address different needs."
+            },
+            {
+              "vi": "Cần quality evidence, data và operating budget.",
+              "en": "They require evidence, data and operational budgets."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "plan",
+      "title": {
+        "vi": "2. Study decision aid: thiếu evidence nào?",
+        "en": "2. A study aid for identifying missing evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn một observed gap và những evidence đã có. Kết quả là next experiment hoặc missing prerequisite, không là production approval và không dự đoán improvement. Retrieval miss cần trace ingest/candidates/packing; behavioral gap có thể compare prompt/schema với SFT; preference gap cần reviewed comparisons và reference/regression evaluation.",
+          "en": "Choose gaps and available evidence to identify experiments or missing prerequisites. The result is not production approval or an improvement forecast. Diagnose retrieval misses, compare behavioral baselines and use reviewed comparisons/reference evaluations for preference work."
+        },
+        {
+          "vi": "Nếu teacher chưa được chứng minh đạt task target, “distill” chỉ copy unverified behavior. Nếu chưa có baseline/holdout, dataset lớn không chứng minh training đáng làm. Mô hình đơn giản này chỉ giúp giữ reasoning rõ; real projects cần thêm privacy, uncertainty, security, hardware và integration constraints.",
+          "en": "Unproven teachers supply unverified behavior, while large datasets cannot replace baselines/holdouts. The study rules organize reasoning rather than covering all privacy, uncertainty, hardware and integration constraints."
+        }
+      ],
+      "experiment": "tune-plan"
+    },
+    {
+      "id": "data",
+      "title": {
+        "vi": "3. Dataset, splits và provenance trước training",
+        "en": "3. Establish datasets, splits and provenance before training"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chuẩn bị examples giống production task inputs, tool/context format và intended outputs. Review label definitions, unknown/abstain rules, multilingual/edge cases và inconsistent demonstrations. Quality và coverage thường quan trọng hơn raw row count, nhưng không có universal vài trăm samples thắng mọi noisy dataset. Teacher-generated examples có thể lặp mistakes/bias hoặc mất long-tail coverage; review/evaluate theo task.",
+          "en": "Match production inputs, context/tools and target outputs. Review labels, abstention, languages, edge cases and inconsistency. Quality/coverage matter, without universal sample-count rules. Synthetic examples can repeat mistakes/bias or miss tails and need task-specific review."
+        },
+        {
+          "vi": "Split train/validation/final-test trước chọn hyperparameters và deduplicate theo exact/near-duplicate, entity/document hoặc conversation family khi có leakage. Time-aware split cần thiết khi deployment dự đoán future inputs. Validation dùng chọn config; final test không được lặp tuning cho tới đẹp. Keep dataset versions, provenance, permitted-use/access scope và deletions/retention theo data policy.",
+          "en": "Split data before hyperparameter selection, detecting exact/near duplicates and entity/document/conversation leakage. Use time-aware splits for future inputs. Validation chooses settings; repeated tuning against final tests compromises independence. Version provenance, permitted scopes and retention/deletion policies."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Data lifecycle cho adaptation",
+          "en": "Adaptation data lifecycle"
+        },
+        "caption": {
+          "vi": "Giữ final test độc lập với target generation và model selection.",
+          "en": "Keep final tests independent of target generation and model selection."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Collect",
+              "en": "Collect"
+            },
+            "detail": {
+              "vi": "Representative tasks và authorized data sources.",
+              "en": "Collect representative authorized tasks."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Review / dedup",
+              "en": "Review and deduplicate"
+            },
+            "detail": {
+              "vi": "Labels, unsafe targets, families và provenance.",
+              "en": "Review labels, unsafe targets, families and provenance."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Split",
+              "en": "Split"
+            },
+            "detail": {
+              "vi": "Train / validation / final test theo leakage model.",
+              "en": "Separate training, validation and final tests under leakage risks."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Version",
+              "en": "Version"
+            },
+            "detail": {
+              "vi": "Dataset manifest và reproducible transforms.",
+              "en": "Record manifests and reproducible transforms."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sft",
+      "title": {
+        "vi": "4. SFT objective và loss masking",
+        "en": "4. SFT objectives and loss masking"
+      },
+      "paragraphs": [
+        {
+          "vi": "Supervised fine-tuning thường minimize negative log-likelihood của target sequence conditioned on task input, với autoregressive teacher forcing. Conversation/task template, role tokens và label masks quyết định model học những tokens nào. Chỉ assistant response tokens hay toàn conversation đều có thể là deliberate objective; không assume framework default đúng intended contract. Inspect serialized examples và loss masks trước expensive run.",
+          "en": "SFT commonly minimizes target negative log-likelihood conditioned on inputs using teacher forcing. Templates, role tokens and masks determine trained tokens. Response-only and whole-conversation losses are deliberate choices; inspect serialization/masks instead of trusting defaults."
+        },
+        {
+          "vi": "Train loss giảm có thể phản ánh memorization, leakage hoặc label shortcuts. Measure held-out task accuracy/support, general/regression slices, tool/format behavior và cost/latency của served artifact. Checkpoints, learning rate, effective batch size, epochs, truncation, packing, random seeds và optimizer config cần recorded; reproducibility còn phụ thuộc kernels/environment.",
+          "en": "Lower training loss can reflect memorization, leakage or shortcuts. Evaluate held-out tasks, regressions, tools/formats and serving costs/latency. Record checkpoints, rates, effective batches, epochs, truncation, packing, seeds and optimizers, with environment-aware reproducibility."
+        }
+      ]
+    },
+    {
+      "id": "lora",
+      "title": {
+        "vi": "5. LoRA: low-rank update cho selected matrices",
+        "en": "5. LoRA applies low-rank updates to selected matrices"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với W shape d_out×d_in, h=Wx+(α/r)BAx, A shape r×d_in và B shape d_out×r. Freeze W, train selected A/B. Một conventional initialization dùng random A và zero B để initial delta bằng 0; variants/scaling/initializers có thể khác. Trainable count mỗi matrix là r(d_in+d_out), không phải r×d_in×d_out. Rank tăng có thêm capacity và state nhưng không guarantee quality tăng.",
+          "en": "For W shaped d_out×d_in, use h=Wx+(α/r)BAx with A shaped r×d_in and B shaped d_out×r. Freeze W and train selected factors. Conventional random-A/zero-B initialization gives a zero initial delta; variants differ. Each matrix adds r(d_in+d_out) parameters, with higher ranks adding capacity/state rather than guaranteed quality."
+        },
+        {
+          "vi": "Một 4096× 4096matrix có 16.777.216 weights; rank 16LoRA có 131.072 parameters, khoảng 0,78125%. Với hypothetical GQA model, K/V output width 1024 nên rank 16projection4096→1024 có 81.920 parameters. Target q/v qua 32 layers cho 6.815.744trainable params. Mỗi projection/module thực tế cần inspect đúng shape, gồm fused matrices, embeddings hoặc trained biases nếu có.",
+          "en": "A4096× 4096 matrix has 16,777,216 weights; rank 16 adds 131,072 parameters,0.78125%. A hypothetical GQA 4096→1024 projection adds 81,920. Selecting q/v across 32 layers gives 6,815,744 trainable parameters. Inspect actual modules, fused shapes, embeddings and any trained biases."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Selected matrix trong fixture",
+            "en": "Selected fixture matrix"
+          },
+          {
+            "vi": "d_in × d_out",
+            "en": "d_in × d_out"
+          },
+          {
+            "vi": "LoRA params ởr 16 mỗi layer",
+            "en": "Rank 16 parameters per layer"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "q / o",
+              "en": "q / o"
+            },
+            {
+              "vi": "4096 ×4096",
+              "en": "4096 ×4096"
+            },
+            {
+              "vi": "131072",
+              "en": "131072"
+            }
+          ],
+          [
+            {
+              "vi": "k / v (GQA)",
+              "en": "k / v (GQA)"
+            },
+            {
+              "vi": "4096 ×1024",
+              "en": "4096 ×1024"
+            },
+            {
+              "vi": "81920",
+              "en": "81920"
+            }
+          ],
+          [
+            {
+              "vi": "gate / up",
+              "en": "gate / up"
+            },
+            {
+              "vi": "4096 ×14336",
+              "en": "4096 ×14336"
+            },
+            {
+              "vi": "294912",
+              "en": "294912"
+            }
+          ],
+          [
+            {
+              "vi": "down",
+              "en": "down"
+            },
+            {
+              "vi": "14336 ×4096",
+              "en": "14336 ×4096"
+            },
+            {
+              "vi": "294912",
+              "en": "294912"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "memory",
+      "title": {
+        "vi": "6. Tính trainable state và supplied runtime budget",
+        "en": "6. Budget trainable state and explicit runtime allocations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lab dùng hypothetical 8B/70B raw parameter budgets và selected module shapes, không claim exact inventory của một published model. BF16 weights/grads và FP32 Adam moments cho 12 bytes/trainable param; thêm FP32 master copy thành 16. Đây là optimizer/precision assumption, không constant của mọi framework. Full training, LoRA và quantized-base LoRA có different frozen/trainable state.",
+          "en": "The lab uses hypothetical parameter budgets/shapes rather than exact published inventories. BF16 weights/gradients plus FP32 Adam moments total 12 bytes per trainable parameter; an FP32 master copy raises this to 16. These are explicit assumptions rather than universal framework constants."
+        },
+        {
+          "vi": "Runtime memory input chỉ là budget được cung cấp cho activations/attention/workspaces/allocator, không công thức dự đoán peak. Target-free LoRA không có trainable adaptation. Một raw total chia device capacity rồiceil không lập được real GPU plan: cần placement, sharding/optimizer/checkpointing, reserved memory và peak measurements. Lab chỉ so arithmetic với một supplied device capacity.",
+          "en": "Runtime allocations are supplied rather than predicted. Target-free LoRA has no trainable adaptation. Dividing pooled state by device capacity does not produce a GPU deployment plan: placement, sharding, optimizer/checkpointing support and measured peaks matter. The lab only compares explicit arithmetic against supplied capacity."
+        }
+      ],
+      "experiment": "tune-budget"
+    },
+    {
+      "id": "qlora",
+      "title": {
+        "vi": "7. QLoRA: low-bit storage, higher-precision compute",
+        "en": "7. QLoRA separates low-bit storage from computation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Quantized-base adaptation giữ base frozen ở low-bit representation và backpropagate qua supported computation để train LoRA factors. QLoRA kết hợp NF4, double quantization cho constants và paged optimizers trong described setup. Stored 4-bit weights không có nghĩa activations hoặc adapter gradients đều 4-bit; dequantization, compute dtype, scales và workspaces vẫn tốn memory/compute.",
+          "en": "Quantized-base adaptation backpropagates through supported operations into trainable factors while storing frozen bases compactly. QLoRA combines NF4, double-quantized constants and paged optimizers in its setup. Low-bit storage does not make activations/gradients low-bit; dequantization, scales and workspaces remain costs."
+        },
+        {
+          "vi": "Frozen base không có trainable weight gradients/optimizer states nhưng vẫn tham gia forward/backward activation flow tới adapters. Gradient checkpointing đổi compute lấy activation memory; CPU paging/offload đổi device memory lấy transfer/latency. Single-GPU feasibility hay matched task performance trong một experiment không guarantee mọi model/context/batch/backend sẽ fit hoặc giữ quality.",
+          "en": "Frozen bases omit trainable base gradients/states but remain in computation paths to adapters. Checkpointing trades recomputation for activation memory, while paging/offload trades device space for transfers. Single-device feasibility or quality in one experiment is not universal across shapes, contexts and backends."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Đi qua frozen quantized base",
+          "en": "Traverse frozen quantized bases"
+        },
+        "caption": {
+          "vi": "Storage precision, compute precision và trainable state phải được nêu riêng.",
+          "en": "Specify storage, compute and trainable-state precision separately."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Store",
+              "en": "Store"
+            },
+            "detail": {
+              "vi": "Low-bit base + scales/metadata.",
+              "en": "Store compact base values and metadata."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Compute",
+              "en": "Compute"
+            },
+            "detail": {
+              "vi": "Supported dequantization kernels và compute dtype.",
+              "en": "Use supported dequantization and computation types."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Backpropagate",
+              "en": "Backpropagate"
+            },
+            "detail": {
+              "vi": "Gradients qua activation path tới trainable factors.",
+              "en": "Propagate through activations into trainable factors."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Save",
+              "en": "Save"
+            },
+            "detail": {
+              "vi": "Adapter/checkpoint cùng exact base/profile dependency.",
+              "en": "Save deltas with exact base/profile dependencies."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "8. Từ dataset tới evaluated artifact và serving",
+        "en": "8. From datasets to evaluated artifacts and serving"
+      },
+      "paragraphs": [
+        {
+          "vi": "Training job là một node trong lifecycle, không là toàn bộ sản phẩm. Data/eval ownership, base compatibility, artifact registry và rollout nằm ở những boundaries khác nhau. Chọn traces để phân biệt objective/data path của SFT, quantized-base training, distillation và preferences; tất cả đều cần independent evaluation trước promote.",
+          "en": "Training is one lifecycle node rather than the whole product. Data/evaluation ownership, compatibility, registries and rollouts have distinct boundaries. The traces distinguish objectives and data paths while preserving independent evaluation before promotion."
+        }
+      ],
+      "diagram": {
+        "id": "adaptation-evidence-lifecycle",
+        "title": {
+          "vi": "Trainable weights là một artifact trong evidence lifecycle",
+          "en": "Trainable weights are artifacts in an evidence lifecycle"
+        },
+        "caption": {
+          "vi": "Trace SFT, quantized-base adaptation, teacher distillation, preference training và rollout. Dataset/eval boundaries và exact revisions đi cùng model, không bị bỏ sau training.",
+          "en": "Trace supervised adaptation, quantized bases, distillation, preferences and rollouts. Dataset/evaluation boundaries and revisions remain part of the deployed artifact."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "task",
+            "label": {
+              "vi": "Task / baseline",
+              "en": "Task / baseline"
+            },
+            "detail": {
+              "vi": "Measured gaps, constraints, traffic slices và current serving cost.",
+              "en": "Measured gaps, constraints, traffic slices and current costs."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "data",
+            "label": {
+              "vi": "Reviewed training data",
+              "en": "Reviewed training data"
+            },
+            "detail": {
+              "vi": "Provenance, access, labels/templates, dedup và split policy.",
+              "en": "Provenance, access, labels/templates, deduplication and splits."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "base",
+            "label": {
+              "vi": "Pinned base model",
+              "en": "Pinned base model"
+            },
+            "detail": {
+              "vi": "Exact weights/tokenizer/modules, supported precision và compatibility.",
+              "en": "Exact weights/tokenizer/modules, supported precision and compatibility."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "model"
+          },
+          {
+            "id": "trainer",
+            "label": {
+              "vi": "Training job",
+              "en": "Training job"
+            },
+            "detail": {
+              "vi": "Objective, targets, optimizer, masking, budgets và reproducible configuration.",
+              "en": "Objectives, targets, optimizers, masking, budgets and configuration."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "worker"
+          },
+          {
+            "id": "teacher",
+            "label": {
+              "vi": "Teacher inference",
+              "en": "Teacher inference"
+            },
+            "detail": {
+              "vi": "Approved task inputs, fixed teacher/profile và labeled quality evidence.",
+              "en": "Approved inputs, pinned teachers/profiles and quality evidence."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "review",
+            "label": {
+              "vi": "Filter / review",
+              "en": "Filter / review"
+            },
+            "detail": {
+              "vi": "Task correctness, diversity, unsafe targets và heldout contamination.",
+              "en": "Correctness, diversity, unsafe targets and contamination."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "quant",
+            "label": {
+              "vi": "Frozen quantized base",
+              "en": "Frozen quantized base"
+            },
+            "detail": {
+              "vi": "Stored low-bit weights, scales và compute-time dequantization.",
+              "en": "Low-bit weights, scales and computation-time dequantization."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "artifact",
+            "label": {
+              "vi": "Adapter / checkpoint",
+              "en": "Adapter / checkpoint"
+            },
+            "detail": {
+              "vi": "Weights plus manifest, base/data/config revisions và artifact checksum.",
+              "en": "Weights/manifests with base/data/config revisions and checksums."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "prefs",
+            "label": {
+              "vi": "Preference pairs",
+              "en": "Preference pairs"
+            },
+            "detail": {
+              "vi": "Same-prompt chosen/rejected outputs, reviewer consistency và scope.",
+              "en": "Same-prompt chosen/rejected outputs, reviewer consistency and scope."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "holdout",
+            "label": {
+              "vi": "Independent evaluation",
+              "en": "Independent evaluation"
+            },
+            "detail": {
+              "vi": "Untouched task/regression sets, uncertainty, serving profiles và access cases.",
+              "en": "Held-out task/regression sets, uncertainty, serving profiles and access cases."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "serve",
+            "label": {
+              "vi": "Canary serving",
+              "en": "Canary serving"
+            },
+            "detail": {
+              "vi": "Compatible base/adapter identity, rollout/rollback, latency và cost monitoring.",
+              "en": "Compatible identities, rollouts/rollback, latency and costs."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "registry",
+            "label": {
+              "vi": "Versioned registry",
+              "en": "Versioned registry"
+            },
+            "detail": {
+              "vi": "Approved manifests, ownership, evaluation evidence và deployment mapping.",
+              "en": "Approved manifests, ownership, evaluations and deployment mappings."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "sft",
+            "label": {
+              "vi": "SFT từ reviewed targets",
+              "en": "SFT using reviewed targets"
+            },
+            "steps": [
+              {
+                "from": "task",
+                "to": "data",
+                "description": {
+                  "vi": "Define target behavior và representative labels; split holdouts trước tuning.",
+                  "en": "Define representative targets and split holdouts before tuning."
+                }
+              },
+              {
+                "from": "data",
+                "to": "trainer",
+                "description": {
+                  "vi": "Pass approved training split và intended loss masks.",
+                  "en": "Supply approved training splits and intended loss masks."
+                }
+              },
+              {
+                "from": "base",
+                "to": "trainer",
+                "description": {
+                  "vi": "Load pinned compatible base/profile, chọn trainable parameters.",
+                  "en": "Load pinned profiles and choose trainable parameters."
+                }
+              },
+              {
+                "from": "trainer",
+                "to": "artifact",
+                "description": {
+                  "vi": "Save checkpoint/adapter cùng config/provenance manifest.",
+                  "en": "Save weights with configuration/provenance manifests."
+                },
+                "async": true
+              },
+              {
+                "from": "artifact",
+                "to": "holdout",
+                "description": {
+                  "vi": "Evaluate task and regression slices trước promote.",
+                  "en": "Evaluate task/regression slices before promotion."
+                }
+              }
+            ]
+          },
+          {
+            "id": "qlora",
+            "label": {
+              "vi": "Train adapters qua frozen low-bit base",
+              "en": "Train adapters through frozen low-bit bases"
+            },
+            "steps": [
+              {
+                "from": "base",
+                "to": "quant",
+                "description": {
+                  "vi": "Load supported low-bit representation/scales, verify revision/layout.",
+                  "en": "Load supported low-bit representations/scales and verify compatibility."
+                }
+              },
+              {
+                "from": "quant",
+                "to": "trainer",
+                "description": {
+                  "vi": "Dequantize theo supported kernels; gradients flow qua computation tới adapters.",
+                  "en": "Use supported dequantization kernels and backpropagate to adapters."
+                }
+              },
+              {
+                "from": "data",
+                "to": "trainer",
+                "description": {
+                  "vi": "Batch/sequence/masking và checkpointing quyết định runtime memory.",
+                  "en": "Batching, lengths, masking and checkpointing shape runtime memory."
+                }
+              },
+              {
+                "from": "trainer",
+                "to": "artifact",
+                "description": {
+                  "vi": "Save trainable deltas; quantized base là dependency riêng.",
+                  "en": "Save deltas with separately identified base dependencies."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "distill",
+            "label": {
+              "vi": "Teacher tới student",
+              "en": "From teacher to student"
+            },
+            "steps": [
+              {
+                "from": "task",
+                "to": "teacher",
+                "description": {
+                  "vi": "Generate approved representative task examples với pinned teacher.",
+                  "en": "Generate approved representative examples using pinned teachers."
+                }
+              },
+              {
+                "from": "teacher",
+                "to": "review",
+                "description": {
+                  "vi": "Review/filter correctness, diversity và prohibited data.",
+                  "en": "Review correctness, diversity and prohibited data."
+                }
+              },
+              {
+                "from": "review",
+                "to": "data",
+                "description": {
+                  "vi": "Create versioned student training set không leak holdout.",
+                  "en": "Create versioned student data without holdout leakage."
+                },
+                "async": true
+              },
+              {
+                "from": "data",
+                "to": "trainer",
+                "description": {
+                  "vi": "Train smaller student bằng supported distillation objective.",
+                  "en": "Train a smaller student under supported distillation objectives."
+                }
+              },
+              {
+                "from": "artifact",
+                "to": "holdout",
+                "description": {
+                  "vi": "Compare against teacher/baselines, cost và regression slices.",
+                  "en": "Compare quality, costs and regression slices against baselines."
+                }
+              }
+            ]
+          },
+          {
+            "id": "preferences",
+            "label": {
+              "vi": "Preference objective",
+              "en": "Preference objectives"
+            },
+            "steps": [
+              {
+                "from": "prefs",
+                "to": "review",
+                "description": {
+                  "vi": "Validate same task, chosen/rejected semantics và reviewer consistency.",
+                  "en": "Validate task alignment, preferences and reviewer consistency."
+                }
+              },
+              {
+                "from": "review",
+                "to": "trainer",
+                "description": {
+                  "vi": "DPO dùng reference policy/profile hoặc RLHF dùng reward/optimization pipeline riêng.",
+                  "en": "Use reference-aware DPO or a separately defined reward/optimization pipeline."
+                }
+              },
+              {
+                "from": "base",
+                "to": "trainer",
+                "description": {
+                  "vi": "Pin reference/base compatibility và tuning hyperparameters.",
+                  "en": "Pin base/reference compatibility and hyperparameters."
+                }
+              },
+              {
+                "from": "trainer",
+                "to": "artifact",
+                "description": {
+                  "vi": "Record objective/version, reference và data provenance.",
+                  "en": "Record objectives, reference identities and data provenance."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "rollout",
+            "label": {
+              "vi": "Promote và monitor",
+              "en": "Promote and monitor"
+            },
+            "steps": [
+              {
+                "from": "artifact",
+                "to": "holdout",
+                "description": {
+                  "vi": "Run independent quality, safety/permission và serving tests.",
+                  "en": "Run independent quality, permission and serving tests."
+                }
+              },
+              {
+                "from": "holdout",
+                "to": "registry",
+                "description": {
+                  "vi": "Approve candidate khi declared gates đạt; record limitations.",
+                  "en": "Approve declared gates with recorded limitations."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "serve",
+                "description": {
+                  "vi": "Canary exact compatible artifact/base/template revisions.",
+                  "en": "Canary compatible artifact/base/template revisions."
+                }
+              },
+              {
+                "from": "serve",
+                "to": "task",
+                "description": {
+                  "vi": "Observe quality/cost/drift và bounded rollback/retraining triggers.",
+                  "en": "Observe quality/cost/drift and rollback/retraining triggers."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "distill",
+      "title": {
+        "vi": "9. Distillation: student học gì từ teacher?",
+        "en": "9. What does a student learn from a teacher?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Distillation có thể train student để match teacher probability distributions, intermediate representations hoặc sampled target sequences theo available access/objective. Khi teacher chỉ trả text/API outputs, sequence-level distillation thường trở thành SFT trên reviewed synthetic targets; nó không tự có full logits. Teacher đúng trên một benchmark không chứng minh mọi generated example đúng hoặc student giữ general capabilities.",
+          "en": "Distillation can target distributions, representations or sampled sequences depending on access/objectives. Text-only teachers often provide reviewed sequence targets rather than full logits. Teacher benchmarks do not establish every target’s correctness or preservation of student capabilities."
+        },
+        {
+          "vi": "Chọn representative inputs, filter/review task correctness và coverage, dedup against holdouts rồi train/evaluate student. Compare với existing small models, routing và prompt baselines, không assume student luôn nhanh/rẻ ở utilization thực. Teacher refreshes, data drift, regression evaluation và retraining vẫn có recurring cost; không phải trả teacher một lần rồi vận hành mãi không maintenance.",
+          "en": "Collect representative inputs, review correctness/coverage and prevent holdout leakage before student training. Compare existing small models, routes and prompts at realistic utilization. Teacher refreshes, drift, regression work and retraining create recurring costs rather than a one-time teacher payment."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Distillation có feedback và regression gates",
+          "en": "Distillation has feedback and regression gates"
+        },
+        "caption": {
+          "vi": "Synthetic labels không thay independent quality evidence.",
+          "en": "Synthetic labels do not replace independent quality evidence."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Teacher tasks",
+              "en": "Teacher tasks"
+            },
+            "detail": {
+              "vi": "Approved representative inputs và pinned profile.",
+              "en": "Use approved representative inputs and pinned profiles."
+            },
+            "icon": "target"
+          },
+          {
+            "title": {
+              "vi": "Review",
+              "en": "Review"
+            },
+            "detail": {
+              "vi": "Correctness, diversity, provenance và holdout separation.",
+              "en": "Review correctness, diversity, provenance and separation."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Student experiment",
+              "en": "Student experiment"
+            },
+            "detail": {
+              "vi": "Train objective/config có version.",
+              "en": "Version training objectives and configuration."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Evaluate and maintain",
+              "en": "Evaluate and maintain"
+            },
+            "detail": {
+              "vi": "Task/regressions, cost/latency và drift triggers.",
+              "en": "Measure tasks, regressions, costs, latency and drift."
+            },
+            "icon": "gauge"
+          }
+        ]
+      }
+    },
+    {
+      "id": "preferences",
+      "title": {
+        "vi": "10. SFT, reward-based RLHF và DPO",
+        "en": "10. Supervision, reward-based RLHF and DPO"
+      },
+      "paragraphs": [
+        {
+          "vi": "SFT dùng desired targets; preference data so sánh outputs cho cùng prompt/task. Một common RLHF pipeline train reward model từ comparisons rồi optimize policy với RL/KL constraints. DPO optimize pairwise objective theo policy/reference log-probability ratios mà không cần separate explicit reward-model training và PPO loop của pipeline đó. Cả hai vẫn cần consistent data, reference/objective assumptions và regression checks.",
+          "en": "SFT uses target outputs; preferences compare outputs under matched tasks. A common RLHF pipeline learns rewards then optimizes policies with RL/KL constraints. DPO uses policy/reference log-probability ratios without that separate reward-training/PPO loop, while still requiring consistent data, assumptions and regressions."
+        },
+        {
+          "vi": "Một DPO form là−logσ(β[(logπθ(y+|x)−logπref(y+|x))−(logπθ(y−|x)−logπref(y−|x))]). Reference policy vàβ có vai trò trong optimization; “chỉ cần preference pairs” không đủ mô tả setup. Preferences có thể favor length/style hơn factuality hoặc có reviewer disagreements; preferred không đồng nghĩa true/safe/authorized. Evaluate task outcomes và drift, không chỉ training preference loss.",
+          "en": "One DPO form is−logσ(β[(logπθ(y+|x)−logπref(y+|x))−(logπθ(y−|x)−logπref(y−|x))]). Reference policies andβ matter. Preferences can reward style/length rather than factuality and include disagreement; preferred does not establish correctness or authority. Evaluate outcomes beyond training loss."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "SFT: desired targets",
+            "en": "SFT: desired targets"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Input→target, serialized template và label masks.",
+              "en": "Use input/target pairs, templates and masks."
+            },
+            {
+              "vi": "Review labels/coverage và heldout generalization.",
+              "en": "Review labels, coverage and held-out behavior."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Reward-based optimization",
+            "en": "Reward-based optimization"
+          },
+          "icon": "gauge",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Reward data/model và policy optimization/KL behavior.",
+              "en": "Define reward data/models and policy/KL behavior."
+            },
+            {
+              "vi": "Có thể over-optimize proxy reward.",
+              "en": "Proxy rewards can be overoptimized."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "DPO: reference-aware pairs",
+            "en": "DPO: reference-aware pairs"
+          },
+          "icon": "compare",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Chosen/rejected pairs, reference policy vàβ.",
+              "en": "Use comparisons, references andβ."
+            },
+            {
+              "vi": "Review consistency, length effects và task regressions.",
+              "en": "Review consistency, length effects and regressions."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "economics",
+      "title": {
+        "vi": "11. Distillation TCO và break-even có giả định",
+        "en": "11. Distillation economics and explicit break-even assumptions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cost comparison cần cùng task mix, quality/SLO targets và measurement window. Project spend có data generation/review, training experiments, evaluation/integration; recurring spend có serving, fallbacks, on-call, monitoring và future retraining. Một student-first cascade trả student cost ngay cả khi sau đó gọi baseline. Savings/latency có thể khác khi router chọn upfront hoặc requests có lengths khác nhau.",
+          "en": "Compare matched tasks, quality/SLOs and windows. Include data/review, experiments/integration and recurring serving, fallbacks, operations and retraining. Student-first cascades pay for the student before fallback; upfront routing and varied lengths change economics."
+        },
+        {
+          "vi": "Fixture 100 Krequests/ngày,30 ngày/tháng, baseline$4/1 Krequests, student$0,8/1 K,10% fallback và$300monthlyops cho baseline$12000/tháng và candidate$3900/tháng. Setup$2400, savings$8100/tháng cho arithmetic break-even≈8,89 ngày. Đây là fictional budget inputs, không market pricing hoặc cam kết quality; real adoption còn phụ thuộc acceptance gates và risk/maintenance costs.",
+          "en": "The fictional 100 K/day,30-day-month fixture uses$4/1 K baseline requests,$0.8/1 K student requests,10% fallbacks and$300 monthly operations: baseline$12,000 versus$3,900/month. A$2,400 setup breaks even arithmetically in≈8.89 days at$8,100 monthly savings. These are assumptions rather than market prices or quality guarantees."
+        }
+      ],
+      "experiment": "tune-cost"
+    },
+    {
+      "id": "serving",
+      "title": {
+        "vi": "12. Merge weights hay giữ adapter?",
+        "en": "12. Merge weights or retain adapters?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong compatible dense linear setup, có thể precompute W+(α/r)BA để bỏ explicit LoRA branch ở forward. Điều đó không có nghĩa zero operational cost: merged artifacts cần storage/rollout và có thể làm mất shared-base multi-adapter economics. Quantized merge/requantization, precision và backend support cần kiểm; không mọi method/setup đều merge tương đương hoặc reversible an toàn bằng simple subtraction trong low precision.",
+          "en": "Compatible dense updates can be merged to remove an explicit LoRA branch, but artifacts still cost storage/operations and can reduce shared-base economics. Validate quantized merging, precision and backend support; low-precision merges are not universally equivalent or safely reversible by subtraction."
+        },
+        {
+          "vi": "Giữ adapter giúp share compatible base giữa tenants/tasks nếu engine hỗ trợ, nhưng có load/rank-dependent compute, residency và KV identity costs. Exact base/tokenizer/modules/adapter revisions cần enforced; caller auth không dựa vào adapter name user tự chọn. Benchmark served artifact sau merge/quantization/export, không dùng training metrics để suy inference quality/performance.",
+          "en": "Adapters support compatible shared bases under engine capabilities but incur residency, loading, compute and KV-identity costs. Enforce exact dependencies and authorization, and benchmark exported/merged/quantized serving artifacts rather than inferring them from training metrics."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Deployment option",
+            "en": "Deployment option"
+          },
+          {
+            "vi": "Có thể có lợi",
+            "en": "Potential benefit"
+          },
+          {
+            "vi": "Cần kiểm",
+            "en": "Validate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Merged compatible weights",
+              "en": "Merged compatible weights"
+            },
+            {
+              "vi": "Không explicit adapter branch trong chosen forward",
+              "en": "No explicit adapter branch in the chosen forward path"
+            },
+            {
+              "vi": "Storage/revisions, precision, export và task quality",
+              "en": "Storage/revisions, precision, exports and task quality"
+            }
+          ],
+          [
+            {
+              "vi": "Separate adapters",
+              "en": "Separate adapters"
+            },
+            {
+              "vi": "Shared base và task/tenant adapters",
+              "en": "Shared bases and task/tenant adapters"
+            },
+            {
+              "vi": "Compatibility, load churn, isolation và active references",
+              "en": "Compatibility, churn, isolation and active references"
+            }
+          ],
+          [
+            {
+              "vi": "Dedicated full model",
+              "en": "Dedicated full model"
+            },
+            {
+              "vi": "Independent artifact/layout khi cần",
+              "en": "Independent artifacts/layouts when needed"
+            },
+            {
+              "vi": "Memory, fleet utilization và maintenance",
+              "en": "Memory, utilization and maintenance"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "upgrade",
+      "title": {
+        "vi": "13. Base upgrades cần compatibility và reevaluation",
+        "en": "13. Base upgrades require compatibility and reevaluation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Adapter phụ thuộc base weights/module shapes và training semantics. Base upgrade có thể giữ shape nhưng thay representation/behavior; không tự assume old adapter vẫn phù hợp. Cũng không khẳng định mọi change đều bắt buộc retrain: verify compatibility, port/load support và task/regression evidence; có thể reuse, adapt hoặc retrain tùy kết quả.",
+          "en": "Adapters depend on weights, modules and semantics. Equal-shaped upgrades can change behavior, requiring compatibility/evaluation rather than blind reuse. Not every change mandates retraining; supported reuse, porting, adaptation or retraining follows evidence."
+        },
+        {
+          "vi": "Version dataset/base/tokenizer/template, targets/rank/scaling, optimizer, objective/reference, quantization, code/container và output artifact checksum. Freeze approved deployment mapping và canary/rollback. Khi data drift hoặc regression xuất hiện, review root cause ở task/data/serving trước tăng rank/epochs. Training asset là maintained product component, không chỉ một fileweights tải lên.",
+          "en": "Version data, dependencies, targets/scaling, objectives/references, optimizers, precision, code and checksums. Canary pinned deployments with rollback, diagnosing task/data/serving drift before increasing ranks or epochs. Adapted models are maintained product components."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Upgrade theo evidence",
+          "en": "Upgrade using evidence"
+        },
+        "caption": {
+          "vi": "Compatible loading chưa đủ chứng minh task behavior giữ nguyên.",
+          "en": "Successful loading does not establish unchanged behavior."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Pin dependencies",
+              "en": "Pin dependencies"
+            },
+            "detail": {
+              "vi": "Base/modules, tokenizer/template và adapter manifest.",
+              "en": "Pin bases/modules, tokenizers/templates and manifests."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Check compatibility",
+              "en": "Check compatibility"
+            },
+            "detail": {
+              "vi": "Supported load/export/merge và numerical behavior.",
+              "en": "Check loading, export/merge and numerics."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Reevaluate",
+              "en": "Reevaluate"
+            },
+            "detail": {
+              "vi": "Task/regression/permission và serving profile.",
+              "en": "Recheck tasks, regressions, permissions and serving profiles."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Canary / rollback",
+              "en": "Canary and roll back"
+            },
+            "detail": {
+              "vi": "Promote có gates hoặc port/retrain khi cần.",
+              "en": "Promote under gates or port/retrain when needed."
+            },
+            "icon": "flag"
+          }
+        ]
+      }
+    },
+    {
+      "id": "risk",
+      "title": {
+        "vi": "14. Regression, privacy và permission không được học thay code",
+        "en": "14. Regression, privacy and permissions need explicit controls"
+      },
+      "paragraphs": [
+        {
+          "vi": "Narrow adaptation có thể giảm general abilities, alter refusal/tool behavior hoặc memorize sensitive examples. Minimize/authorize training data, isolate artifacts/tenants theo data scope và test leakage/regression cases. Xóa document trong RAG source không tự unlearn facts đã vào weights; define policy/process cho trained artifacts và backups thay promise delete index là xóa mọi representation.",
+          "en": "Narrow adaptation can regress capabilities, change tools/refusals or memorize sensitive data. Authorize/minimize training data, scope artifacts and test leakage/regressions. Deleting retrieval sources does not automatically unlearn trained facts; define artifact/backup policies rather than equating index deletion with universal erasure."
+        },
+        {
+          "vi": "Không train model thay resource authorization, monetary/action limits hoặc tool idempotency trong backend. Outputs vẫn là untrusted proposals/data qua validation và runtime policy. Evaluate adversarial/unknown inputs, task slices và abstention; một average score tốt không che critical slice failures hoặc unauthorized effects.",
+          "en": "Training does not replace authorization, action limits or backend idempotency. Outputs still pass validation/runtime policies. Test adversarial/unknown inputs, slices and abstention rather than hiding important failures behind averages."
+        }
+      ]
+    },
+    {
+      "id": "registry",
+      "title": {
+        "vi": "15. Training và artifact contracts minh họa",
+        "en": "15. Teaching contracts for training and artifacts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các internal API dưới đây minh họa lifecycle, không gọi training provider hoặc chạy GPUs thật. Jobs pin immutable input/config references và save provenance/evaluation mapping. Complete job chỉ chứng minh training process kết thúc theo contract, không phải model đã qua quality gate hoặc production-ready.",
+          "en": "These internal teaching APIs neither train real GPUs nor call providers. Jobs pin immutable inputs/configuration and preserve provenance/evaluation mappings. Training completion is not quality approval or production readiness."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/v1/adaptation-jobs",
+          "description": {
+            "vi": "Create bounded training experiment với pinned dependencies.",
+            "en": "Create bounded experiments with pinned dependencies."
+          },
+          "request": "{jobId,baseRevision,datasetRevision,splitPolicy,objective,targets,rank,optimizerProfile,runtimeProfile,budget}",
+          "response": "202 {jobId,state:\"queued\"}",
+          "notes": [
+            {
+              "vi": "Approved dataset và resource policy được server validate.",
+              "en": "Servers validate dataset/resource authorization."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/internal/v1/artifacts/{revision}/evaluations",
+          "description": {
+            "vi": "Evaluate artifact trên independent pinned task/regression sets.",
+            "en": "Evaluate artifacts on independent pinned task/regression sets."
+          },
+          "request": "{evalRevision,suiteRevision,servingProfile,acceptancePolicy}",
+          "response": "202 {evaluationId,state:\"running\"}"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/v1/deployments/{id}/candidate",
+          "description": {
+            "vi": "Canary approved exact artifact/base/profile mapping.",
+            "en": "Canary approved artifact/base/profile mappings."
+          },
+          "request": "{artifactRevision,baseRevision,capabilityProfile,canaryPolicy,rollbackRevision}",
+          "response": "202 {deploymentId,candidateRevision,state:\"validating\"}"
+        }
+      ]
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "16. Luyện giải thích quyết định adaptation",
+        "en": "16. Practice adaptation decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Wiki công ty đổi hàng ngày thì fine-tune để biết docs được không?",
+            "en": "Should daily-changing wiki knowledge be put into fine-tuning?"
+          },
+          "answer": [
+            {
+              "vi": "Xác định task/evidence/access requirements và baseline trước. Retrieval/tools thường hợp freshness/citations/per-user policy, còn tuning có thể complement domain behavior. Weights có thể học facts nhưng không tự giữ current versions hoặc enforce page ACL.",
+              "en": "Define tasks, evidence and access first. Retrieval/tools often suit freshness/citations, while tuning can complement domain behavior. Learned facts do not automatically stay current or obey page access policies."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "LoRA q/v ởGQA có đếm mọi projection square không?",
+            "en": "Are GQA q/v projections always square for LoRA counting?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Inspect d_in/d_out từng module. Fixture q 4096→4096vàv4096→1024, rank 16qua32 layers:32× 16×(8192+5120)=6815744 params. Fused/extra targets cần inventory riêng.",
+              "en": "Inspect each module. The fixture 4096→4096 q and 4096→1024 v at rank 16 over 32 layers give 6,815,744 parameters; fused/additional targets need separate inventories."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "QLoRA 4-bit có nghĩa trainingmemory≈params/2 không?",
+            "en": "Does four-bit adaptation use only half a byte per parameter in total?"
+          },
+          "answer": [
+            {
+              "vi": "Đó chỉ là raw base payload trước metadata. Cộng adapters/gradients/optimizer, activations, dequantization/workspaces, allocator và runtime; checkpointing/offload/sharding có trade-offs. SingleGPUfit phải đo supported config.",
+              "en": "That describes raw base payload only. Add metadata, trainable states, activations, workspaces and runtime costs; checkpointing/offload/sharding trade resources. Validate supported single-device configurations."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có preference pairs là chạyDPO xong không?",
+            "en": "Are preference pairs alone a complete DPO setup?"
+          },
+          "answer": [
+            {
+              "vi": "Cần reference/policy initialization, objective/scalingβ, correct template/sequence probabilities và reviewed paired labels. Preferred chưa chắc factual/authorized. Check heldout/regression slices và length/style effects.",
+              "en": "Define references/initialization, objectives/scaling, templates/probabilities and reviewed labels. Preferences do not establish factuality or authority; evaluate regressions and length/style effects."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Teacher đạt target thì student có giữ quality không?",
+            "en": "Does a successful teacher guarantee student quality?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Student capacity, training coverage, label errors và generalization khác. Review targets, hold out independent evals và compare served student với baselines. Distillation chỉ là candidate có quality/cost evidence cần chứng minh.",
+              "en": "No. Capacity, coverage, errors and generalization differ. Review targets and independently evaluate the served student against baselines rather than assuming copied quality."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Merged adapter có zero servingcost không?",
+            "en": "Does merging adapters eliminate serving costs?"
+          },
+          "answer": [
+            {
+              "vi": "Compatible merge có thể bỏ explicit LoRA branch, nhưng model vẫn tốn inference/storage/rollout và có thể mất shared-base economy. Quantized merge/export và numericalquality cần validate.",
+              "en": "Compatible merging removes an explicit branch, not inference/storage/operations. Validate quantized exports, numerical quality and shared-base trade-offs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Base upgrade có phải luôn retrain adapter không?",
+            "en": "Does every base upgrade require retraining adapters?"
+          },
+          "answer": [
+            {
+              "vi": "Không universal, nhưng không blind reuse. Check exactweights/modules/tokenizer/template compatibility, test task/regressions và serving. Reuse/port/retrain theo evidence, pin approved manifest vàrollback.",
+              "en": "Not universally, but blind reuse is unsafe. Verify dependencies and behavior, choosing supported reuse, porting or retraining with pinned manifests and rollback."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Setup 2400 và savings 8100/tháng thì bao lâu break-even?",
+            "en": "When does a 2400setup break even at 8100monthly savings?"
+          },
+          "answer": [
+            {
+              "vi": "Với 30 days/month vàstable inputs:2400/8100× 30≈8,89 days. Nếu savings≤0không finite break-even. Cần tính fallback/operations/retraining và quality/SLO gates trước adoption; số này chỉ là arithmetic.",
+              "en": "At thirty days/month with stable inputs,2400/8100× 30≈8.89 days. Nonpositive savings have no finite break-even. Include operations/retraining and independent quality/SLO gates; arithmetic alone does not approve adoption."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

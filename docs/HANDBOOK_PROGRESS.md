@@ -4,11 +4,11 @@ Cập nhật23/10/2026. Chủ sở hữu đã quay lại và yêu cầu tiếp t
 
 ## Trạng thái hiện tại
 
-- **56/73 bài có nội dung Việt–Anh trong source**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories và 6 AI Systems. **56 bài đã build/browser local.**
-- Tất cả 56 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
-- **17 mục chưa biên soạn**: 9 AI Systems, 3 Practice và 5 Interview tools. Tiếp theo `ai-rag`; có models/tests, chưa UI/canonical.
-- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local56. Bài mới `/ai-systems/ai-prompting/` có bản `/en/` tương ứng.
-- Giữ198 chương/15 lộ trình,31 Notes & Interview topics, stable IDs, localStorage keys và9 themes. Không portfolio.
+- **58/73 bài có nội dung Việt–Anh**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories và 8 AI Systems. **58 bài đã build và kiểm tra browser local.**
+- Tất cả 58 bài `status: review`, **0 complete**. Còn vòng đối chiếu độc lập về độ phủ, kỹ thuật, diễn giải/English và mục đích của hình/tương tác; tests/counts không thay vòng review.
+- **15 mục chưa biên soạn**: 7 AI Systems, 3 Practice và 5 Interview tools. Tiếp theo `ai-evals`: đã đọc chapter, demos và primary research; models/tests mới có, chưa UI/canonical/wiring/build.
+- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local58. Hai bài mới `/ai-systems/ai-rag/`, `/ai-systems/ai-fine-tuning/` và bản `/en/` tương ứng.
+- Giữ 198 chương/15 lộ trình, 31 Notes & Interview topics, stable IDs, localStorage keys và 9 themes. Không portfolio.
 
 ## Mốc đã push
 
@@ -208,3 +208,42 @@ Mainpreview nếu đã tắt sau shutdown có thể restart tại rootAVLore:`np
 - Finalpolish sourcecheck279files0diagnostics,163tests; finalbuild/verify622pages276984links/assets,localization0missing. Dedicated3labs/VIENkeyboard/mobile9themes và generic2routes pass sau UIlabelsVI/ENpolish; screenshots đã xem. Shared static114HTML1342links/static2pagespass.
 - Main4322publish56;stage4323stopped. Logs`prompt-final-*`; screenshots`artifacts/prompt-contract-*`. Source55+56 ổn định chuẩn bị checkpoint, toàn bộ56vẫnstatusreview/0complete. Còn9AI+8tools chưa author rồi independentreview.
 - RAG57 mới có `rag-learning-models.ts`, `tests/rag-learning-models.test.ts`4tests pass; **chưa UI/canonical/schema/dictionary/browser/static/build57**. Fused fixedlists8docs với eligible/relevance annotations, candidateceiling/rerank và filterstarvation; actual48-point2DIVF/nprobe/exacttop4 comparisons, payloadmemory + PQcodebooks; generation4 latebuild so generation5 current/delete, finalquerypermissionguard. Không fabricated latency/recall curves; rerank outputs precomputedfixture không realneuralmodel. Không commit source57 partial cùng checkpoint56.
+
+## Checkpoint56 đã push; RAG57 đang triển khai
+
+- AVLore`dd8b06e`, ITBasic`ad13dd3` push thành công. Pages https://github.com/avpegnu/av-lore/actions/runs/39887995834 success; ITVPS https://github.com/avpegnu/it-basic/actions/runs/39887996784 failed. Không thay workflows/settings/secrets. Mainlocal4322vẫnvalidated56; stage4323stopped.
+- RAG57 có models4tests và unwired`RagLearningPlayground.tsx` + scopedCSS. WIPcheck282files0diagnostics167tests. SVGIVF vừa bọc scrollregionkeyboard-friendly với minwidth560 để labels không co quá nhỏ trên mobile; chưa browser test. Chưa canonical/schema/renderer/dictionary/browserscript/static57. Không tính167tests là57completed.
+- Lab1fixedrankedlists8chunks,2relevant, precomputedreranks; default hybriddepth3reranktrue givesOPS+RECOVERY recall1; rerankoffrecall.5; lexicalcandidateceiling.5; latedepth1emptyafterineligiblePRIVATE removed.
+- Lab2actual48points/6cells/2D, queriesx/y,nprobe, exacttop4. Memory worksheet riêng(N=1M,d768,m96,bits8): flat3.08e9B, PQpayload104e6B +codebooks786432B, optionaloriginals. NoPQdistance simulation/latency curve.
+- Lab3generation4latejob vs source5update/delete, publicationguard và finalqueryACL/deleteguard; queryguardkhông tự sửa stalebody. Defaultdelete/guardsbothtrue→NONEindex/NOvisible; disablepublicationguardresurrectsv4nhưng finalqueryguardstillblocks; disablebothleaks. SeparateACLrevocationcanstaleevenmatchingcontentversion.
+
+## RAG57: đã authored, đang kiểm final visual polish
+
+- `ai-rag.json`:17sections/5traces/4internalAPIs/3labs/8workedquestions, VIENstatusreview. Added embedding/funnel/access flows, ANNvsrelevancemetrics table, chunk/longcontext cards; giữ technical coverage và diagrams. Canonical đã polish saucreationhelper; đừng rerun author.
+- Sourcecheck283files0diagnostics167tests trước WIP58. Build624pages278494links/assets,localization0missing. Shared57:116HTML1366links/static2pages pass. Main4322vẫn56.
+- Firstunitrun caught wrongrelatedtopicsearch-data→fixedstorage-search. First staticbrowserasserttablecount chưa có table; sau visualpolish thêm relevantmetricscomparison table và flows/cards rồistaticpass. Builddictionarycaught ambiguous “Không chứng minh”→contextualized newheader“Metric chưa chứng minh điều gì?”; unambiguous37716keys verified.
+- Browser caught real React418 ởSVG point title mixedtextnodes; dev4324 reproduced specificdiff, fixed singletemplate-string title, rerun devnoerrors. Dev4324đãstop. Rebuild`rag-fixed-*`: dedicated3labsVIEN/keyboard/mobile9themes +generic2routes pass và screenshotsđãxem. Không suppresspageerrors.
+- Sau visualreview tăng fontrowheaders, moveCcelllabels ra corner, thêm coordinateaxes và đổi labh3 thành outcome-oriented“Probe thêm cells…”. Currentstage sourcecopy gồm final57 +unwired58models/tests, đang build/verify `rag-visual-{build,verify}.log`session75133; stage4323stopped. Cần đợiexit0,startstage,rerun dedicated/generic,screenshots final rồipublish57main. Rootcheck/test`rag-visual-*`session4753 nếu còn. Khôngpublishpreviousdist vìfinalvisualsourceđãđổi.
+-58research/fullchapter+wizard/calculator/modelread; primaryLoRA/QLoRA/DPO methods và distillation/InstructGPT, PEFTquantization/LoRAdocsđãđọc. `fine-tune-models.ts` vàtests4passed local, chưa UI/canonical/wiring/dictionary/browser/static58. Modelsinventory: hypothetical8B/70B shapes,GQAwidth1024, LoRA targetcount, 12/16bytestrainablestate, explicit4bitmetadata(2Bscale/128w), suppliedruntimeGiB; nonrigid evidence-driven experiment choices; distillationTCOsetup/monthlyops/fallback costs. Đừng commit58partial cùng57.
+
+## Snapshot tiếp tục — finalRAGvisual đang browser test,58UI đã có
+
+- `rag-visual-build/verify` exit0:624pages278494links/assets,localization0missing; source285files0diagnostics171tests gồm58models4tests uncommitted. 57release riêng có167tests,58chưa author.
+- Stage4323đangRUNNINGpid95936 phục vụfinal57. Dedicated`rag-visual-browser.log`session29275 và generic`rag-visual-generic-browser.log`session4186 đang chạy hoặc vừa xong. Đợi exit0, xem final screenshots (celllabels góc +axes+tablefont), publishstage→main rồistopstage trước sourcecopy mới. Main4322vẫn56. No ongoingbuild.
+-58 `FineTunePlayground.tsx` đã tạo, scopedCSS có tronghandbook.css; **chưa schema/renderer/canonical/dictionary/browserscript/static/build58**. Three kinds` tune-plan,tune-budget,tune-cost` (actual strings không có leading space). Evidence-led experiment flags/labels; LoRAtargetq/vdefault rank16 mastertrue runtime8GiB cap24GiB với2hypotheticalshapes; TCOdaily100Kteacher$4/1kstudent$.8/1kfback10%setup2400ops300. Unwired source cần check/synckhi canonicalready; globalruntimecollector sẽ scan58UI ở build sau.
+-Checkpoint56GitHubHEADdd8b06e/ad13dd3successPages39887995834. RAG57local chưa commit; giữunrelatedITBasic/Test/Python/test.py. Nếu commit57 phải loại58UI/models/tests và58-onlyCSS để không pushpartial. Tốt hơn batch57+58khi58validate xong; chưa cần push57ngay.
+
+## RAG57 final đã validate/publish local
+
+- Final`rag-visual-build/verify`exit0:624pages278494links/assets,localization0missing. Dedicated3labs/VIENkeyboard/mobile9themes và generic2routes finalpass sau tooltip/visual fixes; final screenshots đã xem. Main4322publish57;stage4323stopped. Static57:116HTML1366links và2VIENbrowserpagespass. Root171tests includes58models4;57release tests167,58chưa author.
+- 57canonical17sections/5traces/4APIs/3labs/8Qs và additionalflows/cards/table. All57statusreview,0complete. Chưa push57; checkpoint56GitHubHEAD. RAGsourceheadertranslation“Metric chưa chứng minh điều gì?” tránh globalkeyambiguity; relatedtopicstorage-search valid. SVGpointtitle dùng one template string để không hydration418; đừng regress thành split JSX text trongtitle.
+-58unwiredUI/models/tests/CSS local; cần authorcanonicalVIEN, schema+renderer, dictionary, browserscript/package, syncstatic, check/test/build/verify và browser/screenshots. Không copy stage source over root. Không rerun57authorcreationhelpers vì đãpolishvisually/spacing/metadata.
+
+## Local58: Fine-tuning Decisions — đã validate và publish local
+
+- Canonical `ai-fine-tuning.json`: 16 sections, 5 traces, 3 internal APIs, 3 labs, 8 câu có giải thích; Việt–Anh, status review. Nội dung về lựa chọn adaptation theo evidence, dataset/provenance/splits, SFT/masks, LoRA/GQA, explicit training-state assumptions, QLoRA, distillation, RLHF/DPO, serving, base upgrades và regressions/privacy.
+- Ba labs: evidence/prerequisite decision aid; LoRA matrix-specific counts + supplied memory budget; student-first TCO/fallback/setup/ongoing operations. Không chạy training thật, không dự đoán quality hoặc measured peak memory và không dùng giá provider.
+- Check trước WIP59: 286 source files/0 diagnostics, 171 tests. Final build/verify 626 pages, 280004 links/assets, localization 0 missing. Dedicated 3 labs/VI–EN/keyboard/mobile/9 themes, generic 2 routes và static 2 pages pass; đã xem desktop/mobile screenshots. Shared static: 118 HTML/1388 internal links.
+- Build đầu bắt 4 SSR matrix strings thiếu identity dictionary; thêm các shape strings, sửa NF4/FP32 spacing và rebuild thành công. Không gọi dịch vụ dịch online. Logs `fine-tune-final-{build,verify,check,unit}.log`, `fine-tune-{browser,generic-browser}.log`; screenshots/report `artifacts/fine-tune-*`.
+- Main4322 publish58; stage4323 stopped. RAG57 + Fine-tuning58 chuẩn bị checkpoint; toàn bộ vẫn review/0 complete.
+- `ai-evals`59: full chapter + judge/harness demos đã đọc, đối chiếu primary judge-bias papers, Wilson intervals, paired bootstrap documentation. Models/tests mới có: paired case resampling (degenerate warning), exact order/accuracy probabilities with unresolved mass, gates rejecting slice/privacy regressions or missing evidence. Chưa UI/canonical/schema/dictionary/browser/build59; không commit partial59 cùng checkpoint58.

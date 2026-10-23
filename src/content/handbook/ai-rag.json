@@ -1,0 +1,1372 @@
+{
+  "id": "ai-rag",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "RAG Systems: tìm đúng evidence, giữ quyền và trả lời có căn cứ",
+    "en": "RAG Systems: retrieve evidence, preserve access and ground answers"
+  },
+  "summary": {
+    "vi": "Xây ingestion/query pipelines với chunking, compatible embeddings, hybrid/RRF, ANN, reranking, freshness và citation checks; phân biệt retrieval recall, answer quality và authorization.",
+    "en": "Build ingestion/query pipelines with chunking, compatible embeddings, hybrid fusion, ANN, reranking, freshness and citation checks while separating retrieval quality, answer quality and access control."
+  },
+  "prerequisites": [
+    "ai-prompting",
+    "ai-serving",
+    "search-engine"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "storage-search",
+    "security",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "RAG đưa evidence vào context; không tự làm model đúng hoặc hết hallucination.",
+      "en": "RAG supplies evidence rather than automatically making generations correct."
+    },
+    {
+      "vi": "Ingestion, candidate retrieval, reranking, context packing và generation có failure modes cần đo riêng.",
+      "en": "Ingestion, candidates, reranking, packing and generation need separate failure measurements."
+    },
+    {
+      "vi": "Hybrid/RRF giúp combine complementary retrievers nhưng không đảm bảo mọi query tốt hơn; rerank không cứu absent candidates.",
+      "en": "Hybrid fusion can combine complementary retrievers without universal gains; reranking cannot recover absent candidates."
+    },
+    {
+      "vi": "ANN exact-neighbor recall và annotated relevance recall là hai metrics khác nhau.",
+      "en": "ANN neighbor recall and annotated relevance recall are different metrics."
+    },
+    {
+      "vi": "Permissions/deletes cần authoritative exposure policy, guarded publication và cache scope; index metadata một mình có thể stale.",
+      "en": "Permissions/deletes require exposure policies, publication guards and scoped caches; index metadata can be stale."
+    },
+    {
+      "vi": "Citation identity chỉ giúp truy nguyên; claim support, version/freshness và abstention vẫn cần kiểm.",
+      "en": "Citation identities aid tracing but do not replace support, freshness and abstention checks."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Hai pipelines, một evidence contract",
+      "en": "Two pipelines and one evidence contract"
+    },
+    "caption": {
+      "vi": "Đo từng layer để sửa đúng nguyên nhân thay chỉ đổi model lớn hơn.",
+      "en": "Measure each layer to address causes rather than only switching to larger models."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Ingest",
+          "en": "Ingest"
+        },
+        "detail": {
+          "vi": "Parse/chunk, provenance, revisions và index publication.",
+          "en": "Parse/chunk with provenance, revisions and publication guards."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Retrieve",
+          "en": "Retrieve"
+        },
+        "detail": {
+          "vi": "Eligible candidates qua lexical/vector và fusion.",
+          "en": "Retrieve eligible lexical/vector candidates and fuse ranks."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Select evidence",
+          "en": "Select evidence"
+        },
+        "detail": {
+          "vi": "Fresh fetch, rerank, diverse spans và context budget.",
+          "en": "Fetch fresh evidence, rerank and budget diverse spans."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Answer and verify",
+          "en": "Answer and verify"
+        },
+        "detail": {
+          "vi": "Claims/citations, abstention và access boundary.",
+          "en": "Check claims/references, abstention and access boundaries."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "scope",
+      "title": {
+        "vi": "1. RAG là retrieval cộng generation, không phải database biết trả lời",
+        "en": "1. RAG combines retrieval and generation rather than replacing a database"
+      },
+      "paragraphs": [
+        {
+          "vi": "Retrieval-augmented generation lấy external information ở query time để bổ sung context cho generator. Nguồn có thể là tài liệu nội bộ, catalog hoặc records thay đổi theo thời gian. RAG hữu ích khi cần fresh/private/evidence-backed information, nhưng retrieval có thể miss và generator vẫn có thể hiểu sai, bỏ qua hoặc thêm claims không được support. Không mặc định phần lớn mọi bad answer đều do retrieval; hãy phân loại bằng evidence.",
+          "en": "RAG retrieves external information at query time for a generator. Sources can include private documents, catalogs or changing records. Retrieval can miss, and generators can misinterpret, ignore or embellish evidence. Diagnose failures rather than universally attributing most errors to retrieval."
+        },
+        {
+          "vi": "Một task có thể cần nhiều passages cùng nhau: tìm một chunk liên quan chưa đủ để trả lời phần còn lại. Distinguish corpus coverage, ingestion completeness, candidate recall, prompt evidence coverage và final answer quality. Nếu record có cấu trúc và query có thể giải deterministic bằng SQL/API, chọn đúng data tool thay ép mọi tác vụ thành nearest-neighbor text search.",
+          "en": "Tasks may require several passages jointly; one relevant chunk does not cover every subquestion. Separate source coverage, ingestion completeness, candidate recall, packed evidence and answer quality. Structured records can be better served by deterministic SQL/APIs than text-neighbor search."
+        }
+      ]
+    },
+    {
+      "id": "ingestion",
+      "title": {
+        "vi": "2. Ingestion giữ cấu trúc, identity và revisions",
+        "en": "2. Ingestion preserves structure, identity and revisions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ingest thường gồm source discovery, stable snapshot/change feed, parsing/OCR khi cần, normalization, chunking, embedding và lexical/vector indexing. Giữ document ID, source generation, chunk span/ordinal, parser/chunker/embedding versions, timestamps, access metadata và checksum. Source offset/page/section giúp trace citations và sửa parser; một chunk ID mutable không đủ nếu content bị thay mà citation cũ vẫn trỏ cùng ID.",
+          "en": "Ingestion includes discovery, snapshots/change feeds, parsing/OCR, normalization, chunking, embeddings and indexing. Preserve document generations, spans, parser/chunker/embedding versions, timestamps, access metadata and checksums. Source positions support citations and debugging; mutable identities alone cannot distinguish historical content."
+        },
+        {
+          "vi": "PDF tables, code blocks, headings và reading order có thể mất nghĩa nếu chỉ extract plain text. Detect parse failures, language/tokenization issues, duplicated headers và missing pages trước publish. Jobs có retry cần stable work identity và conditional publication; source update/delete trong lúc build không được để old job ghi đè current generation. Staging thành công không tự nghĩa generation đã sẵn để query.",
+          "en": "Flattened PDFs/tables/code/headings can lose meaning. Detect parsing failures, language issues, repeated headers and missing pages before publication. Retried jobs need stable identities and conditional publication so late work cannot overwrite updated/deleted sources. Staging success does not automatically establish query readiness."
+        }
+      ]
+    },
+    {
+      "id": "chunking",
+      "title": {
+        "vi": "3. Chunking đổi retrieval coverage và context cost",
+        "en": "3. Chunking changes coverage and context costs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixed token windows dễ budget nhưng có thể cắt bảng/sentence; structural chunking theo headings/paragraphs giữ locality nhưng cần parser tốt; semantic split dựa meaning changes thêm compute và khó reproduce nếu model/version đổi. Chunks quá nhỏ mất surrounding conditions, quá lớn dilute relevance và chiếm context. Có thể dùng small retrieval units rồi expand parent/surrounding spans sau authorization, trong một bounded budget.",
+          "en": "Fixed token windows are easy to budget but split structure; structural boundaries preserve locality with good parsing; semantic splits add computation and version sensitivity. Small chunks can omit conditions, while large chunks dilute relevance and consume context. Small retrieval units can expand into authorized parent/surrounding spans under bounds."
+        },
+        {
+          "vi": "Overlap giúp một số boundary misses nhưng không guarantee mọi answer nằm gọn trong chunk; nó cũng tạo near-duplicates và extra indexing/storage. Ví dụ 10000 tokens, windows 500 và stride 400 cho 25 windows theo cách dừng khi cover hết; serialized payload là 12400 tokens nếu last window 400 tokens. Chọn split policy theo tokenizer/model và document structure, không nhầm word count với model token count.",
+          "en": "Overlap helps some boundary misses without guaranteeing containment, while creating duplicates and extra storage. A10,000-token document with 500-token windows and 400-token stride produces 25 windows when stopping after full coverage, totaling 12,400 serialized tokens with a 400-token final window. Use explicit tokenizer/structure rules rather than confusing words and tokens."
+        },
+        {
+          "vi": "Context headers có thể thêm title/section/path hoặc generated summary trước embedding/indexing. Giữ metadata-derived context chính xác và phân biệt generated text với authoritative source: một summary bịa có thể làm retrieve sai. Preserve raw span để trả citations; nếu header thay, embedding/index version cần tương ứng.",
+          "en": "Headers can supply titles/sections/paths or generated summaries before indexing. Distinguish authoritative metadata from generated context, which can introduce false cues. Preserve raw spans for citations and version representations when headers change."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Fixed windows",
+            "en": "Fixed windows"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Budget đơn giản; token overlap và stride rõ.",
+              "en": "Simple budgets with explicit stride/overlap."
+            },
+            {
+              "vi": "Test sentence/table boundaries và duplicated evidence.",
+              "en": "Test boundaries and duplicated evidence."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Structural units",
+            "en": "Structural units"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Giữ headings/code/tables khi parser hỗ trợ.",
+              "en": "Preserve headings, code and tables when parsing supports them."
+            },
+            {
+              "vi": "Có bounds và fallback cho section quá dài.",
+              "en": "Bound large sections and define fallbacks."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Semantic / parent expansion",
+            "en": "Semantic or parent expansion"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Có thể tăng coherence/coverage theo task.",
+              "en": "Can improve task-specific coherence/coverage."
+            },
+            {
+              "vi": "Đo extra cost, version stability và context budget.",
+              "en": "Measure costs, version stability and context budgets."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "embedding",
+      "title": {
+        "vi": "4. Embedding space, metric và query/document profiles",
+        "en": "4. Embedding spaces, metrics and encoder profiles"
+      },
+      "paragraphs": [
+        {
+          "vi": "Embedding maps input thành vector dùng cho similarity search theo training objective; gần nhau không luôn là answer relevance. Query/document có thể dùng cùng encoder với prefixes khác, hoặc paired encoders được train chung. Pin compatible profile, dimensions, normalization, truncation và metric. Không lấy mọi model cùngdimension để mix vectors hoặc assume query/doc dùng cùng text template.",
+          "en": "Embeddings represent inputs under a training objective; proximity need not equal answer relevance. Queries/documents can use different prefixes or jointly trained encoders. Pin compatible profiles, dimensions, normalization, truncation and metrics rather than mixing equal-dimensional but incompatible vectors."
+        },
+        {
+          "vi": "Cosine(q,d)=dot(q,d)/(||q||||d||), nên bằng dot product khi cả hai unit-normalized. Squared L 2 của unit vectors là 2−2dot, cho ordering tương đương khi assumptions giữ. Zero vectors cần handling, còn unnormalized dot product chịu ảnh hưởng magnitude. Dùng metric/model contract và task evals; similarity score không tự là probability hoặc calibrated threshold dùng chung mọi corpus.",
+          "en": "Cosine equals dot product for unit-normalized vectors; their squared L 2 distance is 2−2dot, giving equivalent ordering under those assumptions. Handle zero vectors and magnitude-sensitive unnormalized products explicitly. Similarity is not automatically a probability or a globally calibrated threshold."
+        },
+        {
+          "vi": "Khi đổi representation không backward-compatible, build separate embedding generation và matching query encoder, backfill rồi catch up incremental changes. Compare recall/answer slices, ACL/freshness và cost trước manifest cutover; giữ rollback bounded. Không khẳng định mọi model update đều phải re-embed nếu compatibility được thiết kế và đo rõ, nhưng không assume compatibility vì cùng tên family.",
+          "en": "Incompatible representations need separate generations and matching query encoders, backfills and change catch-up. Evaluate relevance, answers, access, freshness and costs before manifest cutover with rollback. Compatibility must be designed/validated rather than inferred from family names; compatible changes need not always rebuild every vector."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Compatible profiles trước nearest-neighbor search",
+          "en": "Compatible profiles before neighbor search"
+        },
+        "caption": {
+          "vi": "Cosine/dot/L2 chỉ có ordering tương đương dưới đúng assumptions.",
+          "en": "Metric equivalence depends on explicit assumptions."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Profile",
+              "en": "Profile"
+            },
+            "detail": {
+              "vi": "Query/document templates, encoder pair, truncation và versions.",
+              "en": "Pin query/document templates, encoder pairs, truncation and versions."
+            },
+            "icon": "target"
+          },
+          {
+            "title": {
+              "vi": "Represent",
+              "en": "Represent"
+            },
+            "detail": {
+              "vi": "Vector dimensions và normalization theo model contract.",
+              "en": "Use dimensions and normalization required by the model."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Compare",
+              "en": "Compare"
+            },
+            "detail": {
+              "vi": "Metric, eligibility và exact/approximate search.",
+              "en": "Apply metrics, eligibility and exact/approximate search."
+            },
+            "icon": "compare"
+          },
+          {
+            "title": {
+              "vi": "Evaluate",
+              "en": "Evaluate"
+            },
+            "detail": {
+              "vi": "Neighbor recall riêng với task relevance và answer support.",
+              "en": "Separate neighbor recall from relevance and answer support."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "5. Ingest và query đi qua những đường khác nhau",
+        "en": "5. Ingestion and queries follow distinct paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ingest ưu tiên completeness/versioned publication; query ưu tiên eligible relevant evidence trong latency budget. Query rewrite, lexical/vector retrieval, fusion, fresh fetch, rerank và context assembly là các stages khác nhau, không phải một vector query trả answer cuối. Sơ đồ còn tách source authority/policy khỏi derived indexes và model confidence.",
+          "en": "Ingestion emphasizes completeness/publication while queries seek eligible relevant evidence within latency budgets. Rewriting, retrieval, fusion, fresh fetching, reranking and assembly are separate stages rather than one vector query returning a final answer. The diagram separates source/policy authority from derived indexes and model confidence."
+        }
+      ],
+      "diagram": {
+        "id": "rag-evidence-lifecycle",
+        "title": {
+          "vi": "Index tạo candidates; permission và evidence quyết định được dùng gì",
+          "en": "Indexes supply candidates; permissions and evidence decide what may be used"
+        },
+        "caption": {
+          "vi": "Trace ingestion, authorized retrieval, answer assembly, delete/revocation và embedding migration. Content, embedding và policy revisions có vòng đời liên quan nhưng khác nhau.",
+          "en": "Trace ingestion, authorized retrieval, answers, deletion/revocation and embedding migration. Content, embedding and policy revisions have related but distinct lifecycles."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "source",
+            "label": {
+              "vi": "Authoritative sources",
+              "en": "Authoritative sources"
+            },
+            "detail": {
+              "vi": "Documents, content generations, ACL/policy và delete state.",
+              "en": "Documents, content generations, access policies and deletions."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "parse",
+            "label": {
+              "vi": "Parse / chunk workers",
+              "en": "Parse / chunk workers"
+            },
+            "detail": {
+              "vi": "Structured extraction, immutable chunk IDs, provenance và dedup.",
+              "en": "Structured extraction, immutable chunk IDs, provenance and deduplication."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "worker"
+          },
+          {
+            "id": "embed",
+            "label": {
+              "vi": "Versioned embedding",
+              "en": "Versioned embedding"
+            },
+            "detail": {
+              "vi": "Compatible query/document encoders, input templates, metric và dimensions.",
+              "en": "Compatible encoders, input templates, metrics and dimensions."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "model"
+          },
+          {
+            "id": "vector",
+            "label": {
+              "vi": "Vector index",
+              "en": "Vector index"
+            },
+            "detail": {
+              "vi": "ANN/exact layout, content/embedding generations và filter metadata.",
+              "en": "ANN/exact layouts, content/embedding generations and filters."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "user",
+            "label": {
+              "vi": "User / principal",
+              "en": "User / principal"
+            },
+            "detail": {
+              "vi": "Question, conversation scope và authenticated identity.",
+              "en": "Questions, conversation scopes and authenticated identities."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "client"
+          },
+          {
+            "id": "retrieval",
+            "label": {
+              "vi": "Query / retrieval",
+              "en": "Query / retrieval"
+            },
+            "detail": {
+              "vi": "Scoped rewrite, lexical/vector candidates, rank fusion và budgets.",
+              "en": "Scoped rewrites, lexical/vector candidates, rank fusion and budgets."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "lexical",
+            "label": {
+              "vi": "Lexical index",
+              "en": "Lexical index"
+            },
+            "detail": {
+              "vi": "Analyzers, term statistics, identifiers và document versions.",
+              "en": "Analyzers, term statistics, identifiers and versions."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "rerank",
+            "label": {
+              "vi": "Fetch / rerank",
+              "en": "Fetch / rerank"
+            },
+            "detail": {
+              "vi": "Fresh authorized chunks, bounded pair scoring và relevance evidence.",
+              "en": "Fresh authorized chunks, bounded pair scoring and relevance evidence."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Permission / liveness",
+              "en": "Permission / liveness"
+            },
+            "detail": {
+              "vi": "Server principal, current policy, tombstones và exposure boundary.",
+              "en": "Server principals, current policies, tombstones and exposure boundaries."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "assemble",
+            "label": {
+              "vi": "Evidence assembler",
+              "en": "Evidence assembler"
+            },
+            "detail": {
+              "vi": "Diverse versioned spans, token budget, source IDs và untrusted provenance.",
+              "en": "Diverse versioned spans, token budgets, source IDs and untrusted provenance."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "generate",
+            "label": {
+              "vi": "Generator / checks",
+              "en": "Generator / checks"
+            },
+            "detail": {
+              "vi": "Answer, abstention, citation references và claim support checks.",
+              "en": "Answers, abstention, references and claim-support checks."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "model"
+          },
+          {
+            "id": "registry",
+            "label": {
+              "vi": "Index manifest",
+              "en": "Index manifest"
+            },
+            "detail": {
+              "vi": "Compatible generation, publish guards, migration/cutover và rollback.",
+              "en": "Compatible generations, publication guards, cutovers and rollback."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "ingest",
+            "label": {
+              "vi": "Ingest tới published index",
+              "en": "Ingest into published indexes"
+            },
+            "steps": [
+              {
+                "from": "source",
+                "to": "parse",
+                "description": {
+                  "vi": "Read stable content generation và access/deletion metadata.",
+                  "en": "Read stable content generations and access/deletion metadata."
+                },
+                "async": true
+              },
+              {
+                "from": "parse",
+                "to": "embed",
+                "description": {
+                  "vi": "Embed bounded structured chunks với exact document encoder/profile.",
+                  "en": "Embed bounded structured chunks under pinned profiles."
+                }
+              },
+              {
+                "from": "embed",
+                "to": "vector",
+                "description": {
+                  "vi": "Write staged vectors/chunk metadata theo generation.",
+                  "en": "Write staged vectors/metadata under generations."
+                },
+                "async": true
+              },
+              {
+                "from": "parse",
+                "to": "lexical",
+                "description": {
+                  "vi": "Index normalized lexical fields/IDs với same chunk identity.",
+                  "en": "Index lexical fields/identifiers using matching chunk identities."
+                },
+                "async": true
+              },
+              {
+                "from": "vector",
+                "to": "registry",
+                "description": {
+                  "vi": "Validate staged readiness và reject obsolete builders trước publish.",
+                  "en": "Validate readiness and reject obsolete builders before publishing."
+                }
+              }
+            ]
+          },
+          {
+            "id": "retrieve",
+            "label": {
+              "vi": "Authorized hybrid retrieval",
+              "en": "Authorized hybrid retrieval"
+            },
+            "steps": [
+              {
+                "from": "user",
+                "to": "retrieval",
+                "description": {
+                  "vi": "Validate scope và create bounded standalone/subqueries nếu phù hợp.",
+                  "en": "Validate scopes and form bounded standalone/subqueries when useful."
+                }
+              },
+              {
+                "from": "retrieval",
+                "to": "policy",
+                "description": {
+                  "vi": "Resolve server-trusted principal/current policy; không lấy ACL từ model text.",
+                  "en": "Resolve trusted identity/current policies rather than model-supplied ACLs."
+                }
+              },
+              {
+                "from": "retrieval",
+                "to": "lexical",
+                "description": {
+                  "vi": "Retrieve eligible lexical candidates với analyzer/profile đã pin.",
+                  "en": "Retrieve eligible lexical candidates with pinned analyzers."
+                }
+              },
+              {
+                "from": "retrieval",
+                "to": "vector",
+                "description": {
+                  "vi": "Use compatible query embedding/metric với eligible filtering.",
+                  "en": "Use compatible query vectors/metrics and eligible filtering."
+                }
+              },
+              {
+                "from": "vector",
+                "to": "rerank",
+                "description": {
+                  "vi": "Merge candidate IDs, fresh-fetch và authorize trước text exposure.",
+                  "en": "Merge IDs, fetch fresh content and authorize before exposing text."
+                }
+              }
+            ]
+          },
+          {
+            "id": "answer",
+            "label": {
+              "vi": "Candidates thành cited answer",
+              "en": "Turn candidates into cited answers"
+            },
+            "steps": [
+              {
+                "from": "rerank",
+                "to": "assemble",
+                "description": {
+                  "vi": "Select bounded relevant spans; không coi rerank score là factual proof.",
+                  "en": "Select bounded relevant spans without treating scores as factual proof."
+                }
+              },
+              {
+                "from": "assemble",
+                "to": "generate",
+                "description": {
+                  "vi": "Give versioned evidence IDs và explicit conflict/unknown rules.",
+                  "en": "Provide versioned evidence identities and conflict/unknown rules."
+                }
+              },
+              {
+                "from": "generate",
+                "to": "policy",
+                "description": {
+                  "vi": "Before source previews/citations exposure, enforce intended current-access boundary.",
+                  "en": "Enforce the intended access boundary for previews/references."
+                }
+              },
+              {
+                "from": "generate",
+                "to": "user",
+                "description": {
+                  "vi": "Return answer hoặc abstention, valid references và freshness metadata.",
+                  "en": "Return answers/abstention, valid references and freshness metadata."
+                }
+              }
+            ]
+          },
+          {
+            "id": "delete",
+            "label": {
+              "vi": "Delete hoặc revoke quyền",
+              "en": "Delete or revoke access"
+            },
+            "steps": [
+              {
+                "from": "source",
+                "to": "policy",
+                "description": {
+                  "vi": "Record authoritative deletion/revocation và invalidate exposure decisions theo policy.",
+                  "en": "Record authoritative deletions/revocations and invalidate exposure decisions."
+                },
+                "async": true
+              },
+              {
+                "from": "policy",
+                "to": "registry",
+                "description": {
+                  "vi": "Advance relevant generation/policy barrier; old builders không revive data.",
+                  "en": "Advance relevant generation/policy barriers against stale publication."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "vector",
+                "description": {
+                  "vi": "Apply tombstone/update filter metadata và schedule physical cleanup.",
+                  "en": "Apply tombstones/filter updates and schedule cleanup."
+                },
+                "async": true
+              },
+              {
+                "from": "registry",
+                "to": "lexical",
+                "description": {
+                  "vi": "Remove/update lexical entries và caches theo freshness contract.",
+                  "en": "Remove/update lexical entries and caches under freshness contracts."
+                },
+                "async": true
+              },
+              {
+                "from": "policy",
+                "to": "rerank",
+                "description": {
+                  "vi": "Recheck exposure khi index metadata chưa propagate.",
+                  "en": "Recheck exposure while index metadata catches up."
+                }
+              }
+            ]
+          },
+          {
+            "id": "migration",
+            "label": {
+              "vi": "Đổi embedding profile",
+              "en": "Change embedding profiles"
+            },
+            "steps": [
+              {
+                "from": "registry",
+                "to": "parse",
+                "description": {
+                  "vi": "Build candidate generation trên stable snapshots cộng incremental changes.",
+                  "en": "Build a new generation from stable snapshots plus incremental changes."
+                },
+                "async": true
+              },
+              {
+                "from": "parse",
+                "to": "embed",
+                "description": {
+                  "vi": "Use new compatible document/query profile, không trộn unknown vector spaces.",
+                  "en": "Use new compatible profiles without mixing unverified vector spaces."
+                }
+              },
+              {
+                "from": "embed",
+                "to": "vector",
+                "description": {
+                  "vi": "Populate separate generation và track completion/failures.",
+                  "en": "Populate a separate generation and track completeness/failures."
+                },
+                "async": true
+              },
+              {
+                "from": "vector",
+                "to": "registry",
+                "description": {
+                  "vi": "Compare retrieval/task evals, freshness và memory/cost; atomic manifest cutover.",
+                  "en": "Compare retrieval/task quality, freshness and costs before manifest cutover."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "retrieval",
+                "description": {
+                  "vi": "Pin matching query encoder/index generation; retain bounded rollback.",
+                  "en": "Pin matching query encoders/index generations and retain rollback."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "6. API minh họa giữ evidence và permission scope",
+        "en": "6. Teaching APIs preserve evidence and permission scopes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các API dưới đây minh họa internal contracts, không phải endpoint của một search vendor. Caller cung cấp task input; server bind verified identity và scope, không tin user/model tự gửi group list để cấp quyền. Search results pin index/content/embedding generation; answer response giữ versioned evidence references để trace và check source access khi mở preview.",
+          "en": "These are internal teaching contracts rather than vendor endpoints. Servers bind verified identity/scopes instead of trusting caller-supplied group claims. Results pin index/content/embedding generations, while answers retain versioned evidence references for tracing and access-checked previews."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/v1/documents/{id}/generations",
+          "description": {
+            "vi": "Staged ingest với immutable source generation và checksum.",
+            "en": "Stage ingestion with immutable source generations/checksums."
+          },
+          "request": "{generation,checksum,sourceRef,parserProfile,chunkerProfile,embeddingProfile}",
+          "response": "202 {jobId,generation,state:\"staging\"}",
+          "notes": [
+            {
+              "vi": "ACL/ownership lấy từ authoritative integration; HTTP 202 không chứng minh searchable.",
+              "en": "Authoritative integrations supply ownership/ACLs;202 does not establish search visibility."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/internal/v1/search",
+          "description": {
+            "vi": "Bounded candidate search trong server-resolved scope.",
+            "en": "Bounded candidate search within server-resolved scopes."
+          },
+          "request": "{query,conversationScope,indexProfile,candidateBudget}",
+          "response": "200 {indexGeneration,candidates:[{chunkId,contentGeneration,sourceSpan,rankSignals}]}",
+          "notes": [
+            {
+              "vi": "Chỉ expose eligible metadata/text theo policy; không trả unauthorized snippets.",
+              "en": "Expose eligible metadata/text under policy without unauthorized snippets."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/internal/v1/answers",
+          "description": {
+            "vi": "Generate trong evidence/output/deadline budget có abstention.",
+            "en": "Generate within evidence/output/deadline budgets with abstention."
+          },
+          "request": "{question,conversationId?,deadlineAt,answerContractVersion}",
+          "response": "200 {answer?,abstained,reason?,evidence:[{chunkId,contentGeneration,span}],estimatedAt}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/internal/v1/documents/{id}",
+          "description": {
+            "vi": "Record tombstone/visibility decision, rồi propagate cleanup.",
+            "en": "Record tombstone/visibility decisions before cleanup propagation."
+          },
+          "response": "202 {deletionGeneration,visibilityBoundary,cleanupState}",
+          "notes": [
+            {
+              "vi": "Logical visibility boundary và physical purge/retention không đồng nghĩa; contract cần nói rõ.",
+              "en": "Logical visibility differs from physical purge/retention; define the contract."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hybrid",
+      "title": {
+        "vi": "7. Lexical, semantic và rank fusion",
+        "en": "7. Lexical, semantic and rank fusion"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lexical retrieval giữ exact terms, IDs và phrase/analyzer behavior; BM25 dùng term frequency saturation, inverse document frequency và length normalization. Semantic retrieval có thể match paraphrases nhưng miss rare codes hoặc rank text có nghĩa gần mà không trả lời task. Exact-ID routing, fields/analyzers và multilingual behavior cần eval riêng; không assume mọi embedding xóa identifiers hoặc BM25 luôn hiểu tên/code nếu analyzer đã phá chúng.",
+          "en": "Lexical retrieval preserves term/identifier/phrase signals, with BM25 frequency saturation, rarity and length normalization. Semantic search can match paraphrases yet miss rare codes or retrieve nearby but unhelpful content. Evaluate identifiers, analyzers and languages rather than assuming universal strengths or weaknesses."
+        },
+        {
+          "vi": "BM25 thường cộng IDF(t)×f(k 1+1)/(f+k 1(1−b+b·len/avgLen)); có nhiều IDF/scoring variants. Một common nonnegative variant làln(1+(N−df+0,5)/(df+0,5)). Các scores từ lexical và vector có scale khác nên raw sum cần calibration; RRF chỉ dùng rank, cộng 1/(k+rank) theo mỗi list. k=60 là conventional starting point, không optimal constant cho mọi workload. Duplicate IDs trong một list không được làm tăng votes vô hạn.",
+          "en": "A common BM25 form sums IDF(t)×f(k 1+1)/(f+k 1(1−b+b·len/avgLen)), with variant scoring/IDF choices. One nonnegative IDF isln(1+(N−df+0.5)/(df+0.5)). Raw lexical/vector sums need scale handling; RRF uses ranks through 1/(k+rank). Sixty is a conventional starting value rather than a universal optimum, and duplicate list entries must not inflate votes."
+        },
+        {
+          "vi": "Fusion có thể làm tốt hơn hoặc tệ hơn một retriever tùy query và candidate sets. Một relevant item không xuất hiện trong bất kỳ list nào không được RRF tạo ra. Rerank phía sau chỉ reorder candidate union; tăng depth có thể tăng coverage nhưng thêm work/context noise. Giữ per-retriever recall và latency để biết stage nào cần sửa.",
+          "en": "Fusion can improve or worsen individual queries. It cannot invent candidates absent from all lists; reranking only reorders candidates. Deeper lists can improve coverage at additional work/noise. Track retriever-specific relevance and latency to locate weaknesses."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "content": "rank_A(OPS) = 2, rank_B(OPS) = 3, k = 60\nRRF(OPS) = 1/(60+2) + 1/(60+3) ≈ 0.032002\n// One-based ranks; absent list contributes zero.\n// This score is not an answer-correctness probability.",
+        "caption": {
+          "vi": "Worked rank arithmetic; ranks này là ví dụ riêng, không defaults của lab bên dưới.",
+          "en": "Worked rank arithmetic; these ranks are separate from the lab defaults."
+        }
+      }
+    },
+    {
+      "id": "ranks-lab",
+      "title": {
+        "vi": "8. Thử candidate ceiling, RRF và filter ordering",
+        "en": "8. Explore candidate ceilings, fusion and filter order"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lab khai báo trước hai ranked lists và one-query relevance labels để isolate fusion/selection. Nó không chạy neural embedding hoặc BM25. Với hybriddepth 3 và filter sớm, candidate union có cả OPS/RECOVERY. Rerank scores giả lập đưa hai chunks này vào prompt; bỏ rerank cho recall@2 thấp hơn ở fixture này. Chuyển lexical-only để thấy relevant chunk vắng khỏi candidates không thể được rerank cứu.",
+          "en": "The lab declares two lists and relevance labels to isolate fusion/selection rather than running retrieval models. Early-filtered hybrid depth 3 includes both required chunks; fixed rerank scores select them. Lexical-only omits a relevant candidate, illustrating a ceiling reranking cannot overcome. This fixture does not prove universal reranker gains."
+        },
+        {
+          "vi": "Filter muộn ở lab vẫn diễn ra trước mọi consumer; đây chỉ là comparison về candidate starvation, không claim postfilter luôn safe. Trong production, unauthorized content có thể đã leak nếu fetch/rerank/log/send provider trước check. Early eligibility giúp candidate budget tập trung vào allowed set, nhưng approximate search còn có recall/latency trade-offs và current-policy validation riêng.",
+          "en": "Late filtering here occurs before consumers and illustrates starvation rather than universal safety. Production exposure can already occur if unauthorized content reaches fetch/rerank/log/provider paths first. Early eligibility improves candidate budgets, while approximate search and current-policy checks still need separate treatment."
+        }
+      ],
+      "experiment": "rag-ranks"
+    },
+    {
+      "id": "ann",
+      "title": {
+        "vi": "9. Exact, HNSW, IVF và PQ là những trade-offs khác nhau",
+        "en": "9. Exact, HNSW, IVF and PQ make different trade-offs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Flat exact scan có cost tăng theo corpus/dimension nhưng vẫn có thể phù hợp corpus nhỏ, selective eligible sets, accelerated batches hoặc baseline evaluation. ANN giảm work bằng approximation. HNSW dùng multi-layer proximity graph; efSearch mở rộng search breadth, M/build settings ảnh hưởng connectivity/memory. Không có một efSearch→recall/latency curve đúng cho mọi corpus, filter, query hoặc hardware.",
+          "en": "Exact scans can suit small corpora, selective sets, accelerated batches or evaluation baselines despite scaling costs. HNSW uses layered proximity graphs, with breadth, connectivity and build settings affecting behavior. No universal search-breadth curve predicts recall/latency across data, filters and hardware."
+        },
+        {
+          "vi": "IVF gán vectors vào coarse cells, query probe một số cells rồi score candidates. nprobe tăng có thể recover missed neighbors nhưng thêm work; probing hết cells ở IVF-Flat có thể recover exact neighbors dưới cùng metric/data, cộng overhead coarse search. PQ nén sub-vectors thành codes và dùng codebooks; giảm memory nhưng approximation khác với cell pruning. Rerank originals có thể sửa distance error của candidates nhưng không recover neighbors chưa được scan.",
+          "en": "IVF assigns vectors to coarse cells and probes some cells before scoring candidates. More probes trade work for neighbor coverage; IVF-Flat over all cells can recover exact neighbors plus coarse-search overhead. PQ introduces a separate codebook approximation. Original-vector rescoring can refine candidate distances but cannot recover unscanned neighbors."
+        },
+        {
+          "vi": "ANN recall@k thường so approximate top-k với exact top-k theo cùng metric; annotated retrieval relevance recall hỏi có đủ answer-bearing evidence hay không. Exact-neighbor recall 100% không chứng minh relevant answer tìm thấy. Lab dùng actual 48 points với exact baseline cho metric thứ nhất; rank lab dùng labeled chunks cho metric thứ hai. Memory worksheet tách payload/IDs/codebooks và không fabricate production timing.",
+          "en": "ANN recall compares approximate and exact metric neighbors; relevance recall asks whether answer-bearing evidence was found. Perfect neighbor recall does not imply answer coverage. The point lab computes neighbor recall, while the ranked-list lab measures labeled evidence. Memory arithmetic separates payloads/IDs/codebooks without fabricated timing."
+        }
+      ],
+      "experiment": "rag-ivf",
+      "table": {
+        "headers": [
+          {
+            "vi": "Metric",
+            "en": "Metric"
+          },
+          {
+            "vi": "Ground truth",
+            "en": "Ground truth"
+          },
+          {
+            "vi": "Công thức / câu hỏi",
+            "en": "Formula or question"
+          },
+          {
+            "vi": "Metric chưa chứng minh điều gì?",
+            "en": "Does not establish"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "ANN recall@k",
+              "en": "ANN recall@k"
+            },
+            {
+              "vi": "Exact top-k theo cùng vector metric",
+              "en": "Exact top-k under the same metric"
+            },
+            {
+              "vi": "|ANN∩Exact| / k",
+              "en": "|ANN∩Exact| / k"
+            },
+            {
+              "vi": "Answer evidence đúng task",
+              "en": "Task-relevant answer evidence"
+            }
+          ],
+          [
+            {
+              "vi": "Relevance recall@k",
+              "en": "Relevance recall@k"
+            },
+            {
+              "vi": "Labeled relevant eligible evidence",
+              "en": "Labeled relevant eligible evidence"
+            },
+            {
+              "vi": "|Retrieved relevant| / |All labeled relevant|",
+              "en": "|Retrieved relevant| / |All labeled relevant|"
+            },
+            {
+              "vi": "Model dùng evidence đúng",
+              "en": "Correct model use of evidence"
+            }
+          ],
+          [
+            {
+              "vi": "Prompt precision",
+              "en": "Prompt precision"
+            },
+            {
+              "vi": "Relevant labels của chunks đã pack",
+              "en": "Relevance labels of packed chunks"
+            },
+            {
+              "vi": "|Relevant packed| / |Packed|",
+              "en": "|Relevant packed| / |Packed|"
+            },
+            {
+              "vi": "Cover mọi subquestion",
+              "en": "Coverage of all subquestions"
+            }
+          ],
+          [
+            {
+              "vi": "Claim support",
+              "en": "Claim support"
+            },
+            {
+              "vi": "Evidence spans và claim evaluation",
+              "en": "Evidence spans and claim evaluation"
+            },
+            {
+              "vi": "Claim có được nguồn support không?",
+              "en": "Does evidence support the claim?"
+            },
+            {
+              "vi": "Quyền đọc hiện tại hoặc freshness",
+              "en": "Current access or freshness"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "rerank",
+      "title": {
+        "vi": "10. Reranking, rewrite và HyDE cần evidence riêng",
+        "en": "10. Reranking, rewrites and HyDE need separate evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cross-encoder thường score query-passage pair jointly, đổi thêm compute/latency lấy potential relevance precision. Model có thể sai hoặc vượt input limits; wide→narrow funnel không có magic 50→5cho mọi task. Tune candidate depth, pair batching, truncation và context slots theo eval/cost/SLO. Reranker service cũng là exposure boundary nếu nằm ngoài trust/tenant domain.",
+          "en": "Cross-encoders jointly score query/passage pairs, potentially improving precision at added cost/latency. They can fail or truncate; no candidate-depth recipe fits every task. Tune depths, batching, truncation and context slots under evaluations/budgets, and respect external reranker exposure boundaries."
+        },
+        {
+          "vi": "Rewrite biến follow-up thành standalone question hoặc split multi-hop subqueries, nhưng có thể đổi user intent, bỏ negation, units hoặc ID. Giữ original query, bound expansions và evaluate rewrites theo downstream evidence. HyDE tạo hypothetical document để retrieve, không tạo authoritative answer: generated details có thể sai. Không cite hypothetical text như source; verify actual retrieved documents và query task coverage.",
+          "en": "Rewrites can resolve follow-ups or split questions but may change intent, negation, units or identifiers. Retain originals, bound expansion and evaluate downstream evidence. HyDE retrieves using hypothetical text that can contain false details; never cite that hypothetical text as authoritative evidence."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Evidence funnel có candidate ceiling",
+          "en": "Evidence funnels have candidate ceilings"
+        },
+        "caption": {
+          "vi": "Mỗi stage phải giữ scope, versions và resource budget; không có magic top-k chung mọi task.",
+          "en": "Every stage preserves scopes, versions and budgets rather than one universal top-k."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Retrieve wide",
+              "en": "Retrieve broadly"
+            },
+            "detail": {
+              "vi": "Lexical/vector lists với bounded depth.",
+              "en": "Retrieve bounded lexical/vector lists."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Fuse and fetch",
+              "en": "Fuse and fetch"
+            },
+            "detail": {
+              "vi": "Dedup IDs, current versions và authorized text.",
+              "en": "Deduplicate IDs and fetch current authorized text."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Rerank",
+              "en": "Rerank"
+            },
+            "detail": {
+              "vi": "Score existing query-passage pairs; absent candidates vẫn absent.",
+              "en": "Score existing pairs; absent candidates remain absent."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Pack",
+              "en": "Pack"
+            },
+            "detail": {
+              "vi": "Relevant diverse spans trong context/output budget.",
+              "en": "Pack diverse relevant spans within context/output budgets."
+            },
+            "icon": "scope"
+          }
+        ]
+      }
+    },
+    {
+      "id": "packing",
+      "title": {
+        "vi": "11. Context packing giữ điều kiện, không chỉ chọn top scores",
+        "en": "11. Pack conditions and evidence rather than only scores"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sau retrieval/rerank, deduplicate overlapping chunks, group source versions và chọn spans cover subquestions trong token budget. Diversity, adjacency/parent expansion và title context có thể cần thiết để giữ exceptions/conditions. Nếu top 5là cùng một paragraph lặp lại, similarity cao vẫn có evidence coverage thấp. Reserve tokens cho instructions, conversation, tools và output, không fill tới model limit bằng passages rồi quên phần còn lại.",
+          "en": "Deduplicate overlaps, align source versions and cover subquestions within budgets. Diversity and authorized adjacent/parent spans preserve exceptions/conditions. Repeated high-scoring copies can have poor evidence coverage. Reserve instruction, history, tool and output capacity instead of filling the model limit with passages alone."
+        },
+        {
+          "vi": "Model có thể nhạy với evidence position và distractors; effect phụ thuộc model/task và cần đo thay khẳng định mọi long-context model luôn bỏ phần giữa. Pin source spans và distinguish generated headers/summaries với raw evidence. Với contradictory generations, chọn canonical freshness policy hoặc nêu conflict/abstain; không silently merge old/new policies thành một fact.",
+          "en": "Position/distractor effects depend on models/tasks and need measurement. Preserve source spans and distinguish generated headers from raw evidence. Conflicting generations need canonical freshness policies, explicit conflicts or abstention rather than silent merging."
+        }
+      ]
+    },
+    {
+      "id": "freshness",
+      "title": {
+        "vi": "12. Freshness và late-builder race",
+        "en": "12. Freshness and late-builder races"
+      },
+      "paragraphs": [
+        {
+          "vi": "Content update, delete và ACL change là different events. Query-visible generation cần publication guard, source revision và manifest semantics rõ. Tombstone chặn logical exposure trước eventual physical cleanup theo retention contract; old build completion không được revive deleted content. Retry/idempotency phải preserve logical work identity nhưng không cho old generation overwrite mới.",
+          "en": "Content updates, deletions and access changes are different events. Define generations, publication guards and manifests. Tombstones can stop exposure before eventual physical cleanup; late builds must not revive deleted content. Stable retry identities do not authorize obsolete overwrites."
+        },
+        {
+          "vi": "Lab tách publication guard với query-time delete/ACL guard. Bỏ publication guard có thể làm stale content visible dù ACL vẫn hợp lệ; final authorization không tự sửa content freshness. Ngược lại, current content version vẫn có thể gắn stale ACL, nên version guard một mình không là access control. Đây là sequential race fixture, không distributed implementation.",
+          "en": "The lab separates publication guards from final delete/ACL checks. Stale content can remain authorized, so access checks do not repair freshness. Current content can carry stale ACLs, so version guards do not replace access control. This is a sequential race illustration rather than a distributed implementation."
+        }
+      ],
+      "experiment": "rag-publication"
+    },
+    {
+      "id": "access",
+      "title": {
+        "vi": "13. Authorization phải giữ trước mọi text exposure",
+        "en": "13. Authorization precedes text exposure"
+      },
+      "paragraphs": [
+        {
+          "vi": "Server resolve principal/groups theo intended current-policy contract, attach policy metadata ở ingestion và apply eligibility trong retrieval nếu supported. Sau candidate IDs, fetch/liveness/permission revalidation có thể cần thiết khi index/group caches stale. Không coi model là enforcement point, không tin user gửi groups và không gửi forbidden chunks tới reranker/provider rồi mới bỏ ở answer. Metadata/snippets/citation previews/logs cũng có thể leak.",
+          "en": "Resolve identities/groups under current-policy contracts, attach ingestion metadata and filter eligible retrieval where supported. Candidate fetch/liveness revalidation can be necessary with stale indexes/caches. Models do not enforce permissions; caller group claims and post-generation removal cannot justify earlier forbidden exposure. Metadata, previews and logs can leak too."
+        },
+        {
+          "vi": "Answer, semantic, retrieval và prefix caches cần proper scope và freshness/version keys. Hai users có query giống nhau không tự được share answer chứa different permissions. TTL giảm stale window nhưng không guarantee immediate revocation; stronger guarantees cần barriers/invalidation/revalidation và explicit failure behavior khi authority unavailable. Access can change giữa retrieval và citation click, nên define boundary cho long requests/streams và source previews.",
+          "en": "Answer, semantic, retrieval and prefix caches need scopes and freshness/version identities. Equal queries do not authorize cross-user sharing. TTLs do not guarantee immediate revocation; stronger contracts require barriers, invalidation/revalidation and authority-failure policies. Define access boundaries for long streams and later citation previews."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Giữ quyền trước mọi exposure boundary",
+          "en": "Preserve access at exposure boundaries"
+        },
+        "caption": {
+          "vi": "Index filters, authoritative checks và cache scope làm những việc liên quan nhưng khác nhau.",
+          "en": "Filters, authority checks and cache scopes have related but distinct roles."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Resolve principal",
+              "en": "Resolve principals"
+            },
+            "detail": {
+              "vi": "Trusted server identity và current policy.",
+              "en": "Use trusted identities and current policies."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Eligible candidates",
+              "en": "Eligible candidates"
+            },
+            "detail": {
+              "vi": "Apply supported search filters để giảm starvation.",
+              "en": "Apply supported filters to reduce starvation."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Fetch and revalidate",
+              "en": "Fetch and revalidate"
+            },
+            "detail": {
+              "vi": "Liveness/ACL theo contract trước text đi consumer.",
+              "en": "Check liveness/access before text reaches consumers."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Scoped exposure",
+              "en": "Scoped exposure"
+            },
+            "detail": {
+              "vi": "Reranker, prompt, logs, caches và citation previews.",
+              "en": "Scope reranking, prompts, logs, caches and previews."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "citations",
+      "title": {
+        "vi": "14. Citation ID không tự chứng minh claim đúng",
+        "en": "14. Citation identities do not prove claims"
+      },
+      "paragraphs": [
+        {
+          "vi": "Response nên giữ chunk/document generation, source span và link/preview contract. Check cited IDs có trong eligible supplied evidence và claim thực sự được span support; một link hợp lệ nhưng không nói điều model khẳng định là unsupported citation. References còn cần current-access checks khi mở. Generated summaries/HyDE text không được đổi thành authoritative citations chỉ vì đã ở context.",
+          "en": "Preserve source generations/spans and access-checked preview contracts. Verify cited IDs were supplied/eligible and actually support the associated claims; valid links can still be unsupported citations. Generated summaries/hypothetical text do not become authoritative evidence by appearing in context."
+        },
+        {
+          "vi": "Khi không đủ evidence, explicit not-found/unknown hoặc qualified answer có thể đúng product behavior hơn confident completion. Separate answer completeness, factual support và abstention calibration.",
+          "en": "Insufficient evidence can warrant unknown/not-found or qualified responses rather than confident completion. Measure completeness, support and abstention separately. RAG source references are product evidence tied to retrieved documents."
+        }
+      ]
+    },
+    {
+      "id": "long-context",
+      "title": {
+        "vi": "15. Long context và RAG có thể phối hợp",
+        "en": "15. Long contexts and RAG can work together"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một bounded document có thể đưa thẳng vào context nếu size, access, latency/cost và task quality phù hợp. Large changing corpora thường cần retrieval/selective tools nhưng không có cutoff token count áp dụng mọi sản phẩm. Context caching có thể giảm một phần cost nhưng không miễn context memory, update invalidation hoặc quality problems. RAG có thể retrieve parent document rồi dùng long context bên trong nó.",
+          "en": "Bounded documents can fit directly when size, access, cost and quality permit. Large changing corpora often need retrieval/tools, without a universal token cutoff. Caching can reduce some costs without eliminating memory, invalidation or quality issues. Retrieval can select a parent document for long-context processing."
+        },
+        {
+          "vi": "Compare end-to-end task quality/cost/latency trên representative queries, include ACL/freshness và citations. Long context có thể tránh chunk retrieval miss nhưng vẫn bị distractors/truncation; RAG tiết kiệm selection nhưng có candidate ceiling. Không chọn chỉ bằng max context marketing hoặc nearest-neighbor benchmark.",
+          "en": "Compare end-to-end quality, costs, latency, access, freshness and evidence. Long contexts can avoid chunk misses but still face distractors/truncation; selective retrieval has candidate ceilings. Neither context-window marketing nor neighbor benchmarks suffice."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Bounded long context",
+            "en": "Bounded long context"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Ít hoặc một document phù hợp input budget; giảm chunk-selection misses.",
+              "en": "Fits bounded documents and avoids some chunk-selection misses."
+            },
+            {
+              "vi": "Vẫn trả token/memory cost, distractors và access/freshness checks.",
+              "en": "Still incurs context costs, distractors and access/freshness checks."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Retrieval và tools",
+            "en": "Retrieval and tools"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Selective evidence hoặc structured records từ corpus lớn/thay đổi.",
+              "en": "Select evidence or structured records from larger/changing corpora."
+            },
+            {
+              "vi": "Có ingestion/candidate ceiling và operating overhead cần đo.",
+              "en": "Has ingestion/candidate ceilings and operational overhead."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Hybrid approach",
+            "en": "Hybrid approach"
+          },
+          "icon": "compare",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Retrieve eligible parent document rồi dùng longer context bên trong.",
+              "en": "Retrieve eligible parent documents for longer-context processing."
+            },
+            {
+              "vi": "Chốt bằng task quality, latency/cost và evidence coverage.",
+              "en": "Choose using task quality, costs, latency and evidence coverage."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "eval",
+      "title": {
+        "vi": "16. Debug và vận hành theo từng layer",
+        "en": "16. Debug and operate by layer"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tạo labeled query set theo task/domain/language/permission scope, gồm answer-present/absent, exactIDs, paraphrases, multi-hop, old versions và adversarial documents. Đo corpus coverage, parse/chunk failures, per-retriever relevance recall@k, candidate union recall, rerank precision/nDCG khi labels hỗ trợ, context coverage, groundedness, citation validity và answer/task success. ANN recall dùng exact vector baseline riêng.",
+          "en": "Label queries across tasks, languages and permission scopes, including absent answers, identifiers, paraphrases, multihop evidence, old revisions and adversarial documents. Measure each ingestion/relevance/ranking/context/answer stage; use exact-vector baselines separately for ANN recall. Choose ranking metrics appropriate to labels rather than conflating them with answer success."
+        },
+        {
+          "vi": "Khi user nói “không tìm thấy”: trace source exists/eligible/ingested/current? candidate có relevant span? span có vào prompt không? model có dùng đúng không? Fix đúng stage rồi run regression slices. Increase top-k hoặc model size mù có thể tăng cost/distractors mà không sửa parser, ACL hay missing documents. Track ingest/index lag, delete/revoke exposure delay, query tails, reranker saturation và cache freshness.",
+          "en": "For cannot-find reports, trace source eligibility, ingestion/freshness, candidates, packed spans and model use. Fix the responsible stage and rerun slices. Blindly increasing top-k or model size can add cost/noise without fixing missing documents, parsing or access. Observe ingestion/visibility delays, tails, saturation and caches."
+        },
+        {
+          "vi": "Cost/query gồm query embedding/rewrite, index search, fetch/auth, rerank pairs, generation tokens và amortized ingestion/storage/replicas. Offline indexing vẫn có spend và quality impact. Pin versions, canary migrations, bound failures và fallback/abstain khi required evidence/authority unavailable. Evals cần fresh holdouts và không leak labels vào retrieval corpus.",
+          "en": "Query costs include embeddings/rewrites, searches, fetching/authorization, reranking, generation and amortized indexing/storage. Offline work still costs resources. Version/canary migrations and define bounded failures/abstention when evidence or authorities are unavailable, keeping evaluation labels out of retrieval corpora."
+        }
+      ]
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "17. Câu hỏi và lời giải",
+        "en": "17. Questions with worked answers"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Docs có đáp án nhưng RAG không trả được: kiểm gì?",
+            "en": "Documents contain an answer but RAG misses it. What should be checked?"
+          },
+          "answer": [
+            {
+              "vi": "Trace source eligibility/current version, parser/chunks, per-retriever candidates, rerank/packing và generator use. Dùng labeled failing queries để phân loại misses. Đừng đổi embedding/model trước khi biết evidence đã mất ở đâu.",
+              "en": "Trace source eligibility, parsing, candidates, reranking/packing and generation using labeled failures. Locate missing evidence before replacing models."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Recall ANN 100% có nghĩa answer quality 100% không?",
+            "en": "Does perfect ANN recall imply perfect answers?"
+          },
+          "answer": [
+            {
+              "vi": "Không. ANN metric chỉ so neighbors theo vector distance với exact baseline. Exact nearest chunks vẫn có thể irrelevant, stale hoặc insufficient. Annotated relevance/evidence coverage và answer support cần metrics riêng.",
+              "en": "No. Neighbor recall compares vector-distance rankings; exact neighbors can be irrelevant, stale or insufficient. Measure evidence coverage and supported answers separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Rerank có cứu relevant chunk nằm ngoài candidate union không?",
+            "en": "Can reranking recover evidence outside the candidate union?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu chỉ score existing candidates. Sửa retriever/depth/query/chunking hoặc thêm authorized evidence retrieval. Rerank score cao cũng không là probability answer đúng.",
+              "en": "Not when it scores existing candidates only. Improve retrieval/depth/queries/chunks or retrieve additional authorized evidence. Reranker scores are not answer-correctness probabilities."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "RRF dùng raw similarity scores thế nào?",
+            "en": "How does RRF use raw similarity scores?"
+          },
+          "answer": [
+            {
+              "vi": "RRF dùng ranks, không cần raw scores cùng scale. Mỗi list góp 1/(k+rank), absentitem góp 0. Chọn k/weights/candidate depth bằng eval; dedup IDs và không assume fusion luôn hơn best retriever trên mọi query.",
+              "en": "It uses ranks through 1/(k+rank), with absent items contributing zero. Tune constants/weights/depths, deduplicate identities and evaluate rather than assuming universal gains."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đổi embedding model cùngdimension có query chung index được không?",
+            "en": "Can an equal-dimensional new embedding model query the same index?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi representation compatibility được xác minh. Dimensions giống không chứng minh cùng geometry/metric/templates. Thường cần separate generation, re-embed/backfill/catch-up, matching query profile và controlled cutover/rollback nếu incompatible.",
+              "en": "Only with verified representation compatibility. Equal dimensions do not establish geometry, metrics or template compatibility. Incompatible changes need separate generations, backfills/change catch-up and controlled cutovers."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Filter sau search có luôn không leak không?",
+            "en": "Is post-search filtering always leak-free?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu forbidden text đã đi fetch/log/reranker/provider trước filter. Apply eligibility phù hợp và validate authoritative access trước intended exposure; handle stale policy/cache và citation previews. Candidate starvation còn là quality issue riêng.",
+              "en": "No when forbidden content already reached logs, rerankers or providers. Enforce eligibility and authoritative access at exposure boundaries, including caches/previews; starvation is a separate quality issue."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Old builder xong sau delete thì xử lý ra sao?",
+            "en": "What if an old builder finishes after deletion?"
+          },
+          "answer": [
+            {
+              "vi": "Conditional publish theo source generation/tombstone để reject old work, propagate delete state và clean derived indexes/caches theo contract. Finalquery check có thể block exposure trong propagation lag; physical purge khác logical visibility.",
+              "en": "Reject obsolete publication using generations/tombstones, propagate deletion and clean derived state/caches under contracts. Final checks can block exposure during lag; physical purge differs from logical visibility."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Citation link mở được thì claim đã grounded chưa?",
+            "en": "Does a working citation link establish grounding?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Check đúng eligible version/span và evidence có support claim, không chỉ ID tồn tại. Handle conflicts/freshness và access tại preview boundary; nếu evidence thiếu thì abstain hoặc qualify answer.",
+              "en": "No. Verify eligible versions/spans actually support claims, including conflicts, freshness and preview access. Insufficient evidence can require abstention or qualification."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
