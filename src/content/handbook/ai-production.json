@@ -1,0 +1,1245 @@
+{
+  "id": "ai-production",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Production LLM Apps: streaming, cache và vận hành có kiểm soát",
+    "en": "Production LLM Apps: streaming, caching and controlled operations"
+  },
+  "summary": {
+    "vi": "Thiết kế product boundary và model gateway; xử lý first-content deadlines, partial failures, cache identity, token/spend quotas, retry/fallback, usage evidence và rollout. Mô phỏng stream, cache correctness và conditional cost inventory.",
+    "en": "Design application/gateway boundaries for content deadlines, partial failures, cache identity, quotas, retry/fallback, usage and rollout. Explore streaming, cache correctness and conditional cost inventory."
+  },
+  "prerequisites": [
+    "ai-serving",
+    "ai-evals",
+    "ai-agents",
+    "rate-limiting"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "cache",
+    "observability",
+    "security"
+  ],
+  "takeaways": [
+    {
+      "vi": "Gateway tập trung shared controls, còn application/resource server giữ business/data authorization và task semantics.",
+      "en": "Gateways centralize shared controls while applications/resources retain task semantics and authorization."
+    },
+    {
+      "vi": "TTFT/first content, inter-chunk idle và whole-request deadlines là những metrics/limits khác nhau.",
+      "en": "First-content, inter-chunk and whole-request timing measure and limit different behavior."
+    },
+    {
+      "vi": "Exact response, semantic response và provider prefix caching khác nhau về saved work, correctness và accounting.",
+      "en": "Exact responses, semantic responses and provider prefix reuse differ in saved work, correctness and accounting."
+    },
+    {
+      "vi": "Similarity không thay permission, dependency identity hoặc semantic task correctness.",
+      "en": "Similarity does not replace permission, dependency identity or task correctness."
+    },
+    {
+      "vi": "Reserve trước admission, reconcile actual usage sau; timeout/cancel không tự chứng minh không có bill hoặc effect.",
+      "en": "Reserve before admission and reconcile afterward; timeouts/cancellation do not establish zero cost or effects."
+    },
+    {
+      "vi": "Fallback/cache/routing đều là behavior changes cần eval và operational evidence, không chỉ uptime.",
+      "en": "Fallbacks, caching and routing change behavior and need quality as well as availability evidence."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một request production đi qua những điểm kiểm nào?",
+      "en": "Which checks does a production request cross?"
+    },
+    "caption": {
+      "vi": "Cost, quality và availability phải được đánh giá trên cùng task/usage boundaries.",
+      "en": "Evaluate cost, quality and availability over matched task/usage boundaries."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Authenticate / scope",
+          "en": "Authenticate / scope"
+        },
+        "detail": {
+          "vi": "Principal, task, data policy và allowed actions.",
+          "en": "Bind principals, tasks, data policy and allowed actions."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Resolve / admit",
+          "en": "Resolve / admit"
+        },
+        "detail": {
+          "vi": "Versioned profile, eligible cache và quotas.",
+          "en": "Resolve profiles, eligible caches and quotas."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Generate / stream",
+          "en": "Generate / stream"
+        },
+        "detail": {
+          "vi": "Bound attempts, frame output và enforce commit boundaries.",
+          "en": "Bound attempts and frame output with explicit commit boundaries."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Settle / observe",
+          "en": "Settle / observe"
+        },
+        "detail": {
+          "vi": "Usage evidence, quality, latency và privacy-aware traces.",
+          "en": "Reconcile usage, quality, latency and scoped traces."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Roll out / learn",
+          "en": "Roll out / learn"
+        },
+        "detail": {
+          "vi": "Gated versions, canary, drift và rollback.",
+          "en": "Gate versions and monitor canaries, drift and rollback."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "boundaries",
+      "title": {
+        "vi": "1. Application boundary và model gateway",
+        "en": "1. Application boundaries and model gateways"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một model call là dependency có latency, quota, cost, data handling và behavior contract. Có thể dùng shared gateway để gom routing, request normalization, attempt limits, cache policy và usage attribution. Không phải mọi project đều cần một gateway service riêng ngay từ đầu: một internal module với explicit contracts có thể đủ; tách service khi ownership/scale/isolation yêu cầu. Gateway cũng là dependency cần capacity, availability và rollout riêng.",
+          "en": "Model calls carry latency, quota, cost, data-handling and behavioral contracts. Shared gateways can centralize routing, normalization, attempts, caches and attribution. Small systems may use well-defined internal modules before separate services are justified. Gateways themselves need capacity, reliability and controlled releases."
+        },
+        {
+          "vi": "Application vẫn quyết định task, user intent, business rules và allowed evidence/actions; resource server vẫn enforce object-level auth. Không chuyển mọi policy sang một prompt hoặc để caller tự chọn tenant/model endpoint không hạn chế. Gateway cần trusted principal/feature context và chỉ route tới endpoints đáp ứng data/capability policy. Nếu gateway lỗi, degraded mode phải là quyết định product có chủ đích, không trả arbitrary cached output cho mọi user.",
+          "en": "Applications retain task intent and business/evidence rules, with resource servers enforcing authorization. Gateway calls need trusted scope and qualified endpoints rather than arbitrary tenant/endpoint selection. Degraded modes must preserve explicit product constraints instead of returning arbitrary cached content."
+        }
+      ],
+      "diagram": {
+        "id": "llm-product-delivery-boundaries",
+        "title": {
+          "vi": "Từ product request đến stream, usage và quality evidence",
+          "en": "From product requests to streams, usage and quality evidence"
+        },
+        "caption": {
+          "vi": "Theo trace cache hit, model miss, fallback, cancellation hoặc rollout. Gateway chuẩn hóa cross-cutting controls nhưng app/resource servers vẫn giữ business semantics và authorization.",
+          "en": "Trace cache hits, model calls, fallback, cancellation and rollout. Gateways centralize shared controls without replacing application semantics or resource authorization."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client / UI",
+              "en": "Client / UI"
+            },
+            "detail": {
+              "vi": "Request/generation IDs, visible output state, abort và explicit errors.",
+              "en": "Track request/generation identities, visible output, aborts and errors."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "app",
+            "label": {
+              "vi": "Product API",
+              "en": "Product API"
+            },
+            "detail": {
+              "vi": "Auth, task/business context, data scope và completion contract.",
+              "en": "Enforce identity, business context, data scope and completion contracts."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Model gateway",
+              "en": "Model gateway"
+            },
+            "detail": {
+              "vi": "Route/profile, bounded admission, cache lookup và attempt control.",
+              "en": "Coordinate routing, bounded admission, caches and attempts."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "provider",
+            "label": {
+              "vi": "Qualified model endpoint",
+              "en": "Qualified model endpoint"
+            },
+            "detail": {
+              "vi": "Supported context/tools/schema, deadlines, quotas và usage evidence.",
+              "en": "Match context/tool/schema support, deadlines, quotas and usage evidence."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "model"
+          },
+          {
+            "id": "registry",
+            "label": {
+              "vi": "Versioned manifests",
+              "en": "Versioned manifests"
+            },
+            "detail": {
+              "vi": "Prompt/model/retriever/safety/profile và rollout revision.",
+              "en": "Version prompts, models, retrieval, safety profiles and rollouts."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "cache",
+            "label": {
+              "vi": "Scoped response cache",
+              "en": "Scoped response cache"
+            },
+            "detail": {
+              "vi": "Identity, dependency versions, current permission và semantic validation.",
+              "en": "Check identity, dependencies, permission and semantic suitability."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "quota",
+            "label": {
+              "vi": "Quota / usage ledger",
+              "en": "Quota / usage ledger"
+            },
+            "detail": {
+              "vi": "Request/token/concurrency/spend reservations và reconcile states.",
+              "en": "Track request, token, concurrency and spend reservations/reconciliation."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "fallback",
+            "label": {
+              "vi": "Qualified fallback",
+              "en": "Qualified fallback"
+            },
+            "detail": {
+              "vi": "Data policy/capabilities, available quota và declared degraded behavior.",
+              "en": "Match data policies, capabilities, capacity and degraded behavior."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "trace",
+            "label": {
+              "vi": "Minimal traces",
+              "en": "Minimal traces"
+            },
+            "detail": {
+              "vi": "Tenant/feature tags, attempts, finish/usage/cache state và retention.",
+              "en": "Record scoped tags, attempts, finish/usage/cache states and retention."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "eval",
+            "label": {
+              "vi": "Offline / online evals",
+              "en": "Offline / online evals"
+            },
+            "detail": {
+              "vi": "Per-slice quality/operations, holdout và incident regressions.",
+              "en": "Review slice quality, operations, holdouts and incident regressions."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "rollout",
+            "label": {
+              "vi": "Rollout controller",
+              "en": "Rollout controller"
+            },
+            "detail": {
+              "vi": "Canary, stop conditions, pinning và rollback mapping.",
+              "en": "Control canaries, stopping conditions, pinning and rollback."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Cancellation / reconcile",
+              "en": "Cancellation / reconcile"
+            },
+            "detail": {
+              "vi": "Stop future work, request upstream abort và resolve unknown usage/effects.",
+              "en": "Stop work, request upstream abort and resolve unknown usage/effects."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "worker"
+          }
+        ],
+        "traces": [
+          {
+            "id": "cache-hit",
+            "label": {
+              "vi": "Trả cached response đúng scope",
+              "en": "Serve a scoped response hit"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "app",
+                "description": {
+                  "vi": "Bind request/principal và intended task/context.",
+                  "en": "Bind requests/principals to tasks and context."
+                }
+              },
+              {
+                "from": "app",
+                "to": "gateway",
+                "description": {
+                  "vi": "Render pinned prompt/profile và exact cache identity.",
+                  "en": "Render pinned prompts/profiles and identities."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "cache",
+                "description": {
+                  "vi": "Lookup theo scope/dependencies và revalidate permission.",
+                  "en": "Look up scoped dependencies and revalidate access."
+                }
+              },
+              {
+                "from": "cache",
+                "to": "app",
+                "description": {
+                  "vi": "Return eligible answer/provenance; hit không bypass task constraints.",
+                  "en": "Return eligible answers/provenance without bypassing task constraints."
+                }
+              },
+              {
+                "from": "app",
+                "to": "client",
+                "description": {
+                  "vi": "Serve declared completed response/generation.",
+                  "en": "Serve declared completed response generations."
+                }
+              }
+            ]
+          },
+          {
+            "id": "model",
+            "label": {
+              "vi": "Model miss và usage",
+              "en": "Handle a miss and model usage"
+            },
+            "steps": [
+              {
+                "from": "gateway",
+                "to": "registry",
+                "description": {
+                  "vi": "Pin supported route/model/template capabilities và data policy.",
+                  "en": "Pin supported routing, templates, capabilities and data policies."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "quota",
+                "description": {
+                  "vi": "Atomically admit request/token/concurrency/spend reservations.",
+                  "en": "Admit request/token/concurrency/spend atomically."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "provider",
+                "description": {
+                  "vi": "Start bounded attempt và first-content/overall deadlines.",
+                  "en": "Start bounded attempts with content/overall deadlines."
+                }
+              },
+              {
+                "from": "provider",
+                "to": "client",
+                "description": {
+                  "vi": "Deliver framed output qua app/gateway với generation identity.",
+                  "en": "Deliver framed output through application/gateway boundaries."
+                }
+              },
+              {
+                "from": "provider",
+                "to": "quota",
+                "description": {
+                  "vi": "Reconcile authoritative usage; preserve unknown exposure khi thiếu evidence.",
+                  "en": "Reconcile authoritative usage or retain unknown exposure."
+                },
+                "async": true
+              },
+              {
+                "from": "gateway",
+                "to": "trace",
+                "description": {
+                  "vi": "Record attempt/config/finish/cache metadata theo data policy.",
+                  "en": "Record attempt/config/finish/cache metadata under data policies."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "fallback",
+            "label": {
+              "vi": "Fallback có commit boundary",
+              "en": "Fallback across explicit commit boundaries"
+            },
+            "steps": [
+              {
+                "from": "provider",
+                "to": "gateway",
+                "description": {
+                  "vi": "Retryable error hoặc first-content deadline trước visible/effect commit.",
+                  "en": "Detect eligible failure before visible/effect commitments."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "quota",
+                "description": {
+                  "vi": "Check remaining deadline, retry budget và fallback capacity.",
+                  "en": "Check remaining deadlines, retry budgets and fallback capacity."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "fallback",
+                "description": {
+                  "vi": "Use qualified capabilities/data endpoint, không blind provider swap.",
+                  "en": "Use qualified capabilities and data endpoints rather than blind swaps."
+                }
+              },
+              {
+                "from": "fallback",
+                "to": "client",
+                "description": {
+                  "vi": "Return fresh answer; after partial content cần explicit generation restart.",
+                  "en": "Return fresh answers with explicit restarts after partial content."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Client rời đi",
+              "en": "Handle client departure"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "cancel",
+                "description": {
+                  "vi": "Signal abort; client disconnect không tự chứng minh upstream stop.",
+                  "en": "Signal abort without assuming upstream work stopped."
+                }
+              },
+              {
+                "from": "cancel",
+                "to": "gateway",
+                "description": {
+                  "vi": "Stop queued work và request provider cancellation.",
+                  "en": "Stop queued work and request cancellation."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "provider",
+                "description": {
+                  "vi": "Propagate abort theo supported contract.",
+                  "en": "Propagate abort under supported contracts."
+                }
+              },
+              {
+                "from": "provider",
+                "to": "quota",
+                "description": {
+                  "vi": "Settle actual usage hoặc preserve unknown until reconcile.",
+                  "en": "Settle actual usage or preserve unknowns for reconciliation."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "rollout",
+            "label": {
+              "vi": "Deploy prompt/model có evidence",
+              "en": "Deploy prompts and models with evidence"
+            },
+            "steps": [
+              {
+                "from": "registry",
+                "to": "eval",
+                "description": {
+                  "vi": "Evaluate candidate prompt/model/retriever/safety configuration.",
+                  "en": "Evaluate candidate prompts, models, retrieval and safety settings."
+                }
+              },
+              {
+                "from": "eval",
+                "to": "rollout",
+                "description": {
+                  "vi": "Qualify task slices, latency/cost và fallback scenarios.",
+                  "en": "Qualify task slices, operations and fallbacks."
+                }
+              },
+              {
+                "from": "rollout",
+                "to": "gateway",
+                "description": {
+                  "vi": "Expose bounded candidate mapping, preserve rollback profile.",
+                  "en": "Expose bounded mappings with rollback profiles."
+                }
+              },
+              {
+                "from": "trace",
+                "to": "eval",
+                "description": {
+                  "vi": "Review drift/incidents và cost/quality per feature.",
+                  "en": "Review drift, incidents and feature-level economics."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "streaming",
+      "title": {
+        "vi": "2. Streaming UX: first content không phải response headers",
+        "en": "2. Streaming UX: content is not response headers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Phân biệt time to response headers, first transport event/heartbeat, first meaningful model content, inter-chunk gaps và total completion latency. Một HTTP 200 hoặc SSE heartbeat không chứng minh model đang trả answer. Định rõ TTFT đang đo provider token, server chunk hay first visible content; tokenizer/chunking/buffering làm các thời điểm khác nhau. Đo p50/p95/p99 theo route/task/length và include failures/timeouts theo SLO contract, không chỉ successful fast calls.",
+          "en": "Separate headers, transport events, meaningful content, inter-chunk gaps and completion. HTTP success and heartbeats do not establish answer progress. Define whether TTFT means provider tokens, server chunks or visible content, and report task/route/length distributions with explicit failure treatment."
+        },
+        {
+          "vi": "SSE dùng text/event-stream, UTF-8 và event framing; network chunk không luôn là một SSE event hoặc một token. Parser cần incremental decoding, multiline data fields và event boundaries. Native EventSource thường phục vụ GET event streams; authenticated POST generation thường dùng fetch streaming hoặc một request-then-subscribe design phù hợp. WebSocket có hai chiều nhưng thêm connection/session complexity; chọn theo interaction contract, không vì tên protocol.",
+          "en": "SSE uses UTF-8 event framing, while network chunks need not match events or tokens. Parse incrementally and handle multiline fields/boundaries. Native EventSource generally consumes GET streams; generation with POST bodies may use streaming fetch or request/subscription designs. WebSockets add bidirectionality and connection complexity; choose by interaction needs."
+        },
+        {
+          "vi": "Partial JSON thường chưa parse được và cũng chưa qua schema/business checks. Có thể render provisional text nhưng không execute tools hoặc commit business action dựa trên half payload. Define completion/error/abort events, finish reasons và request/generation IDs; app-level sentinel như [DONE] không là yêu cầu chung của SSE. Reconnect chỉ resume đúng nếu server có retained event cursor/replay contract, không tự regenerate một answer khác rồi nối vào đoạn cũ.",
+          "en": "Partial JSON generally has not passed parsing, schema or business validation. Provisional rendering must not commit actions. Define completion/error/abort and generation identities; application sentinels are not universal SSE requirements. Reconnection requires retained event/cursor semantics, not silent regeneration appended to old content."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Output có trạng thái rõ",
+          "en": "Give output explicit states"
+        },
+        "caption": {
+          "vi": "Client không chỉ có boolean loading=false cho cả success lẫn partial failure.",
+          "en": "Do not collapse success and partial failure into a single finished flag."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Waiting",
+              "en": "Waiting"
+            },
+            "detail": {
+              "vi": "Headers/heartbeat khác first answer content.",
+              "en": "Distinguish transport progress from content."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Provisional output",
+              "en": "Provisional output"
+            },
+            "detail": {
+              "vi": "Stream framed chunks, giữ generation ID.",
+              "en": "Frame chunks and preserve generation identities."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Complete / validate",
+              "en": "Complete / validate"
+            },
+            "detail": {
+              "vi": "Finish reason, parse/schema và task constraints.",
+              "en": "Check finish reasons, parsing and task constraints."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Partial failure",
+              "en": "Partial failure"
+            },
+            "detail": {
+              "vi": "Giữ partial/error hoặc explicit restart, không splice.",
+              "en": "Preserve partial errors or restart explicitly without splicing."
+            },
+            "icon": "warning"
+          }
+        ]
+      }
+    },
+    {
+      "id": "timeouts",
+      "title": {
+        "vi": "3. Deadline, fallback và visible commit boundary",
+        "en": "3. Deadlines, fallback and visible commit boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng connection/setup, first-content, idle và overall deadlines phù hợp với workload; không reset model first-content deadline chỉ vì transport heartbeat. Retry/fallback phải còn đủ end-to-end time và budget, không nhân mỗi attempt timeout vô hạn. Slow first content là một tín hiệu quan trọng nhưng không phải lúc nào tốt nhất: queueing, network, context length và provider state cần diagnosis.",
+          "en": "Choose setup, content, idle and overall deadlines for workloads. Heartbeats must not extend content deadlines indefinitely. Attempts share end-to-end time and budgets. Slow content is useful evidence but requires queue/network/context/provider diagnosis rather than universal rules."
+        },
+        {
+          "vi": "Trước visible content, một fresh qualified attempt có thể thay thế failed generation nếu không có unsafe external effect. Sau content đã hiển thị, silent retry tạo duplicate/spliced answers; dừng với partial-error state hoặc explicit restart bằng generation mới và UI giải thích. Với tool-enabled requests, effect commit có thể xảy ra trước first visible text, nên “chưa stream token” không tự làm retry safe.",
+          "en": "Before visible output, qualified fresh attempts can replace failures if effects permit it. After output, silent retries can splice answers; stop explicitly or start a new visible generation. Tool effects can precede text, so absence of visible tokens does not by itself authorize retries."
+        }
+      ],
+      "experiment": "prod-stream"
+    },
+    {
+      "id": "cache-types",
+      "title": {
+        "vi": "4. Ba kiểu cache: response reuse và prefix reuse",
+        "en": "4. Response reuse differs from prefix reuse"
+      },
+      "paragraphs": [
+        {
+          "vi": "Exact response cache tránh model call bằng trả output đã có cho cùng effective request identity. Semantic response cache mở rộng matching theo similarity nhưng có false-hit risk: gần vector không chứng minh cùng intent, tenant, time hoặc answer conditions. Provider prompt/prefix caching tái dùng phần input/prefill work được support; output vẫn được generate và billed theo actual contract. Đây là ba lớp khác nhau, có thể phối hợp nhưng không cộng hit rates tùy tiện.",
+          "en": "Exact response caching avoids calls by reusing eligible outputs. Semantic caching broadens matching with false-hit risks; vector similarity does not establish intent, scope or time equivalence. Provider prefix caching reuses supported input/prefill work while still generating outputs. These layers differ and their hit rates cannot be simply added."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Cache",
+            "en": "Cache"
+          },
+          {
+            "vi": "Work được reuse",
+            "en": "Reused work"
+          },
+          {
+            "vi": "Cần kiểm",
+            "en": "Validate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Exact response",
+              "en": "Exact response"
+            },
+            {
+              "vi": "Eligible full output",
+              "en": "Eligible full outputs"
+            },
+            {
+              "vi": "Effective identity, freshness, permissions và task semantics",
+              "en": "Identity, freshness, permissions and semantics"
+            }
+          ],
+          [
+            {
+              "vi": "Semantic response",
+              "en": "Semantic response"
+            },
+            {
+              "vi": "Output cho query tương tự",
+              "en": "Outputs for similar queries"
+            },
+            {
+              "vi": "Labeled false hits, intent/scope và fallback on miss",
+              "en": "Labeled false hits, intent/scope and miss handling"
+            }
+          ],
+          [
+            {
+              "vi": "Provider prefix",
+              "en": "Provider prefix"
+            },
+            {
+              "vi": "Supported prompt-prefix/prefill state",
+              "en": "Supported prefix/prefill state"
+            },
+            {
+              "vi": "Exact prefix rules, eligibility/TTL, writes/reads và output charges",
+              "en": "Prefix rules, eligibility/TTL, writes/reads and output charges"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "identity",
+      "title": {
+        "vi": "5. Cache identity, invalidation và current authorization",
+        "en": "5. Cache identity, invalidation and current authorization"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một response-cache identity có thể gồm principal/tenant permission scope, task/locale, canonical effective input, model/revision, generation parameters, prompt/template, tools/schema, evidence/source/policy versions và freshness window. Không nhất thiết đưa raw secrets vào key: dùng canonical IDs/hashes theo privacy policy. Hash đầy đủ text không giải quyết mutable dependency không có trong text, clock-based questions hoặc resource auth đã bị revoke.",
+          "en": "Response identities may include scope, task/locale, effective inputs, model/settings, templates, tools/schemas, evidence/policy revisions and freshness. Use suitable identifiers/hashes without embedding secrets. Text hashes alone do not capture omitted mutable dependencies, time-sensitive questions or revoked access."
+        },
+        {
+          "vi": "TTL giới hạn age nhưng không tự là invalidation correctness. Source update/delete, ACL changes hoặc policy revision có thể cần namespace/version change, targeted invalidation và current permission check trước trả sensitive data. Không cache một external side effect như một answer rồi replay tool writes; effect receipts có semantics/idempotency contract riêng. Exact caching không tự “an toàn tuyệt đối” chỉ vì string match.",
+          "en": "TTL bounds age without guaranteeing invalidation correctness. Updates, deletion, permissions and policies may require versioned namespaces, invalidation and current access checks. Side-effect receipts have separate contracts from response caching; exact matching is not a universal safety guarantee."
+        }
+      ],
+      "experiment": "prod-cache"
+    },
+    {
+      "id": "semantic",
+      "title": {
+        "vi": "6. Đánh giá semantic cache bằng labeled mistakes",
+        "en": "6. Evaluate semantic caches with labeled mistakes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tạo task/locale/tenant/time slices và negative pairs gần nhau nhưng khác meaning: refund versus exchange, “không được” versus “được”, product edition khác hoặc policy vừa đổi. Đo false accept, false reject, stale/unauthorized hits và quality sau fallback. Threshold cần dựa trên actual embedding/metric/index và workload, không dùng một universal 0.9. Candidate retrieval, relevance validation và permission là các bước khác nhau.",
+          "en": "Build task/locale/scope/time slices and nearby negative pairs: distinct operations, negation, editions and policy changes. Measure false accepts/rejects, stale/unauthorized hits and fallback quality. Calibrate thresholds for actual representations and workloads rather than universal values; retrieval, relevance and authorization are separate."
+        },
+        {
+          "vi": "Nếu dùng model validator sau similarity, tính thêm latency/cost và grader errors; validator không thay deterministic access rules. Low-risk FAQ public có thể khác financial/account-specific answers; policy có thể disable semantic reuse cho task nhạy cảm. Rollout cache policy qua eval/canary, giữ cache provenance/age/hit type trong trace để diagnosis.",
+          "en": "A validator adds costs and errors without replacing access controls. Public FAQ reuse differs from sensitive financial/account tasks; some tasks should disable semantic reuse. Qualify cache policies and retain provenance, age and hit type for diagnosis."
+        }
+      ]
+    },
+    {
+      "id": "prefix",
+      "title": {
+        "vi": "7. Provider prefix cache: eligibility và accounting",
+        "en": "7. Provider prefix-cache eligibility and accounting"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đặt stable instructions/tools/reference prefix trước changing query khi provider supports matching như vậy. Exact segment matching, minimum cacheable tokens, supported models, TTL, workspace/organization isolation và cache write/read accounting tùy endpoint/version; kiểm docs/config hiện tại thay đoán. Không đổi prompt order chỉ để cache nếu làm hỏng task semantics hoặc model behavior.",
+          "en": "Where supported, place stable instructions, tools and references before changing queries. Matching, minimum lengths, model support, lifetimes, isolation and read/write accounting depend on endpoints and revisions. Verify actual contracts and preserve task semantics rather than reordering blindly."
+        },
+        {
+          "vi": "Cache hit input discount không xóa output generation cost hoặc guarantee total latency tốt hơn cho mọi request. Cache creation/storage/refresh có thể thêm phí; cold traffic và prefix churn thay economics. Prefix cache isolation của provider không tự thay per-user authorization trong app dùng shared organization credentials. Không ghi provider-specific TTL/discount thành constant universal trong product code.",
+          "en": "Input discounts do not remove output costs or guarantee per-request latency improvements. Creation, refresh, cold traffic and churn affect economics. Provider cache isolation does not replace application-user authorization under shared credentials; avoid universal hard-coded assumptions."
+        }
+      ]
+    },
+    {
+      "id": "cost",
+      "title": {
+        "vi": "8. Conditional hit rates và unit economics",
+        "en": "8. Conditional hit rates and unit economics"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu exact hit rate e tính trên mọi requests, semantic hit rate s tính trên exact misses, semantic share toàn traffic là (1−e)s và model share là (1−e)(1−s). Với 100000 requests, e=20% và s=10%, có 20000 exact, 8000 semantic và 72000 model calls. Nếu 2% semantic hits sai thì expected wrong cached answers là 160 trong fixture assumptions, không 2% toàn traffic.",
+          "en": "With exact hit rate e over all requests and semantic rate s conditional on exact misses, semantic share is (1−e)s and model share (1−e)(1−s). For 100000 requests, 20% exact and 10% conditional semantic yield 20000, 8000 and 72000 requests respectively. A 2% semantic false-hit rate implies 160 expected wrong cached answers under those assumptions."
+        },
+        {
+          "vi": "Worksheet dùng fixed hypothetical token inventory và prices để tách response avoidance với prefix discounts. Lookup embeddings dùng query tokens, không mặc định embed toàn rendered prompt/system context. Full production economics còn có retrieval/rerank, cache infrastructure/write fees, retries/fallbacks, tools, human review và failed tasks. Không suy saving cao là quality tốt; track cost per successful task cùng quality/severity và overall spend.",
+          "en": "The worksheet separates avoided generation from prefix discounts using hypothetical inventory/prices. Lookup embeddings use query tokens rather than assuming full rendered prompts. Real economics include retrieval, caches, writes, retries, tools, humans and failed work. Report quality/severity and spend alongside cost per success."
+        }
+      ],
+      "experiment": "prod-cost"
+    },
+    {
+      "id": "quotas",
+      "title": {
+        "vi": "9. RPM, TPM, concurrency và spend không cùng một quota",
+        "en": "9. Requests, tokens, concurrency and spend are distinct quotas"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một request dài có thể tiêu nhiều input/output/reasoning budget, trong khi nhiều short requests có thể hit RPM hoặc concurrency trước TPM. Provider definitions về estimated/admitted/actual token usage và windows khác nhau; app cần request, token, concurrency và spend dimensions theo tenant/feature/tier. Invoice cũng có thể gồm image/audio/tools/cache/batch charges, không chỉ một token rate.",
+          "en": "Long requests and many short calls stress different limits. Provider admission/usage definitions and windows vary; applications need appropriate request, token, concurrency and spend dimensions. Invoices may also include modalities, tools, caches and batch work rather than one universal token price."
+        },
+        {
+          "vi": "Reserve trước admission bằng known input estimate và bounded output/external-spend allowance theo contract; settle actual authoritative usage sau completion. Estimator không exact tokenizer/reasoning usage thì cần headroom/limits phù hợp. Concurrent admission phải atomic hoặc quota partitioned đúng; timeout/cancel không tự release toàn reservation nếu upstream work vẫn có thể bill. Giữ explicit unknown/reconcile state và receipts để không double charge/release.",
+          "en": "Reserve known estimates and bounded allowances before admission, reconciling authoritative usage later. Estimator gaps need suitable headroom and limits. Concurrency requires atomic or sound partitioned admission; uncertain upstream work must not immediately release all exposure. Receipts prevent duplicate settlement/release."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Reserve trước, reconcile sau",
+          "en": "Reserve first, reconcile afterward"
+        },
+        "caption": {
+          "vi": "Unknown usage không được tự biến thành zero.",
+          "en": "Unknown usage does not become zero by assumption."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Admit",
+              "en": "Admit"
+            },
+            "detail": {
+              "vi": "Check tenant/feature và provider capacity budgets.",
+              "en": "Check scoped budgets and provider capacity."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Reserve",
+              "en": "Reserve"
+            },
+            "detail": {
+              "vi": "Atomic request/token/concurrency/spend allowance.",
+              "en": "Reserve required dimensions atomically."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Attempt",
+              "en": "Attempt"
+            },
+            "detail": {
+              "vi": "Bound outputs/deadlines, tag attempt identity.",
+              "en": "Bound outputs/deadlines and identify attempts."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Settle",
+              "en": "Settle"
+            },
+            "detail": {
+              "vi": "Actual usage evidence hoặc unresolved exposure.",
+              "en": "Settle actual evidence or retain unresolved exposure."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "retries",
+      "title": {
+        "vi": "10. Retry budgets, backoff và failure amplification",
+        "en": "10. Retry budgets, backoff and failure amplification"
+      },
+      "paragraphs": [
+        {
+          "vi": "Classify retryable network/temporary capacity failures so với invalid request, policy rejection, unsupported schema và auth failure. Không retry y hệt payload invalid vô hạn. Exponential backoff với jitter giảm synchronized bursts nhưng không tạo thêm provider capacity. Chọn bounded retry ở một tầng hoặc coordinate retry budgets; nếu ba tầng đều tối đa 3 attempts, một logical request có thể thành tối đa 27 downstream attempts trong worst-case nested retry.",
+          "en": "Separate transient failures from invalid requests, policy, unsupported features and authorization errors. Backoff/jitter spreads attempts without creating capacity. Coordinate retry layers: three layers of up to three attempts can produce 27 downstream attempts in the nested worst case."
+        },
+        {
+          "vi": "Shared overall deadline, admission budget, queue bounds và Retry-After handling phải đi cùng retries. Circuit breaker open giảm load vào unhealthy dependency; half-open probes cần bounded concurrency và tránh false recovery. Một provider slow không có nghĩa tất cả regions/models/routes cùng hỏng; phân scope health theo observed failure domains. Không record mọi user error thành provider outage.",
+          "en": "Combine retries with deadlines, budgets, bounded queues and applicable retry hints. Bound breaker probes and scope health by actual routes/regions/failure domains. User errors should not automatically trip provider-health circuits."
+        }
+      ]
+    },
+    {
+      "id": "routing",
+      "title": {
+        "vi": "11. Routing và fallback cần qualification theo task",
+        "en": "11. Qualify routing and fallbacks for the task"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fallback có thể khác model capabilities, context length, tool/schema behavior, languages, safety profile, data region và price. Evaluate actual task slices và expected degraded behavior; không tự nói provider B “parity” trên mọi task vì endpoint trả HTTP 200. Prearrange capacity/quota hoặc fallback outage chỉ chuyển từ A sang B. Có thể pause batch, queue bounded work, serve eligible cached/public FAQ hoặc báo limited mode theo product policy.",
+          "en": "Fallbacks differ in context, tools, schemas, languages, safety, geography and price. Qualify actual tasks/degradation rather than equating availability with parity. Arrange capacity and deliberate degradation instead of merely moving outages between endpoints."
+        },
+        {
+          "vi": "Upfront routing khác student-first cascade. Ví dụ 100 requests, giả định small call cost 1 unit và large cost 4, route trực tiếp 80 small/20 large tốn 160 units; chạy small cho tất cả rồi fallback 20 sang large tốn 180 units trước classifier/validation costs. Quality phụ thuộc routing mistakes và joint outcomes, không chỉ share; latency tails và initial paid work cũng khác. Giá này chỉ là illustrative units.",
+          "en": "Upfront routing and student-first cascades pay different paths. With illustrative costs 1 and 4, routing 80/20 requests costs 160 units; running small for all plus 20 large fallbacks costs 180 before extra validation. Routing errors, joint outcomes and tails determine usefulness, not shares alone."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Mode",
+            "en": "Mode"
+          },
+          {
+            "vi": "Cần declare",
+            "en": "Declare"
+          },
+          {
+            "vi": "Failure concern",
+            "en": "Failure concern"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Primary",
+              "en": "Primary"
+            },
+            {
+              "vi": "Normal task/data/capability contract",
+              "en": "Normal task/data/capability contracts"
+            },
+            {
+              "vi": "Quota, latency, quality và usage failures",
+              "en": "Capacity, latency, quality and usage failures"
+            }
+          ],
+          [
+            {
+              "vi": "Qualified fallback",
+              "en": "Qualified fallback"
+            },
+            {
+              "vi": "Supported slices và approved data endpoint",
+              "en": "Qualified slices and data endpoints"
+            },
+            {
+              "vi": "Capability drift, quota storms và retry effects",
+              "en": "Capability drift, capacity storms and effects"
+            }
+          ],
+          [
+            {
+              "vi": "Degraded mode",
+              "en": "Degraded mode"
+            },
+            {
+              "vi": "Limited features và clear user-visible state",
+              "en": "Limited features and visible state"
+            },
+            {
+              "vi": "Không âm thầm giảm task guarantees",
+              "en": "Avoid silent erosion of task guarantees"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cancellation",
+      "title": {
+        "vi": "12. Cancellation, backpressure và disconnected clients",
+        "en": "12. Cancellation, backpressure and disconnected clients"
+      },
+      "paragraphs": [
+        {
+          "vi": "Client abort nên propagate qua app/gateway tới upstream khi supported, bỏ queued work chưa dispatch và stop unnecessary downstream consumers. Nhưng request abort không chứng minh provider đã dừng compute/billing hoặc tool đã abort. Reconcile usage/effects theo actual receipts và giữ limitations trong run state. Một intentional background job có owner/retention riêng không nhất thiết bị cancel vì UI tab đóng; phân biệt job lifecycle với stream connection.",
+          "en": "Propagate supported aborts, remove queued work and stop unnecessary consumers, without assuming remote compute, billing or effects stopped. Reconcile under actual contracts. Owned background jobs can outlive a tab; distinguish job and connection lifecycles."
+        },
+        {
+          "vi": "Slow client cần bounded buffers/backpressure và idle policies để không giữ vô hạn memory/connection. SSE reconnect với event IDs chỉ replay an toàn khi backend retained events và dedup/generation rules phù hợp. Không dùng reconnect để silently invoke model mới có tool effects; nếu retention không đủ, báo snapshot/restart contract rõ.",
+          "en": "Bound buffers and idle connections for slow consumers. Safe cursor replay requires retained events and suitable deduplication/generation rules. Reconnection must not silently invoke new effectful model work; declare restart/snapshot behavior when replay is unavailable."
+        }
+      ]
+    },
+    {
+      "id": "observability",
+      "title": {
+        "vi": "13. Metrics và traces: attribution, denominators và privacy",
+        "en": "13. Observe attribution, denominators and privacy"
+      },
+      "paragraphs": [
+        {
+          "vi": "Record request/attempt IDs, tenant/feature tier, route/model revision, prompt/retriever/config revisions, cache layer/hit reason/age, input/output/cache token categories, finish reason, content/total latency, retries, failure class và usage evidence status. Logical request và provider attempts khác denominators; cost một successful user task có thể gồm failed attempts và fallbacks. Không cộng p95 của các stages thành p95 end-to-end.",
+          "en": "Record request/attempt identities, scope, revisions, cache details, token categories, finish reasons, timing, retries, failures and usage status. Requests, attempts and successful tasks have different denominators; failed work can contribute to task costs. Stage percentiles cannot simply be added into an end-to-end percentile."
+        },
+        {
+          "vi": "Dùng consistent schemas và version conventions khi adopt OpenTelemetry/instrumentation; attribute names/stability có thể đổi, cần pin compatible SDK/schema thay coi một blog code sample là fixed standard. Trace sampling không tự cho phép lưu raw prompts/secrets. Store minimal authorized payloads/redacted samples khi thực sự cần diagnosis/evals, với access, retention/deletion và audit; high-cardinality user IDs không nên thành metric labels tùy tiện.",
+          "en": "Use consistent versioned telemetry schemas and compatible instrumentation rather than treating sample attribute names as immutable standards. Sampling does not authorize secret storage. Minimize, authorize and retain diagnostic data deliberately, and avoid uncontrolled high-cardinality metric dimensions."
+        }
+      ]
+    },
+    {
+      "id": "versioning",
+      "title": {
+        "vi": "14. Prompt/model/cache policies là deployable configuration",
+        "en": "14. Deploy prompts, models and cache policies deliberately"
+      },
+      "paragraphs": [
+        {
+          "vi": "Manifest nên bind template/model route, retriever/embedding/index versions, tool schemas, safety settings, cache policy và gateway normalization. Pin available immutable revisions khi provider supports; nếu alias có thể đổi thì monitor task evidence/drift, không giả version string đủ reproduce. Rollback phải giữ compatible dependencies và prior config, không chỉ đổi model name.",
+          "en": "Bind templates/routes, retrieval/index dependencies, tools, safety, cache policy and normalization in manifests. Pin available immutable revisions and monitor aliases that can change; names alone do not ensure reproducibility. Rollbacks require compatible dependencies as well as model selections."
+        },
+        {
+          "vi": "Offline evals gồm streaming truncation, partial failure, fallback capability, cache false hits/staleness/ACL và billing reconciliation. Sau đó bounded shadow/canary theo data policy và online guardrails. Shadow vẫn có costs/data exposure; canary không tự causal proof. Cache rollout cũng cần version/invalidation plan, nếu không old response artifacts có thể sống qua config rollback.",
+          "en": "Evaluate partial streams, fallbacks, cache mistakes/access and reconciliation before bounded exposure. Shadowing still has costs/data exposure, and canaries are not automatic causal evidence. Cache configuration releases need invalidation/version plans so old artifacts do not silently survive rollbacks."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Version đến rollback evidence",
+          "en": "Version releases through rollback evidence"
+        },
+        "caption": {
+          "vi": "Đổi prompt hoặc cache threshold cũng là behavior change.",
+          "en": "Prompts and cache thresholds also change behavior."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Pin manifest",
+              "en": "Pin manifests"
+            },
+            "detail": {
+              "vi": "Task/data/capability dependencies và rollback profile.",
+              "en": "Pin dependencies and rollback profiles."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Qualify",
+              "en": "Qualify"
+            },
+            "detail": {
+              "vi": "Task slices, cache/fallback failures và operations.",
+              "en": "Qualify tasks, caches, fallbacks and operations."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Expose",
+              "en": "Expose"
+            },
+            "detail": {
+              "vi": "Canary bounded với clear stop criteria.",
+              "en": "Bound canaries with explicit stopping criteria."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Monitor / revert",
+              "en": "Monitor / revert"
+            },
+            "detail": {
+              "vi": "Quality, usage, drift và cache artifact compatibility.",
+              "en": "Monitor quality, usage, drift and artifact compatibility."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "privacy",
+      "title": {
+        "vi": "15. Data policy theo từng boundary và artifact",
+        "en": "15. Apply data policies to every boundary and artifact"
+      },
+      "paragraphs": [
+        {
+          "vi": "Prompt/RAG context, tool outputs, embeddings, cached answers, provider state và traces đều có thể chứa dữ liệu nhạy cảm. Minimize/redact/tokenize khi task không cần raw data, route tới approved endpoints/regions theo applicable policy và verify provider retention/training controls thực tế. Không khẳng định mọi prompt luôn rời organization hoặc mọi endpoint có cùng retention: self-hosted/private routes và configurations khác nhau.",
+          "en": "Prompts, context, tools, embeddings, caches, provider state and traces can contain sensitive data. Minimize data and qualify endpoints, geography and actual retention/training controls. Not every prompt leaves an organization, and endpoint configurations differ."
+        },
+        {
+          "vi": "Source deletion cần propagation plan cho derived caches/indexes/logs và provider artifacts theo available contracts, với retention/backups/legal scope được định nghĩa. Không hứa mọi copy biến mất tức thì chỉ vì xóa một database row. Quản access và deletion evidence; semantic caches dễ bị quên nhưng có thể chứa personal answer dù query text chung chung.",
+          "en": "Plan deletion propagation across derived stores and provider artifacts under real contracts, including retention/backups and governing scope. Deleting one row does not prove instantaneous removal everywhere. Track access and deletion evidence, including personalized semantic-cache answers."
+        }
+      ]
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "16. Completion, stream và usage contracts minh họa",
+        "en": "16. Teaching completion, stream and usage contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các internal APIs sau không gọi provider thật. Tách logical request, attempt, output generation và usage settlement; server lấy principal/scope từ trusted authentication. Retry request ID không tự đảm bảo effect idempotency; tool actions giữ contract riêng.",
+          "en": "These internal APIs make no real provider calls. Distinguish requests, attempts, output generations and usage settlement under trusted identity. Retrying a generation request does not replace separate tool-effect contracts."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/llm-requests",
+          "description": {
+            "vi": "Tạo bounded generation theo profile đã approve.",
+            "en": "Create bounded generation under approved profiles."
+          },
+          "request": "{ requestKey, taskProfile, inputRef, expectedManifestHash, maxOutputTokens, deadlineMs }",
+          "response": "202 { requestId, generationId, manifestHash, streamUrl, state: \"QUEUED\" }"
+        },
+        {
+          "method": "GET",
+          "path": "/internal/llm-requests/{requestId}/events?after={cursor}",
+          "description": {
+            "vi": "Stream/replay theo retained event contract.",
+            "en": "Stream or replay retained events."
+          },
+          "response": "200 text/event-stream: { eventId, generationId, type: \"delta | complete | error | restarted\", payload }",
+          "notes": [
+            {
+              "vi": "Expired cursor cần explicit snapshot/restart response, không splice generation mới.",
+              "en": "Expired cursors need explicit snapshot/restart behavior rather than spliced generations."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/internal/llm-requests/{requestId}/usage",
+          "description": {
+            "vi": "Usage có attempt và settlement state.",
+            "en": "Read attempt-aware usage and settlement states."
+          },
+          "response": "200 { requestId, attempts, inputTokens, outputTokens, cacheReadTokens, costEvidenceRef, settlement: \"CONFIRMED | UNKNOWN\" }",
+          "notes": [
+            {
+              "vi": "UNKNOWN không là zero cost và không giải phóng exposure tùy tiện.",
+              "en": "Unknown usage is not zero cost or unconditional budget release."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "17. Luyện giải thích production LLM decisions",
+        "en": "17. Practice production LLM decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Bill tăng nhanh hơn traffic: bắt đầu từ đâu?",
+            "en": "The bill grows faster than traffic: where do you start?"
+          },
+          "answer": [
+            {
+              "vi": "Break down theo feature/tenant/route, attempts per task, input/output/cache usage, context lengths, tools và price/config changes. So sánh cùng window/task mix và usage evidence. Sau đó test context trimming, eligible response/prefix reuse hoặc routing bằng quality gates; không giảm cost bằng giấu failed/unsafe tasks.",
+              "en": "Attribute requests, attempts, inputs/outputs, caches, context, tools and pricing/configuration under matched windows and usage evidence. Qualify optimizations without hiding failures or harmful outcomes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Provider headers nhanh nhưng answer chờ 20 giây thì sao?",
+            "en": "Headers arrive quickly but content takes 20 seconds: what now?"
+          },
+          "answer": [
+            {
+              "vi": "Headers/heartbeat không là first model content. Kiểm content deadline, queue/context/provider slices và bounded failover capacity. Retry chỉ khi visible/effect boundaries cho phép, giữ overall deadline và usage exposure. Đừng xem HTTP 200 là healthy answer completion.",
+              "en": "Inspect content deadlines and workload/provider evidence. Use bounded qualified fallback only across permissible output/effect boundaries, with shared deadlines and usage exposure."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Stream được nửa câu rồi lỗi: nối fallback vào được không?",
+            "en": "Can fallback continue a half-streamed answer?"
+          },
+          "answer": [
+            {
+              "vi": "Không silent splice từ independent generation. Dừng partial/error hoặc explicit restart với generation mới và clear UI. Reconnect cursor chỉ resume retained original events theo contract; tool effects có idempotency/reconciliation boundary riêng.",
+              "en": "Do not silently splice independent generations. Preserve errors or restart explicitly; retained-event replay and tool-effect reconciliation have separate contracts."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Exact cache có luôn safe không?",
+            "en": "Is exact response caching always safe?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu thiếu principal/ACL/source/policy/time dependencies hoặc cached result có personal data. Kiểm effective identity, invalidation/current permissions và task semantics. Match cùng text không tự chứng minh context hoặc quyền hiện tại giống nhau.",
+              "en": "Not with missing scope, permissions, source/policy/time dependencies or personalized outputs. Validate effective identity, freshness and current authority."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Semantic threshold tăng có chắc giảm false hits không?",
+            "en": "Does a higher semantic threshold guarantee fewer wrong hits?"
+          },
+          "answer": [
+            {
+              "vi": "Trên fixed scores nó thường giảm số accepts, nhưng không đảm bảo remaining hits đúng hoặc quality tốt hơn theo mọi metric. Fixture wrong-intent0.96 vượt valid paraphrase0.94: threshold0.95 giữ wrong hit và bỏ valid one. Cần labeled workload/calibration cùng deterministic scope checks.",
+              "en": "A stricter threshold reduces accepts on fixed scores without guaranteeing the remaining matches or overall task quality. Labeled calibration and deterministic scope controls remain necessary."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Prefix cache hit có tránh cả model bill không?",
+            "en": "Does prefix reuse avoid the entire model bill?"
+          },
+          "answer": [
+            {
+              "vi": "Không: output vẫn generate và billed theo contract; input cache reads/writes, TTL/minimums và other usage còn phải tính. Response cache avoidance và prefix reuse có denominators khác nhau. Dùng authoritative usage để settle, không suy mọi cache hit là free.",
+              "en": "No: outputs and other contract-specific usage remain. Response avoidance and prefix reuse have different denominators; settle authoritative usage."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Client cancel thì trả hết reserved budget ngay không?",
+            "en": "Should cancellation immediately release all reserved budget?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu upstream usage/effects còn unknown. Stop new work, propagate supported cancel và reconcile actual evidence; release phần chắc không dùng theo contract, giữ uncertain exposure. Cancellation request không chứng minh remote compute hay billing dừng ngay.",
+              "en": "Not while upstream usage/effects remain uncertain. Stop admission, propagate cancellation and reconcile evidence while retaining uncertain exposure."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Fallback có uptime tốt hơn nhưng quality thấp thì sao?",
+            "en": "What if fallback is available but lower quality?"
+          },
+          "answer": [
+            {
+              "vi": "Định qualified task scope/degraded mode trước, kiểm tools/schema/data policy và capacity. Có thể hạn chế features hoặc báo limited mode, không silently giữ promise của primary. Evaluate quality/cost/latency theo slices và keep rollback/stop criteria.",
+              "en": "Declare qualified tasks and degradation, validate capability/data/capacity and expose limitations rather than silently preserving primary guarantees. Monitor slices and stopping criteria."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
