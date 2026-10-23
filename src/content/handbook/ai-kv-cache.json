@@ -1,0 +1,1293 @@
+{
+  "id": "ai-kv-cache",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "KV Cache, Memory & Quantization: tính đúng bytes và tái dùng đúng state",
+    "en": "KV Cache, Memory & Quantization: budget bytes and reuse the right state"
+  },
+  "summary": {
+    "vi": "Từ attention state tới bộ nhớ từng rank, paged allocation, prefix identity, copy-on-write, offload và precision rollout; bốn mô phỏng giúp kiểm tra các trade-off bằng số cụ thể.",
+    "en": "Connect attention state to per-rank memory, paged allocation, prefix identity, copy-on-write, offloading and precision rollouts through four numerical experiments."
+  },
+  "prerequisites": [
+    "ai-inference",
+    "llm-serving"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "cache",
+    "os",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "KV là state của token/context đã xử lý, khác model weights và khác cache câu trả lời.",
+      "en": "KV stores processed token/context state; it differs from weights and response caches."
+    },
+    {
+      "vi": "Dense KV bytes phụ thuộc KV heads, dimensions, layer/context và dtype; không mặc định mọi kiến trúc dùng cùng công thức.",
+      "en": "Dense KV bytes depend on KV heads, dimensions, layers/context and dtype; the same formula does not fit every architecture."
+    },
+    {
+      "vi": "Capacity phải kiểm trên từng rank với head replication, workspace và future growth; tổng HBM không tự là một pool chung.",
+      "en": "Check each rank with head replication, workspace and future growth; aggregate HBM is not automatically a shared pool."
+    },
+    {
+      "vi": "Paging giảm reservation waste nhưng không tạo token capacity vô hạn; shared mutable tails cần copy-on-write.",
+      "en": "Paging reduces reservation waste without creating unlimited token capacity; shared mutable tails need copy-on-write."
+    },
+    {
+      "vi": "Prefix hit cần exact state identity và placement; nó giảm reused prefill work nhưng không bỏ decode đọc history.",
+      "en": "Prefix hits require exact state identity and placement; they reduce reused prefill work without removing history reads during decode."
+    },
+    {
+      "vi": "Quantization/offload là trade-off memory, quality, kernels và latency cần đo theo workload.",
+      "en": "Quantization and offloading trade memory, quality, kernels and latency under measured workloads."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một ngân sách đi qua cả request",
+      "en": "A budget across the request lifecycle"
+    },
+    "caption": {
+      "vi": "Tách logical tokens khỏi physical bytes và state reuse khỏi result reuse.",
+      "en": "Separate logical tokens from physical bytes and state reuse from result reuse."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Đọc cấu hình",
+          "en": "Read the configuration"
+        },
+        "detail": {
+          "vi": "Layers/KV heads/dimensions, context policy và cache format.",
+          "en": "Read layers, KV heads, dimensions, context policy and cache format."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Tính từng rank",
+          "en": "Budget each rank"
+        },
+        "detail": {
+          "vi": "Weights, scales, KV, workspace và safe headroom.",
+          "en": "Budget weights, scales, KV, workspace and safe headroom."
+        },
+        "icon": "chart"
+      },
+      {
+        "title": {
+          "vi": "Quản lý pages",
+          "en": "Manage pages"
+        },
+        "detail": {
+          "vi": "Allocate, share, grow, copy-on-write và release an toàn.",
+          "en": "Allocate, share, grow, copy on write and release safely."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Đo và gate",
+          "en": "Measure and gate"
+        },
+        "detail": {
+          "vi": "Quality, TTFT/TPOT, preemptions và capacity dưới realistic load.",
+          "en": "Evaluate quality, TTFT/TPOT, preemptions and realistic loaded capacity."
+        },
+        "icon": "check"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "state",
+      "title": {
+        "vi": "1. KV lưu gì và không lưu gì?",
+        "en": "1. What does KV store?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong causal self-attention, mỗi layer tạo key và value cho token đã xử lý. Cache giữ state đó để token tiếp theo không phải project lại toàn bộ K/V cũ. Attention vẫn phải đọc hoặc truy cập phần history mà kiến trúc cho phép; cache không biến decode thành operation không phụ thuộc context. Weights là tham số model, KV là state theo sequence; chúng có lifetime và scaling khác nhau.",
+          "en": "Causal self-attention creates keys and values for processed tokens at each layer. Caching avoids recomputing their projections, while later attention still accesses the history retained by the architecture. Decode does not become independent of context. Weights are model parameters; KV is sequence state with a different lifetime and scaling behavior."
+        },
+        {
+          "vi": "Giữ KV không đồng nghĩa giữ câu trả lời đã sinh. Một prompt cache có thể tái dùng prefix state nhưng new user turn và output mới vẫn cần compute; response cache trả lại một result cũ theo contract khác. Trong chat, model không nhất thiết giữ GPU state giữa hai API calls: engine có thể release, giữ reusable cache, offload hoặc recompute. Không suy session ID của ứng dụng là bằng chứng KV còn resident.",
+          "en": "KV is not a stored completed answer. Prefix caching reuses state while new turns and outputs still require work; response caches reuse completed results under different contracts. Engines may release, retain, offload or recompute state between calls. An application session identity does not prove GPU residency."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Weights",
+            "en": "Weights"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Loaded model/adapter parameters và format/scales; thường dùng chung requests của replica.",
+              "en": "Model/adapter parameters and formats/scales, usually shared by replica requests."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "KV state",
+            "en": "KV state"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Token history và execution context quyết định nội dung; tăng theo live sequence lengths hoặc architecture window.",
+              "en": "Token history and execution context determine state; memory follows live lengths or architectural windows."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Working memory",
+            "en": "Working memory"
+          },
+          "icon": "gauge",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Activations, temporary workspaces, graphs, communication buffers và allocator overhead còn cần chỗ riêng.",
+              "en": "Activations, workspaces, graphs, communication buffers and allocation overhead need separate space."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "formula",
+      "title": {
+        "vi": "2. Công thức dense KV và đơn vị",
+        "en": "2. Dense KV formulas and units"
+      },
+      "paragraphs": [
+        {
+          "vi": "Với một sequence ở các dense attention layers, dạng tổng quát là tổng theo layer của T_l × H_KV,l × (d_K,l × bytes_K,l + d_V,l × bytes_V,l). Nếu mọi layer cùng L, T, H_KV, d và dtype, rút gọn thành 2 × L × H_KV × d × bytes/value × T. Nhân nhiều sequences phải cộng từng live length, không lấy max context nhân request count trừ khi cố ý đang tính worst-case reservation.",
+          "en": "For a sequence, sum T_l × H_KV,l × (d_K,l × bytes_K,l + d_V,l × bytes_V,l) across dense attention layers. Uniform layers reduce this to 2 × L × H_KV × d × bytes/value × T. Sum sequence lengths for multiple sequences; maximum context times request count is a deliberate reservation/worst-case calculation, not actual live usage."
+        },
+        {
+          "vi": "Ví dụ shape giả định L = 80, H_KV = 8, d = 128, BF16 = 2 bytes: mỗi token cần 327.680 bytes = 320 KiB; 32.768 tokens cần 10 GiB logical KV. Không dùng query-head count thay KV-head count. GB = 10^9 bytes, GiB = 2^30 bytes; 70 tỷ weights × 2 bytes xấp xỉ 140 GB nhưng chỉ khoảng 130,39 GiB. Các số này chưa tính page padding, scales, duplicated heads hoặc workspace.",
+          "en": "A hypothetical shape with L=80, H_KV=8, d=128 and two-byte BF16 uses 327,680 bytes/320 KiB per token and 10 GiB at 32,768 tokens. Use KV heads rather than query heads. Decimal GB and binary GiB differ: 70 billion two-byte weights occupy about 140 GB/130.39 GiB, excluding padding, scales, duplicated heads and workspaces."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "content": "uniform_dense_KV_bytes = 2 * layers * kv_heads * head_dim * bytes_per_value * live_tokens\nlogical_batch_KV_bytes = sum(KV_bytes(sequence) for sequence in live_sequences)\nper_rank_required = rank_weights + rank_KV + rank_workspace + rank_runtime_reserve\n# Check every rank, not only sum(all_GPU_memory).\n# Sliding-window / hybrid / latent-attention caches need their own layout formula.",
+        "caption": {
+          "vi": "Logical payload là điểm bắt đầu, không phải complete engine memory estimate.",
+          "en": "Logical payload is a starting point rather than a complete engine memory estimate."
+        }
+      }
+    },
+    {
+      "id": "variants",
+      "title": {
+        "vi": "3. MHA, GQA, MQA và những ngoại lệ",
+        "en": "3. MHA, GQA, MQA and exceptions"
+      },
+      "paragraphs": [
+        {
+          "vi": "MHA có KV cho từng attention head; GQA cho một nhóm query heads dùng chung KV head; MQA là trường hợp một KV head. Đây là thuộc tính checkpoint/architecture, không phải serving flag có thể đổi tùy ý mà vẫn giữ cùng model. Chuyển architecture có thể cần training/uptraining và quality validation. Chỉ đổi KV dtype không biến MHA thành GQA.",
+          "en": "MHA has KV for each attention head; GQA shares KV across groups of query heads; MQA uses one KV head. These belong to the checkpoint/architecture, not arbitrary serving flags that preserve the same model. Architectural changes may require training/uptraining and quality validation. Changing cache dtype does not convert MHA into GQA."
+        },
+        {
+          "vi": "Sliding-window layers chỉ giữ architecture-defined history; global layers có thể tiếp tục tăng. Hybrid recurrent/state-space hoặc compressed/latent attention có state layout khác, nên phải đọc model config và backend implementation. FlashAttention tối ưu attention IO/intermediate allocation, không tự xóa toàn bộ persistent KV cần cho autoregressive serving. Không tùy tiện drop old tokens của một full-attention model rồi claim output semantics giữ nguyên.",
+          "en": "Sliding-window layers retain architecture-defined history while global layers may keep growing. Hybrid recurrent/state-space and compressed/latent attention have other layouts, requiring model/backend inspection. FlashAttention improves attention IO/intermediates without eliminating all persistent autoregressive KV. Arbitrarily dropping old full-attention tokens changes semantics."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Giả định 80 layers / d128 / BF16",
+            "en": "Assume 80 layers / d128 / BF16"
+          },
+          {
+            "vi": "KV heads",
+            "en": "KV heads"
+          },
+          {
+            "vi": "KV/token",
+            "en": "KV/token"
+          },
+          {
+            "vi": "KV tại 32.768 tokens",
+            "en": "KV at 32,768 tokens"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "MHA",
+              "en": "MHA"
+            },
+            {
+              "vi": "64",
+              "en": "64"
+            },
+            {
+              "vi": "2.5 MiB",
+              "en": "2.5 MiB"
+            },
+            {
+              "vi": "80 GiB",
+              "en": "80 GiB"
+            }
+          ],
+          [
+            {
+              "vi": "GQA",
+              "en": "GQA"
+            },
+            {
+              "vi": "8",
+              "en": "8"
+            },
+            {
+              "vi": "320 KiB",
+              "en": "320 KiB"
+            },
+            {
+              "vi": "10 GiB",
+              "en": "10 GiB"
+            }
+          ],
+          [
+            {
+              "vi": "MQA",
+              "en": "MQA"
+            },
+            {
+              "vi": "1",
+              "en": "1"
+            },
+            {
+              "vi": "40 KiB",
+              "en": "40 KiB"
+            },
+            {
+              "vi": "1.25 GiB",
+              "en": "1.25 GiB"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "ranks",
+      "title": {
+        "vi": "4. Bộ nhớ từng rank và head replication",
+        "en": "4. Per-rank memory and head replication"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tensor parallel không đồng nghĩa mọi tensor chia đúng 1/TP. Với mapping chia KV heads đều khi đủ heads và replicate khi TP > H_KV, local KV heads dừng ở 1. Tăng TP từ 8 lên 16 khi H_KV = 8 làm total physical KV nhân đôi dù mỗi rank không giảm cache nữa. Mapping khác, pipeline layers, replicated embeddings và uneven shards cần công thức thực tế của engine; lab chỉ cô lập một trường hợp để thấy lỗi khi coi tổng memory là pool dùng chung.",
+          "en": "Tensor parallelism does not divide every tensor by TP. In a mapping that shards KV heads when possible and replicates beyond the head count, each rank retains at least one KV head. With eight KV heads, increasing TP from eight to sixteen doubles aggregate physical KV without further reducing local cache. Other mappings, pipeline layers, embeddings and uneven shards need engine-specific accounting."
+        },
+        {
+          "vi": "FITS của lab chỉ nói current resident payload theo giả định vừa từng rank. Concurrency limit thật còn phụ thuộc future output tokens, graph/workspace peaks, speculative branches, adapters, communication buffers và latency target. Không lấy maxSequences ở một context length làm safe admission cho một workload có prompt/output lengths khác nhau.",
+          "en": "FITS only means that assumed current payloads fit each rank. Real concurrency also depends on future outputs, graph/workspace peaks, speculative branches, adapters, communication and latency targets. A capacity count at one context length is not safe admission for a different length distribution."
+        }
+      ],
+      "experiment": "kv-ranks"
+    },
+    {
+      "id": "paging",
+      "title": {
+        "vi": "5. Paged allocation và token tăng thêm",
+        "en": "5. Paged allocation and future growth"
+      },
+      "paragraphs": [
+        {
+          "vi": "Mỗi sequence có logical block table trỏ tới physical pages trong pool. Không cần một contiguous allocation dài bằng max context cho mọi request; last-page rounding vẫn tốn chỗ, và block-table/kernel management vẫn có cost. Page nhỏ giảm tail slack nhưng tăng entries/indirection; page lớn giảm metadata nhưng làm sharing granularity thô và COW đắt hơn. Kích thước phải phù hợp kernels/backend.",
+          "en": "Each sequence maps logical blocks to physical pool pages instead of reserving one maximum-length contiguous region. Tail rounding and block-table/kernel costs remain. Small pages reduce slack but increase indirection, while larger pages coarsen sharing and copy-on-write. Choose sizes supported and measured by the backend."
+        },
+        {
+          "vi": "Một request vừa ở prompt length chưa chắc còn pages khi decode dài thêm. Scheduler có thể reserve worst-case, reserve theo policy, preempt/recompute hoặc queue để bảo vệ SLO; phải nói rõ trade-off thay khẳng định paging luôn fit nhiều người mà không đổi latency. Khi cancel/completion, không free page còn referenced bởi sequence khác hoặc kernel chưa hoàn tất.",
+          "en": "A prompt that fits now may run out of pages during generation. Schedulers can reserve, preempt/recompute or queue under explicit policies. Paging does not promise unlimited concurrency at unchanged latency. Cancellation/completion must not free pages still referenced by other sequences or unfinished kernels."
+        }
+      ],
+      "experiment": "kv-pages"
+    },
+    {
+      "id": "prefix",
+      "title": {
+        "vi": "6. Exact prefix reuse và copy-on-write",
+        "en": "6. Exact prefix reuse and copy-on-write"
+      },
+      "paragraphs": [
+        {
+          "vi": "KV của block sau phụ thuộc tokens/context trước đó, không chỉ tokens bên trong block. Key phải bind ancestry và execution identity: weights revision, adapter, positions/RoPE settings, relevant cache layout/dtype/scales và multimodal input identity. Token IDs giống cho một image placeholder chưa chứng minh image tensor giống. Dùng lookup/hash implementation có collision policy phù hợp và trusted tenant/cache scope; request không được tự khai identity để vượt isolation.",
+          "en": "Later-block KV depends on preceding tokens/context, not only the block’s tokens. Bind ancestry and execution identity: weight revisions, adapters, positions/RoPE, cache formats/scales and multimodal inputs. Equal image-placeholder IDs do not establish equal image tensors. Use appropriate collision handling and trusted cache/tenant scope rather than requester-asserted identities."
+        },
+        {
+          "vi": "Trong full-block APC fixture, cache có 12 tokens cho request 14 tokens: tái dùng 12 tokens và compute 2 tail tokens. Đổi token thứ 5 chỉ còn full block đầu gồm 4 tokens hợp lệ. Một engine có thể cần chạy tail/last token để lấy logits và có reuse granularity riêng; “same prefix” không có nghĩa bỏ toàn bộ prefill hoặc output decode. Sampling/beam forks có thể share partial tail nhưng append cần COW; đó là use case khác với published full-block APC.",
+          "en": "In this full-block fixture, twelve cached tokens in a fourteen-token request leave two uncached tail tokens; changing token five preserves only the first four-token block. Engines may need tail/last-token work for logits and use different granularities. Sampling forks can share partial tails but require copy-on-write on append, unlike published full-block APC."
+        }
+      ],
+      "experiment": "kv-prefix"
+    },
+    {
+      "id": "lifecycle",
+      "title": {
+        "vi": "7. Theo dõi KV qua năm đường đi",
+        "en": "7. Trace KV across five paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trace Cold và Warm cho thấy cache hit thay công việc nào. Decode vẫn đọc retained history và xin tail/page growth. Offload/Release nhấn mạnh validity, ownership và asynchronous completion; state metadata đúng ở CPU chưa chắc bytes đã copy xong vào GPU. Không đặt KV cache vào vai trò durable source-of-truth cho user conversation.",
+          "en": "Cold and Warm show precisely which work reuse replaces. Decode still reads retained history and grows tails/pages. Offload and Release expose validity, ownership and asynchronous completion: correct CPU metadata does not prove GPU copies are ready. KV is not the durable source of truth for conversation history."
+        }
+      ],
+      "diagram": {
+        "id": "kv-lifecycle",
+        "title": {
+          "vi": "KV có identity, owner và lifetime",
+          "en": "KV has identity, ownership and a lifetime"
+        },
+        "caption": {
+          "vi": "Theo từng trace để tách uncached prefill, reuse, decode growth, offload và release. Cache hit không phải câu trả lời đã sinh sẵn.",
+          "en": "Trace uncached prefill, reuse, decode growth, offloading and release separately. A cache hit is not a pre-generated answer."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "request",
+            "label": {
+              "vi": "Prompt / request",
+              "en": "Prompt / request"
+            },
+            "detail": {
+              "vi": "Authenticated context, model profile, prompt và output limits.",
+              "en": "Authenticated context, model profile, prompt and output limits."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "tokens",
+            "label": {
+              "vi": "Token / context builder",
+              "en": "Token / context builder"
+            },
+            "detail": {
+              "vi": "Final token IDs, positions, template/model/adapter và multimodal context.",
+              "en": "Final token identities, positions, templates, model/adapter and multimodal context."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "admit",
+            "label": {
+              "vi": "Admission / scheduler",
+              "en": "Admission / scheduler"
+            },
+            "detail": {
+              "vi": "Per-rank memory, token growth, latency budgets và fairness.",
+              "en": "Per-rank memory, token growth, latency budgets and fairness."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "lookup",
+            "label": {
+              "vi": "Prefix index",
+              "en": "Prefix index"
+            },
+            "detail": {
+              "vi": "Trusted execution/security identity, resident full blocks và hit validation.",
+              "en": "Trusted execution/security identities, resident full blocks and hit validation."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "client",
+            "label": {
+              "vi": "Token stream",
+              "en": "Token stream"
+            },
+            "detail": {
+              "vi": "Ordered output với cancellation, usage và completion semantics.",
+              "en": "Ordered output with cancellation, usage and completion semantics."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "client"
+          },
+          {
+            "id": "kv",
+            "label": {
+              "vi": "GPU KV pages",
+              "en": "GPU KV pages"
+            },
+            "detail": {
+              "vi": "Physical pages, refcounts, pinning và immutable shared blocks.",
+              "en": "Physical pages, reference counts, pinning and immutable shared blocks."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "engine",
+            "label": {
+              "vi": "Attention / model kernels",
+              "en": "Attention / model kernels"
+            },
+            "detail": {
+              "vi": "Read allowed history, compute new states và append token KV; respect profile.",
+              "en": "Read permitted history, compute states and append KV under the selected profile."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "blocks",
+            "label": {
+              "vi": "Block manager",
+              "en": "Block manager"
+            },
+            "detail": {
+              "vi": "Allocate, reference, copy-on-write và defer reclamation tới safe kernel boundary.",
+              "en": "Allocate, reference, copy on write and defer reclamation until kernels are safe."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "host",
+            "label": {
+              "vi": "CPU / tiered cache",
+              "en": "CPU / tiered cache"
+            },
+            "detail": {
+              "vi": "Versioned payloads, secure retention, transfer budget và validity evidence.",
+              "en": "Versioned payloads, secure retention, transfer budgets and validity evidence."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "weights",
+            "label": {
+              "vi": "Pinned model profile",
+              "en": "Pinned model profile"
+            },
+            "detail": {
+              "vi": "Weights/adapter revision, dtype/scales, kernels, positions và compatibility.",
+              "en": "Weight/adapter revisions, data types/scales, kernels, positions and compatibility."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "cold",
+            "label": {
+              "vi": "Cold prefill",
+              "en": "Cold prefill"
+            },
+            "steps": [
+              {
+                "from": "request",
+                "to": "tokens",
+                "description": {
+                  "vi": "Serialize prompt và kiểm token/context bounds.",
+                  "en": "Serialize the prompt and validate token/context bounds."
+                }
+              },
+              {
+                "from": "tokens",
+                "to": "admit",
+                "description": {
+                  "vi": "Gửi prompt/output budget và pinned execution context.",
+                  "en": "Pass prompt/output budgets and pinned execution context."
+                }
+              },
+              {
+                "from": "admit",
+                "to": "lookup",
+                "description": {
+                  "vi": "Lookup reusable prefix đúng identity và placement.",
+                  "en": "Look up a reusable prefix with correct identity and placement."
+                }
+              },
+              {
+                "from": "lookup",
+                "to": "blocks",
+                "description": {
+                  "vi": "Miss: allocate uncached pages trong budget.",
+                  "en": "On a miss, allocate uncached pages within budget."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "engine",
+                "description": {
+                  "vi": "Run prefill trên uncached context với selected profile.",
+                  "en": "Run prefill on uncached context under the selected profile."
+                }
+              },
+              {
+                "from": "engine",
+                "to": "kv",
+                "description": {
+                  "vi": "Write KV với block ownership/refcount hợp lệ.",
+                  "en": "Write KV with valid block ownership and reference counts."
+                }
+              }
+            ]
+          },
+          {
+            "id": "warm",
+            "label": {
+              "vi": "Warm prefix, new tail",
+              "en": "Warm prefix, new tail"
+            },
+            "steps": [
+              {
+                "from": "tokens",
+                "to": "lookup",
+                "description": {
+                  "vi": "Same token prefix và compatible context, không chỉ text nhìn giống.",
+                  "en": "Match token prefixes and compatible context, not merely similar text."
+                }
+              },
+              {
+                "from": "lookup",
+                "to": "kv",
+                "description": {
+                  "vi": "Validate resident full blocks và pin trước khi reuse.",
+                  "en": "Validate resident full blocks and pin them before reuse."
+                }
+              },
+              {
+                "from": "lookup",
+                "to": "blocks",
+                "description": {
+                  "vi": "Add references; immutable shared pages không bị mutate.",
+                  "en": "Add references without mutating shared pages."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "engine",
+                "description": {
+                  "vi": "Compute uncached tail/logits theo engine; future output vẫn decode.",
+                  "en": "Compute uncached tails/logits as required; future output still needs decoding."
+                }
+              }
+            ]
+          },
+          {
+            "id": "grow",
+            "label": {
+              "vi": "Decode và page growth",
+              "en": "Decode and page growth"
+            },
+            "steps": [
+              {
+                "from": "admit",
+                "to": "engine",
+                "description": {
+                  "vi": "Schedule bounded decode work theo fairness/latency.",
+                  "en": "Schedule bounded decode work under fairness/latency budgets."
+                }
+              },
+              {
+                "from": "kv",
+                "to": "engine",
+                "description": {
+                  "vi": "Read retained attention context; cached prefix vẫn có memory traffic.",
+                  "en": "Read retained attention context; cached prefixes still generate memory traffic."
+                }
+              },
+              {
+                "from": "engine",
+                "to": "blocks",
+                "description": {
+                  "vi": "Append cần tail capacity hoặc COW khi shared.",
+                  "en": "Appending needs tail capacity or copy-on-write when shared."
+                }
+              },
+              {
+                "from": "engine",
+                "to": "kv",
+                "description": {
+                  "vi": "Publish new KV sau appropriate write ordering.",
+                  "en": "Publish new KV with appropriate write ordering."
+                }
+              },
+              {
+                "from": "engine",
+                "to": "client",
+                "description": {
+                  "vi": "Stream token, update live length và usage.",
+                  "en": "Stream tokens and update live lengths/usage."
+                }
+              }
+            ]
+          },
+          {
+            "id": "offload",
+            "label": {
+              "vi": "Preempt, transfer và resume",
+              "en": "Preempt, transfer and resume"
+            },
+            "steps": [
+              {
+                "from": "admit",
+                "to": "blocks",
+                "description": {
+                  "vi": "Chọn victim theo SLO/fairness và safe point.",
+                  "en": "Choose victims under SLO/fairness policy at safe points."
+                }
+              },
+              {
+                "from": "kv",
+                "to": "host",
+                "description": {
+                  "vi": "Copy payload/context; chỉ reclaim sau completion và required ownership checks.",
+                  "en": "Copy payload/context and reclaim only after completion and ownership checks."
+                },
+                "async": true
+              },
+              {
+                "from": "host",
+                "to": "kv",
+                "description": {
+                  "vi": "Reload đúng version/format/sequence, tính transfer budget.",
+                  "en": "Reload the correct version/format/sequence within transfer budgets."
+                },
+                "async": true
+              },
+              {
+                "from": "kv",
+                "to": "engine",
+                "description": {
+                  "vi": "Resume chỉ khi required state đã ready; nếu mất thì recompute/reject.",
+                  "en": "Resume only when required state is ready; otherwise recompute or reject."
+                }
+              }
+            ]
+          },
+          {
+            "id": "release",
+            "label": {
+              "vi": "Cancel và safe release",
+              "en": "Cancel and safe release"
+            },
+            "steps": [
+              {
+                "from": "request",
+                "to": "admit",
+                "description": {
+                  "vi": "Cancel hoặc completion không cho schedule new work.",
+                  "en": "Cancellation or completion prevents new scheduling."
+                }
+              },
+              {
+                "from": "admit",
+                "to": "engine",
+                "description": {
+                  "vi": "Fence outstanding work; không free pages khi kernel còn dùng.",
+                  "en": "Fence outstanding work; pages cannot be freed while kernels use them."
+                }
+              },
+              {
+                "from": "engine",
+                "to": "blocks",
+                "description": {
+                  "vi": "Release references tại safe completion boundary.",
+                  "en": "Release references at a safe completion boundary."
+                }
+              },
+              {
+                "from": "blocks",
+                "to": "lookup",
+                "description": {
+                  "vi": "Unreferenced reusable blocks có thể giữ cache hoặc evict theo policy.",
+                  "en": "Unreferenced reusable blocks may remain cached or be evicted by policy."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "routing",
+      "title": {
+        "vi": "8. Routing, locality và tenant isolation",
+        "en": "8. Routing, locality and tenant isolation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Replica giữ prefix có thể warm nhưng đang overload; route theo locality mà bỏ queue delay có thể làm TTFT tệ hơn. So avoided prefill với queue/transfer cost và remaining deadline. Hashing prefix tới replica chỉ tạo affinity, không bảo đảm block còn resident sau eviction/restart. Disaggregated prefill/decode còn cần transfer state đúng version/shape/ownership và đủ interconnect budget.",
+          "en": "A warm replica can be overloaded; locality-only routing can worsen TTFT. Compare avoided prefill against queue/transfer costs and deadlines. Prefix hashing creates affinity but cannot guarantee residency after eviction/restarts. Disaggregated prefill/decode needs compatible state, ownership and transfer budgets."
+        },
+        {
+          "vi": "Cache policy phải theo data access boundaries, không tối đa hit rate bằng cách bỏ auth/tenant. Same text không tự cấp quyền truy cập private prefix; KV và timing/hit signals có thể nhạy cảm. Cache eviction là optimization event, không thay document deletion/privacy retention policy; replicas, host tiers và logs cần controls tương ứng. Stable instructions/schema ở đầu prompt có thể giúp reuse nếu không phá message semantics, permissions hoặc dữ liệu mới cần đúng vị trí.",
+          "en": "Cache policy follows access boundaries rather than maximizing hits by removing scope. Similar text grants no private-prefix permission, and KV/timing signals may be sensitive. Eviction does not replace privacy/deletion policy across replicas, host tiers and logs. Stable instructions/schemas can help reuse when prompt semantics, permissions and freshness are preserved."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Locality",
+            "en": "Locality"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Hỏi cache có ở đâu, còn sống không và queue tại đó bao lâu.",
+              "en": "Ask where cached state lives, whether it remains resident and how long its queue is."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Identity",
+            "en": "KV identity"
+          },
+          "icon": "inspect",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Bind exact execution/input context; retrieval similarity không là KV equality.",
+              "en": "Bind exact execution/input context; retrieval similarity is not KV equality."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Isolation",
+            "en": "KV isolation"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Access policy và trusted scope trước cache hit; retention/side-channel risk có threat model.",
+              "en": "Enforce access/trusted scope before reuse and define retention/side-channel threats."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transfer",
+      "title": {
+        "vi": "9. Preempt, offload hay recompute?",
+        "en": "9. Preempt, offload or recompute?"
+      },
+      "paragraphs": [
+        {
+          "vi": "GPU HBM nhanh nhưng hữu hạn. CPU/SSD tiers có thể giữ reusable state hoặc preempted requests; copy-out và copy-in cùng tốn bandwidth nếu chưa có valid backing. Payload size/bandwidth là transfer lower-order arithmetic, chưa queue, synchronization, layout conversion và contention. Layer-wise overlap có thể đổi end-to-end latency; không so một HBM peak với PCIe peak rồi kết luận SLO.",
+          "en": "HBM is finite. Host tiers can retain reusable or preempted state, but both outgoing and incoming copies cost bandwidth unless valid backing already exists. Payload/bandwidth arithmetic excludes queues, synchronization, conversion and contention. Layer-wise overlap can change latency, so peak bandwidth comparisons alone cannot establish SLOs."
+        },
+        {
+          "vi": "Recompute chỉ hợp lệ nếu còn input/positions/model context và có budget. Offload chỉ resume nếu state identity, completeness và ownership khớp; stale payload phải bị reject. Preemption fairness cần tránh một long-context user liên tục bị đẩy ra rồi tính lại, làm tail latency và wasted compute tăng dù average throughput đẹp.",
+          "en": "Recomputation needs retained inputs/context and available budgets. Offloading resumes only matching, complete, correctly owned state. Reject stale payloads and avoid repeatedly evicting the same long-context users, which inflates tails and wasted compute despite attractive averages."
+        }
+      ],
+      "experiment": "kv-transfer"
+    },
+    {
+      "id": "quantization",
+      "title": {
+        "vi": "10. Weights, activations và KV là ba precision decisions",
+        "en": "10. Weights, activations and KV are separate precision decisions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Weight-only INT4 giảm stored weight payload, không tự giảm KV hoặc chuyển mọi multiplication sang INT4. Scale/zero-point/group metadata, packing/padding, dequantization và supported kernels quyết định memory/speed thật. W8A8 còn quantize activations; FP8/INT8 là formats/paths khác, không chỉ thay nhãn cho một byte. KV quantization giảm bytes của retained attention state, có calibration/scales và backend constraints riêng.",
+          "en": "Weight-only INT4 reduces stored weight payload, not automatically KV or every multiplication. Metadata, packing, dequantization and supported kernels determine actual memory and speed. W8A8 also quantizes activations; FP8 and INT8 are distinct formats/paths. KV quantization has its own scales, calibration and backend requirements."
+        },
+        {
+          "vi": "GPTQ dùng thông tin xấp xỉ second-order cho post-training weight quantization; AWQ dùng activation statistics để bảo vệ salient weight channels; LLM.int8() xử lý outlier-sensitive computation bằng higher-precision paths. Đây là các hướng kỹ thuật, không guarantee mọi checkpoint/task có cùng quality hoặc speedup. Low-precision decode có thể lợi khi giảm memory traffic, nhưng compute-bound prefill hoặc conversion-heavy kernels có thể lợi ít hay chậm hơn.",
+          "en": "GPTQ uses approximate second-order information for post-training weight quantization; AWQ uses activation statistics to protect salient channels; LLM.int8() handles outlier-sensitive work in higher precision. These techniques do not guarantee universal quality or speed. Memory-traffic reductions can help decode while compute-bound prefill or conversion-heavy paths may benefit less or slow down."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Decision về precision",
+            "en": "Precision decision"
+          },
+          {
+            "vi": "Giảm phần nào",
+            "en": "Reduced component"
+          },
+          {
+            "vi": "Cần đánh giá",
+            "en": "Evaluate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Weight-only INT4",
+              "en": "Weight-only INT4"
+            },
+            {
+              "vi": "Raw weight bytes, cộng scales/metadata",
+              "en": "Raw weights plus scales/metadata"
+            },
+            {
+              "vi": "Kernel/dequant cost, group size, quality theo task",
+              "en": "Kernels/dequantization, groups and task quality"
+            }
+          ],
+          [
+            {
+              "vi": "Weight + activation INT8/FP8",
+              "en": "Weight + activation INT8/FP8"
+            },
+            {
+              "vi": "Storage và supported low-precision compute path",
+              "en": "Storage and supported low-precision computation"
+            },
+            {
+              "vi": "Calibration/outliers, hardware/backend và saturation/error",
+              "en": "Calibration/outliers, backends and saturation/error"
+            }
+          ],
+          [
+            {
+              "vi": "KV 8-bit",
+              "en": "KV 8-bit"
+            },
+            {
+              "vi": "Retained KV payload, không toàn request memory",
+              "en": "Retained KV payload rather than all request memory"
+            },
+            {
+              "vi": "Long-context quality, scales và attention path compatibility",
+              "en": "Long-context quality, scales and attention compatibility"
+            }
+          ],
+          [
+            {
+              "vi": "Mixed precision / skipped layers",
+              "en": "Mixed precision / skipped layers"
+            },
+            {
+              "vi": "Chỉ supported/selected tensors hoặc layers",
+              "en": "Only selected supported tensors/layers"
+            },
+            {
+              "vi": "Memory estimate phải cộng heterogeneous layout",
+              "en": "Sum heterogeneous layouts in memory estimates"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "profile",
+      "title": {
+        "vi": "11. Ghi một serving profile có thể kiểm chứng",
+        "en": "11. Record a verifiable serving profile"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đừng chỉ ghi “model70B, FP8”. Pinned revisions và measured runtime config phải đủ để reproduce: weights, tokenizer/template, adapter, attention/cache backend, group/scales, hardware topology, supported shapes và concurrency/length mix. Cache identity phải invalidated/versioned khi các state-producing choices đổi; không reuse old KV vì tên model string chưa đổi.",
+          "en": "“70B, FP8” is insufficient for reproduction. Pin weights, tokenizer/template, adapters, attention/cache backends, scales, topology, shapes and traffic distributions. Version/invalidate state when state-producing choices change rather than reusing KV because a model-name string is unchanged."
+        }
+      ],
+      "code": {
+        "language": "yaml",
+        "content": "profile_revision: teaching-profile-v2\nweights_revision: pinned-digest\nadapter_revision: none\nattention_layout: uniform-dense-gqa\nkv_dtype: bf16\nkv_block_tokens: 16\nkv_scale_revision: not-applicable\nparallel_mapping_revision: tested-layout-v1\ncache_security_scope: trusted-tenant-scope\nlimits:\n  prompt_tokens: measured-policy\n  output_tokens: admitted-policy\nvalidation:\n  task_quality: required\n  loaded_latency_and_memory: required",
+        "caption": {
+          "vi": "Manifest minh họa, không phải cấu hình copy-paste cho một inference engine.",
+          "en": "An illustrative manifest rather than a copy-paste engine configuration."
+        }
+      }
+    },
+    {
+      "id": "evals",
+      "title": {
+        "vi": "12. Quality gate trước khi đổi precision",
+        "en": "12. Gate precision changes on quality"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chọn representative eval set gồm tiếng Việt và ngôn ngữ sử dụng thật, code/math, structured outputs/tool schemas, long context/retrieval và failure-sensitive tasks. Calibration set phải phù hợp nhưng tách held-out evaluation để tránh overfit lựa chọn format vào chính sample đã tune. Perplexity hữu ích nhưng không thay product correctness, safety và accepted regression thresholds.",
+          "en": "Use representative languages, code/math, structured outputs/tools, long contexts/retrieval and failure-sensitive tasks. Keep calibration data separate from held-out evaluation to avoid tuning choices to the evaluation examples. Perplexity does not replace product correctness, safety or accepted regression thresholds."
+        },
+        {
+          "vi": "Đo quality cùng latency/throughput/cost ở matched workload; compare prompt/output distributions và hardware/backend tương thích. Canary per profile/tier với rollback giữ old weights/cache-format compatibility riêng. Không hứa bitwise-identical output giữa kernels chỉ vì toán học ideal tương đương; dùng deterministic setup/tolerances phù hợp và business metrics.",
+          "en": "Measure quality with matched workload latency, throughput and cost. Canary by profile/tier and keep rollback formats separate. Mathematical equivalence does not guarantee bitwise-identical outputs across kernels; use suitable deterministic setups, tolerances and product metrics."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một lần thay precision có gate",
+          "en": "A gated precision change"
+        },
+        "caption": {
+          "vi": "Memory savings chưa là điều kiện đủ để rollout.",
+          "en": "Memory savings alone do not justify rollout."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Đóng băng baseline",
+              "en": "Freeze a baseline"
+            },
+            "detail": {
+              "vi": "Model/data/workload versions và accepted thresholds.",
+              "en": "Pin model/data/workload versions and thresholds."
+            },
+            "icon": "target"
+          },
+          {
+            "title": {
+              "vi": "Calibrate + offline eval",
+              "en": "Calibrate and evaluate"
+            },
+            "detail": {
+              "vi": "Scales/kernel compatibility, task slices và long-context tails.",
+              "en": "Check scales, kernels, task slices and long-context tails."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Load test + canary",
+              "en": "Load test and canary"
+            },
+            "detail": {
+              "vi": "TTFT/TPOT, memory peaks, errors và user-visible quality.",
+              "en": "Measure TTFT/TPOT, memory peaks, errors and quality."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Version + rollback",
+              "en": "Version and roll back"
+            },
+            "detail": {
+              "vi": "Profile/cache namespace tách biệt, rollback có evidence.",
+              "en": "Separate profile/cache namespaces with proven rollback."
+            },
+            "icon": "flag"
+          }
+        ]
+      }
+    },
+    {
+      "id": "admission",
+      "title": {
+        "vi": "13. Admission theo bytes, tokens và deadline",
+        "en": "13. Admit by bytes, tokens and deadlines"
+      },
+      "paragraphs": [
+        {
+          "vi": "Request count là metric thô: hai requests 8K và 128K tokens không tiêu cùng memory hoặc prefill budget. Scheduler cần biết current physical pages, future growth policy, per-rank limits, prefill/decode work và deadlines. Cached prefixes giảm physical duplicates nhưng refcounts/pins có thể làm cached pages chưa evict được. GPU compute utilization thấp không loại trừ memory-capacity hoặc memory-bandwidth bottleneck.",
+          "en": "Request counts hide length differences. Admission considers physical pages, growth policies, per-rank limits, work and deadlines. Shared prefixes reduce duplication but referenced/pinned pages may not be evictable. Low compute utilization does not rule out memory capacity or bandwidth bottlenecks."
+        },
+        {
+          "vi": "Phân biệt active/live KV, cached-but-evictable blocks, pinned transfer state, free pages và reserved growth; một utilization% không giải thích đủ. Queueing không miễn phí: nếu không thể đạt deadline thì explicit reject/degrade theo product policy thay chờ vô hạn. Context/output cap phải được user hiểu và enforce trên serialized tokens, không cắt text tùy tiện để vừa một chart memory.",
+          "en": "Distinguish live KV, evictable cache, pinned transfers, free pages and growth reservations. Queueing still costs deadlines; explicitly reject or degrade under policy when budgets cannot be met. Enforce understandable context/output limits on serialized tokens rather than truncating text to fit a memory chart."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Áp lực",
+            "en": "Pressure"
+          },
+          {
+            "vi": "Can thiệp phù hợp",
+            "en": "Potential intervention"
+          },
+          {
+            "vi": "Giá phải trả",
+            "en": "Cost/trade-off"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Tail slack/reservation lớn",
+              "en": "Large slack/reservations"
+            },
+            {
+              "vi": "Paged allocation, supported block size, measured reservation policy",
+              "en": "Paged allocation, supported block sizes and measured reservations"
+            },
+            {
+              "vi": "Metadata/COW/growth management; không universal speedup",
+              "en": "Metadata/COW/growth work; no universal speedup"
+            }
+          ],
+          [
+            {
+              "vi": "Long-context load chiếm pool",
+              "en": "Long contexts dominate the pool"
+            },
+            {
+              "vi": "Token-aware fairness, separate pool hoặc explicit limits",
+              "en": "Token-aware fairness, separate pools or explicit limits"
+            },
+            {
+              "vi": "Fragmented capacity hoặc queued/rejected work",
+              "en": "Fragmented capacity or queued/rejected work"
+            }
+          ],
+          [
+            {
+              "vi": "Warm replica có queue dài",
+              "en": "Warm replica has a long queue"
+            },
+            {
+              "vi": "So locality benefit với queue/transfer/deadline",
+              "en": "Compare locality benefits with queues/transfers/deadlines"
+            },
+            {
+              "vi": "Cold prefill cost khi route sang replica khác",
+              "en": "Cold prefill when routing elsewhere"
+            }
+          ],
+          [
+            {
+              "vi": "HBM thiếu nhưng host còn chỗ",
+              "en": "HBM is full while host memory is available"
+            },
+            {
+              "vi": "Costed preemption/offload/recompute policy",
+              "en": "Costed preemption/offload/recompute policies"
+            },
+            {
+              "vi": "Transfer/recompute stalls, fairness và stale-state risks",
+              "en": "Transfer/recompute stalls, fairness and stale-state risks"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "14. Dấu hiệu lỗi và cách kiểm tra",
+        "en": "14. Failure signals and verification"
+      },
+      "paragraphs": [
+        {
+          "vi": "Theo dõi allocated/live/free/shared pages từng rank, peak workspace, block-table/COW events, prefix hit theo eligible prompt tokens, eviction/transfer/preemption rates và recomputed tokens. Correlate profile revision, input/output lengths, TTFT/TPOT/queue tails và error type. Giữ logs không chứa sensitive KV tensors hoặc raw private prompts ngoài policy.",
+          "en": "Track per-rank allocated/live/free/shared pages, workspace peaks, COW events, eligible-token prefix hits, evictions/transfers/preemptions and recomputed tokens. Correlate profile versions, lengths, queue/TTFT/TPOT tails and error types while governing sensitive tensors/prompts in logs."
+        },
+        {
+          "vi": "Chaos/recovery test nên có cancel lúc kernel đang chạy, shared-prefix eviction, partial-tail fork, cache-key context change, failed transfer và worker restart. Cache mất có thể giảm hiệu năng hoặc buộc recompute; user conversation/history phải có durable storage policy riêng. Không biến optimization cache thành nơi duy nhất còn giữ input cần để recover request.",
+          "en": "Test cancellation during kernels, shared-prefix eviction, partial-tail forks, identity changes, failed transfers and worker restarts. Losing caches may require recomputation, while conversation/history durability belongs to a separate storage policy. An optimization cache must not be the only remaining source of recovery inputs."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Triệu chứng KV",
+            "en": "KV symptom"
+          },
+          {
+            "vi": "Điều cần phân biệt",
+            "en": "Distinguish"
+          },
+          {
+            "vi": "Kiểm chứng",
+            "en": "Verify"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Aggregate memory còn nhưng một rank OOM",
+              "en": "Aggregate memory remains while one rank OOMs"
+            },
+            {
+              "vi": "Uneven/replicated tensors, local KV heads, workspace peaks",
+              "en": "Uneven/replicated tensors, local heads and workspace peaks"
+            },
+            {
+              "vi": "Inspect per-rank allocation/profile và actual load mix",
+              "en": "Inspect per-rank allocations/profiles and actual load"
+            }
+          ],
+          [
+            {
+              "vi": "High cache hit nhưng TTFT tăng",
+              "en": "High cache hits but worse TTFT"
+            },
+            {
+              "vi": "Queue, partial hits, routing hoặc transfer overhead",
+              "en": "Queues, partial hits, routing or transfer overhead"
+            },
+            {
+              "vi": "Latency breakdown theo reused/uncached tokens và replica",
+              "en": "Break down latency by reused/uncached tokens and replica"
+            }
+          ],
+          [
+            {
+              "vi": "Fork outputs lẫn nhau",
+              "en": "Fork outputs contaminate each other"
+            },
+            {
+              "vi": "Shared mutable tail/refcount/synchronization bug",
+              "en": "Shared-tail, reference-count or synchronization errors"
+            },
+            {
+              "vi": "COW ownership và asynchronous lifetime tests",
+              "en": "Copy-on-write ownership and asynchronous lifetime tests"
+            }
+          ],
+          [
+            {
+              "vi": "Quantization memory giảm nhưng task fail",
+              "en": "Less quantized memory but task failures"
+            },
+            {
+              "vi": "Scales, clipping/outliers, backend và long-context sensitivity",
+              "en": "Scales, clipping/outliers, backends and long-context sensitivity"
+            },
+            {
+              "vi": "Held-out task slices, pinned calibration/profile và rollback",
+              "en": "Held-out task slices, pinned calibration/profiles and rollback"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Câu hỏi có đáp án và phép tính",
+        "en": "15. Questions with reasoning and calculations"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Shape 80 layers / 8 KV heads / d128 / BF16 cần bao nhiêu KV cho 32K tokens?",
+            "en": "How much KV does an 80-layer / 8-KV-head / d128 / BF16 shape need at 32K tokens?"
+          },
+          "answer": [
+            {
+              "vi": "2 × 80 × 8 × 128 × 2 = 327.680 bytes/token = 320 KiB/token. 32K ở đây là 32.768 tokens, nên cần 10 GiB logical payload; nếu dùng 32.000 tokens thì kết quả khác. Physical memory trên từng rank còn phụ thuộc mapping/replication, pages/scales/workspace và live lengths của các sequences khác.",
+              "en": "The shape uses 327,680 bytes / 320 KiB per token. Here 32K means 32,768 tokens, giving 10 GiB of logical payload; 32,000 tokens would differ. Per-rank physical accounting still needs placement/replication, pages/scales/workspaces and other live sequences."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tăng TP từ 8 lên 16 có chia đôi mọi KV allocation không?",
+            "en": "Does increasing TP from 8 to 16 halve every KV allocation?"
+          },
+          "answer": [
+            {
+              "vi": "Không trong mapping của lab có 8 KV heads và replicate khi TP lớn hơn số heads. Cả TP = 8 và TP = 16 vẫn giữ 1 local head/rank; TP = 16 có tổng physical KV gấp đôi. Ideal weight shard trên mỗi rank giảm nhưng communication/replicated tensors có thể đổi. Cần đọc engine mapping thực tế, thay vì chỉ chia total bytes cho số GPU.",
+              "en": "Not in this fixture’s eight-head mapping, which replicates beyond the head count. Both settings retain one local KV head per rank, so sixteen ranks double aggregate physical KV. Weight sharding and communication have separate behavior; inspect actual layouts instead of dividing total bytes by device count."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Pages hiện tại vừa thì mọi request có decode tiếp được không?",
+            "en": "If current pages fit, can every request continue decoding?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Fixture có block size 8, shared prefix 8 và current lengths 13/17/22/26 dùng 72 slots, admit 4 requests. Nhưng thêm 8 tokens/sequence cần 104 slots, vượt pool 96. Reserve future ngay từ đầu chỉ admit 3 trong fixture và giữ đủ planned growth. Scheduler có thể chọn policy khác nhưng phải thể hiện rõ queue/preemption/latency cost.",
+              "en": "No. With eight-token blocks and shared prefixes, current lengths use 72 slots and admit four requests, but eight more tokens each require 104 slots in a 96-slot pool. Reserving growth admits three in this fixture. Other policies must expose queueing, preemption and latency costs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Đổi token thứ 5 trong cached prefix 12 tokens thì tái dùng được bao nhiêu?",
+            "en": "How much of a 12-token prefix can be reused after changing token 5?"
+          },
+          "answer": [
+            {
+              "vi": "Với full blocks gồm 4 tokens, chỉ block đầu còn đúng. Later blocks phụ thuộc preceding prefix nên không được tái dùng độc lập dù internal tokens giống nhau. Nếu prefix không đổi, request 14 tokens có thể reuse 12 và compute 2 tail tokens trong fixture; engine thực tế còn logits/last-token/granularity requirements.",
+              "en": "With four-token full blocks, only the first four tokens remain reusable. Later blocks depend on preceding context even if their own tokens match. An unchanged twelve-token prefix in a fourteen-token request reuses twelve and computes two here, subject to actual engine tail/logit/granularity requirements."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "INT4 weights có nghĩa tổng memory còn một phần tư BF16 không?",
+            "en": "Do INT4 weights make total memory one quarter of BF16?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Raw weight payload có thể còn một phần tư, nhưng scales/zero-points/packing và unquantized tensors vẫn cần thêm chỗ. KV có dtype riêng; workspace, activations và graphs không tự chia 4. Hãy đo resident footprint và workload peaks; weight-only kernels còn dequantization/compute costs nên không suy ra tốc độ tăng 4 lần.",
+              "en": "Only raw weight payload may be one quarter. Metadata, packing and unquantized tensors add bytes; KV, workspaces, activations and graphs have separate formats. Measure loaded footprints and peaks, including dequantization, rather than inferring fourfold total-memory or speed gains."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Offload 4 GiB qua link 16 GB/s chỉ mất 250 ms?",
+            "en": "Does offloading 4 GiB over 16 GB/s take only 250 ms?"
+          },
+          "answer": [
+            {
+              "vi": "GiB và GB khác nhau: một chiều cần 4 × 2^30 / (16 × 10^9), khoảng 268,4 ms trước overhead. Round trip hai chiều khoảng 536,9 ms; fixture thêm 2 ms/chiều thành 540,9 ms. Nếu CPU đã có valid copy và chỉ reload thì khoảng 270,4 ms. Contention/overlap còn làm end-to-end khác; peak link rate không chứng minh latency bound.",
+              "en": "One binary 4 GiB payload over decimal 16 GB/s takes about 268.4 ms per direction before overhead. A round trip is about 536.9 ms, or 540.9 ms with this fixture’s overhead. Existing valid CPU backing permits a roughly 270.4 ms reload. Contention and overlap still affect actual latency."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Same prompt khác tenant có nên reuse KV để tăng hit rate?",
+            "en": "Should matching prompts reuse KV across tenants to improve hits?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ theo cache-sharing policy và threat model đã được cho phép, không vì text giống nhau. Fixture dùng trusted scope để cô lập tenants nên khác tenant phải miss; bỏ scope tạo unsafe reuse. Model/adapter/RoPE/multimodal/cache-format context còn phải khớp dù token IDs giống. Cache hit không cấp quyền hoặc chứng minh response caching an toàn.",
+              "en": "Follow explicitly authorized cache-sharing policies, not text similarity alone. This fixture isolates tenants through trusted scope, so cross-tenant reuse is unsafe when that scope is omitted. Model, adapter, positional, multimodal and cache-format contexts must also match; hits do not grant permissions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "GPU compute 40% nhưng KV full: tăng compute có giải quyết được không?",
+            "en": "Compute utilization is 40% but KV is full: does more compute solve it?"
+          },
+          "answer": [
+            {
+              "vi": "Có thể bottleneck là memory capacity hoặc bandwidth, không phải FLOPs. Xem live/evictable/pinned/reserved pages trên từng rank, context distribution và future policy. Đánh giá reservation/paging, authorized prefix reuse, cache precision có quality gate, hoặc memory/pool capacity theo measured SLO. Autoscale chỉ dựa compute utilization sẽ bỏ sót queue time, TTFT/TPOT và preemption rates.",
+              "en": "Memory capacity or bandwidth may bind before FLOPs. Inspect per-rank live, evictable, pinned and reserved pages, lengths and growth policies. Evaluate reservations/paging, authorized reuse, quality-gated precision and memory/pool capacity under measured SLOs. Compute-only autoscaling misses queueing, TTFT/TPOT and preemption behavior."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

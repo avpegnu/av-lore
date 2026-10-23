@@ -1,0 +1,1287 @@
+{
+  "id": "ai-parallelism",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Parallelism & MoE: chia model, đặt GPU và mở rộng fleet",
+    "en": "Parallelism & MoE: partition models, place GPUs and scale fleets"
+  },
+  "summary": {
+    "vi": "Phân biệt DP, TP, PP, SP/CP và EP; tính memory/communication có giả định, đọc pipeline timeline, xử lý expert skew và vận hành cả một group GPU an toàn.",
+    "en": "Distinguish DP, TP, PP, SP/CP and EP; reason about memory/communication, read pipeline timelines, handle expert skew and operate complete GPU groups safely."
+  },
+  "prerequisites": [
+    "ai-inference",
+    "ai-kv-cache",
+    "ai-batching"
+  ],
+  "relatedTopics": [
+    "distributed",
+    "system-design",
+    "observability",
+    "kubernetes"
+  ],
+  "takeaways": [
+    {
+      "vi": "Replica phục vụ một model có thể là cả group GPU; mất một required rank thường làm group không phục vụ được.",
+      "en": "A serving replica can be an entire GPU group; losing a required rank generally makes the group unavailable."
+    },
+    {
+      "vi": "Memory fit, latency SLO, throughput và failure isolation là bốn bài toán riêng cần thỏa đồng thời.",
+      "en": "Memory fit, latency, throughput and failure isolation are distinct requirements that must work together."
+    },
+    {
+      "vi": "TP đổi tensor memory/compute lấy collectives; PP đổi layer placement lấy handoffs và pipeline scheduling.",
+      "en": "TP trades tensor memory/computation for collectives; PP trades layer placement for handoffs and scheduling."
+    },
+    {
+      "vi": "MoE total parameters quyết định weight inventory; selected experts chỉ là một phần của compute và communication cost.",
+      "en": "Total MoE parameters determine the weight inventory; selected experts explain only part of computation and communication costs."
+    },
+    {
+      "vi": "Replicate matching expert copies có thể giữ lựa chọn model; drop hoặc đổi expert khác không giữ nguyên computation.",
+      "en": "Matching expert copies can preserve model selection; dropping contributions or choosing other experts changes computation."
+    },
+    {
+      "vi": "Fleet capacity phải tính readiness delay, warm headroom, drain và correlated failures.",
+      "en": "Fleet capacity includes readiness delays, warm headroom, draining and correlated failures."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Đi từ workload tới operational layout",
+      "en": "From workloads to operational layouts"
+    },
+    "caption": {
+      "vi": "Chọn layout theo measured workload và topology, không chỉ tìm số GPU nhỏ nhất đủ weights.",
+      "en": "Choose layouts using measured workloads and topology rather than the smallest weight-fitting GPU count."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Xác định budgets",
+          "en": "Define budgets"
+        },
+        "detail": {
+          "vi": "Model/revision, lengths, concurrency, quality và SLO.",
+          "en": "Specify revisions, lengths, concurrency, quality and SLOs."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Chia state và compute",
+          "en": "Partition state and computation"
+        },
+        "detail": {
+          "vi": "Tensor, layers, sequence hoặc experts; biết nhóm nào giao tiếp.",
+          "en": "Partition tensors, layers, sequences or experts and identify communicating groups."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Đặt lên topology",
+          "en": "Map onto topology"
+        },
+        "detail": {
+          "vi": "Fast links, shared bottlenecks, replica fault domains.",
+          "en": "Consider fast links, shared bottlenecks and replica fault domains."
+        },
+        "icon": "compare"
+      },
+      {
+        "title": {
+          "vi": "Đo và vận hành",
+          "en": "Measure and operate"
+        },
+        "detail": {
+          "vi": "Profile tails, validate semantics, scale/drain cả group.",
+          "en": "Profile tails, validate semantics and scale/drain whole groups."
+        },
+        "icon": "gauge"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "replica",
+      "title": {
+        "vi": "1. Replica không nhất thiết là một GPU",
+        "en": "1. A replica need not be one GPU"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một serving replica là tập tài nguyên đủ để tính toàn bộ model cho request được giao. Với model nhỏ nó có thể nằm trên một GPU; với model lớn, weights và computation phân bố qua nhiều ranks. Rank là một process/member trong distributed execution group, không luôn đồng nghĩa một physical device trong mọi runtime. Các bài thử dưới đây giả định một rank trên một GPU.",
+          "en": "A serving replica contains enough resources to evaluate the full model for its assigned requests. Small models can occupy one GPU; larger models distribute weights and work across ranks. A rank is a distributed process/member and is not universally identical to a physical device. The experiments assume one rank per GPU."
+        },
+        {
+          "vi": "Model dense 70B với 2 bytes/weight có raw weight payload 140 tỷ bytes, khoảng 130,39 GiB. Đây chưa gồm KV, activations, workspaces, quantization metadata, duplicated tensors hoặc allocator overhead. Chia weights lý tưởng cho4 GPU cho 32,60 GiB/GPU; không được suy ra mỗi GPU còn toàn bộ phần trống cho user requests nếu chưa đo peak memory.",
+          "en": "A dense 70B model at two bytes per weight has 140 billion raw weight bytes, about 130.39 GiB. This excludes KV, activations, workspaces, quantization metadata, duplicated tensors and allocator overhead. Ideal four-way sharding yields 32.60 GiB per GPU; unmeasured free space is not automatically safe request capacity."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Fit trên mỗi rank",
+            "en": "Per-rank fit"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Tính maximum rank memory, không chỉ average của cả cluster.",
+              "en": "Budget the most loaded rank, not just a cluster average."
+            },
+            {
+              "vi": "Embedding, final head hoặc uneven layers có thể làm stages lệch nhau.",
+              "en": "Embeddings, output heads and uneven layers can unbalance stages."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Đạt trải nghiệm",
+            "en": "Meet user targets"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Queue + prefill + transfers quyết định TTFT; decode tails quyết định độ mượt.",
+              "en": "Queueing, prefill and transfers shape TTFT; decode tails shape smoothness."
+            },
+            {
+              "vi": "Thêm GPU có thể tăng overhead thay vì giảm latency.",
+              "en": "Adding GPUs can increase overhead rather than reduce latency."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Sống qua lỗi",
+            "en": "Survive failures"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Một rank thiếu có thể làm collective của cả group fail.",
+              "en": "A missing rank can fail a whole group collective."
+            },
+            {
+              "vi": "Hai replicas cùng node/rack vẫn có correlated failure.",
+              "en": "Replicas sharing a node/rack still have correlated failures."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "axes",
+      "title": {
+        "vi": "2. Mỗi kiểu parallelism cắt một trục khác nhau",
+        "en": "2. Each parallelism strategy partitions a different axis"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong inference data parallelism (DP), các serving groups có bản model tương đương và xử lý requests khác nhau. Chúng không cần gradient synchronization hoặc per-forward tensor collectives với nhau như training DP, nhưng vẫn có thể phụ thuộc chung router, weight store, control plane và network. Replicas còn cần đúng revision/adapter semantics để route requests hợp lệ.",
+          "en": "Inference DP uses equivalent model copies to process different requests. Unlike training DP, these groups do not require gradient synchronization or per-forward tensor collectives with one another. They can still share routers, artifact stores, control planes and networks, and routing must respect revisions/adapters."
+        },
+        {
+          "vi": "TP chia các tensors/operators; PP chia các đoạn layers; EP phân bố experts; SP/CP xử lý sequence/activation partitions theo specific algorithm. Có thể kết hợp, nhưng phải vẽ process groups thực. Không nhân DP×TP×PP×SP×CP×EP một cách máy móc: SP thường gắn với TP group, EP có thể dùng lại một chiều group đã tồn tại, và expert TP có thể khác attention TP.",
+          "en": "TP partitions tensors/operators, PP partitions layer ranges, EP distributes experts, and SP/CP partition sequences/activations under specific algorithms. Combinations require explicit process groups. Do not blindly multiply every abbreviation: SP often uses TP groups, EP can reuse existing group dimensions, and expert TP can differ from attention TP."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Trục",
+            "en": "Axis"
+          },
+          {
+            "vi": "Chia gì?",
+            "en": "Partition"
+          },
+          {
+            "vi": "Trao đổi chính",
+            "en": "Main communication"
+          },
+          {
+            "vi": "Câu hỏi khi chọn",
+            "en": "Selection question"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "DP replicas",
+              "en": "DP replicas"
+            },
+            {
+              "vi": "Independent request cohorts",
+              "en": "Independent request cohorts"
+            },
+            {
+              "vi": "Routing/state placement; không per-forward cross-replica collective",
+              "en": "Routing/state placement without cross-replica forward collectives"
+            },
+            {
+              "vi": "Một replica đã đáp ứng SLO chưa?",
+              "en": "Does one replica meet SLOs?"
+            }
+          ],
+          [
+            {
+              "vi": "TP",
+              "en": "TP"
+            },
+            {
+              "vi": "Tensor dimensions/operator work",
+              "en": "Tensor dimensions/operator work"
+            },
+            {
+              "vi": "All-reduce, all-gather hoặc reduce-scatter tùy layout",
+              "en": "All-reduce, all-gather or reduce-scatter by layout"
+            },
+            {
+              "vi": "Bandwidth/latency collective có chịu được?",
+              "en": "Are collective bandwidth/latency acceptable?"
+            }
+          ],
+          [
+            {
+              "vi": "PP",
+              "en": "PP"
+            },
+            {
+              "vi": "Consecutive layer stages",
+              "en": "Consecutive layer stages"
+            },
+            {
+              "vi": "Activation handoff theo dependencies",
+              "en": "Dependency-ordered activation handoffs"
+            },
+            {
+              "vi": "Có đủ independent work để fill pipeline?",
+              "en": "Is there enough independent work to fill the pipeline?"
+            }
+          ],
+          [
+            {
+              "vi": "SP / CP",
+              "en": "SP / CP"
+            },
+            {
+              "vi": "Selected activations / context partitions",
+              "en": "Selected activations / context partitions"
+            },
+            {
+              "vi": "Gather/scatter hoặc distributed attention state",
+              "en": "Gather/scatter or distributed attention state"
+            },
+            {
+              "vi": "Đang dùng định nghĩa/algorithm nào?",
+              "en": "Which definition/algorithm is being used?"
+            }
+          ],
+          [
+            {
+              "vi": "EP",
+              "en": "EP"
+            },
+            {
+              "vi": "Logical experts tới physical GPUs",
+              "en": "Logical experts across GPUs"
+            },
+            {
+              "vi": "Token dispatch và return/combine",
+              "en": "Token dispatch and return/combine"
+            },
+            {
+              "vi": "Skew và expert batch shape ra sao?",
+              "en": "What are expert skew and batch shapes?"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "tp",
+      "title": {
+        "vi": "3. Tensor parallelism và cost của collective",
+        "en": "3. Tensor parallelism and collective cost"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một ví dụ hai linear layers trong FFN: phân chia columns của matrix thứ nhất tạo independent hidden shards, rồi partition rows của matrix thứ hai tạo partial outputs cần cộng. Attention heads cũng có thể chia, với output projection cần kết hợp. Một chosen Megatron-style forward layout dùng hai all-reduces mỗi transformer layer; SP/fusions/other layouts có communication khác. Không khẳng định mọi matrix multiply đều yêu cầu cùng một all-reduce.",
+          "en": "For a two-linear-layer FFN, column partitioning of the first matrix creates independent hidden shards, while row partitioning of the second creates partial outputs that need summation. Attention heads can also be partitioned with a combined output projection. A particular Megatron-style forward layout uses two all-reduces per layer; SP, fusions and other layouts change the pattern."
+        },
+        {
+          "vi": "Ring all-reduce analytical model với n ranks và payload S bytes: mỗi rank truyền khoảng2(n−1)S/n bytes qua2(n−1)rounds. T≈bytes/B_eff+rounds×latency là mô hình đơn giản bỏ compute/communication overlap và contention. Decode batch nhỏ có S nhỏ nhưng nhiều sequential collectives, nên latency rounds có thể chi phối; prefill có payload lớn hơn và compute shape khác.",
+          "en": "For n ranks and S payload bytes, a ring all-reduce sends approximately2(n−1)S/n bytes per rank over2(n−1) rounds. T≈bytes/B_eff+rounds×latency omits overlap and contention. Small decode batches have small payloads but many sequential collectives, making round latency important; prefill has different payloads and compute shapes."
+        },
+        {
+          "vi": "Đặt communication dày lên links nhanh là heuristic tốt, không phải luật TP chỉ được trong node. Cần kiểm topology thực, effective bandwidth, GPU↔NIC locality, switch bisection và concurrent traffic. Con số advertised link bandwidth có thể là aggregate/bidirectional và không bằng một usable pairwise path. Sum HBM bandwidth chỉ là roofline component; không hứa throughput tăng tuyến tính theo TP.",
+          "en": "Mapping frequent communication onto fast links is a useful heuristic, not a prohibition on cross-node TP. Inspect effective bandwidth, GPU/NIC locality, switch bisection and concurrent traffic. Advertised bandwidth may be aggregate/bidirectional rather than one usable pairwise path. Summed HBM bandwidth is a roofline component rather than a linear TP speedup promise."
+        }
+      ]
+    },
+    {
+      "id": "placement",
+      "title": {
+        "vi": "4. Thử placement, memory và node failure",
+        "en": "4. Explore placement, memory and node failure"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bài thử cố ý tách communication arithmetic khỏi end-to-end performance. Cùng tổng GPU có thể dùng TP lớn để giảm weight share nhưng thêm collective overhead, hoặc nhiều DP copies để tăng parallel requests. Thay PP làm giảm layers/stage nhưng thêm activation boundaries. Không có một slider nào tự chọn configuration tối ưu.",
+          "en": "This experiment separates communication arithmetic from end-to-end performance. The same GPU budget can increase TP to reduce weight shares with more collective overhead, or increase DP to serve more requests. PP reduces layers per stage while adding activation boundaries. No slider automatically selects an optimal configuration."
+        },
+        {
+          "vi": "Mặc định TP4 × PP1 × DP2 là8 ranks, packed trong node 0: mất node này mất cả2 replicas. Bật placement tách replica sang node riêng giữ ít nhất1replica qua one-node loss trong fixture. Điều đó vẫn chưa kiểm rack/power/control-plane loss, spare throughput hoặc exact state recovery. Replicas sống nhưng quá tải vẫn không đạt availability target của sản phẩm.",
+          "en": "Default TP4 × PP1 × DP2 uses eight ranks packed into node 0, so losing that node loses both replicas. Separate-node placement retains at least one replica after a single-node failure in the fixture. This does not test rack/power/control-plane failures, spare throughput or state recovery. Surviving but overloaded replicas can still miss availability targets."
+        }
+      ],
+      "experiment": "parallel-layout"
+    },
+    {
+      "id": "pipeline",
+      "title": {
+        "vi": "5. Pipeline parallelism: layers, bubbles và dependencies",
+        "en": "5. Pipeline parallelism: layers, bubbles and dependencies"
+      },
+      "paragraphs": [
+        {
+          "vi": "PP chuyển activation từ một layer range sang range kế tiếp. Stage có thể nằm cùng node hoặc khác node; mục tiêu placement là cân memory, compute và handoff cost. Equal layer counts không luôn equal cost vì embedding/head, attention context, MoE traffic hoặc kernels khác nhau. Một slow stage có thể giữ cả pipeline lại dù average GPU utilization đẹp.",
+          "en": "PP passes activations between layer ranges within or across nodes. Placement balances memory, computation and handoffs. Equal layer counts do not ensure equal costs because embeddings/heads, attention contexts, MoE traffic and kernels differ. One slow stage can bottleneck a pipeline despite appealing average utilization."
+        },
+        {
+          "vi": "Với p equal-cost stages, m independent forward microbatches cùng sẵn sàng và bỏ transfer, makespan=(m+p−1)×stageTime; average stage utilization=m/(m+p−1). Đây không phải training forward/backward schedule và không phải công thức latency cho một chat sequence. Token t+1 của một sequence phải đợi token t được chọn; không tạo future token inputs bằng cách chia sequence tùy ý thành m microbatches. Có thể pipeline independent requests hoặc supported speculative/chunked workloads với dependencies riêng.",
+          "en": "For p equal-cost stages and m ready independent forward microbatches with transfers omitted, makespan=(m+p−1)×stageTime and average utilization=m/(m+p−1). This is neither a training forward/backward schedule nor a chat-sequence latency formula. Token t+1 depends on selecting token t; arbitrary splitting cannot invent future inputs. Independent requests or supported speculative/chunked work have their own dependencies."
+        }
+      ],
+      "experiment": "parallel-pipeline"
+    },
+    {
+      "id": "context",
+      "title": {
+        "vi": "6. Sequence parallelism và context parallelism không phải cùng một nhãn",
+        "en": "6. Sequence and context parallelism are distinct concepts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tên sequence parallelism được dùng cho nhiều algorithms. Trong conventional Megatron SP, một số activations vốn duplicated trong TP group, chẳng hạn ở LayerNorm/dropout, được shard theo sequence dimension; gather/scatter phối hợp với tensor operators. Megatron CP chia context của inputs/activations rộng hơn và attention phải trao đổi thông tin KV giữa các context partitions. Luôn ghi rõ implementation và version thay gọi chung “split sequence”.",
+          "en": "Sequence parallelism names several algorithms. Conventional Megatron SP shards selected activations otherwise duplicated within TP groups, such as LayerNorm/dropout activations, coordinating gather/scatter with tensor operators. Megatron CP partitions context more broadly, with attention exchanging KV information across context partitions. Specify implementations and versions rather than using one generic label."
+        },
+        {
+          "vi": "Long-context prefill có nhiều tokens để phân bố nhưng causal attention và load balance cần đúng masks/positions. Decode của một query token qua long cached context lại có work/communication shape khác. KV cache sharding còn phụ thuộc attention architecture, head count, replication và engine; không lấy training CP memory formula áp nguyên cho mọi serving engine. Distributed attention có thể cần blockwise exchange và stable softmax combination, không đơn giản cộng independently normalized attention outputs.",
+          "en": "Long-context prefill offers many tokens to distribute but requires correct causal masks, positions and balance. Decoding one query over a long cache has a different work/communication shape. KV sharding depends on attention architecture, heads, replication and engines; training CP formulas do not automatically apply to every serving engine. Distributed attention may require block exchange and stable softmax combination rather than summing independently normalized outputs."
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "7. Theo dõi request và lifecycle của một GPU group",
+        "en": "7. Trace requests and GPU-group lifecycles"
+      },
+      "paragraphs": [
+        {
+          "vi": "Router chọn ready group, còn intra-group coordinator giữ compatible sequence/model state và ordered collectives. Rank membership của group không được thay tùy ý giữa một forward pass. Hình dưới mô tả logical TP stage rồi PP stage và nhánh MoE; một real model có nhiều layers và groups lặp lại. Chọn từng trace để thấy serve, dispatch, scale, failure và drain là các flows khác nhau.",
+          "en": "Routers choose ready groups; group coordination preserves compatible sequence/model state and collective ordering. Membership cannot change arbitrarily during a forward pass. The diagram shows logical TP and PP stages with an MoE branch; real models repeat layers/groups. Its traces distinguish serving, dispatch, scaling, failure and draining."
+        }
+      ],
+      "diagram": {
+        "id": "parallel-replica-lifecycle",
+        "title": {
+          "vi": "Một replica có nhiều ranks; một fleet có nhiều failure domains",
+          "en": "A replica has many ranks; a fleet needs failure domains"
+        },
+        "caption": {
+          "vi": "Chọn trace để theo dõi dense forward, MoE dispatch, scale-out, rank failure hoặc drain. Sơ đồ logical, không đại diện fixed GPU count hay layout của một sản phẩm.",
+          "en": "Trace a dense forward pass, MoE dispatch, scaling, rank failures or draining. This is a logical diagram rather than a fixed product layout."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client / deadline",
+              "en": "Client / deadline"
+            },
+            "detail": {
+              "vi": "Tenant, prompt/output bounds, stream và cancellation.",
+              "en": "Tenant, bounded inputs/outputs, streaming and cancellation."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "router",
+            "label": {
+              "vi": "Fleet router",
+              "en": "Fleet router"
+            },
+            "detail": {
+              "vi": "Healthy group, queue/KV headroom, locality và failure-domain policy.",
+              "en": "Healthy groups, queue/KV headroom, locality and failure-domain policy."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "group",
+            "label": {
+              "vi": "Replica coordinator",
+              "en": "Replica coordinator"
+            },
+            "detail": {
+              "vi": "Pinned model revision, rank membership, scheduling và KV ownership.",
+              "en": "Pinned revisions, rank membership, scheduling and KV ownership."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "tp",
+            "label": {
+              "vi": "TP stage ranks",
+              "en": "TP stage ranks"
+            },
+            "detail": {
+              "vi": "Tensor shards của cùng layer; collectives đúng group/order.",
+              "en": "Tensor shards of the same layer with ordered group collectives."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "worker"
+          },
+          {
+            "id": "control",
+            "label": {
+              "vi": "Capacity controller",
+              "en": "Capacity controller"
+            },
+            "detail": {
+              "vi": "Queue age, latency, memory, readiness lag và safe scale policy.",
+              "en": "Queue age, latency, memory, readiness lag and safe scaling."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "ready",
+            "label": {
+              "vi": "Group readiness",
+              "en": "Group readiness"
+            },
+            "detail": {
+              "vi": "Weights, layouts, collectives, warm-up và coherent membership đã kiểm.",
+              "en": "Verified weights, layouts, collectives, warm-up and coherent membership."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "next",
+            "label": {
+              "vi": "Next PP stage",
+              "en": "Next PP stage"
+            },
+            "detail": {
+              "vi": "Activation handoff và dependency ordering; có thể cùng hoặc khác node.",
+              "en": "Ordered activation handoffs within or across nodes."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "dispatch",
+            "label": {
+              "vi": "MoE dispatcher",
+              "en": "MoE dispatcher"
+            },
+            "detail": {
+              "vi": "Logical top-k selection tới physical expert copies.",
+              "en": "Maps logical top-k selections to physical expert copies."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "weights",
+            "label": {
+              "vi": "Versioned weights",
+              "en": "Versioned weights"
+            },
+            "detail": {
+              "vi": "Artifacts/checksums, sharding metadata, local staging và conversion.",
+              "en": "Artifacts, checksums, sharding metadata, staging and conversion."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "spare",
+            "label": {
+              "vi": "New / spare group",
+              "en": "New / spare group"
+            },
+            "detail": {
+              "vi": "Gang allocation và full group initialization trước nhận traffic.",
+              "en": "Gang allocation and full initialization before traffic admission."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "experts",
+            "label": {
+              "vi": "Expert GPUs",
+              "en": "Expert GPUs"
+            },
+            "detail": {
+              "vi": "Expert identity/revision, skew, capacity và return to token owner.",
+              "en": "Expert identity/revision, skew, capacity and return to token owners."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "model"
+          }
+        ],
+        "traces": [
+          {
+            "id": "dense",
+            "label": {
+              "vi": "Dense forward / decode",
+              "en": "Dense forward and decode"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "router",
+                "description": {
+                  "vi": "Validate bounds/deadline; chọn replica sẵn sàng với capacity evidence.",
+                  "en": "Validate bounds/deadlines and choose a ready group with capacity evidence."
+                }
+              },
+              {
+                "from": "router",
+                "to": "group",
+                "description": {
+                  "vi": "Pin model revision và sequence state trên toàn group.",
+                  "en": "Pin model revision and sequence state across the group."
+                }
+              },
+              {
+                "from": "group",
+                "to": "tp",
+                "description": {
+                  "vi": "Schedule tensor shards; tất cả ranks theo cùng collective order.",
+                  "en": "Schedule tensor shards with consistent collective ordering."
+                }
+              },
+              {
+                "from": "tp",
+                "to": "next",
+                "description": {
+                  "vi": "Khi stage hoàn tất, chuyển activation tới PP stage kế tiếp.",
+                  "en": "Pass completed activations to the next pipeline stage."
+                }
+              },
+              {
+                "from": "next",
+                "to": "group",
+                "description": {
+                  "vi": "Hoàn tất output distribution và sampling theo engine contract.",
+                  "en": "Complete output distributions and sampling under the engine contract."
+                }
+              },
+              {
+                "from": "group",
+                "to": "client",
+                "description": {
+                  "vi": "Emit committed token; next token phụ thuộc valid prefix.",
+                  "en": "Emit committed tokens; subsequent tokens depend on valid prefixes."
+                }
+              }
+            ]
+          },
+          {
+            "id": "moe",
+            "label": {
+              "vi": "Token qua experts",
+              "en": "Dispatch tokens through experts"
+            },
+            "steps": [
+              {
+                "from": "tp",
+                "to": "dispatch",
+                "description": {
+                  "vi": "Tính router scores/top-k theo pinned model semantics.",
+                  "en": "Compute router scores/top-k under pinned model semantics."
+                }
+              },
+              {
+                "from": "dispatch",
+                "to": "experts",
+                "description": {
+                  "vi": "Dispatch hidden vectors tới chosen logical experts và matching copies.",
+                  "en": "Dispatch hidden vectors to selected experts and matching copies."
+                }
+              },
+              {
+                "from": "experts",
+                "to": "dispatch",
+                "description": {
+                  "vi": "Return contributions; giữ token/expert identity và gating weights.",
+                  "en": "Return contributions with token/expert identities and gating weights."
+                }
+              },
+              {
+                "from": "dispatch",
+                "to": "next",
+                "description": {
+                  "vi": "Combine đủ selected outputs trước downstream computation.",
+                  "en": "Combine required selected outputs before downstream computation."
+                }
+              }
+            ]
+          },
+          {
+            "id": "scale",
+            "label": {
+              "vi": "Scale-out và readiness",
+              "en": "Scale out and verify readiness"
+            },
+            "steps": [
+              {
+                "from": "control",
+                "to": "spare",
+                "description": {
+                  "vi": "Allocate đủ compatible ranks theo topology/failure policy.",
+                  "en": "Allocate a compatible rank group under topology/failure policies."
+                },
+                "async": true
+              },
+              {
+                "from": "weights",
+                "to": "spare",
+                "description": {
+                  "vi": "Load/check revision, metadata và shard layout; không trộn generations.",
+                  "en": "Load and verify revisions, metadata and shard layouts without mixing generations."
+                },
+                "async": true
+              },
+              {
+                "from": "spare",
+                "to": "ready",
+                "description": {
+                  "vi": "Initialize collectives/KV/workspaces, warm-up và group health.",
+                  "en": "Initialize collectives, KV and workspaces, then warm up and check group health."
+                }
+              },
+              {
+                "from": "ready",
+                "to": "router",
+                "description": {
+                  "vi": "Publish healthy membership sau full group readiness.",
+                  "en": "Publish healthy membership only after the whole group is ready."
+                }
+              }
+            ]
+          },
+          {
+            "id": "failure",
+            "label": {
+              "vi": "Một rank hoặc node lỗi",
+              "en": "A rank or node fails"
+            },
+            "steps": [
+              {
+                "from": "tp",
+                "to": "group",
+                "description": {
+                  "vi": "Collective stalls/errors hoặc health signal đánh dấu group không dùng được.",
+                  "en": "Collective stalls/errors or health signals mark the group unavailable."
+                }
+              },
+              {
+                "from": "group",
+                "to": "router",
+                "description": {
+                  "vi": "Remove group khỏi admission; không tiếp tục bằng thiếu tensor shards.",
+                  "en": "Remove the group from admission rather than continuing with missing shards."
+                }
+              },
+              {
+                "from": "router",
+                "to": "spare",
+                "description": {
+                  "vi": "Retry theo output contract và deadline; replay state cần thiết ở healthy group.",
+                  "en": "Retry under output/deadline contracts and replay required state on a healthy group."
+                }
+              },
+              {
+                "from": "spare",
+                "to": "client",
+                "description": {
+                  "vi": "Nếu stream đã phát, cần resumable semantics hoặc explicit failure/restart.",
+                  "en": "After streaming begins, use resumable semantics or explicit failure/restart."
+                }
+              }
+            ]
+          },
+          {
+            "id": "drain",
+            "label": {
+              "vi": "Drain trước scale-in",
+              "en": "Drain before scaling in"
+            },
+            "steps": [
+              {
+                "from": "control",
+                "to": "router",
+                "description": {
+                  "vi": "Ngừng new admissions vào chosen group.",
+                  "en": "Stop new admissions to the selected group."
+                }
+              },
+              {
+                "from": "router",
+                "to": "group",
+                "description": {
+                  "vi": "Giữ active streams với bounded drain deadline và cancellation policy.",
+                  "en": "Retain active streams under bounded drain and cancellation policies."
+                }
+              },
+              {
+                "from": "group",
+                "to": "ready",
+                "description": {
+                  "vi": "Finish/migrate compatible state; confirm no outstanding kernels/references.",
+                  "en": "Finish or compatibly migrate state and confirm no outstanding kernels/references."
+                }
+              },
+              {
+                "from": "ready",
+                "to": "spare",
+                "description": {
+                  "vi": "Release full group resources khi safe; giữ warm floor đủ recovery.",
+                  "en": "Release the group safely while retaining a suitable warm recovery floor."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "moe",
+      "title": {
+        "vi": "8. MoE: total weights, active experts và output combination",
+        "en": "8. MoE: total weights, active experts and output combination"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một sparse MoE block có router chọn một số experts cho mỗi token, tính các expert outputs rồi combine theo gating weights của model. Experts thường là FFN blocks của từng layer, không phải nhiều complete chat models hoặc mặc định một expert cho mỗi ngành nghề. Selection có thể đổi theo token/layer. Shared attention, shared experts và other dense components vẫn chạy theo architecture.",
+          "en": "A sparse MoE block selects experts per token, evaluates them and combines outputs using model gating weights. Experts are typically per-layer FFN blocks rather than complete chat models or predetermined subject specialists. Selection can vary by token/layer, while attention, shared experts and other dense components still follow the architecture."
+        },
+        {
+          "vi": "Total parameter count nói về weight inventory; active parameter count nói về subset tham gia một token theo convention. Chúng không đủ dự đoán wall-clock: routing, dispatch, return/combine, attention, padding và expert matrix shape đều tốn cost. Tất cả required weights phải available ở đúng lúc; có thể offload/cache expert weights nhưng đổi lấy transfer/latency và residency policy. “Không active ở token này” không đồng nghĩa có thể bỏ weights khỏi model artifact.",
+          "en": "Total parameters describe the weight inventory; active parameters describe the subset used per token under a counting convention. Neither predicts wall-clock time alone: routing, transfers, attention, padding and matrix shapes also cost resources. Required weights must be available when needed; offloading/caching trades residency for transfers and latency. Inactivity on one token does not remove weights from the artifact."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Minh họa model",
+            "en": "Model illustration"
+          },
+          {
+            "vi": "Total / active mỗi token",
+            "en": "Total / active per token"
+          },
+          {
+            "vi": "Raw 2-byte weight payload",
+            "en": "Raw two-byte weight payload"
+          },
+          {
+            "vi": "Điều không suy ra",
+            "en": "Cannot infer"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Dense 70B hypothetical",
+              "en": "Hypothetical dense 70B"
+            },
+            {
+              "vi": "70B /70B",
+              "en": "70B /70B"
+            },
+            {
+              "vi": "140 GB≈130,39 GiB",
+              "en": "140 GB≈130.39 GiB"
+            },
+            {
+              "vi": "KV/workspace fit hoặc latency",
+              "en": "KV/workspace fit or latency"
+            }
+          ],
+          [
+            {
+              "vi": "Mixtral8×7B published architecture",
+              "en": "Mixtral8×7B published architecture"
+            },
+            {
+              "vi": "≈47B /≈13B",
+              "en": "≈47B /≈13B"
+            },
+            {
+              "vi": "≈94 GB≈87,54 GiB",
+              "en": "≈94 GB≈87.54 GiB"
+            },
+            {
+              "vi": "Total là8×7B hoặc tốc độ bằng dense 13B",
+              "en": "That total is8×7B or speed equals dense 13B"
+            }
+          ],
+          [
+            {
+              "vi": "DeepSeek-V3 published architecture",
+              "en": "DeepSeek-V3 published architecture"
+            },
+            {
+              "vi": "671B /37B",
+              "en": "671B /37B"
+            },
+            {
+              "vi": "1342 GB≈1249,83 GiB",
+              "en": "1342 GB≈1249.83 GiB"
+            },
+            {
+              "vi": "37Bweights đủ để phục vụ fullmodel",
+              "en": "That 37B weights suffice to serve the full model"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "experts",
+      "title": {
+        "vi": "9. Expert parallelism và một vòng dispatch",
+        "en": "9. Expert parallelism and a dispatch round"
+      },
+      "paragraphs": [
+        {
+          "vi": "EP đặt expert parameters trên các GPUs và đưa token hidden vectors tới nơi chứa selected experts. Với top-k, một token có thể sinh nhiều assignments; sau compute, contributions trở về đúng token owner để weighted combine. All-to-all là logical communication pattern phổ biến, không có nghĩa mọi GPU luôn gửi cùng số bytes tới mọi GPU hoặc chỉ có một collective call cho cả layer. Dispatchers có thể dùng hierarchy, packing, fused kernels và overlap.",
+          "en": "EP places expert parameters across GPUs and sends token hidden vectors to selected experts. Top-k can produce several assignments per token; outputs return to the correct owner for weighted combination. All-to-all is a common logical pattern, not equal traffic on every pair or one mandatory collective call per layer. Dispatchers can use hierarchy, packing, fused kernels and overlap."
+        },
+        {
+          "vi": "Gọi N là số tokens, k là selected experts/token, h là hidden width và b là bytes/activation. Nếu mọi assignment remote và input/output vector đều h phần tử, payload đi+về khoảng2Nkhb bytes, trước metadata/padding. Local assignments không cần inter-GPU path; experts collocated hoặc shared dispatch có thể thay thực tế. Vì traffic matrix skew nên aggregate GB/s không mô tả congestion và completion của slowest destination.",
+          "en": "For N tokens, k selected experts per token, hidden width h and b bytes per activation, all-remote assignments with equal input/output widths move about2Nkhb payload bytes for dispatch plus return, before metadata/padding. Local work avoids inter-GPU paths and co-location/dispatch sharing can change actual traffic. A skewed traffic matrix makes aggregate bandwidth insufficient to describe congestion or the slowest destination."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Giữ token và expert identity xuyên suốt",
+          "en": "Preserve token and expert identity"
+        },
+        "caption": {
+          "vi": "Một expert output trả nhầm token vẫn là lỗi dù tổng byte count đúng.",
+          "en": "Correct byte counts cannot compensate for returning outputs to the wrong tokens."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Select",
+              "en": "Select"
+            },
+            "detail": {
+              "vi": "Pin router semantics và top-k assignments.",
+              "en": "Pin router semantics and top-k assignments."
+            },
+            "icon": "target"
+          },
+          {
+            "title": {
+              "vi": "Pack + dispatch",
+              "en": "Pack and dispatch"
+            },
+            "detail": {
+              "vi": "Token/expert IDs, shapes, offsets và compatible copies.",
+              "en": "Preserve identities, shapes, offsets and compatible copies."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Evaluate",
+              "en": "Evaluate"
+            },
+            "detail": {
+              "vi": "Batches per expert, capacity và skew.",
+              "en": "Evaluate expert batches under capacity and skew."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Return + combine",
+              "en": "Return and combine"
+            },
+            "detail": {
+              "vi": "Đúng owner, đủ contributions và gating weights.",
+              "en": "Return to owners and combine required weighted contributions."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "skew",
+      "title": {
+        "vi": "10. Hot experts: replicate, queue hay drop?",
+        "en": "10. Hot experts: replicate, queue or drop?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Routing skew thay đổi theo workload và time window. Average toàn fleet có thể che một GPU giữ hot expert hoặc một small microbatch thiếu efficient GEMM shape. Training balancing objectives, router policies và expert capacity là thiết kế của model/training system; không bật một auxiliary loss trong serving để sửa ngay distribution đã train. Một số models dùng learned balancing mechanisms hoặc shared experts, nên không giả định cùng top-k softmax cho mọi MoE.",
+          "en": "Routing skew varies by workload and window. Fleet averages can hide a hot expert GPU or small inefficient expert batches. Training balance objectives, router policies and capacity belong to model/training design; enabling an auxiliary loss during serving does not repair a trained distribution. Models can use learned balancing or shared experts rather than one universal top-k softmax."
+        },
+        {
+          "vi": "Có thể replicate một hot logical expert ra nhiều physical copies với cùng parameters/revision và chọn copy phù hợp. Việc đó tăng memory và placement complexity nhưng có thể giữ selected experts; floating-point execution vẫn có tolerance/nondeterminism cần kiểm. Trái lại, chuyển token sang logical expert khác hoặc bỏ contribution khi overflow đổi computation. Queue/split work có thể giữ selected outputs nhưng làm latency tăng. Không trình bày dropping/rerouting như optimization không ảnh hưởng quality.",
+          "en": "Replicating a hot logical expert with matching parameters/revisions can preserve selected experts at additional memory/placement cost, subject to numerical tolerance checks. Sending work to different logical experts or dropping overflow contributions changes computation. Queueing/splitting can preserve selected outputs while increasing latency. Dropping/rerouting is not a quality-neutral optimization."
+        },
+        {
+          "vi": "Bài thử capacity ở đây chia 16 assignments cho4 experts để có baseline4/copy; đây là quy ước riêng, không config của engine cụ thể. Bật skew tạo load8/3/3/2. So sánh queue, matching expert copies và drop để thấy memory/communication/semantics đổi khác nhau. GPU work count không tự là measured latency vì sizes, kernels và topology còn ảnh hưởng.",
+          "en": "This experiment defines capacity from sixteen assignments and four experts, giving a baseline of four per copy; it is not an engine configuration. Skew creates logical loads8/3/3/2. Compare queues, matching copies and dropping to see different memory, communication and semantic effects. Work counts are not measured latency because shapes, kernels and topology still matter."
+        }
+      ],
+      "experiment": "parallel-experts"
+    },
+    {
+      "id": "budget",
+      "title": {
+        "vi": "11. Tính một deployment budget có đơn vị rõ",
+        "en": "11. Build an explicit deployment budget"
+      },
+      "paragraphs": [
+        {
+          "vi": "Ví dụ dense 405B ở2 bytes/weight cần 810 GB≈754,37 GiB raw weights. Trên hypothetical8×80 GiB, tổng 640 GiB chưa đủ weights, chưa kể runtime state. TP8×PP2 chia đều cho 16 GPU cho≈47,15 GiB/rank, có thể là weight-fit candidate nhưng chưa chứng minh peak memory, SLO hoặc failure isolation. At 1 byte/weight raw còn≈377,19 GiB, khoảng 47,15 GiB/rank ởTP8; quantization metadata và kernels/quality vẫn phải kiểm.",
+          "en": "A dense 405B model at two bytes per weight needs 810 GB≈754.37 GiB of raw weights. Eight hypothetical 80 GiB GPUs total 640 GiB, insufficient even before runtime state. Ideal TP8×PP2 across sixteen GPUs gives≈47.15 GiB per rank, a weight-fitting candidate rather than proof of peak fit, latency or resilience. One-byte weights reduce raw storage to≈377.19 GiB, or 47.15 GiB per rank atTP8, still requiring metadata, kernel and quality checks."
+        },
+        {
+          "vi": "Nếu cần 5000 requests/phút, arrival average≈83,33 requests/s. Không chia số này cho GPU count để ra replicas: cần measured service capacity theo exact workload và SLO, rồi headroom/peak/failure reserve. Nếu một ready group measured goodput 20 requests/s tại SLO đã nêu và chỉ dùng 70%budget khi bình thường, baselineceil(83,33/14)=6 groups; N−1 vẫn cần đủ capacity ở peak. Đây là capacity arithmetic với input giả định, không benchmark của 405B.",
+          "en": "Five thousand requests per minute average≈83.33 requests/s. Replica count needs measured per-group goodput under the actual workload/SLO plus peak/failure headroom, not division by GPU count. If one group delivers an assumed 20 requests/s within targets and normal operation uses 70% of that budget, ceil(83.33/14)=six groups is a starting point. N−1 and peaks need separate checks; this is not a 405B benchmark."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Budget",
+            "en": "Budget"
+          },
+          {
+            "vi": "Bao gồm",
+            "en": "Includes"
+          },
+          {
+            "vi": "Evidence để chốt",
+            "en": "Acceptance evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Memory/rank",
+              "en": "Memory/rank"
+            },
+            {
+              "vi": "Weights + metadata + KV + peak activations/workspace + reserve",
+              "en": "Weights, metadata, KV, peak activations/workspace and reserve"
+            },
+            {
+              "vi": "Measured peak ở supported lengths/concurrency",
+              "en": "Measured peaks at supported lengths/concurrency"
+            }
+          ],
+          [
+            {
+              "vi": "Latency",
+              "en": "Latency"
+            },
+            {
+              "vi": "Queue + compute + collectives/handoffs + output delivery",
+              "en": "Queues, compute, communication and output delivery"
+            },
+            {
+              "vi": "TTFT/ITL tails theo traffic mix",
+              "en": "TTFT/ITL tails by traffic mix"
+            }
+          ],
+          [
+            {
+              "vi": "Fleet",
+              "en": "Fleet"
+            },
+            {
+              "vi": "Ready groups, spare domains, warm capacity và cost",
+              "en": "Ready groups, spare domains, warm capacity and cost"
+            },
+            {
+              "vi": "Burst/failure/drain tests",
+              "en": "Burst, failure and draining tests"
+            }
+          ],
+          [
+            {
+              "vi": "Quality",
+              "en": "Quality"
+            },
+            {
+              "vi": "Quantization, router semantics, revision và numerical tolerance",
+              "en": "Quantization, routing, revisions and numerical tolerance"
+            },
+            {
+              "vi": "Task evals + distribution/numerical regressions",
+              "en": "Task evaluations and distribution/numerical regressions"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "fleet",
+      "title": {
+        "vi": "12. Fleet routing, cold start và autoscaling",
+        "en": "12. Fleet routing, cold starts and autoscaling"
+      },
+      "paragraphs": [
+        {
+          "vi": "Scale-out thêm complete ready groups, không thêm một GPU rời vào running TP collective. Trong thực tế engine có supported elastic/reconfiguration protocol thì làm theo contract đó; không tự coi group membership thay được không gián đoạn. Router nên xem queue age, estimated work, KV growth/headroom, prefix locality, tenant priority và deadlines. Least request count có thể route sai khi prompt/output lengths lệch lớn.",
+          "en": "Scaling adds complete ready groups rather than arbitrary GPUs to running collectives, unless an engine supplies a supported reconfiguration protocol. Routing can consider queue age, estimated work, KV growth/headroom, prefix locality, priorities and deadlines. Least request count can mislead when lengths differ substantially."
+        },
+        {
+          "vi": "Cold start gồm gang allocation, artifact download/read, integrity/revision checks, decompression/conversion, device copy, layout/collective initialization, workspace/KV setup và warm-up/graph capture. Raw 140 GB qua4 GB/s có lower-bound 35 giây chỉ cho ideal serial transfer nếu cùng byte basis; không phải startup guarantee. Local artifact staging giảm một bottleneck nhưng không xóa phần còn lại. Readiness cần full group, không chỉ process listening hoặc rank0 healthy.",
+          "en": "Cold starts include group allocation, artifact reads, integrity/revision checks, decompression/conversion, device copies, collective/layout initialization, memory setup and warm-up/graph capture. Raw 140 GB over4 GB/s has an ideal 35-second transfer lower bound, not a startup guarantee. Local staging removes one bottleneck rather than all initialization. Readiness covers the group, not just a listening process or healthy rank0."
+        },
+        {
+          "vi": "Autoscaling dùng leading pressure và measured readiness delay với stabilization/hysteresis, warm floor và capacity ceiling. GPU utilization một mình không cho biết decode memory pressure, expert straggler hoặc SLO headroom. Scale-in phải stop admissions rồi drain active streams theo deadline; state migration chỉ khi KV/layout/model compatible và ownership an toàn. Tránh autoscaler và load-balancer feedback làm traffic oscillate giữa cold/warm groups.",
+          "en": "Autoscaling combines leading pressure with measured readiness delays, stabilization, a warm floor and capacity limits. GPU utilization alone does not reveal decode memory pressure, expert stragglers or SLO headroom. Scale-in stops admissions and drains streams under deadlines; migration requires compatible state and sound ownership. Avoid controller/routing feedback that oscillates traffic between cold and warm groups."
+        }
+      ]
+    },
+    {
+      "id": "failure",
+      "title": {
+        "vi": "13. Rank failure, stream recovery và failure domains",
+        "en": "13. Rank failures, stream recovery and failure domains"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi một rank chết hoặc collective ordering lệch, những ranks khác có thể wait/hang cho tới timeout. Controller cần bounded detection, fence old group, remove admission và clean up kernels/resources theo supported runtime behavior. Không tiếp tục forward bằng cách bỏ tensor shard/expert contributions cần thiết. Khi replay sang group khác, prompt, generated prefix, model revision, sampling state và usage/billing boundaries cần contract rõ.",
+          "en": "A failed rank or mismatched collective order can leave peers waiting until timeout. Recovery needs bounded detection, fencing, admission removal and runtime-supported cleanup. Missing required tensor shards or expert contributions cannot simply be omitted. Replay to another group needs explicit prompt/prefix, revision, sampling and usage boundaries."
+        },
+        {
+          "vi": "Nếu client đã thấy tokens, retry cả request có thể tạo text khác, duplicate chunks hoặc double side effects. Thiết kế request/stream generation IDs, sequence/ack boundaries và cancellation; chọn explicit failure/restart hoặc supported resume thay promise transparent recovery. Resumable output không đồng nghĩa KV tự nằm ở replica khác; recompute/migration có latency và memory cost. Node/rack/power/network failures phải xét theo actual rank placement, không theo replica label.",
+          "en": "Once tokens are visible, replay can produce different text, duplicate chunks or repeated side effects. Define request/stream generations, sequencing, acknowledgements and cancellation, choosing explicit restart or supported resumption. Resumable delivery does not imply another replica already holds KV; recomputation/migration costs memory and time. Evaluate node/rack/power/network failures against actual placement rather than replica labels."
+        }
+      ]
+    },
+    {
+      "id": "validation",
+      "title": {
+        "vi": "14. Profile và kiểm trước khi chọn layout",
+        "en": "14. Profile and validate before choosing a layout"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tạo workload matrix theo prompt/output length, concurrency, arrival bursts, prefix reuse và task/domain. Đo per-rank memory peak, compute/collective time, link traffic, per-stage waiting, per-expert assignments, max/min GPU step time và TTFT/ITL/goodput tails. Compare layouts trên cùng quality/revision/precision và request mix; warm/cold measurement phải tách. Không chọn chỉ vì small benchmark throughput hoặc average across all ranks.",
+          "en": "Build a workload matrix across lengths, concurrency, bursts, reuse and domains. Measure rank memory peaks, compute/communication time, link traffic, stage waiting, expert assignments, GPU step-time skew and latency/goodput tails. Compare layouts under matching quality, revisions, precision and traffic, separating warm/cold measurements. Small throughput tests or rank averages are insufficient."
+        },
+        {
+          "vi": "Validation phải gồm uneven expert load, long-context memory, partial group readiness, rank crash giữa collective, node loss, stale revision, stream cancel và drain timeout. Kiểm model output/numerical tolerance sau shard/precision/dispatcher changes; test dropping policy như model behavior change nếu có. Load tests cần bounded arrivals và realistic deadlines để overload không bị che bởi client tự chậm lại.",
+          "en": "Validate expert skew, long contexts, partial readiness, crashes within collectives, node loss, stale revisions, cancellations and drain timeouts. Recheck output/numerical tolerances after sharding, precision or dispatcher changes, treating dropping as a model behavior change. Load tests need controlled arrivals and realistic deadlines so client slowdown does not hide overload."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Chọn candidate",
+            "en": "Choose candidates"
+          },
+          "icon": "decision",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Weight-fit rồi kiểm peak state; align head counts, layers và kernel support.",
+              "en": "Check peak state after weight fit; align heads, layers and kernel support."
+            },
+            {
+              "vi": "Tìm topology mapping hợp group communication.",
+              "en": "Map communicating groups onto suitable topology."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Chốt bằng evidence",
+            "en": "Decide with evidence"
+          },
+          "icon": "inspect",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Measure cả latency tails, cost và quality ở supported workload.",
+              "en": "Measure latency tails, cost and quality under supported traffic."
+            },
+            {
+              "vi": "Chạy burst/failure/drain trước khi scale production.",
+              "en": "Exercise bursts, failures and draining before production scaling."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Đặt điều kiện đổi",
+            "en": "State revision triggers"
+          },
+          "icon": "warning",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Workload/context mix hoặc expert skew đổi có thể cần layout mới.",
+              "en": "Changed context mixes or expert skew can require new layouts."
+            },
+            {
+              "vi": "Engine/hardware upgrade cần reprofile thay dùng con số cũ.",
+              "en": "Engine/hardware upgrades need fresh profiling rather than inherited numbers."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Câu hỏi luyện giải thích và tính toán",
+        "en": "15. Questions with worked reasoning"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "70B BF16 fit trên2×80 GiB thì chọnTP2 luôn được không?",
+            "en": "If 70B BF16 fits on two 80 GiB GPUs, should TP2 be the default?"
+          },
+          "answer": [
+            {
+              "vi": "Raw weights khoảng 130,39 GiB; chia lý tưởng cho hai ranks là 65,19 GiB/rank. Mỗi rank còn khoảng 14,81 GiB trước runtime state. Kiểm KV growth, activation/workspace peaks, duplicated tensors và layout support. Sau đó đo latency/goodput và so sánh TP4 hoặc quantization theo quality; weight fit chỉ là bước lọc đầu tiên.",
+              "en": "Raw weights are≈130.39 GiB, or≈65.19 GiB/rank ideally, leaving≈14.81 GiB before runtime state. Check KV growth, activation/workspace peaks, duplication and layout support, then compare measured latency/goodput against alternatives. Weight fit is only an initial filter."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "TP8 có luôn nhanh gấp đôiTP4 không?",
+            "en": "Is TP8 always twice as fast as TP4?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Compute/HBM share có thể giảm nhưng collective rounds tăng, tensor shards nhỏ có thể chạy kernels kém hiệu quả và đường truyền qua node có thể chậm. So sánh cùng workload và SLO. Với fixed budget, TP8 còn giảm số DP copies; latency của một sequence và aggregate goodput có thể thay đổi ngược chiều.",
+              "en": "No. Reduced compute/HBM shares compete with collective rounds, smaller kernel shapes and potentially slower paths. Under fixed budgets, TP8 also reduces DP copies. Single-sequence latency and fleet goodput can move in opposite directions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Pipeline4stages,8microbatches equal 10 ms có utilization bao nhiêu?",
+            "en": "What is utilization for four 10 ms stages and eight independent microbatches?"
+          },
+          "answer": [
+            {
+              "vi": "Fixture forward-only có makespan (8+4−1)×10 = 110 ms. Total busy time là 4×8×10 = 320 stage-ms; available time là 4×110 = 440 stage-ms, nên average utilization khoảng 72,7%. First microbatch hoàn tất sau 40 ms. Không dùng kết quả này làm GPU kernel benchmark hoặc để hứa decode latency của một chat sequence.",
+              "en": "The forward fixture takes 110 ms with 320 busy stage-ms out of 440 available stage-ms, giving≈72.7% utilization. The first microbatch takes 40 ms. This is neither a kernel utilization benchmark nor a single-chat decoding guarantee."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "MoE13Bactive có cần chỉ26GBweights ởBF16 không?",
+            "en": "Does a 13B-active MoE need only 26 GB of BF16 weights?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu full model có total parameters lớn hơn. 26 GB chỉ là active-weight count xấp xỉ ở 2 bytes/weight, không phải toàn bộ weight inventory. Lập kế hoạch resident/offloaded weights cho tất cả experts và shared components, cộng KV/runtime overhead. Sau đó tính communication và expert batch shapes khi đánh giá latency.",
+              "en": "Not when the full model has more total parameters.26 GB is an active-weight count approximation rather than the full inventory. Plan resident/offloaded storage for experts/shared parts plus runtime state, then assess communication and expert batch shapes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "MoEp 99xấu nhưng averageGPUutil ổn: kiểm gì trước?",
+            "en": "MoE p 99 is poor despite reasonable average GPU utilization. What should be checked?"
+          },
+          "answer": [
+            {
+              "vi": "Kiểm queue, length mix, KV pressure, network/collective tails và per-expert/per-rank timing trước khi kết luận expert skew. Nếu có evidence về hot expert, thử matching copies, placement và batch shapes. Giữ output semantics; drop hoặc chuyển sang logical expert khác cần quality policy và evals riêng.",
+              "en": "Check queues/lengths, KV pressure, network/collective tails and expert/rank timing before blaming skew. With evidence of a hot expert, evaluate matching copies, placement and batch shapes. Dropping or selecting different experts requires separate quality policies/evaluations."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "HaiDPcopies trên cùng8 GPU node có chịu nodefailure không?",
+            "en": "Can two DP copies on one eight-GPU node survive node loss?"
+          },
+          "answer": [
+            {
+              "vi": "Không. TP4 × PP1 × DP2 packed dùng chung một node, nên node loss làm mất cả hai replicas. Tách sang hai nodes có thể giữ một group, nhưng vẫn cần spare capacity và routing recovery. Rack, power và network failures dùng chung cần được xét riêng.",
+              "en": "No. Packed TP4PP1DP2 shares one node, so losing it removes both copies. Separate nodes can preserve one group but still require spare capacity and routing recovery, with rack/power/network failures evaluated separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì saoCP không chỉ là bậtSP=true?",
+            "en": "Why is CP more than enabling SP=true?"
+          },
+          "answer": [
+            {
+              "vi": "Trong cách đặt tên của Megatron, SP shards selected activations trong TP group, còn CP chia context và attention cần trao đổi KV. Algorithms, process groups, attention masks và memory footprints khác nhau. Xác định training hay inference, engine version và supported layout trước khi ước tính.",
+              "en": "In Megatron terminology, SP shards selected activations within TP groups, whereas CP partitions context and exchanges attention state. Algorithms, groups, masks and memory footprints differ. Specify training/inference, engine versions and supported layouts first."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Queue tăng thì autoscaler thêm bao nhiêuGPU?",
+            "en": "How many GPUs should an autoscaler add when queues grow?"
+          },
+          "answer": [
+            {
+              "vi": "Scale theo compatible groups và measured capacity/readiness delay, không chỉ GPU count. Ước lượng arrivals/work, healthy headroom, KV, SLO và peak/failure reserve. Pre-stage weights, giữ warm floor và kiểm full-group readiness. Khi scale-in, drain active requests theo deadline rõ.",
+              "en": "Scale compatible groups using measured capacity and readiness delay. Account for arrival work, headroom, KV, targets and peak/failure reserve; stage weights, retain warm capacity and verify group readiness. Scale-in needs bounded draining."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

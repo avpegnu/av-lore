@@ -4,15 +4,15 @@ Cập nhật23/10/2026. Chủ sở hữu đã quay lại và yêu cầu tiếp t
 
 ## Trạng thái hiện tại
 
-- **51/73 bài có nội dung Việt–Anh trong source**, gồm4 Foundations,8 Building Blocks,26 Case Studies,12 Build Stories và1 AI Systems. **51 bài đã build/browser local.**
-- Tất cả51 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
-- **22 mục chưa biên soạn**:14 AI Systems,3 Practice và5 Interview tools. Chưa bắt đầu AI tiếp theo.
-- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local51. Các bài `/episodes/ep-whatsapp/`, `/episodes/ep-figma/` có bản `/en/` tương ứng.
+- **54/73 bài có nội dung Việt–Anh trong source**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories và 4 AI Systems. **54 bài đã build/browser local.**
+- Tất cả 54 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
+- **19 mục chưa biên soạn**: 11 AI Systems, 3 Practice và 5 Interview tools. Tiếp theo `ai-serving`; đã research, chưa implementation.
+- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local54. Bài mới `/ai-systems/ai-parallelism/` có bản `/en/` tương ứng.
 - Giữ198 chương/15 lộ trình,31 Notes & Interview topics, stable IDs, localStorage keys và9 themes. Không portfolio.
 
 ## Mốc đã push
 
-- **HEAD hiện tại checkpoint49:** AV Lore `be7817b`, IT Basic `ff7e396`. Push thành công; Pages https://github.com/avpegnu/av-lore/actions/runs/39760389076 thành công, IT VPS https://github.com/avpegnu/it-basic/actions/runs/39760401575 failed. Phần Figma50/YouTube51 đang local, **chưa commit/push** theo yêu cầu tạm dừng mới nhất.
+- **Checkpoint51 đã push:** AV Lore `5b4043d`, IT Basic `c957138`. Pages https://github.com/avpegnu/av-lore/actions/runs/39882720793 thành công; IT VPS https://github.com/avpegnu/it-basic/actions/runs/39882722183 failed. Checkpoint52–54 đã kiểm tra và chuẩn bị commit/push trong lượt tiếp tục23/10.
 
 - Checkpoint33: AV Lore `3f3974547036498387b2bab2d6fcbe58aa581916`, IT Basic `996c995f1ec763944fe9d5bc53efc52d74861ef2`. Pages thành công39721870116.
 - Checkpoint40: AV Lore `243167f548a0a2a6add8a9adf6c98d9e263f8f4a`, IT Basic `4cd80c94c25287d217e12e5fb53c0a4cf50836af`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39740983441 . IT VPS39740981336 failed `ssh-keyscan`, vẫn failed sau1retry.
@@ -154,3 +154,29 @@ Mainpreview nếu đã tắt sau shutdown có thể restart tại rootAVLore:`np
 - YouTube51 đã qua sourcecheck259files0diagnostics,142tests,build/verify **612pages269522links/assets**, localization0missing; dedicated13stages/3labs/VIEN/keyboard/mobile/9themes và generic2routes pass. Đã xem screenshot desktop/mobile.
 - StaticFigma+YouTube4VIENpages pass; shared51static104HTML1226links đã kiểm. Main4322publish51, staging4323stopped. Logs`resume51-*`,`creator-{build,verify,browser,generic-browser}.log`,`batch51-legacy-browser.log`; screenshots/reports`artifacts/creator-*`.
 - Checkpoint51Figma+YouTube chuẩn bị commit/push stable. Còn22mục chưa author và final independentreview;0complete. Tiếp theo`ai-kv-cache`. Đã đọc full referencechapter+allocator model và primary PagedAttention/GQA/GPTQ/AWQ/Transformerscache/vLLMprefix+quantizedKV docs. Sourceoversimplifications cần sửa: full causal KVformula có kiến trúc điều kiện, perrankTPreplication, cachedprefix không xóa decode/newtail work, quantization không universal speedup/near-lossless.
+
+## Local52: KV Cache — đã publish local
+
+`ai-kv-cache.json`:15sections,5traces,4labs,8workedquestions, VI/ENstatusreview. Per-rank denseKV/quantizedweightscale arithmetic, TPheadreplication, pagedcurrentvsfutureallocation, full-prefixsecurity/contextidentity, samplingforkCOW và roundtripoffloadvsrecompute. Không claim benchmark/security implementation.
+
+-262sourcefiles0diagnostics,147tests;614pages271006links/assets,localization0missing. Dedicated4labs/VIEN/keyboard/mobile/9themes và generic2routes pass; đã xem desktop/mobile screenshot. Dedicated đầu chỉ fail screenshotlocator vìprefixcó2dl, đã sửaselector và rerunpassed, không cheUIbug.
+-Static52lessons106HTML1248links và2VIENpages pass. Main4322publish52,stage4323stopped. `scripts/kv-cache-browser-check.mjs`, reports/screenshots`artifacts/kv-cache-*`,logs`kv-cache-*`.
+-Checkpoint51đãpush: AVLore`5b4043d`, ITBasic`c957138`; Pages39882720793success, ITVPS39882722183failed. Chưapushlocal52. Giữ workflows/settings/secrets.
+-Tiếp theo`ai-batching`: fullreferencechapter/modelđãđọc, primaryOrca/Sarathi-Serve/DistServe/speculativepapers và exactsamplingalgorithm/methodsđãđốichiếu. Added`llm-scheduling-models.ts`/tests local, chưaUI/canonical/dictionary/browser/static. Models: chunked-prefilltradeoff/starvation, exactone-positionresidualprobabilitymass, gamma/verificationcost/memorybudget, splitpoolKVhandoffTTFT/TPOT. Chưa tính vào52.
+
+## Local53: Batching & Speculative Decoding — đã publish local
+
+`ai-batching.json`:14sections,5traces,4labs,8workedquestions, VI/ENstatusreview. Static/dynamic/continuous membership; chunkedprefill/fairness; splitpoolKVhandoff; exact residual sampling, limits/rollback; expectedcost/memory và adaptivepolicy. Mô hình minh họa, không benchmark.
+
+-266sourcefiles0diagnostics,151tests;616pages272494links/assets,localization0missing. Dedicated4labs/VIEN/keyboard/mobile/9themes và generic2routes pass; đã xem screenshots desktop/mobile. Static53:108HTML1272links và2VIENbrowserpages pass.
+-Main4322publish53;stage4323stopped. Logs `batch-schedule-*`, `batch53-legacy-browser.log`; scripts`batch-schedule-browser-check.mjs`; screenshots`artifacts/batch-schedule-*`. Chưa push52/53.
+-Tiếp theo `ai-parallelism`: đã đọc fullchapter; research Megatron/GPipe/SPvsCP/MoE. Cần mô phỏng placement/failure domain, collective cost, pipeline utilization và expert routing/replication/capacity; không nhầm active weights với resident weights, không coi drop/reroute là bảo toàn semantics. Còn12AI+8tools chưa author;0complete.
+
+## Local54: Parallelism & MoE — đã publish local
+
+`ai-parallelism.json`:15sections,5traces,3labs,8workedquestions, VI/ENstatusreview. DP/TP/PP/SPvsCP/EP; perrankmemory/ringcollectivecost; actualplacement/failure-domain map; forward-onlypipeline recurrence; MoEweightinventory/dispatch/skew/copies/capacity; fleetreadiness/drain/recovery và workedcapacitybudgets. Không hardwarebenchmark hoặc productionplanner.
+
+-271sourcefiles0diagnostics,155tests;618pages273988links/assets,localization0missing. Dedicated3labs/VIEN/keyboard/mobile/9themes, generic2routes và static2pages pass; screenshots desktop/mobile đã xem. Static54lessons110HTML1296links pass.
+-Dedicated đầu scenario pass nhưng axe harness lỗi vìbrowser.newPage; sửa explicitbrowser.newContext/newPage rồi chạy lại dedicatedpass. Không sửa app để bỏ qua check. Test/logs `parallel-*`; screenshots/reports`artifacts/parallel-*`.
+-Main4322publish54;stage4323stopped. Chuẩn bị checkpoint52–54 stable, chưa hoàn thành scope. Còn11AI+8Practice/Interview chưa author; toàn bộ54bài vẫnstatusreview,0complete.
+-Tiếp theo`ai-serving`: fullchapter+cascade model đã đọc; primarycurrentvLLMLoRA/OpenAIcompatible, SGLang, TensorRT-LLM, Triton, TGImaintenanceREADME, llama.cpp, S-LoRA/Punica/RouteLLM đã kiểm. Corrections: engine/server-layer taxonomy overlapping; APIcompatibility không fullsemanticparity; schema validation không semanticconfidence; fallback có thể làm đáp án đúng thành sai; costformula cần3600 và không double utilization; arbitraryfullfinetunes không tự thànhLoRA; adapterauth/revision/pinning/cacheidentity phải rõ.

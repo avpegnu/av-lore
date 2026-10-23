@@ -1,0 +1,1340 @@
+{
+  "id": "ai-batching",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Batching & Speculative Decoding: bảo vệ latency và sampling đúng",
+    "en": "Batching & Speculative Decoding: protect latency and sampling correctness"
+  },
+  "summary": {
+    "vi": "Hiểu iteration-level scheduling, chunked prefill, fairness, split pools và speculative verification; bốn mô phỏng tách latency, probability mass, chi phí draft và KV handoff.",
+    "en": "Understand iteration scheduling, chunked prefill, fairness, split pools and speculative verification through four experiments covering latency, probability mass, draft costs and KV handoffs."
+  },
+  "prerequisites": [
+    "ai-inference",
+    "ai-kv-cache",
+    "llm-serving"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "os",
+    "distributed",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Batch membership, token budget và memory admission là các quyết định liên quan nhưng không giống nhau.",
+      "en": "Batch membership, token budgets and memory admission are related but distinct decisions."
+    },
+    {
+      "vi": "Chunked prefill thường đổi prompt-completion overhead lấy smaller decode gaps; không tự là hard latency guarantee.",
+      "en": "Chunked prefill trades prompt-completion overhead for smaller decode gaps rather than guaranteeing hard latency bounds."
+    },
+    {
+      "vi": "TPOT trung bình và individual inter-token gaps cần đo riêng để thấy stream bị khựng.",
+      "en": "Average TPOT and individual inter-token gaps need separate measurement to reveal stuttering."
+    },
+    {
+      "vi": "Exact speculative sampling giữ target distribution bằng acceptance và residual correction đúng; không hứa cùng sample path ở một seed.",
+      "en": "Exact speculative sampling preserves the target distribution through correct acceptance/correction, not identical sample paths at one seed."
+    },
+    {
+      "vi": "Expected accepted tokens chưa là speedup: draft, verification, memory và load đều có cost.",
+      "en": "Expected accepted tokens are not speedups; drafting, verification, memory and load all cost resources."
+    },
+    {
+      "vi": "Disaggregation chỉ có lợi khi tổng queue, compute, transfer và capacity phù hợp các SLO.",
+      "en": "Disaggregation helps only when queueing, computation, transfers and capacity jointly fit SLOs."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ request tới verified output",
+      "en": "From requests to verified output"
+    },
+    "caption": {
+      "vi": "Mỗi optimization phải giữ resource budgets, target semantics và user-visible deadline.",
+      "en": "Optimizations preserve resource budgets, target semantics and user-visible deadlines."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Admit có điều kiện",
+          "en": "Admit conditionally"
+        },
+        "detail": {
+          "vi": "Bounds, priority, tenant, memory và deadline.",
+          "en": "Check bounds, priority, tenant, memory and deadline."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Chia iteration work",
+          "en": "Divide iteration work"
+        },
+        "detail": {
+          "vi": "Selected decodes và bounded prefill chunks.",
+          "en": "Schedule selected decodes and bounded prefill chunks."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Verify speculation",
+          "en": "Verify speculation"
+        },
+        "detail": {
+          "vi": "Proposal không là committed output hoặc tool action.",
+          "en": "Proposals are neither committed output nor tool actions."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Đo goodput",
+          "en": "Measure goodput"
+        },
+        "detail": {
+          "vi": "Requests đạt đủ TTFT/TPOT targets trong một time window.",
+          "en": "Count requests meeting both latency targets in a time window."
+        },
+        "icon": "gauge"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "metrics",
+      "title": {
+        "vi": "1. Throughput, TTFT, TPOT và ITL",
+        "en": "1. Throughput, TTFT, TPOT and ITL"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một replica phục vụ nhiều sequence với prompt/output lengths khác nhau. TTFT tính từ agreed request boundary đến first visible token, gồm queue/routing/prefill và relevant handoff. TPOT thường là average time per subsequent output token của một request; individual inter-token latency (ITL) là từng khoảng giữa tokens. Average TPOT tốt vẫn có thể che một pause rất dài giữa stream.",
+          "en": "A replica serves sequences with varied lengths. TTFT runs from an agreed request boundary to the first visible token, including queues, routing, prefill and handoffs. TPOT commonly averages subsequent-token time for a request; ITL measures each gap. A good average TPOT can hide a long pause."
+        },
+        {
+          "vi": "Throughput tokens/s, completed requests/s và goodput không thay cho nhau. Ví dụ, trong 10 giây hoàn tất 40 requests nhưng chỉ 30 requests đạt cả TTFT/TPOT targets thì observed goodput là 3 requests/s, không phải 4. Cần nêu targets, traffic mix, arrival pattern, hardware/profile và counting window; benchmark bỏ queue hoặc chỉ tính output tokens có thể không phản ánh sản phẩm.",
+          "en": "Token throughput, request throughput and goodput differ. If forty requests complete in ten seconds but only thirty meet both latency targets, observed goodput is three requests/second rather than four. State targets, traffic mix, arrivals, hardware/profile and measurement windows; benchmarks that omit queues may misrepresent the product."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Metric của scheduler",
+            "en": "Scheduler metric"
+          },
+          {
+            "vi": "Cho biết",
+            "en": "Reveals"
+          },
+          {
+            "vi": "Không chứng minh",
+            "en": "Does not prove"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Output tokens/s",
+              "en": "Output tokens/s"
+            },
+            {
+              "vi": "Aggregate token production",
+              "en": "Aggregate token production"
+            },
+            {
+              "vi": "Mỗi user được first token nhanh",
+              "en": "Every user gets a fast first token"
+            }
+          ],
+          [
+            {
+              "vi": "TTFT distribution",
+              "en": "TTFT distribution"
+            },
+            {
+              "vi": "Queue + first-output delay",
+              "en": "Queue and first-output delay"
+            },
+            {
+              "vi": "Stream không có pause sau đó",
+              "en": "Later streaming has no pauses"
+            }
+          ],
+          [
+            {
+              "vi": "TPOT + ITL tails",
+              "en": "TPOT and ITL tails"
+            },
+            {
+              "vi": "Average pace và individual gaps",
+              "en": "Average pace and individual gaps"
+            },
+            {
+              "vi": "Quality, fairness hoặc future memory safety",
+              "en": "Quality, fairness or future memory safety"
+            }
+          ],
+          [
+            {
+              "vi": "Goodput tại targets đã nêu",
+              "en": "Goodput at stated targets"
+            },
+            {
+              "vi": "Rate requests đạt targets",
+              "en": "Rate meeting request targets"
+            },
+            {
+              "vi": "Capacity cho workload khác giữ nguyên",
+              "en": "Unchanged capacity for different traffic"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "batching",
+      "title": {
+        "vi": "2. Static, dynamic và continuous batching",
+        "en": "2. Static, dynamic and continuous batching"
+      },
+      "paragraphs": [
+        {
+          "vi": "Static cohort có thể chạy một nhóm tới completion; slots của sequences xong sớm không được tái dùng cho arrivals mới nếu implementation giữ cohort. Dynamic batching thường gom arrivals theo count/timeout ở entry, còn admission trong execution có thể vẫn cohort-based. Streaming output không bắt buộc chờ whole cohort: đó là output-delivery decision riêng với batch membership.",
+          "en": "Static cohorts can retain membership until completion, leaving early-finished slots unavailable. Dynamic batching often forms entry cohorts by count/timeouts, while execution admission may remain cohort-based. Streaming need not wait for the cohort; delivery policy differs from batch membership."
+        },
+        {
+          "vi": "Continuous/iteration-level scheduling xem lại runnable set sau mỗi model iteration: finished sequences rời, new prefills/decodes có thể được admit theo limits. Nó không bắt buộc một particular allocator và không giữ GPU luôn100%busy; arrival gaps, memory limits, token shapes và overhead còn chi phối. Paged KV thường giúp flexible membership nhưng là cơ chế memory, không định nghĩa duy nhất của iteration scheduling.",
+          "en": "Iteration scheduling revisits runnable membership after each model step, admitting new work within limits. It neither requires one allocator nor guarantees full utilization: arrivals, memory, shapes and overhead still matter. Paged KV supports flexibility but does not define iteration scheduling."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Batch formation",
+            "en": "Batch formation"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Count/timeout quyết định ai được gom vào trước khi run.",
+              "en": "Count/timeouts determine entry grouping."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Iteration membership",
+            "en": "Iteration membership"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Engine đổi selected work ở safe iteration boundary theo KV/token budgets.",
+              "en": "The engine changes selected work at safe iteration boundaries under budgets."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Output delivery",
+            "en": "Output delivery"
+          },
+          "icon": "scope",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Stream/buffer/burst quyết định user thấy tokens khi nào, tách khỏi membership.",
+              "en": "Streaming, buffering and bursts determine visible tokens separately from membership."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "interference",
+      "title": {
+        "vi": "3. Chunked prefill và decode interference",
+        "en": "3. Chunked prefill and decode interference"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một long prefill chạy cùng GPU có thể kéo dài iteration mà các streams cũ đang chờ token. Chunking cho phép interleave prompt work với decode, thường giảm long gaps nhưng thêm iterations/overhead và làm prompt mới chờ lâu hơn. Token count chỉ là proxy cho work: attention cost phụ thuộc context, kernel/batch shape, dtype và hardware; token cap không tự là hard millisecond bound.",
+          "en": "A long colocated prefill can lengthen an iteration for existing streams. Chunking interleaves prompt work with decoding, often reducing long gaps at additional iteration/overhead cost and slower prompt completion. Token count is only a work proxy; context, shapes, kernels, precision and hardware affect timing."
+        },
+        {
+          "vi": "Decode-first cần growth/memory checks và admission cap, nhưng strict decode-only có thể làm prefills starvation nếu streams tiếp tục tới. Ngược lại, unbounded prefill-first làm existing streams khựng. Scheduler có thể reserve prefill progress, dùng aging/deficits hoặc long-context pool; chọn policy theo targets và workload thay một khẩu hiệu “decode luôn trước”.",
+          "en": "Decode-first policies still need growth checks and admission caps, and strict decode-only scheduling can starve prefills. Unbounded prefill-first scheduling stalls existing streams. Reserve progress, use aging/deficits or separate traffic pools according to targets rather than absolute priority slogans."
+        }
+      ],
+      "experiment": "batch-interference"
+    },
+    {
+      "id": "policy",
+      "title": {
+        "vi": "4. Fairness, admission và deadline",
+        "en": "4. Fairness, admission and deadlines"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trước build batch, validate prompt/output limits, tenant quotas, priority/deadline và KV capacity/growth. Nếu selected decode count vượt token/work budget, không tạo negative remaining budget rồi im lặng append prefill; cần bounded selection/rescheduling hoặc overload policy. Work đã admit vẫn có thể preempt nhưng phải account recompute/transfer cost và fairness cho victim.",
+          "en": "Before forming work, check lengths, quotas, priorities/deadlines and KV/growth capacity. If selected decodes exceed budgets, do not continue with negative remaining work; select bounded subsets, reschedule or apply overload policies. Account for preemption and its victim’s recomputation/transfer costs."
+        },
+        {
+          "vi": "FCFS fair theo arrival order nhưng có head-of-line effects; short-first phụ thuộc estimates và có thể đói long requests; strict paid/interactive priority có thể đói background tiers. Token budgets, deficit/aging, per-tenant caps và limits cho concurrent long sequences là công cụ, không guarantee fairness tự động. KV residency hoặc token-seconds cũng có thể quan trọng ngoài prompt token count.",
+          "en": "FCFS preserves arrival order but can block short jobs; short-first depends on estimates and can starve long work; strict priorities can starve lower tiers. Token budgets, deficits/aging and per-tenant/concurrent-length caps are tools rather than automatic fairness guarantees. Residency or token-seconds can matter beyond prompt counts."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một iteration có guard",
+          "en": "A guarded iteration"
+        },
+        "caption": {
+          "vi": "Giữ explicit policy khi budget không đủ.",
+          "en": "Make insufficient-budget policies explicit."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Check runnable state",
+              "en": "Check runnable state"
+            },
+            "detail": {
+              "vi": "Valid profile, cancellation, deadline và memory growth.",
+              "en": "Validate profiles, cancellation, deadlines and growth."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Select bounded decodes",
+              "en": "Select bounded decodes"
+            },
+            "detail": {
+              "vi": "Work budget và tenant fairness, không mặc định chọn tất cả.",
+              "en": "Apply work budgets and tenant fairness rather than selecting everything."
+            },
+            "icon": "users"
+          },
+          {
+            "title": {
+              "vi": "Allocate prefill progress",
+              "en": "Allocate prefill progress"
+            },
+            "detail": {
+              "vi": "Bound chunks và đảm bảo policy không starvation.",
+              "en": "Bound chunks and provide policy-defined progress."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Run + commit",
+              "en": "Run and commit"
+            },
+            "detail": {
+              "vi": "Record timings/results, reconcile KV và safe release.",
+              "en": "Record timings/results and reconcile KV/lifetimes."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "trace",
+      "title": {
+        "vi": "5. Theo dõi colocated, split và speculative paths",
+        "en": "5. Trace colocated, split and speculative paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sơ đồ là các logical responsibilities; một engine có thể colocate nhiều node. Split trace thêm queue/state handoff, không chỉ chuyển tên service. Speculative trace chỉ commit verified output; rejected suffix cần rollback logical lengths/pages trước khi tiếp tục. Draft và target model không dùng chung KV tùy ý vì state phụ thuộc weights và architecture.",
+          "en": "These are logical responsibilities that may share an engine. Split serving adds queues and state handoffs rather than only renaming services. Speculation commits verified output and rolls back rejected state before continuing. Draft and target KV cannot be interchanged arbitrarily because weights and architectures differ."
+        }
+      ],
+      "diagram": {
+        "id": "batching-request-decisions",
+        "title": {
+          "vi": "Một scheduler, nhiều loại công việc",
+          "en": "One scheduler, several kinds of work"
+        },
+        "caption": {
+          "vi": "Chọn trace cho colocated prefill/decode, split pools, speculative verify và cancel. KV của draft và target không được coi là một state chung.",
+          "en": "Trace colocated work, split pools, speculative verification and cancellation. Draft and target KV are not interchangeable state."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "request",
+            "label": {
+              "vi": "Request / client",
+              "en": "Request / client"
+            },
+            "detail": {
+              "vi": "Prompt, limits, cancellation và mục tiêu trải nghiệm.",
+              "en": "Prompts, limits, cancellation and experience targets."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "router",
+            "label": {
+              "vi": "Router / admission",
+              "en": "Router / admission"
+            },
+            "detail": {
+              "vi": "Tenant/priority, deadline, cache locality và capacity evidence.",
+              "en": "Tenant/priority, deadlines, locality and capacity evidence."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "sched",
+            "label": {
+              "vi": "Iteration scheduler",
+              "en": "Iteration scheduler"
+            },
+            "detail": {
+              "vi": "Budget decode, chunked prefill, fairness và KV growth mỗi iteration.",
+              "en": "Budgets decoding, chunked prefill, fairness and KV growth each iteration."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "prefill",
+            "label": {
+              "vi": "Prefill compute",
+              "en": "Prefill compute"
+            },
+            "detail": {
+              "vi": "Pinned model/profile, prompt chunks và first-token state.",
+              "en": "Pinned models/profiles, prompt chunks and first-token state."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "worker"
+          },
+          {
+            "id": "stream",
+            "label": {
+              "vi": "Verified token stream",
+              "en": "Verified token stream"
+            },
+            "detail": {
+              "vi": "Chỉ committed output, stop/usage và bounded delivery.",
+              "en": "Only committed outputs, stops/usage and bounded delivery."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "client"
+          },
+          {
+            "id": "kv",
+            "label": {
+              "vi": "KV block manager",
+              "en": "KV block manager"
+            },
+            "detail": {
+              "vi": "Allocation, valid token prefixes, rollback, refcounts và cancellation safety.",
+              "en": "Allocation, valid prefixes, rollback, reference counts and cancellation safety."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "target",
+            "label": {
+              "vi": "Target model",
+              "en": "Target model"
+            },
+            "detail": {
+              "vi": "Authoritative conditional distributions theo sampling policy.",
+              "en": "Authoritative conditional distributions under the sampling policy."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "draft",
+            "label": {
+              "vi": "Draft proposal",
+              "en": "Draft proposal"
+            },
+            "detail": {
+              "vi": "Cheap proposals với their probabilities/context hoặc supported draft scheme.",
+              "en": "Cheap proposals with probabilities/context or a supported draft scheme."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "transfer",
+            "label": {
+              "vi": "KV handoff",
+              "en": "KV handoff"
+            },
+            "detail": {
+              "vi": "Compatible state, source/destination ownership và transfer completion.",
+              "en": "Compatible state, source/destination ownership and transfer completion."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "queue"
+          },
+          {
+            "id": "verify",
+            "label": {
+              "vi": "Accept / correction",
+              "en": "Accept / correction"
+            },
+            "detail": {
+              "vi": "Conditioned verification, residual correction và valid-prefix commit.",
+              "en": "Conditioned verification, residual correction and valid-prefix commits."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "chunk",
+            "label": {
+              "vi": "Chunked prefill trên replica chung",
+              "en": "Chunked prefill on a shared replica"
+            },
+            "steps": [
+              {
+                "from": "request",
+                "to": "router",
+                "description": {
+                  "vi": "Validate identity, prompt/output bounds và deadline.",
+                  "en": "Validate identity, bounds and deadlines."
+                }
+              },
+              {
+                "from": "router",
+                "to": "sched",
+                "description": {
+                  "vi": "Admit khi resource/fairness budget cho phép.",
+                  "en": "Admit under resource/fairness budgets."
+                }
+              },
+              {
+                "from": "sched",
+                "to": "prefill",
+                "description": {
+                  "vi": "Allocate bounded prompt chunk, giữ budget cho selected decodes.",
+                  "en": "Allocate bounded prompt chunks alongside selected decode work."
+                }
+              },
+              {
+                "from": "prefill",
+                "to": "kv",
+                "description": {
+                  "vi": "Update đúng model/sequence state và length.",
+                  "en": "Update model/sequence state and lengths."
+                }
+              },
+              {
+                "from": "sched",
+                "to": "target",
+                "description": {
+                  "vi": "Run selected decoding trong iteration; thời gian cần đo theo real kernels.",
+                  "en": "Run selected decoding with measured kernel timing."
+                }
+              },
+              {
+                "from": "target",
+                "to": "stream",
+                "description": {
+                  "vi": "Emit next committed token và update request state.",
+                  "en": "Emit committed tokens and update request state."
+                }
+              }
+            ]
+          },
+          {
+            "id": "split",
+            "label": {
+              "vi": "Prefill/decode ở hai pools",
+              "en": "Prefill/decode in separate pools"
+            },
+            "steps": [
+              {
+                "from": "router",
+                "to": "prefill",
+                "description": {
+                  "vi": "Chọn prefill worker với queue/cache-aware policy.",
+                  "en": "Choose prefill workers using queue/locality evidence."
+                }
+              },
+              {
+                "from": "prefill",
+                "to": "transfer",
+                "description": {
+                  "vi": "Transfer KV/context theo compatible layout và limits.",
+                  "en": "Transfer compatible KV/context under limits."
+                },
+                "async": true
+              },
+              {
+                "from": "transfer",
+                "to": "kv",
+                "description": {
+                  "vi": "Destination validate complete state và ownership trước activate.",
+                  "en": "Validate destination state and ownership before activation."
+                }
+              },
+              {
+                "from": "kv",
+                "to": "target",
+                "description": {
+                  "vi": "Decode ở destination sau handoff và its queue.",
+                  "en": "Decode after destination handoff and queueing."
+                }
+              },
+              {
+                "from": "target",
+                "to": "stream",
+                "description": {
+                  "vi": "Stream output, đo TTFT và TPOT/ITL riêng.",
+                  "en": "Stream output and measure TTFT separately from TPOT/ITL."
+                }
+              }
+            ]
+          },
+          {
+            "id": "speculate",
+            "label": {
+              "vi": "Draft và conditioned verify",
+              "en": "Draft and conditioned verification"
+            },
+            "steps": [
+              {
+                "from": "sched",
+                "to": "draft",
+                "description": {
+                  "vi": "Chọn γ theo measured acceptance/cost và memory budget.",
+                  "en": "Choose draft length using measured acceptance/cost and memory."
+                }
+              },
+              {
+                "from": "draft",
+                "to": "target",
+                "description": {
+                  "vi": "Score proposals tại đúng conditioned prefixes; retain Q probabilities cần thiết.",
+                  "en": "Score proposals at their conditioned prefixes with required proposal probabilities."
+                }
+              },
+              {
+                "from": "target",
+                "to": "verify",
+                "description": {
+                  "vi": "Apply target sampling transforms và exact supported acceptance/correction.",
+                  "en": "Apply target sampling transforms and supported acceptance/correction."
+                }
+              },
+              {
+                "from": "verify",
+                "to": "kv",
+                "description": {
+                  "vi": "Commit accepted prefix; discard invalid speculative suffix/state.",
+                  "en": "Commit accepted prefixes and discard invalid speculative state."
+                }
+              },
+              {
+                "from": "verify",
+                "to": "stream",
+                "description": {
+                  "vi": "Chỉ emit verified prefix/correction trong EOS/stop/limit.",
+                  "en": "Emit verified prefixes/corrections within stops and limits."
+                }
+              }
+            ]
+          },
+          {
+            "id": "reject",
+            "label": {
+              "vi": "Reject và rollback suffix",
+              "en": "Reject and roll back the suffix"
+            },
+            "steps": [
+              {
+                "from": "draft",
+                "to": "target",
+                "description": {
+                  "vi": "Target evaluates đề xuất, có thể reject sớm.",
+                  "en": "The target evaluates proposals and may reject early."
+                }
+              },
+              {
+                "from": "target",
+                "to": "verify",
+                "description": {
+                  "vi": "Tại first rejection, không dùng những tokens conditioned theo rejected prefix.",
+                  "en": "After the first rejection, discard tokens conditioned on that rejected prefix."
+                }
+              },
+              {
+                "from": "verify",
+                "to": "kv",
+                "description": {
+                  "vi": "Giữ only valid lengths/context; correction cần state phù hợp khi tiếp tục.",
+                  "en": "Retain valid lengths/context and continue with correction-compatible state."
+                }
+              },
+              {
+                "from": "verify",
+                "to": "sched",
+                "description": {
+                  "vi": "Reschedule từ committed context, không hidden tool effects từ drafts.",
+                  "en": "Reschedule from committed context without draft-triggered external effects."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Cancel trong iteration",
+              "en": "Cancel during an iteration"
+            },
+            "steps": [
+              {
+                "from": "request",
+                "to": "router",
+                "description": {
+                  "vi": "Authenticated cancellation/update deadline.",
+                  "en": "Receive authenticated cancellations/deadline updates."
+                }
+              },
+              {
+                "from": "router",
+                "to": "sched",
+                "description": {
+                  "vi": "Stop new scheduling; account completed work theo contract.",
+                  "en": "Stop scheduling new work and account for completed work."
+                }
+              },
+              {
+                "from": "sched",
+                "to": "target",
+                "description": {
+                  "vi": "Fence outstanding target/draft work tại safe boundary.",
+                  "en": "Fence outstanding target/draft work at safe boundaries."
+                }
+              },
+              {
+                "from": "target",
+                "to": "kv",
+                "description": {
+                  "vi": "Release/preserve pages theo references và kernel completion.",
+                  "en": "Release or retain pages under references and kernel completion."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "disaggregation",
+      "title": {
+        "vi": "6. Khi nào tách prefill và decode pools?",
+        "en": "6. When should prefill and decode pools split?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tách pools cho phép tune batch/parallelism/hardware theo từng phase và giảm direct prefill–decode interference. Đổi lại có transfer, pool queues, memory duplication/buffering, placement và failure recovery. Prefix locality ở prefill không chứng minh destination KV hoặc decode capacity đã ready. Chọn router bằng predicted end-to-end completion, không chỉ cache hit hoặc compute time.",
+          "en": "Separate pools allow phase-specific tuning and reduce direct interference, at the cost of transfers, queues, buffering, placement and recovery. Prefill cache locality does not establish destination readiness. Route using end-to-end completion evidence rather than cache hits or compute time alone."
+        },
+        {
+          "vi": "KV payload/context phải compatible giữa sender/receiver: model/adapter, token positions, layout/dtype/scales, parallel partition và ownership. Có thể cần conversion/resharding; copy hoàn tất phải được xác nhận trước destination dùng state. Pin source/destination buffers qua failure/cancel và nêu retry/fallback; một transfer queue không tự là durable recovery log.",
+          "en": "Transferred state needs compatible model/adapter, positions, formats/scales, partitions and ownership. Conversion/resharding may be needed, with completion confirmed before use. Pin buffers through cancellation/failures and define fallback; transfer queues do not automatically provide durable recovery."
+        }
+      ],
+      "experiment": "batch-handoff"
+    },
+    {
+      "id": "speculation",
+      "title": {
+        "vi": "7. Draft, verify, correction và commit",
+        "en": "7. Draft, verify, correct and commit"
+      },
+      "paragraphs": [
+        {
+          "vi": "Draft đề xuất γ tokens nhanh hơn target; target có thể score nhiều conditioned positions trong một run khi backend hỗ trợ. Verify phải dùng đúng context trước từng token. Accept theo thứ tự; tại first rejection, later draft tokens đã conditioned trên một token sai nên không được giữ vì chúng nhìn có vẻ hợp lý. Correction/bonus token phải theo đúng algorithm và stop rules.",
+          "en": "A draft proposes tokens and a supported target run scores multiple conditioned positions. Verification uses the context before each token. After the first rejection, later proposals depend on a rejected prefix and cannot be retained merely because they appear plausible. Corrections/bonus tokens follow the selected algorithm and stop rules."
+        },
+        {
+          "vi": "Accepted drafts không “free” về FLOPs/memory: draft compute, target verification, temporary KV, logits và rollback có cost. Nếu target đã compute-bound ở loaded batch, speculative work có thể làm chậm cả batch. Giữ valid-prefix lengths và state ownership trên cả draft/target; stream chỉ verified tokens và không dispatch external tool actions từ unverified drafts.",
+          "en": "Accepted drafts still cost compute and memory: proposals, verification, temporary KV, logits and rollback consume resources. Loaded compute-bound batches may slow down. Maintain valid lengths/ownership in both models and stream only verified tokens without dispatching external effects from proposals."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một speculative cycle",
+          "en": "A speculative cycle"
+        },
+        "caption": {
+          "vi": "Chỉ valid-prefix output được commit.",
+          "en": "Commit only valid-prefix output."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Draft γ",
+              "en": "Draft γ"
+            },
+            "detail": {
+              "vi": "Generate proposals và required proposal probabilities.",
+              "en": "Generate proposals and required proposal probabilities."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Conditioned verify",
+              "en": "Conditioned verification"
+            },
+            "detail": {
+              "vi": "Target evaluates đúng prefix trước từng token.",
+              "en": "The target evaluates each token’s preceding prefix."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "First rejection / bonus",
+              "en": "First rejection or bonus"
+            },
+            "detail": {
+              "vi": "Correct đúng distribution hoặc thêm bonus nếu allaccepted và còn budget.",
+              "en": "Correct the distribution or add a permitted bonus after full acceptance."
+            },
+            "icon": "decision"
+          },
+          {
+            "title": {
+              "vi": "Commit + reconcile",
+              "en": "Commit and reconcile"
+            },
+            "detail": {
+              "vi": "Apply EOS/stop/limits, discard invalid KV suffix và resume.",
+              "en": "Apply stops/limits, discard invalid KV suffixes and resume."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sampling",
+      "title": {
+        "vi": "8. Vì sao exact speculative sampling giữ distribution?",
+        "en": "8. Why does exact speculative sampling preserve a distribution?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Gọi P là target distribution, Q là proposal distribution tại cùng conditioned prefix, sau relevant sampling transforms. Draft x~Q được accept với min(1,P(x)/Q(x)). Accepted mass của token x là min(P(x),Q(x)). Khi reject, sample từ normalized max(0,P−Q), không sample lại tùy tiện từ P. Tổng accepted mass cộng reject/correction mass khi đó bằng P.",
+          "en": "Let P and Q be target/proposal distributions at the same conditioned prefix after relevant sampling transforms. Accept a Q-drawn token with min(1,P(x)/Q(x)), giving accepted mass min(P(x),Q(x)). On rejection sample from normalized positive P−Q, rather than arbitrarily resampling P. Accepted and correction masses then sum to P."
+        },
+        {
+          "vi": "Đây là distributional guarantee của exact algorithm và assumptions, không hứa cùng random seed cho đúng từng token hoặc mọi heuristic gọi “speculation” đều lossless. Greedy verification có contract riêng; sampling còn phải xử lý temperature/top-p/masks/penalties theo đúng target semantics. Nếu tokenizer/vocabulary khác, alignment cần thuật toán hỗ trợ, không chỉ ghép token IDs của hai models.",
+          "en": "This is a distributional statement under the exact algorithm’s assumptions, not identical seeded token paths or a guarantee for every speculative heuristic. Greedy verification has its own contract. Sampling transforms, masks and penalties must match target semantics, and different tokenizers require supported alignment rather than concatenated identities."
+        },
+        {
+          "vi": "Total variation (TV) trong lab bằng một nửa tổng |output probability − target probability| trên các tokens. TV = 0 nghĩa hai distributions trùng trong fixture; TV = 8% không có nghĩa 8% token cụ thể là sai về factual quality. Đây là thước đo probability distance, tách khỏi đánh giá chất lượng câu trả lời.",
+          "en": "The lab’s total variation distance is half the sum of absolute output/target probability differences. Zero means matching fixture distributions; eight percent does not mean eight percent of individual tokens are factually wrong. Probability distance differs from response-quality evaluation."
+        }
+      ],
+      "experiment": "spec-mass"
+    },
+    {
+      "id": "limits",
+      "title": {
+        "vi": "9. EOS, output limits và speculative KV rollback",
+        "en": "9. EOS, output limits and speculative KV rollback"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một cycle có thể tạo từ 1 đến γ + 1 tokens trong idealized algorithm, nhưng output limit/EOS/stop có thể dừng trước. Không emit bonus sau EOS, không vượt max output để đủ một batch và không tính discarded proposals như delivered tokens. Stop-string detection có thể cross token/chunk boundaries nên streaming buffer/usage semantics phải rõ.",
+          "en": "An ideal cycle yields one to γ+1 tokens, but output limits and stops may terminate earlier. Do not emit bonuses after EOS, exceed limits to fill batches or count discarded proposals as delivered tokens. Stop strings can span token/chunk boundaries and need explicit buffering/usage semantics."
+        },
+        {
+          "vi": "Target đã score rejected suffix không có nghĩa suffix KV là committed. Keep accepted context, invalidate incorrect suffix lengths và compute/append correction state theo engine. Async kernels, graph captures, page refcounts và cancellation phải giữ lifetime đúng. Nếu một performance mode dùng relaxed acceptance làm đổi distribution, đặt tên/version/eval rõ thay hứa exact target equivalence.",
+          "en": "Scoring rejected suffixes does not commit their KV. Preserve accepted context, invalidate incorrect lengths and handle correction state correctly. Kernels, graphs, reference counts and cancellation need sound lifetimes. Name/version/evaluate relaxed acceptance separately instead of claiming exact target equivalence."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Boundary speculative",
+            "en": "Speculative boundary"
+          },
+          {
+            "vi": "Phải giữ",
+            "en": "Preserve"
+          },
+          {
+            "vi": "Lỗi dễ gặp",
+            "en": "Common error"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "First rejection",
+              "en": "First rejection"
+            },
+            {
+              "vi": "Only accepted prefix + valid correction",
+              "en": "Only accepted prefix and valid correction"
+            },
+            {
+              "vi": "Giữ later drafts conditioned trên rejected token",
+              "en": "Keeping later drafts conditioned on a rejected token"
+            }
+          ],
+          [
+            {
+              "vi": "EOS/max output",
+              "en": "EOS/max output"
+            },
+            {
+              "vi": "User-visible limits và correct accounting",
+              "en": "Visible limits and correct accounting"
+            },
+            {
+              "vi": "Emit γ+1 dù request đã stop",
+              "en": "Emitting a full cycle after stopping"
+            }
+          ],
+          [
+            {
+              "vi": "KV rollback",
+              "en": "KV rollback"
+            },
+            {
+              "vi": "Valid lengths/ownership và safe kernel lifetime",
+              "en": "Valid lengths/ownership and safe kernel lifetimes"
+            },
+            {
+              "vi": "Chỉ sửa text output, để KV stale",
+              "en": "Fixing text while retaining stale KV"
+            }
+          ],
+          [
+            {
+              "vi": "Tool/output consumer",
+              "en": "Tool/output consumer"
+            },
+            {
+              "vi": "Only committed semantics trigger side effects",
+              "en": "Only committed semantics trigger side effects"
+            },
+            {
+              "vi": "Dispatch action từ unverified draft",
+              "en": "Dispatching actions from unverified proposals"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cost",
+      "title": {
+        "vi": "10. Từ acceptance tới expected speedup",
+        "en": "10. From acceptance to expected speedup"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu per-position acceptance độc lập với constant α và generation đủ dài, expected tokens/target call là E = 1 + α + … + α^γ; khi α=1 thì E=γ+1. Đây không phải guarantee mỗi call hoặc mọi workload dùng cùng α. Conditional acceptance thay đổi theo prefix, position, content, sampling policy và load; EOS/limits làm truncated cycles khác geometric idealization.",
+          "en": "Under independent constant per-position acceptance and sufficiently long generations, E = 1 + α + … + α^γ tokens per target call, with E = γ+1 at α=1. Calls and workloads need not share this expectation. Acceptance varies with context, content, positions and policies, while stops truncate cycles."
+        },
+        {
+          "vi": "Speed ratio phải so baseline cost/token với cycle cost/E. Nếu giả định target verification bằng single-token target cost T, draft step=t_d và bỏ overhead, S=T×E/(T+γ×t_d). Backend/load thực có thể làm verification tăng theo γ; draft còn chiếm memory và giảm active KV slots. Best γ theo single-stream arithmetic không phải optimal goodput của loaded fleet.",
+          "en": "Compare baseline token cost with cycle cost divided by E. Under constant verification T, drafting t_d and no overhead, S = T×E/(T+γ×t_d). Real verification can grow with draft length/load, while draft memory reduces active KV capacity. Single-stream optima need not maximize fleet goodput."
+        }
+      ],
+      "experiment": "spec-cost"
+    },
+    {
+      "id": "drafts",
+      "title": {
+        "vi": "11. Chọn draft source theo contract",
+        "en": "11. Choose proposal sources by contract"
+      },
+      "paragraphs": [
+        {
+          "vi": "Small separate model đơn giản về conceptual boundary nhưng cần memory, compatible tokenizer/sampling và serving lifecycle. N-gram/prompt lookup có thể hữu ích khi output lặp spans từ input; non-repetitive traffic có thể ít hit. Feature/head-based methods cần model-specific training/backend/verification; không gán một acceptance/speedup number cố định cho tên phương pháp.",
+          "en": "Separate models need memory, tokenization/sampling compatibility and lifecycle management. Prompt lookup can help repeated spans but may miss on other traffic. Feature/head methods require model-specific training, backends and verification; method names do not determine fixed acceptance or speedups."
+        },
+        {
+          "vi": "Medusa-style multiple heads/tree proposals và EAGLE-style feature-level proposals minh họa những cách tạo drafts khác nhau. Exactness phụ thuộc particular verification/acceptance mode và liệu target backbone có đổi trong training; phân biệt frozen target, jointly trained target và relaxed quality-preserving heuristic. Evaluate against đúng baseline version được hứa với users.",
+          "en": "Multiple-head/tree and feature-level proposals illustrate different draft mechanisms. Exactness depends on verification/acceptance modes and whether training changes the target backbone. Distinguish frozen targets, jointly trained targets and relaxed quality heuristics, evaluating against the promised baseline revision."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Draft mechanism",
+            "en": "Draft mechanism"
+          },
+          {
+            "vi": "Có thể phù hợp",
+            "en": "Potential fit"
+          },
+          {
+            "vi": "Yêu cầu với draft source",
+            "en": "Verify"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Separate autoregressive model",
+              "en": "Separate autoregressive model"
+            },
+            {
+              "vi": "Cheap proposals với measured agreement",
+              "en": "Cheap proposals with measured agreement"
+            },
+            {
+              "vi": "Extra weights/KV, vocab/context và proposal probabilities",
+              "en": "Extra weights/KV, vocab/context and proposal probabilities"
+            }
+          ],
+          [
+            {
+              "vi": "Prompt lookup / n-gram",
+              "en": "Prompt lookup / n-gram"
+            },
+            {
+              "vi": "Repetitive editing/copy contexts",
+              "en": "Repetitive editing/copy contexts"
+            },
+            {
+              "vi": "Supported exact verifier, fallback và actual hit rate",
+              "en": "Supported exact verification, fallback and actual hit rates"
+            }
+          ],
+          [
+            {
+              "vi": "Extra heads / tree",
+              "en": "Extra heads / tree"
+            },
+            {
+              "vi": "Parallel proposal paths trong compatible model",
+              "en": "Parallel paths in compatible models"
+            },
+            {
+              "vi": "Head training, tree cost và chosen acceptance semantics",
+              "en": "Training, tree costs and chosen acceptance semantics"
+            }
+          ],
+          [
+            {
+              "vi": "Feature-level draft",
+              "en": "Feature-level draft"
+            },
+            {
+              "vi": "Model-specific trained proposal path",
+              "en": "Trained model-specific proposal paths"
+            },
+            {
+              "vi": "Feature compatibility, draft/target revisions và verification",
+              "en": "Feature compatibility, revisions and verification"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "adaptive",
+      "title": {
+        "vi": "12. Adaptive policy theo workload và load",
+        "en": "12. Adapt policies to workload and load"
+      },
+      "paragraphs": [
+        {
+          "vi": "Đo accepted prefix length, proposed/accepted/discarded tokens, verification time, draft time và KV overhead theo workload/profile; global α có thể che code traffic tốt và chat traffic kém. Thử γ=0 baseline bên cạnh những γ khác, giữ canary/fallback và không bật speculation chỉ vì isolated token latency đẹp. Load cao không tự luôn làm speculation tệ, nhưng thay bottleneck nên phải đo conditional goodput.",
+          "en": "Measure accepted lengths, proposal/discard counts, verification/draft time and memory by workload/profile. Global acceptance can hide differences. Include a no-speculation baseline, canaries and fallbacks. High load changes bottlenecks and requires measurement rather than universal on/off rules."
+        },
+        {
+          "vi": "Autoscale/router cần queue/TTFT/ITL/goodput và memory pressure, không chỉ GPU utilization. Separate pools cần capacity balance và failure reserve ở cả hai phía; extra prefill throughput không giúp nếu decode queue hoặc transfer saturate. Cancellation/deadline phải chặn future work để stale requests không chiếm resources vô ích.",
+          "en": "Use queues, TTFT, ITL, goodput and memory pressure alongside utilization. Split pools need balanced capacity and reserves on both sides; faster prefills cannot fix saturated decode queues or transfers. Cancellations/deadlines prevent stale requests from consuming future resources."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Latency khi scheduling",
+            "en": "Scheduling latency"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "TTFT, ITL tails, queue delay và decode progress theo traffic slices.",
+              "en": "Track TTFT, ITL tails, queues and progress by traffic slice."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Hiệu quả sử dụng resources",
+            "en": "Scheduling efficiency"
+          },
+          "icon": "chart",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Goodput/accelerator, wasted speculative work và useful token throughput.",
+              "en": "Track goodput per accelerator, wasted speculation and useful tokens."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Độ đúng của sampling",
+            "en": "Sampling correctness"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Target sampling semantics, stop limits, tenant fairness và KV lifetime.",
+              "en": "Preserve target sampling, limits, tenant fairness and KV lifetimes."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "failure-review",
+      "title": {
+        "vi": "13. Failure review và validation",
+        "en": "13. Failure review and validation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Load tests phải có prompt/output length distribution, arrival bursts, cancellation, slow clients, long-context tenants và profile mix. Đo từ user-facing boundary; chỉ đo forward pass sẽ bỏ queue/transfer/streaming. Sampling tests có finite distributions với zeros, identical/disjoint support, multiple positions và supported transforms; numerical tolerances không thay proof của algorithm.",
+          "en": "Load tests include length distributions, bursts, cancellation, slow clients, tenant mixes and profiles. User-facing boundaries include queues/transfers/streaming. Sampling tests cover finite distributions with zeros, identical/disjoint supports, conditioning and transforms; tolerances do not replace algorithmic correctness."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Failure của serving",
+            "en": "Serving failure"
+          },
+          {
+            "vi": "Nguy cơ",
+            "en": "Risk"
+          },
+          {
+            "vi": "Evidence cần có",
+            "en": "Required evidence"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Long prefill arrives",
+              "en": "Long prefill arrives"
+            },
+            {
+              "vi": "ITL spike dù average TPOT tốt",
+              "en": "ITL spikes despite good average TPOT"
+            },
+            {
+              "vi": "Per-iteration timing, prompt sizes và gap tails",
+              "en": "Iteration timing, prompt sizes and gap tails"
+            }
+          ],
+          [
+            {
+              "vi": "Decode-first overload",
+              "en": "Decode-first overload"
+            },
+            {
+              "vi": "Prefill starvation hoặc unfair victims",
+              "en": "Prefill starvation or unfair preemptions"
+            },
+            {
+              "vi": "Aging/progress bounds, queue ages và tenant slices",
+              "en": "Aging/progress evidence, queue ages and tenant slices"
+            }
+          ],
+          [
+            {
+              "vi": "Wrong reject correction",
+              "en": "Wrong reject correction"
+            },
+            {
+              "vi": "Output bias dù target đã verify",
+              "en": "Biased output despite target verification"
+            },
+            {
+              "vi": "Exact probability mass tests và distributional contract",
+              "en": "Exact mass tests and distributional contracts"
+            }
+          ],
+          [
+            {
+              "vi": "Failed KV handoff",
+              "en": "Failed KV handoff"
+            },
+            {
+              "vi": "Destination dùng partial/stale state",
+              "en": "Destination uses partial/stale state"
+            },
+            {
+              "vi": "Completion/identity/ownership checks và safe retry/fallback",
+              "en": "Completion/identity/ownership checks and safe fallback"
+            }
+          ],
+          [
+            {
+              "vi": "Draft adds memory pressure",
+              "en": "Draft adds memory pressure"
+            },
+            {
+              "vi": "Single-stream faster nhưng fewer active requests",
+              "en": "Faster individual streams but fewer active requests"
+            },
+            {
+              "vi": "Loaded goodput, KV slots và real profile footprint",
+              "en": "Loaded goodput, KV slots and actual profile footprints"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "14. Câu hỏi luyện giải thích và tính toán",
+        "en": "14. Questions with explanations and calculations"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Continuous batching có giữ mọi slot luôn bận không?",
+            "en": "Does continuous batching keep every slot busy?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nó cho phép đổi runnable membership theo iteration; actual occupancy còn phụ thuộc arrivals, KV/headroom, shapes và scheduler overhead. Streaming output cũng là quyết định riêng, không phải mọi static cohort đều phải chờ longest request mới phát token. Hãy hỏi admission và delivery contracts cụ thể.",
+              "en": "No. It permits membership changes per iteration, while arrivals, memory, shapes and overhead still determine occupancy. Output streaming is separate; static membership need not delay every visible token until the longest request ends. Inspect both admission and delivery contracts."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Long prompt làm streams khựng: kiểm gì và sửa gì?",
+            "en": "A long prompt stalls streams: what should be checked?"
+          },
+          "answer": [
+            {
+              "vi": "Đối chiếu long prefill admission với iteration duration và từng ITL spike, không chỉ average TPOT. Thử bounded prefill chunks, reserved decode work và fairness/progress cho prompt mới. Trong fixture có prompt 8K, chunk 1.024 tokens và 2 streams: max gap là 12 ms, prompt TTFT là 96 ms; monolithic gap là 68 ms nhưng TTFT cũng chỉ 68 ms. Đây là trade-off theo giả định, cần load test thật.",
+              "en": "Correlate prefill admission with iteration durations and individual ITL spikes. Test bounded chunks with decode and prefill progress policies. The fixture’s 8K prompt, 1,024-token chunks and two streams give a 12 ms gap and 96 ms TTFT, versus a 68 ms monolithic gap/TTFT. Real workloads need measured trade-offs."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao reject rồi sample từ P không luôn đúng?",
+            "en": "Why is resampling P after rejection not generally correct?"
+          },
+          "answer": [
+            {
+              "vi": "Accepted mass đã là min(P,Q), nên remaining mass cần normalized positive P − Q. Với P = (0.6, 0.3, 0.1) và Q = (0.1, 0.1, 0.8), acceptance là 0.3. Reject rồi sample lại từ P tạo output (0.52, 0.31, 0.17), không phải P. Residual đúng khôi phục P; target verification đơn thuần không sửa một correction algorithm sai.",
+              "en": "Accepted mass is already min(P,Q), so the remaining mass needs normalized positive P−Q. For P=(.6,.3,.1) and Q=(.1,.1,.8), acceptance is .3; resampling P on rejection produces (.52,.31,.17). Correct residual sampling restores P. Verification alone cannot fix incorrect correction rules."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "“Output không đổi” có nghĩa cùng seed luôn ra cùng chuỗi?",
+            "en": "Does unchanged output distribution mean identical seeded token strings?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Exact sampling contract nói marginal/conditional distribution của target được giữ dưới assumptions; random draw ordering và numerical kernels có thể khác sample path. Greedy path có contract riêng. Cần đúng conditioned probabilities, transforms, vocab alignment, stops và valid-prefix KV; relaxed heuristics phải được gọi tên/evaluate riêng.",
+              "en": "No. Exact sampling preserves target conditional distributions under its assumptions, while random draw ordering and numerics can change individual paths. Greedy contracts differ. Correct conditioning, transforms, vocab alignment, stops and KV prefixes remain necessary; evaluate relaxed heuristics separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "α = 0.8, γ = 4 thì target call tạo đúng 3.36 tokens?",
+            "en": "Does α = 0.8 and γ = 4 produce exactly 3.36 tokens per target call?"
+          },
+          "answer": [
+            {
+              "vi": "3.3616 là expectation theo iid constant acceptance và đủ output budget: 1 + 0.8 + 0.64 + 0.512 + 0.4096. Một call thực tạo số tokens nguyên, có thể bị EOS/limit cắt ngắn. Speed cần chia cho cycle cost, không coi 3.36 là speedup. Fixture có cycle 30 ms và baseline 20 ms cho ratio khoảng 2.24×, chưa phải loaded goodput.",
+              "en": "3.3616 is an expectation under independent constant acceptance and sufficient output budget. Calls emit integer counts and stops truncate them. Speed also includes cycle costs: the fixture’s 30 ms cycle and 20 ms baseline yield about 2.24×, before loaded goodput effects."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao tăng γ có thể chậm hơn baseline?",
+            "en": "Why can larger drafts be slower than baseline?"
+          },
+          "answer": [
+            {
+              "vi": "Nhiều proposals hơn làm tăng draft work, verification positions, scratch/KV và discarded work sau early rejection. Acceptance thấp hoặc target đã compute-bound có thể làm cost/E vượt baseline. Extra draft memory còn giảm số sequences fit. Cần tối ưu measured goodput và cho phép γ = 0 làm fallback, thay vì chọn từ một global acceptance rate.",
+              "en": "Larger drafts add proposal/verification work, memory and discarded suffixes. Low acceptance or compute saturation can make cost per emitted token exceed baseline. Extra memory also reduces fitting sequences. Optimize measured goodput with a no-speculation fallback rather than one global acceptance rate."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tách pools luôn giúp TTFT và TPOT cùng tốt hơn?",
+            "en": "Does splitting pools always improve both TTFT and TPOT?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Transfer và hai queues có thể làm TTFT tăng dù decode interference giảm. Fixture có payload 4 GiB, link 32 GB/s và split queues 5 ms cho TTFT khoảng 198.2 ms; link 128 GB/s giảm còn khoảng 97.6 ms. Với targets TTFT = 150 ms và TPOT = 20 ms, chỉ fast split case đạt cả hai. Các constants là giả định; fleet goodput cần workload/rate/capacity thực.",
+              "en": "No. Transfers and both queues can increase TTFT. With this fixture’s 4 GiB and 5 ms queues, split TTFT is about 198.2 ms at 32 GB/s and 97.6 ms at 128 GB/s. Only the faster split meets the stated pair of targets. Fleet goodput requires actual load/capacity measurements."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Ưu tiên decode tuyệt đối có công bằng không?",
+            "en": "Is absolute decode priority fair?"
+          },
+          "answer": [
+            {
+              "vi": "Có thể bảo vệ streams hiện tại nhưng làm prompt mới starvation khi decode work luôn đầy. Cần reserve progress, aging/deficits, tenant budgets và overload admission. Long-context/low-priority users cũng cần policy rõ về preemption/recompute. Fairness phải kiểm queue age và progress theo tenant/workload, không chỉ aggregate TPS.",
+              "en": "It can protect current streams while starving new prompts. Use progress reservations, aging/deficits, tenant budgets and overload admission. Define preemption/recomputation for long or lower-priority work. Evaluate queue age and progress by workload/tenant rather than aggregate throughput alone."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
