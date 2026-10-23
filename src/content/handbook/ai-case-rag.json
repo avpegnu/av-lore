@@ -1,0 +1,1279 @@
+{
+  "id": "ai-case-rag",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Enterprise RAG: trợ lý kiến thức có quyền và độ mới rõ ràng",
+    "en": "Enterprise RAG: knowledge assistants with explicit access and freshness"
+  },
+  "summary": {
+    "vi": "Thiết kế multi-tenant assistant từ requirements/capacity tới APIs, permission-aware retrieval, ingestion/delete/ACL races, evidence/citations, scoped sharing/cache và embedding migration. Có mô phỏng ba principal scopes, in-flight revocation và index cutover.",
+    "en": "Design multi-tenant assistants from requirements/capacity through scoped retrieval, ingestion/access races, evidence/citations, sharing/caches and embedding migrations. Explore principal scopes, in-flight revocation and index cutover."
+  },
+  "prerequisites": [
+    "ai-rag",
+    "ai-safety",
+    "ai-evals",
+    "ai-production"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "storage-search",
+    "cache",
+    "security",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Permission correctness gồm source semantics, trusted identity, current access và mọi data processor/cache/viewer, không chỉ vector filter.",
+      "en": "Permission correctness spans source semantics, identity, current access, processors, caches and viewers rather than one vector filter."
+    },
+    {
+      "vi": "Prefilter giúp scope/candidate quality nhưng không universal full ANN recall; postfilter phải trước unauthorized processing nếu dùng.",
+      "en": "Prefiltering supports scope without universal ANN recall; postfiltering must precede unauthorized processing where used."
+    },
+    {
+      "vi": "Delete/ACL priority lane cần version/tombstone fences để old build không resurrect data hoặc stale authority.",
+      "en": "Prioritized control events still need revision/tombstone fences against stale publication."
+    },
+    {
+      "vi": "Citations cần existing/authorized sources và claim support; numeric IDs hợp lệ chưa chứng minh grounded correctness.",
+      "en": "Citations require accessible sources and claim support rather than merely valid identifiers."
+    },
+    {
+      "vi": "Cache/shared-answer keys cần evidence/policy/model/context dependencies và viewer revalidation, không chỉ question/group hash.",
+      "en": "Caches and shared answers need dependency identities and viewer checks beyond question/group hashes."
+    },
+    {
+      "vi": "Embedding migration là data/query/permission lifecycle có catch-up/evals/rollback, không chỉ đếm backfill 100%.",
+      "en": "Embedding migrations require compatible queries, authorization catch-up, evaluations and rollback beyond backfill counts."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một answer có thể truy vết tới authority và evidence",
+      "en": "Trace answers to authority and evidence"
+    },
+    "caption": {
+      "vi": "Read-only assistant vẫn có data disclosure và freshness risks.",
+      "en": "Read-only assistants still carry disclosure and freshness risks."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Scope / authenticate",
+          "en": "Scope / authenticate"
+        },
+        "detail": {
+          "vi": "Trusted tenant/principal, source semantics và task.",
+          "en": "Bind trusted identities, source semantics and tasks."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Retrieve / authorize",
+          "en": "Retrieve / authorize"
+        },
+        "detail": {
+          "vi": "Compatible search và current permission evidence.",
+          "en": "Retrieve with compatible profiles and access evidence."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Pack / answer",
+          "en": "Pack / answer"
+        },
+        "detail": {
+          "vi": "Relevant supported passages, uncertainty và citations.",
+          "en": "Pack relevant support with uncertainty and citations."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Serve / share",
+          "en": "Serve / share"
+        },
+        "detail": {
+          "vi": "Viewer/dependency revalidation và scoped cache.",
+          "en": "Revalidate viewers/dependencies and scope caching."
+        },
+        "icon": "users"
+      },
+      {
+        "title": {
+          "vi": "Sync / migrate",
+          "en": "Sync / migrate"
+        },
+        "detail": {
+          "vi": "Source versions, revoke controls, evals và rollout.",
+          "en": "Maintain versions, revocation, evaluations and rollout."
+        },
+        "icon": "route"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "requirements",
+      "title": {
+        "vi": "1. Làm rõ requirements và permission/freshness contract",
+        "en": "1. Define requirements and access/freshness contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thiết kế một read-only enterprise assistant trả lời từ approved company sources, có citations, follow-up conversations và admin-managed connectors. Tách actions như sửa ticket/gửi email/refund ra khỏi scope để không trộn read-only knowledge path với agent side effects. Multi-tenancy gồm trusted identity, source semantics, region/data policy, budgets và data lifecycle, không chỉ một tenant_id trong prompt.",
+          "en": "Design a read-only assistant over approved sources with citations, conversations and managed connectors. Keep effectful actions outside this knowledge path. Multi-tenancy spans identity, source semantics, regions, budgets and lifecycle rather than a prompt field."
+        },
+        {
+          "vi": "Định nghĩa no unauthorized disclosure là invariant cần enforce, cùng measurable targets cho content freshness, delete/ACL/group revocation và first-content/full-answer latency. “Revocations reflected trong vài phút” là bounded propagation target, không tự đồng nghĩa zero stale access trong window đó. Nếu product cần current authorization mạnh hơn mirrored index, dùng trusted policy revalidation hoặc fail-closed khi evidence stale/unavailable, và làm rõ in-flight request linearization.",
+          "en": "Define disclosure invariants and measurable content/access freshness and latency. Bounded revocation propagation is not automatically zero stale access within that window. Stronger current-access requirements need suitable policy checks or fail-closed behavior and explicit in-flight semantics."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Functional scope",
+            "en": "Functional scope"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Search/answer/citations, conversations và managed connectors.",
+              "en": "Support answers, citations, conversations and connectors."
+            },
+            {
+              "vi": "Không tự execute source-system writes trong case này.",
+              "en": "Exclude source-system writes in this case."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Hard boundaries",
+            "en": "Hard boundaries"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Principal/tenant/source permission semantics và privacy.",
+              "en": "Preserve identities, source authority and privacy."
+            },
+            {
+              "vi": "Không đưa unauthorized evidence tới downstream processors.",
+              "en": "Avoid unauthorized exposure to processors."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Operational targets",
+            "en": "Operational targets"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Declared latency/freshness SLOs, availability và budgets.",
+              "en": "Declare timing, availability and budget targets."
+            },
+            {
+              "vi": "Fallback khi policy/source evidence unavailable.",
+              "en": "Define behavior for unavailable policy/source evidence."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "2. Capacity worksheet với assumptions cụ thể",
+        "en": "2. Estimate capacity from explicit assumptions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Fixture planning: 20000 active employees, 10 questions/ngày, peak bằng 6× average; 5 triệu source documents, trung bình 6 chunks/document và 768-dimensional FP16 vector. Mỗi chunk giả định 2 KB text/metadata payload chưa tính index; mỗi answer dùng 5000 input và 500 output tokens. 1% documents thay đổi mỗi ngày. Đây là design inputs, không mô tả một customer thật hoặc benchmark hardware.",
+          "en": "Assume 20000 active employees, 10 questions/day and a 6× peak; 5 million documents average six chunks and 768-dimensional FP16 vectors. Assume 2 KB text/metadata per chunk, 5000 input/500 output tokens per answer and 1% daily document changes. These are planning inputs rather than customer or hardware claims."
+        },
+        {
+          "vi": "Raw vectors là 30M×768×2=46,08 GB decimal; thêm 8-byte IDs là 0,24 GB. HNSW/other index structures, ACL fields, text, fragmentation, replicas và repair/backfill headroom chưa nằm trong số này. Không dùng một “PQ giảm 8×” constant cho mọi profile: code sizes, codebooks, IDs, optional original vectors và measured recall quyết định actual trade-off.",
+          "en": "Thirty million FP16 vectors occupy 46.08 decimal GB, plus 0.24 GB for 8-byte IDs. Index structures, permissions, text, replicas and operational headroom are additional. Compression depends on actual codebooks, codes, identifiers and retained originals, with measured retrieval trade-offs rather than a universal ratio."
+        },
+        {
+          "vi": "200000 questions/ngày tương đương khoảng 2,31 average QPS và 13,89 peak QPS; 1,1 tỷ total input+output tokens/ngày là inventory, không một đơn giá chung. 50000 changed docs×6=300000 chunks/ngày≈3,47 chunks/s average; bursty edits, ACL-only events, source rate limits, retries và backfill có thể chi phối capacity hơn average này.",
+          "en": "The workload averages about 2.31 QPS and peaks at 13.89 QPS, with 1.1 billion input/output tokens per day as inventory rather than one price. Daily changed chunks average 3.47/s; bursts, access changes, API limits and backfills can dominate capacity."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Quantity",
+            "en": "Quantity"
+          },
+          {
+            "vi": "Arithmetic",
+            "en": "Arithmetic"
+          },
+          {
+            "vi": "Planning result",
+            "en": "Planning result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Questions/day",
+              "en": "Questions/day"
+            },
+            {
+              "vi": "20000×10",
+              "en": "20000×10"
+            },
+            {
+              "vi": "200000",
+              "en": "200000"
+            }
+          ],
+          [
+            {
+              "vi": "Peak QPS",
+              "en": "Peak QPS"
+            },
+            {
+              "vi": "200000/86400×6",
+              "en": "200000/86400×6"
+            },
+            {
+              "vi": "≈13.89",
+              "en": "≈13.89"
+            }
+          ],
+          [
+            {
+              "vi": "Chunks",
+              "en": "Chunks"
+            },
+            {
+              "vi": "5M×6",
+              "en": "5M×6"
+            },
+            {
+              "vi": "30M",
+              "en": "30M"
+            }
+          ],
+          [
+            {
+              "vi": "Raw FP16 vectors",
+              "en": "Raw FP16 vectors"
+            },
+            {
+              "vi": "30M×768×2 B",
+              "en": "30M×768×2 B"
+            },
+            {
+              "vi": "46.08 GB decimal",
+              "en": "46.08 GB decimal"
+            }
+          ],
+          [
+            {
+              "vi": "Text/metadata assumption",
+              "en": "Text/metadata assumption"
+            },
+            {
+              "vi": "30M×2000 B",
+              "en": "30M×2000 B"
+            },
+            {
+              "vi": "60 GB before extra index/replicas",
+              "en": "60 GB before extra index/replicas"
+            }
+          ],
+          [
+            {
+              "vi": "Tokens/day",
+              "en": "Tokens/day"
+            },
+            {
+              "vi": "200000×5500",
+              "en": "200000×5500"
+            },
+            {
+              "vi": "1.1B, price categories separate",
+              "en": "1.1B, price categories separate"
+            }
+          ],
+          [
+            {
+              "vi": "Changed chunks/s average",
+              "en": "Changed chunks/s average"
+            },
+            {
+              "vi": "5M×0.01×6/86400",
+              "en": "5M×0.01×6/86400"
+            },
+            {
+              "vi": "≈3.47, not burst capacity",
+              "en": "≈3.47, not burst capacity"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "apis",
+      "title": {
+        "vi": "3. Public contracts: ask, answer sharing và connectors",
+        "en": "3. Define asking, answer-sharing and connector contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Principal/tenant phải lấy từ trusted session/token và policy lookup, không cho model/user tự supply groups để mở rộng scope. Stored answer là derived sensitive artifact: viewer phải được phép xem text và underlying evidence theo declared sharing semantics, không chỉ deep links. Feedback là user signal cần review trước trở thành golden labels.",
+          "en": "Resolve identity and policy through trusted channels rather than caller-selected groups. Stored answers are sensitive derivatives: sharing must govern text and evidence, not just links. Feedback needs review before becoming evaluation truth."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/v1/knowledge-questions",
+          "description": {
+            "vi": "Tạo bounded answer request và stream identity.",
+            "en": "Create bounded answer requests and stream identities."
+          },
+          "request": "{ requestKey, question, conversationId?, expectedConversationRevision? }",
+          "response": "202 { answerId, generationId, streamUrl, retrievalProfileRevision }"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/knowledge-answers/{answerId}",
+          "description": {
+            "vi": "Read stored answer sau current viewer/dependency checks.",
+            "en": "Read stored answers after viewer/dependency checks."
+          },
+          "response": "200 { text, citations:[{docId,sourceRevision,chunkRef}], evidenceProfile, createdAt } OR 403/409 if scope/evidence invalid"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/knowledge-feedback",
+          "description": {
+            "vi": "Gửi feedback có scope và optional comment.",
+            "en": "Submit scoped feedback and optional comments."
+          },
+          "request": "{ answerId, rating, reasonCode?, comment? }",
+          "response": "202 { feedbackId, reviewState: \"UNREVIEWED\" }"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/knowledge-connectors",
+          "description": {
+            "vi": "Admin tạo source integration qua scoped grant flow.",
+            "en": "Administrators configure sources through scoped grants."
+          },
+          "request": "{ sourceType, approvedScopeProfile, regionProfile }",
+          "response": "201 { connectorId, status: \"AWAITING_AUTHORIZATION\" }",
+          "notes": [
+            {
+              "vi": "Contract minh họa, không thực hiện OAuth/provider API thật.",
+              "en": "Teaching contracts do not execute real provider/OAuth calls."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "4. Query, ingestion và control planes",
+        "en": "4. Separate query, ingestion and control planes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Query path giữ latency budget cho identity, rewrite, search, rerank, packing và generation; ingestion path chịu source API limits, parse/chunk/embed và publication. Control path quản delete/access revisions, query/index mapping và rollout. Tách paths để expensive bulk embeddings không chặn permission revocation, nhưng vẫn giữ ordered/source-version fences giữa chúng.",
+          "en": "Queries budget identity, rewriting, retrieval, packing and generation; ingestion manages source limits and builds; controls manage access revisions and profile rollout. Separation prevents bulk embedding from blocking access controls while preserving revision/order fences."
+        }
+      ],
+      "diagram": {
+        "id": "enterprise-rag-query-ingest-control",
+        "title": {
+          "vi": "Enterprise RAG có query, ingestion và authorization control paths",
+          "en": "Enterprise RAG has query, ingestion and authorization control paths"
+        },
+        "caption": {
+          "vi": "Chọn query, generation, ingestion, revoke hoặc migration. ACL mirror giúp retrieval nhưng current access/freshness contract và generation fences vẫn cần được enforce.",
+          "en": "Trace queries, generation, ingestion, revocation and migration. Mirrored permissions support retrieval without replacing current-access contracts or generation fences."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "user",
+            "label": {
+              "vi": "Chat / enterprise client",
+              "en": "Chat / enterprise client"
+            },
+            "detail": {
+              "vi": "Authenticated principal, tenant, conversation và current viewer context.",
+              "en": "Bind authenticated principals, tenants, conversations and viewers."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "identity",
+            "label": {
+              "vi": "Identity / policy service",
+              "en": "Identity / policy service"
+            },
+            "detail": {
+              "vi": "Current memberships, source-policy semantics và bounded cache/freshness evidence.",
+              "en": "Resolve current memberships, source semantics and bounded freshness evidence."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "retrieval",
+            "label": {
+              "vi": "Hybrid candidate service",
+              "en": "Hybrid candidate service"
+            },
+            "detail": {
+              "vi": "Trusted tenant filter, compatible query encoder, permission filtering và fusion.",
+              "en": "Filter trusted tenant/access scope, encode compatibly and fuse candidates."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "index",
+            "label": {
+              "vi": "Versioned search index",
+              "en": "Versioned search index"
+            },
+            "detail": {
+              "vi": "Doc/chunk generations, content/ACL revisions, vector space và tombstones.",
+              "en": "Store document generations, content/access revisions, vectors and tombstones."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "rerank",
+            "label": {
+              "vi": "Scoped reranker",
+              "en": "Scoped reranker"
+            },
+            "detail": {
+              "vi": "Only authorized candidates, bounded batch và task-evaluated ranking.",
+              "en": "Rerank authorized bounded candidates under evaluated profiles."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "prompt",
+            "label": {
+              "vi": "Evidence / prompt builder",
+              "en": "Evidence / prompt builder"
+            },
+            "detail": {
+              "vi": "Recheck liveness/access, pack compatible evidence và explicit unknowns.",
+              "en": "Recheck access/liveness and pack evidence with explicit unknowns."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "model",
+            "label": {
+              "vi": "Qualified LLM route",
+              "en": "Qualified LLM route"
+            },
+            "detail": {
+              "vi": "Scoped evidence, quotas, streaming/citation contract và data residency.",
+              "en": "Apply evidence, quotas, output contracts and data-residency policy."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "answers",
+            "label": {
+              "vi": "Stored answers / cache",
+              "en": "Stored answers / cache"
+            },
+            "detail": {
+              "vi": "Viewer access, evidence dependency revisions, citation support và retention.",
+              "en": "Bind viewers, evidence revisions, support and retention."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "connector",
+            "label": {
+              "vi": "Source connectors",
+              "en": "Source connectors"
+            },
+            "detail": {
+              "vi": "Least-privilege content/permissions sync, webhooks/polling và repair scans.",
+              "en": "Synchronize scoped content/permissions through events, polling and repair scans."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "log",
+            "label": {
+              "vi": "Versioned change log",
+              "en": "Versioned change log"
+            },
+            "detail": {
+              "vi": "Content, ACL, membership và delete events có source identities/checkpoints.",
+              "en": "Record content/access/membership/deletion events with source identities."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "queue"
+          },
+          {
+            "id": "workers",
+            "label": {
+              "vi": "Parse / chunk / embed",
+              "en": "Parse / chunk / embed"
+            },
+            "detail": {
+              "vi": "Idempotent generation work, dependency profiles và publish fences.",
+              "en": "Build idempotent generations under pinned profiles and publish fences."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "manifest",
+            "label": {
+              "vi": "Generation / rollout control",
+              "en": "Generation / rollout control"
+            },
+            "detail": {
+              "vi": "Active query/index pair, per-source watermarks, revoke state và rollback.",
+              "en": "Coordinate compatible profiles, watermarks, revocation and rollback."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "query",
+            "label": {
+              "vi": "Retrieve theo caller scope",
+              "en": "Retrieve within caller scope"
+            },
+            "steps": [
+              {
+                "from": "user",
+                "to": "identity",
+                "description": {
+                  "vi": "Resolve trusted principal/tenant và applicable source policy.",
+                  "en": "Resolve trusted identity and source-policy scope."
+                }
+              },
+              {
+                "from": "identity",
+                "to": "retrieval",
+                "description": {
+                  "vi": "Supply bounded current policy evidence, không nhận groups tùy ý từ model.",
+                  "en": "Supply bounded policy evidence rather than model-selected groups."
+                }
+              },
+              {
+                "from": "manifest",
+                "to": "retrieval",
+                "description": {
+                  "vi": "Pin compatible query encoder/index generation.",
+                  "en": "Pin compatible query/index generations."
+                }
+              },
+              {
+                "from": "retrieval",
+                "to": "index",
+                "description": {
+                  "vi": "Search keyword/vector theo tenant và eligible scope; preserve candidate provenance.",
+                  "en": "Search scoped candidates and preserve provenance."
+                }
+              },
+              {
+                "from": "index",
+                "to": "rerank",
+                "description": {
+                  "vi": "Authorize trước external reranker, tránh leaks trong logs/providers.",
+                  "en": "Authorize before reranking or external/log exposure."
+                }
+              }
+            ]
+          },
+          {
+            "id": "generate",
+            "label": {
+              "vi": "Build evidence và answer",
+              "en": "Build evidence and answers"
+            },
+            "steps": [
+              {
+                "from": "rerank",
+                "to": "prompt",
+                "description": {
+                  "vi": "Choose useful evidence theo token budget và task quality.",
+                  "en": "Select useful evidence within task/token budgets."
+                }
+              },
+              {
+                "from": "identity",
+                "to": "prompt",
+                "description": {
+                  "vi": "Check current access/liveness theo consistency contract.",
+                  "en": "Apply current access/liveness contracts."
+                }
+              },
+              {
+                "from": "prompt",
+                "to": "model",
+                "description": {
+                  "vi": "Supply numbered/versioned passages như untrusted task data.",
+                  "en": "Supply versioned passages as untrusted task data."
+                }
+              },
+              {
+                "from": "model",
+                "to": "answers",
+                "description": {
+                  "vi": "Validate finish/citations/support và store scoped dependencies.",
+                  "en": "Validate output/support and store scoped dependencies."
+                },
+                "async": true
+              },
+              {
+                "from": "answers",
+                "to": "user",
+                "description": {
+                  "vi": "Revalidate viewer và answer dependencies, không chỉ citation link.",
+                  "en": "Revalidate viewers and answer dependencies, not only links."
+                }
+              }
+            ]
+          },
+          {
+            "id": "ingest",
+            "label": {
+              "vi": "Ingest có generation fence",
+              "en": "Ingest under generation fences"
+            },
+            "steps": [
+              {
+                "from": "connector",
+                "to": "log",
+                "description": {
+                  "vi": "Record versioned content/access changes và source checkpoint.",
+                  "en": "Record versioned source changes and checkpoints."
+                },
+                "async": true
+              },
+              {
+                "from": "log",
+                "to": "workers",
+                "description": {
+                  "vi": "Parse/chunk/embed dưới pinned profiles, skip only truly compatible unchanged work.",
+                  "en": "Build under pinned profiles and reuse only compatible unchanged work."
+                }
+              },
+              {
+                "from": "workers",
+                "to": "index",
+                "description": {
+                  "vi": "Stage chunks theo doc generation và exact embedding identity.",
+                  "en": "Stage chunks by document generation and embedding identity."
+                },
+                "async": true
+              },
+              {
+                "from": "index",
+                "to": "manifest",
+                "description": {
+                  "vi": "Conditional publish nếu source/tombstone/ACL revisions còn valid.",
+                  "en": "Publish conditionally against current source/access/tombstone revisions."
+                }
+              }
+            ]
+          },
+          {
+            "id": "revoke",
+            "label": {
+              "vi": "Delete / revoke nhanh hơn content rebuild",
+              "en": "Propagate deletions/revocations independently"
+            },
+            "steps": [
+              {
+                "from": "connector",
+                "to": "log",
+                "description": {
+                  "vi": "Record authoritative delete/ACL/membership events khi source exposes.",
+                  "en": "Record authoritative deletion/access/membership changes where available."
+                },
+                "async": true
+              },
+              {
+                "from": "log",
+                "to": "manifest",
+                "description": {
+                  "vi": "Priority control path invalidate eligibility trước expensive embedding.",
+                  "en": "Prioritize eligibility invalidation ahead of expensive rebuilds."
+                }
+              },
+              {
+                "from": "manifest",
+                "to": "index",
+                "description": {
+                  "vi": "Apply tombstone/ACL revision; reject late old generation publication.",
+                  "en": "Apply deletion/access revisions and reject stale publication."
+                }
+              },
+              {
+                "from": "manifest",
+                "to": "answers",
+                "description": {
+                  "vi": "Invalidate/revalidate scoped answer/cache dependencies.",
+                  "en": "Invalidate or revalidate answer/cache dependencies."
+                },
+                "async": true
+              },
+              {
+                "from": "identity",
+                "to": "prompt",
+                "description": {
+                  "vi": "Final current-access gate theo freshness/linearization policy.",
+                  "en": "Apply the final pre-model access contract."
+                }
+              }
+            ]
+          },
+          {
+            "id": "migrate",
+            "label": {
+              "vi": "Shadow index và compatible cutover",
+              "en": "Shadow indexes and compatible cutover"
+            },
+            "steps": [
+              {
+                "from": "manifest",
+                "to": "workers",
+                "description": {
+                  "vi": "Create candidate encoder/chunk/index profile và versioned backfill.",
+                  "en": "Create candidate profiles and backfills."
+                }
+              },
+              {
+                "from": "log",
+                "to": "workers",
+                "description": {
+                  "vi": "Catch up changes/deletes/ACL tới declared watermarks.",
+                  "en": "Catch up content and authorization changes to declared watermarks."
+                }
+              },
+              {
+                "from": "workers",
+                "to": "index",
+                "description": {
+                  "vi": "Publish candidate generations với stale-build fences.",
+                  "en": "Publish fenced candidate generations."
+                },
+                "async": true
+              },
+              {
+                "from": "index",
+                "to": "manifest",
+                "description": {
+                  "vi": "Evaluate quality/permissions/operations và readiness, retain rollback path.",
+                  "en": "Evaluate quality, access, operations and rollback readiness."
+                }
+              },
+              {
+                "from": "manifest",
+                "to": "retrieval",
+                "description": {
+                  "vi": "Cut over atomic compatible query/index mapping theo tenant.",
+                  "en": "Cut over compatible query/index mappings by tenant."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "permissions",
+      "title": {
+        "vi": "5. Source permissions không phải luôn một list groups đơn giản",
+        "en": "5. Source permissions can exceed simple group lists"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một source có thể dùng user/groups, nested membership, explicit deny, inheritance, link sharing, time/attribute conditions hoặc field-level access. Index mirror phải biểu diễn đúng semantics được hỗ trợ, hoặc gọi authoritative policy cho parts không thể flatten safely. “Anyone with link” không tự là public cho mọi tenant/user; group expansion/cache cần generation, expiry và revocation policy. Authentication thành công không tự cho phép mọi document.",
+          "en": "Sources can combine groups, nested membership, denies, inheritance, links, attributes and field-level rules. Mirror supported semantics accurately and use authoritative checks where flattening is unsafe. Link possession is not universal public access, and memberships need expiry/revocation handling. Authentication alone does not authorize documents."
+        },
+        {
+          "vi": "Tenant partition/filter dựa trên trusted identity và phải áp vào cả keyword, vector, reranker, evidence store và caches. Authorization filter do app xây từ arbitrary principal strings không tự authenticate caller; không expose broad search credentials cho untrusted clients. Chú ý logs/embeddings/provider processors cũng có thể thấy sensitive data trước final rendering.",
+          "en": "Apply trusted tenant scope across search, processors, stores and caches. Caller-supplied principal strings do not authenticate or authorize anyone, and broad search credentials must remain protected. Authorization must precede downstream data exposure, not only rendering."
+        }
+      ]
+    },
+    {
+      "id": "filtering",
+      "title": {
+        "vi": "6. Filter placement: recall, underfill và disclosure",
+        "en": "6. Understand filtering, underfill and disclosure"
+      },
+      "paragraphs": [
+        {
+          "vi": "Eligible-first search tránh restricted documents chiếm hết top-k trong exact toy ranking. Trong ANN thực, filtering mode ảnh hưởng traversal/shards/candidate recall và cost; không có universal “prefilter = full recall”. Postfilter top-k có thể underfill và miss authorized relevant docs. Nếu thực hiện trước mọi unauthorized downstream processing và current permission contract đúng, postfilter có thể bảo vệ data nhưng cần đo chất lượng/latency; filter ở final UI sau model không đủ.",
+          "en": "Eligible-first search avoids restricted top-k crowding in exact rankings. Actual ANN filters affect traversal, shards, recall and cost rather than guaranteeing perfect recall. Postfiltering can protect data under suitable pre-processing authorization while underfilling results; filtering only after models see data is insufficient."
+        },
+        {
+          "vi": "Over-fetch có thể cải thiện underfill nhưng không bảo đảm tìm đủ evidence và không chữa stale ACL. Recall@k cần labeled authorized relevant set; đừng đổi denominator thành min(k,relevantTotal) rồi gọi đó là standard recall mà không định nghĩa. Lab bên dưới tách exact fixed rankings, candidate misses và permission scope để các quantities có ý nghĩa rõ.",
+          "en": "Overfetch can reduce underfill without guaranteeing evidence or fixing stale authority. Define recall against labeled authorized relevance rather than silently changing denominators. The lab separates fixed ranking, explicit candidate misses and scope."
+        }
+      ],
+      "experiment": "enterprise-access"
+    },
+    {
+      "id": "revocation",
+      "title": {
+        "vi": "7. Quyền bị thu hồi khi query đang chạy",
+        "en": "7. Handle revocation while queries are in flight"
+      },
+      "paragraphs": [
+        {
+          "vi": "Index ACL mirror và group cache có thể lag. Check eligibility trước reranker/model/cached answer theo declared current-access policy; source liveness/deletion cũng cần xét. Nếu data đã gửi unauthorized tới external reranker/provider, chặn final answer không xóa exposure đó. Ngược lại, khi processing đã authorized rồi permission đổi, không thể retroactively unsend data; cần rõ linearization point và scope của future delivery/use.",
+          "en": "Indexes and membership caches can lag. Apply current eligibility/liveness contracts before processors and answers. Blocking final text does not erase unauthorized upstream exposure. Revocation after previously authorized processing cannot undo that processing, requiring explicit timing and future-use semantics."
+        },
+        {
+          "vi": "Nếu identity/policy service unavailable hoặc permission evidence quá stale, product có thể fail closed, serve only independently authorized public data hoặc ask for retry, tùy requirement. Một short TTL không chứng minh immediate revocation; cached allow/deny có risks khác nhau. Audit decision revisions/minimal evidence và test membership changes, document ACL changes, stored answers, conversation history và shared viewers.",
+          "en": "Unavailable or stale policy evidence needs deliberate fail-closed or independently authorized degradation. Short TTLs do not establish immediate revocation. Track revisions and test changes across memberships, documents, conversations, caches and shared viewers."
+        }
+      ],
+      "experiment": "enterprise-revoke"
+    },
+    {
+      "id": "ingestion",
+      "title": {
+        "vi": "8. Connector sync và generation-aware publication",
+        "en": "8. Synchronize connectors and publish versioned generations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Connector dùng least-privilege approved grants, webhook/events khi available và polling/checkpoint repair khi không. Track source object identity, monotonic version hoặc comparable change token, content/ACL/membership/deletion events và cursor recovery. Webhook delivery có thể duplicate, out-of-order hoặc miss; reconciliation scans cần owner/SLO, không chỉ một best-effort cron không ai monitor.",
+          "en": "Use scoped grants and appropriate events, polling and repair. Track source identities, content/access versions, deletion and cursor recovery. Duplicate, reordered or missing notifications require owned observable reconciliation."
+        },
+        {
+          "vi": "Parse theo structure, preserve title/section/table context và generate stable chunk references dưới document generation. Content hash giúp skip embedding khi text và encoder/profile/context dependencies thực sự unchanged; thay title/preprocessing có thể đổi embedded text. ChunkIndex có thể shift khi thêm đoạn đầu, nên không assume upsert(docId,chunkIndex) tự xóa old trailing chunks. Stage complete generation và conditional publish/retire old set theo contract.",
+          "en": "Preserve structure and version chunk references by document generation. Reuse hashes only under compatible encoder and preprocessing dependencies. Positional chunk identities can shift or leave old tails; stage and publish/retire complete sets under explicit rules."
+        },
+        {
+          "vi": "Publish check source generation/tombstone và access revision độc lập: old embedding job không được resurrect deleted document hoặc ghi lại stale ACL. Content-current không tự là permission-current. Nếu source không có usable ordering token, define stronger reconciliation/serialization strategy và limitations; queue priority không thay correctness fences.",
+          "en": "Fence publication against content/deletion and access revisions independently. Current content can still have stale permissions. Sources without usable ordering need suitable serialization/reconciliation; priority alone does not establish correctness."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Build và publish có fence",
+          "en": "Fence builds and publication"
+        },
+        "caption": {
+          "vi": "Content work chậm không được undo control update mới hơn.",
+          "en": "Slow builds must not undo newer controls."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Source change",
+              "en": "Source change"
+            },
+            "detail": {
+              "vi": "Capture object/revision/content/access event.",
+              "en": "Capture identities and revisioned events."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Build generation",
+              "en": "Build generations"
+            },
+            "detail": {
+              "vi": "Parse/chunk/embed theo pinned dependency profile.",
+              "en": "Build under pinned dependencies."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Validate current state",
+              "en": "Validate current state"
+            },
+            "detail": {
+              "vi": "Compare source/tombstone/ACL revisions.",
+              "en": "Compare content, deletion and access revisions."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Publish / retire",
+              "en": "Publish / retire"
+            },
+            "detail": {
+              "vi": "Activate eligible set và retire superseded chunks.",
+              "en": "Activate eligible sets and retire superseded chunks."
+            },
+            "icon": "check"
+          }
+        ]
+      }
+    },
+    {
+      "id": "deletes",
+      "title": {
+        "vi": "9. Delete/ACL priority lane và freshness SLO",
+        "en": "9. Prioritize deletions/access without losing freshness semantics"
+      },
+      "paragraphs": [
+        {
+          "vi": "Delete/revocation lane có thể skip expensive embedding để update eligibility/tombstone và invalidate dependencies nhanh. Nhưng group revocation có thể nằm trong identity service thay vì document events; per-source semantics phải có propagation path riêng. Define age metrics từ authoritative observed time và ingestion timestamps, lag theo tenant/source, backlogs/dead-letter queues và repair success.",
+          "en": "Control changes can bypass embedding to update eligibility and dependencies quickly. Membership revocations may originate outside document events and need their own path. Measure source/tenant freshness, backlogs, failures and repair using defined timestamps."
+        },
+        {
+          "vi": "Nếu source API chỉ cho polling hoặc slow per-file permissions, không hứa immediate no-leak từ index mirror. Chọn query-time authoritative check, shorter bounded staleness/limited source scope hoặc fail-closed khi chưa verify, với explicit product trade-off. Deletion còn ảnh hưởng stored answers, caches, raw blobs, logs và backups theo retention policy; deleting vectors không tự xóa facts đã render/copy hoặc trained weights.",
+          "en": "Slow or polling-only sources cannot support imaginary immediate mirror freshness. Use suitable authoritative checks, bounded scope/staleness or fail-closed behavior. Deletion also involves answers, caches, blobs, logs and backups under actual lifecycle policies."
+        }
+      ]
+    },
+    {
+      "id": "quality",
+      "title": {
+        "vi": "10. Hybrid retrieval, reranking và context packing",
+        "en": "10. Evaluate hybrid retrieval, reranking and packing"
+      },
+      "paragraphs": [
+        {
+          "vi": "Keyword search có thể giúp exact IDs/names; dense retrieval có thể giúp paraphrase/concepts. Fusion cần compatible access filters và evaluated ranking; hybrid/cross-encoder không luôn thắng mọi task hoặc có fixed extra latency. Benchmark end-to-end retrieval quality và operations theo tenant/language/task, giữ candidate recall ceilings trước rerank. Nếu relevant document không vào candidate set, reranker không thể tạo nó từ hư không.",
+          "en": "Keyword and dense methods can cover different needs, but fusion/reranking require evaluated scoped profiles rather than universal superiority or fixed latency claims. Measure candidate ceilings and task slices; reranking cannot recover evidence absent from candidates."
+        },
+        {
+          "vi": "Pack bounded useful passages theo actual tokenizer/context budget, preserve provenance và claim context. “Luôn lấy 5–10 chunks” không là universal best choice: tables, multi-hop question, conflicting policy và document lengths khác nhau. Long-context position effects là một eval concern, không lý do tự bỏ middle evidence cần thiết. Conversation rewrite phải giữ user intent và không dùng unauthorized prior history.",
+          "en": "Pack useful evidence under actual budgets while preserving context/provenance. Fixed chunk counts are not universal optima across tables, multi-hop tasks and conflicts. Evaluate context selection and conversation rewriting without discarding necessary or using unauthorized historical evidence."
+        }
+      ]
+    },
+    {
+      "id": "citations",
+      "title": {
+        "vi": "11. Citations, uncertainty và conflicting sources",
+        "en": "11. Validate citations, uncertainty and conflicting sources"
+      },
+      "paragraphs": [
+        {
+          "vi": "Citation contract gồm source identity/version, chunk/section reference, viewer access và claim support. Code kiểm cited ID tồn tại hoặc URL hợp format chỉ là structural validation; entailment/completeness/correctness cần task/evidence checks và calibrated review phù hợp. Source itself có thể sai/stale hoặc contradictory; answer cần nêu uncertainty/version/date thay force one confident conclusion.",
+          "en": "Citation contracts include identities, revisions, access and support. Structural existence checks do not establish entailment, completeness or truth. Review source quality and conflicts, exposing uncertainty and versions where needed."
+        },
+        {
+          "vi": "Khi thiếu authorized relevant evidence, abstain/ask clarify/escalate theo product thay dùng model prior như thể đã có source. Faithful với retrieved context không đảm bảo world truth; correct answer tình cờ không chứng minh grounded. Retrieved instructions là untrusted data; read-only generation path không có write tools không cần cho task.",
+          "en": "With insufficient authorized support, decline, clarify or escalate rather than presenting model priors as sourced facts. Faithfulness and correctness differ, and retrieved instructions remain untrusted. Keep unnecessary write capabilities outside this path."
+        }
+      ]
+    },
+    {
+      "id": "cache-share",
+      "title": {
+        "vi": "12. Cache, conversation và shared-answer isolation",
+        "en": "12. Scope caches, conversations and shared answers"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache keys có thể cần tenant/principal-policy scope, source/evidence generations, query/context, model/template/schema/retrieval profiles và freshness. Principal-set hash chỉ đủ khi nó biểu diễn chính xác applicable policies và còn current; denies/ABAC/resource changes hoặc membership expiry có thể yêu cầu thêm identity/revalidation. Scope retrieval/embedding/answer caches và logs theo dữ liệu thực tế, không chỉ cache cuối.",
+          "en": "Cache identities may require policy scope, evidence revisions, context, model/templates and freshness. Principal hashes work only when they represent current applicable semantics; attributes, denies and resource changes can require more. Scope intermediate caches and logs as well as final answers."
+        },
+        {
+          "vi": "Conversation history và shared answer text có thể chứa facts từ restricted docs, dù citations không được mở. Recheck viewer/access và dependencies trước reuse/delivery; policy có thể deny whole answer hoặc regenerate từ authorized evidence thay chỉ hide restricted links. User exports/copies ngoài hệ thống không thể được retroactively revoked bằng một cache invalidation.",
+          "en": "Conversation and shared-answer text can disclose restricted facts despite inaccessible links. Revalidate text/dependencies, deny or regenerate as policy requires, rather than hiding links alone. External copies cannot be retroactively removed by cache invalidation."
+        }
+      ]
+    },
+    {
+      "id": "schema",
+      "title": {
+        "vi": "13. Data model: content, access và embedding identities",
+        "en": "13. Model content, access and embedding identities"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giữ document/source identity, generation/revisions, chunk reference, embedded-text hash, parser/chunker/encoder/metric profile, permission metadata/revision, source liveness, citation anchor và processing timestamps. Source content version và ACL revision có thể khác nhau; version fields phải có semantics, không dùng một updatedAt wall-clock làm universal causal order.",
+          "en": "Track source/generation/chunk identities, content hashes, processing/embedding profiles, access revisions, liveness, anchors and timestamps. Content and permissions can evolve independently; timestamps alone need not establish causal order."
+        }
+      ],
+      "code": {
+        "language": "ts",
+        "caption": {
+          "vi": "Illustrative chunk manifest; policy evaluation và storage schema phụ thuộc source/product.",
+          "en": "Illustrative manifests; actual policies and storage depend on source/product."
+        },
+        "content": "type KnowledgeChunk = {\n  tenantId: string; sourceId: string; documentId: string;\n  documentGeneration: string; sourceContentRevision: string;\n  accessRevision: string; chunkRef: string; embeddedTextHash: string;\n  profile: { parser: string; chunker: string; encoder: string; metric: string };\n  policyRef: string; sourceAlive: boolean; citationAnchor: string;\n  indexedAt: string;\n};\n// Trusted query identity is resolved separately.\n// Do not accept caller-provided tenant/group strings as authorization."
+      }
+    },
+    {
+      "id": "migration",
+      "title": {
+        "vi": "14. Shadow index, catch-up và compatible cutover",
+        "en": "14. Shadow indexes, catch-up and compatible cutover"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi đổi encoder/chunker/index profile, tạo candidate generation, backfill dưới source/access fences và catch up events tới declared watermarks. Pin query encoder và document representation/metric tương thích; same dimensionality không chứng minh same semantic space. Reusing old vectors hoặc mapping spaces chỉ khi actual compatibility/evals chứng minh phù hợp, không assume mọi upgrade chắc giữ hoặc chắc phá mọi reuse.",
+          "en": "Build candidate profiles under content/access fences and catch up declared watermarks. Match query and document representations/metrics; equal dimensions do not establish compatibility. Reuse or mappings need actual evidence rather than universal assumptions about upgrades."
+        },
+        {
+          "vi": "Readiness cần backfill coverage, content/delete/ACL/group sync, per-partition catch-up, quality/permission/latency/cost evals và online exposure plan. Atomic active profile mapping phải ghép query/index/dependencies; keep old generation warm/caught-up theo rollback policy. Một “100% rows processed” counter không tự chứng minh no gaps hoặc safe rollback.",
+          "en": "Readiness includes coverage, authorization changes, partition catch-up, quality/operations and exposure plans. Cutovers bind compatible profiles, retaining rollback dependencies as needed. Processed-row counters alone do not establish completeness or rollback safety."
+        }
+      ],
+      "experiment": "enterprise-migrate"
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "15. Tenant isolation, budgets và quality gates",
+        "en": "15. Operate tenant isolation, budgets and quality gates"
+      },
+      "paragraphs": [
+        {
+          "vi": "Large tenant có thể cần dedicated partition/index/resources; small tenants có thể shared infrastructure với enforced isolation. Quyết định theo skew, cost, quotas, residency và noisy-neighbor SLOs, không một universal physical index/tenant rule. Separate query và bulk-embedding budgets, bound concurrent rerank/model calls và prioritize access-control propagation. Regional providers/storage must match data policy; audit traces có minimal access-controlled evidence.",
+          "en": "Choose physical/shared isolation by workload, cost, geography and noisy-neighbor requirements under enforced scope. Separate interactive and bulk budgets, bound processors and prioritize controls. Storage/providers and minimal traces must respect data policy."
+        },
+        {
+          "vi": "Suite gồm permission-negative users/docs, membership/doc revocation, stale source/delete, cache/shared viewers, retrieval recall/ranking, citation support/correctness, abstention và poisoned inputs. Calibrate judges bằng reviewed domain labels; feedback không tự gold. Trace rewrite→candidate→filtered/reranked→packed evidence→generation→delivery để diagnosis, nhưng không lưu raw customer secrets tùy tiện.",
+          "en": "Evaluate negative permissions, revocations, stale/deleted evidence, caches/viewers, retrieval, support, abstention and poisoning. Calibrate graders and review feedback. Trace boundaries with appropriate minimization instead of unrestricted secret logging."
+        }
+      ]
+    },
+    {
+      "id": "tradeoffs",
+      "title": {
+        "vi": "16. Failure modes và trade-offs cần nói rõ",
+        "en": "16. Explain failures and trade-offs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Source/identity outage có thể buộc decline thay answer nhanh; tighter current checks thêm latency và load nhưng có thể cần cho invariant. Priority revocations vẫn có missed-event risk nếu connectors/repair không đáng tin. More chunks/rerank complexity có thể tăng cost mà không thêm support; semantic caching có thể tăng false hits. Chọn theo task/security evidence, không theo danh sách technologies.",
+          "en": "Current checks can trade latency and availability for required authority, while priority events still depend on reliable detection/repair. More evidence/reranking and semantic caches can add costs or mistakes. Choose through measured task/security needs rather than technology lists."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Decision",
+            "en": "Decision"
+          },
+          {
+            "vi": "Benefit",
+            "en": "Benefit"
+          },
+          {
+            "vi": "Risk / evidence needed",
+            "en": "Risk / evidence needed"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Index permission mirror",
+              "en": "Index permission mirror"
+            },
+            {
+              "vi": "Fast scoped candidate search",
+              "en": "Fast scoped search"
+            },
+            {
+              "vi": "Source semantics, staleness và current revalidation",
+              "en": "Semantics, staleness and revalidation"
+            }
+          ],
+          [
+            {
+              "vi": "Pre-model authoritative checks",
+              "en": "Pre-model authoritative checks"
+            },
+            {
+              "vi": "Stronger current eligibility boundary",
+              "en": "Stronger current-access boundaries"
+            },
+            {
+              "vi": "Policy availability, latency và in-flight contract",
+              "en": "Availability, latency and timing semantics"
+            }
+          ],
+          [
+            {
+              "vi": "Priority control lane",
+              "en": "Priority control lane"
+            },
+            {
+              "vi": "Delete/revoke không chờ bulk embedding",
+              "en": "Avoid bulk-build delays"
+            },
+            {
+              "vi": "Ordering/tombstones, source detection và repair",
+              "en": "Ordering, source detection and repair"
+            }
+          ],
+          [
+            {
+              "vi": "Shadow embedding index",
+              "en": "Shadow embedding index"
+            },
+            {
+              "vi": "Evaluate before compatible cutover",
+              "en": "Evaluate candidate profiles"
+            },
+            {
+              "vi": "Backfill cost, catch-up, ACL/delete parity và rollback",
+              "en": "Costs, catch-up, access parity and rollback"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "17. Luyện giải thích Enterprise RAG",
+        "en": "17. Practice Enterprise RAG decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Đảm bảo user không thấy restricted document bằng cách nào?",
+            "en": "How do you prevent unauthorized evidence exposure?"
+          },
+          "answer": [
+            {
+              "vi": "Trusted tenant/principal, correct source-policy semantics, scoped retrieval và current eligibility trước processors/delivery. Index filters hỗ trợ nhưng cần freshness/revocation contract, caches/shared-answer checks và negative tests. Không dùng prompt instruction như access control hoặc hứa zero stale access chỉ từ short TTL.",
+              "en": "Use trusted identities, correct policy semantics and current eligibility before processing/delivery. Filters need freshness, caches/viewer controls and negative tests rather than prompt-based authority."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Prefilter có luôn full recall không?",
+            "en": "Does prefiltering always give full recall?"
+          },
+          "answer": [
+            {
+              "vi": "Không với ANN/candidate limits/profile mismatch. Exact fixture eligible-first khác approximation thực. Đo recall trên labeled authorized evidence, filter selectivity/shards/candidate budget và end-to-end task quality; không chỉ leak count.",
+              "en": "Not with approximation, candidate limits or incompatible profiles. Evaluate authorized relevance, selectivity and end-to-end quality as well as disclosure."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Chỉ postfilter trước LLM có safe không?",
+            "en": "Is filtering only before the LLM sufficient?"
+          },
+          "answer": [
+            {
+              "vi": "Có thể quá muộn nếu unauthorized data đã tới reranker/log/provider khác. Postfilter bảo vệ data chỉ dưới đúng current-permission semantics và trước mọi unauthorized processing; vẫn có underfill/recall risks. Final UI filter chắc chắn không chữa upstream exposure.",
+              "en": "It can be too late for earlier processors/logs. Appropriate current filtering must precede all unauthorized processing, with underfill measured separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Delete event đi trước old embedding job thì sao?",
+            "en": "What if deletion precedes an old embedding job?"
+          },
+          "answer": [
+            {
+              "vi": "Persist tombstone/source/access revisions và fence conditional publication. Old job không được resurrect doc hoặc overwrite ACL mới. Priority lane tăng tốc nhưng không thay version ordering; repair scans và late-job tests cần thiết.",
+              "en": "Fence stale publication against deletion and access revisions; priority alone does not preserve ordering. Test late work and repair."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Citation number đúng có chứng minh grounded không?",
+            "en": "Do valid citation numbers establish grounding?"
+          },
+          "answer": [
+            {
+              "vi": "Không: chỉ structural reference. Cần current accessible source, claim support, completeness và source correctness/freshness theo task. Conflicting/insufficient evidence cần uncertainty/abstention thay confident fabricated support.",
+              "en": "No: validate accessible support, completeness and source quality, with uncertainty for conflicting or insufficient evidence."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Cùng groups hash có share cached answer được không?",
+            "en": "Can equal group hashes justify answer reuse?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi hash đại diện đúng current applicable policy và mọi dependencies khác tương thích. ABAC/denies/resource ACL/time/identity context có thể khác. Revalidate viewer và underlying answer facts; hide citation links không đủ.",
+              "en": "Only with correct current policy equivalence and compatible dependencies. Attributes, denials and context can differ; govern the answer text as well as links."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Encoder upgrade đã backfill 100% thì switch chưa?",
+            "en": "Can an encoder switch after 100% backfill?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa nếu source/access/deletes chưa caught up, queryspace mismatch hoặc evals/rollback chưa đủ. Cut over compatible query/index profile theo declared per-partition watermarks và ongoing sync; keep old mapping để rollback có nghĩa.",
+              "en": "Not without caught-up changes, compatible queries, evaluations and rollback readiness. Bind cutovers to actual synchronized profiles."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Source chỉ sync permissions hàng giờ nhưng muốn immediate revoke?",
+            "en": "What if hourly permission sync must support immediate revocation?"
+          },
+          "answer": [
+            {
+              "vi": "Requirement và source contract đang mâu thuẫn nếu chỉ dựa mirror. Cần query-time authoritative decision/deny overlay phù hợp, source integration khác hoặc limit/decline khi chưa verify; nói rõ availability/latency trade-off, không hứa điều source không cung cấp.",
+              "en": "A mirror alone cannot satisfy incompatible freshness requirements. Add suitable authoritative controls, change integrations or limit service with explicit trade-offs."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
