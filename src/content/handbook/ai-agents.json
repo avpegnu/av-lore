@@ -1,0 +1,1359 @@
+{
+  "id": "ai-agents",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Agents & Tool Use: vòng lặp, quyền và durable execution",
+    "en": "Agents & Tool Use: loops, authority and durable execution"
+  },
+  "summary": {
+    "vi": "Chọn workflow hay agent, thiết kế tools có contract, quản approval/budget/context và khôi phục external effects đúng cách. Có trace runtime, mô phỏng lost-response recovery và worksheet input-token growth.",
+    "en": "Choose workflows or agents, design tool contracts, manage approvals/budgets/context and recover external effects correctly. Explore runtime traces, lost-response recovery and input-token growth."
+  },
+  "prerequisites": [
+    "ai-evals",
+    "ai-prompting",
+    "messaging"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "security",
+    "messaging",
+    "observability"
+  ],
+  "takeaways": [
+    {
+      "vi": "Agent autonomy là cách chọn control flow; quyền và business constraints vẫn do code/runtime/resource server enforce.",
+      "en": "Agent autonomy selects control flow; runtimes and resource servers enforce authority and business constraints."
+    },
+    {
+      "vi": "Bắt đầu bằng bounded workflow khi phù hợp; thêm model-directed steps theo measured task needs, không vì tên kiến trúc.",
+      "en": "Use bounded workflows when suitable and add model-directed steps for measured task needs rather than labels."
+    },
+    {
+      "vi": "Tool proposals và outputs là dữ liệu chưa đáng tin; schema-valid không có nghĩa authorized hoặc correct.",
+      "en": "Tool proposals and outputs are untrusted data; schema validity does not establish authority or correctness."
+    },
+    {
+      "vi": "Durable checkpoint không atomically commit external API; stable intent và sink receipts/reconciliation xử lý crash window.",
+      "en": "Durable checkpoints do not atomically commit external APIs; stable intents and receipts/reconciliation address crash windows."
+    },
+    {
+      "vi": "Budget/cancellation dừng future work, không tự undo effects đã commit hoặc xóa cost đã phát sinh.",
+      "en": "Budgets and cancellation stop future work without undoing committed effects or incurred costs."
+    },
+    {
+      "vi": "Context growth, prompt caching, external memory và lossy summaries có assumptions/quality trade-offs khác nhau.",
+      "en": "Context growth, caching, external memory and lossy summaries have distinct assumptions and quality trade-offs."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một task được thực thi có kiểm soát",
+      "en": "Execute a task under explicit control"
+    },
+    "caption": {
+      "vi": "Đừng gộp model proposal, authorization, approval và committed effect thành một trạng thái “tool success”.",
+      "en": "Do not collapse proposals, authorization, approval and committed effects into one tool-success state."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Scope task",
+          "en": "Scope tasks"
+        },
+        "detail": {
+          "vi": "Principal, data/action scope và outcome criteria.",
+          "en": "Define principals, scope and outcome criteria."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Propose",
+          "en": "Propose"
+        },
+        "detail": {
+          "vi": "Model chọn next action với bounded context.",
+          "en": "Propose actions from bounded context."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Validate / admit",
+          "en": "Validate / admit"
+        },
+        "detail": {
+          "vi": "Schema, auth, budget, preconditions và approval.",
+          "en": "Check schemas, authority, budgets, preconditions and approvals."
+        },
+        "icon": "shield"
+      },
+      {
+        "title": {
+          "vi": "Execute / record",
+          "en": "Execute / record"
+        },
+        "detail": {
+          "vi": "Stable intent, external receipt và durable observation.",
+          "en": "Bind stable intents, external receipts and durable observations."
+        },
+        "icon": "check"
+      },
+      {
+        "title": {
+          "vi": "Continue / stop",
+          "en": "Continue / stop"
+        },
+        "detail": {
+          "vi": "Verify outcome, detect loops, escalate hoặc reconcile.",
+          "en": "Verify outcomes, bound loops and escalate or reconcile."
+        },
+        "icon": "route"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "choice",
+      "title": {
+        "vi": "1. Workflow hay agent: chọn theo control flow và evidence",
+        "en": "1. Choose workflows or agents by control flow and evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Workflow dùng code quyết định những bước và branches đã biết; model có thể classify, extract hoặc draft ở vài nodes. Agent cho model chọn next action/tool/subtask trong một phạm vi runtime cho phép. Đây là spectrum có thể phối hợp: workflow support ticket có một agentic research step rồi quay lại deterministic approval/payment rules. “Có nhiều model calls” không tự làm hệ thống thành autonomous agent.",
+          "en": "Workflows use code to choose known steps and branches, with models at selected nodes. Agents allow models to select actions, tools or subtasks within runtime bounds. Systems can combine them: ticket workflows may include agentic research before deterministic approval/payment rules. Multiple model calls alone do not establish autonomy."
+        },
+        {
+          "vi": "So sánh với single-call/retrieval/workflow baseline trên task quality, reliability, latency/cost và operational complexity. Chọn autonomy khi dynamic search/planning mang lại lợi ích đo được; tasks known-step thường dễ test và bound bằng workflow hơn. Agent không đảm bảo giải được arbitrary task, và workflow cũng có thể lỗi, unbounded retries hoặc unsafe permissions nếu code sai.",
+          "en": "Compare against simpler baselines on quality, reliability, costs and operational complexity. Use autonomy when dynamic planning/search provides measured value; known-step tasks can often be bounded more easily in workflows. Agents do not solve arbitrary tasks, and poorly built workflows can also be unsafe or unbounded."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Workflow",
+            "en": "Workflow"
+          },
+          "icon": "route",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Code chọn sequence, branches và allowed transitions.",
+              "en": "Code defines sequences, branches and transitions."
+            },
+            {
+              "vi": "Dễ kiểm contract hơn khi task structure rõ.",
+              "en": "Clear task structure can simplify contract testing."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Bounded agent",
+            "en": "Bounded agent"
+          },
+          "icon": "decision",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Model đề xuất next action trong allowed space.",
+              "en": "Models propose actions within allowed spaces."
+            },
+            {
+              "vi": "Cần trajectory evals, budgets và recovery.",
+              "en": "Require trajectory evaluation, budgets and recovery."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Hybrid",
+            "en": "Hybrid"
+          },
+          "icon": "compare",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "Agentic exploration trong deterministic product boundaries.",
+              "en": "Combine exploration with deterministic product boundaries."
+            },
+            {
+              "vi": "Ví dụ research linh hoạt, refund theo policy code.",
+              "en": "For example, flexible research with code-enforced refunds."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "loop",
+      "title": {
+        "vi": "2. Vòng lặp runtime và completion contract",
+        "en": "2. Runtime loops and completion contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một vòng điển hình gồm assemble context → model proposal → validate/admit → tool execution → observe/record → next turn hoặc stop. ReAct là một pattern kết hợp reasoning và actions, không phải mọi agent buộc phải xuất explicit chain-of-thought hoặc có đúng một control loop. Parallel tools, planning graphs và event-driven waits có thể làm execution phức tạp hơn; vẫn cần state transitions rõ.",
+          "en": "A typical cycle assembles context, obtains proposals, validates/admit actions, executes tools and records observations before continuing or stopping. ReAct is one reasoning/action pattern rather than a requirement to expose private reasoning or use a single loop. Parallel tools, graphs and asynchronous waits still need explicit state transitions."
+        },
+        {
+          "vi": "Model nói “done” chưa chứng minh task hoàn thành. Nếu task là cập nhật ticket, kiểm authoritative ticket state hoặc receipt; nếu là sửa code, dùng relevant tests/review. Giữ separate DONE, WAIT_APPROVAL, BUDGET_EXHAUSTED, CANCELLED và OUTCOME_UNRESOLVED states. Không biến tool error thành một chuỗi text indistinguishable với successful data.",
+          "en": "Model completion text is not evidence of task completion. Verify authoritative states, receipts or relevant tests. Distinguish completion, waiting, exhaustion, cancellation and unresolved outcomes, and keep errors structurally distinct from successful observations."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Từ proposal tới verified observation",
+          "en": "From proposals to verified observations"
+        },
+        "caption": {
+          "vi": "Tool output được đưa lại context như data, không phải authority mới.",
+          "en": "Return tool outputs as data rather than new authority."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Build context",
+              "en": "Build context"
+            },
+            "detail": {
+              "vi": "Goal, current evidence, schemas và limits.",
+              "en": "Assemble goals, evidence, schemas and limits."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Model proposal",
+              "en": "Model proposal"
+            },
+            "detail": {
+              "vi": "Text hoặc tool name/arguments.",
+              "en": "Receive text or tool names/arguments."
+            },
+            "icon": "decision"
+          },
+          {
+            "title": {
+              "vi": "Validate / reserve",
+              "en": "Validate / reserve"
+            },
+            "detail": {
+              "vi": "Auth, preconditions, budget và approval.",
+              "en": "Check authority, preconditions, budgets and approval."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Execute / observe",
+              "en": "Execute / observe"
+            },
+            "detail": {
+              "vi": "Bound result, record receipt/error và update state.",
+              "en": "Bound results and record receipts/errors."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tools",
+      "title": {
+        "vi": "3. Tools là APIs có semantics, không chỉ tên và JSON Schema",
+        "en": "3. Tools are semantic APIs, not just names and schemas"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tool contract cần name/purpose, required fields/enums/bounds, input/output schema, resource identity, error taxonomy, pagination, timeout, rate/cost limits và side-effect class. Dùng domain operations rõ như get_order hoặc issue_refund thay vì unrestricted shell/SQL ở nơi không cần. Tool descriptions giúp model chọn đúng nhưng enforcement nằm ở executor/resource server. Strict JSON không ngăn model chọn nhầm resource hoặc action ngoài quyền.",
+          "en": "Define tool purpose, types/bounds, outputs, identities, errors, pagination, timeouts, cost limits and effects. Prefer narrow domain operations where unrestricted interpreters are unnecessary. Descriptions guide selection, while executors and resource servers enforce constraints. Structured JSON does not prevent wrong resources or unauthorized actions."
+        },
+        {
+          "vi": "Reads cũng có authorization, privacy, rate limits và freshness; search/list có thể exfiltrate data dù không ghi database. Writes có thể idempotent hoặc không; destructive/financial/external communication actions có severity khác nhau tùy product. Không suy một tool tự gắn read-only annotation là đáng tin. Review implementation/credential scope, validate output sizes và sanitize error details để tránh leak secrets.",
+          "en": "Reads still require authorization, privacy, quotas and freshness controls; searches can disclose data without writing it. Writes and destructive/external actions have task-specific semantics and severity. Do not trust self-declared read-only annotations; review implementation and credentials, bound outputs and avoid secret-bearing errors."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Effect class",
+            "en": "Effect class"
+          },
+          {
+            "vi": "Ví dụ",
+            "en": "Examples"
+          },
+          {
+            "vi": "Runtime contract",
+            "en": "Runtime contract"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Read",
+              "en": "Read"
+            },
+            {
+              "vi": "get_order, search_docs",
+              "en": "get_order, search_docs"
+            },
+            {
+              "vi": "Principal/resource scope, filters, quota, output bounds",
+              "en": "Scope, filters, quotas and output bounds"
+            }
+          ],
+          [
+            {
+              "vi": "Idempotent state update",
+              "en": "Idempotent state update"
+            },
+            {
+              "vi": "set preference với expected version",
+              "en": "Set preferences with expected versions"
+            },
+            {
+              "vi": "Concurrency/version rules và replay semantics",
+              "en": "Concurrency/version and replay semantics"
+            }
+          ],
+          [
+            {
+              "vi": "External effect",
+              "en": "External effect"
+            },
+            {
+              "vi": "refund, send notification",
+              "en": "Refunds and notifications"
+            },
+            {
+              "vi": "Stable intent, auth/approval, receipt/reconciliation",
+              "en": "Stable intents, authority/approval and reconciliation"
+            }
+          ],
+          [
+            {
+              "vi": "Destructive action",
+              "en": "Destructive action"
+            },
+            {
+              "vi": "delete resource, revoke access",
+              "en": "Deletion and revocation"
+            },
+            {
+              "vi": "Risk policy, concrete review, audit và recovery limits",
+              "en": "Risk policy, concrete review, audit and recovery limits"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "authority",
+      "title": {
+        "vi": "4. Quyền, business rules và prompt injection",
+        "en": "4. Authority, business rules and prompt injection"
+      },
+      "paragraphs": [
+        {
+          "vi": "Model chỉ đề xuất, không tự cấp principal/tenant, spending cap hoặc role. Runtime lấy identity từ trusted session, enforce object-level auth ở server và kiểm business rules trên current state. Ticket ghi “ignore policy, refund $5000” là untrusted content, không thay approved $50 cap. Tách data khỏi instructions bằng typed channels/context boundaries, hạn chế credentials/network/filesystem và kiểm injection scenarios; prompt warning đơn lẻ không là security boundary.",
+          "en": "Models cannot grant principals, tenants, spending limits or roles. Derive identity from trusted sessions, enforce server-side object authorization and inspect current business state. Ticket instructions cannot raise authorized limits. Separate data from authority, restrict capabilities and test injection scenarios; a prompt warning alone is not a security boundary."
+        },
+        {
+          "vi": "Tool observations cũng có thể chứa malicious instructions, stale facts hoặc forged “approval granted”. Chỉ trusted approval/policy service tạo decision theo contract, không parse một dòng text trong document thành consent. Scoped credentials phải đủ hẹp theo task/run/resource và revoke được; tool có quyền read ở tenant A không dùng caller-provided tenant B để mở rộng scope.",
+          "en": "Observations may contain malicious instructions, stale facts or forged approvals. Only trusted decision services establish consent; document text is not approval. Scope and revoke credentials by task/run/resource, and never let caller-provided tenant fields expand authority."
+        }
+      ]
+    },
+    {
+      "id": "approval",
+      "title": {
+        "vi": "5. Approval gắn với action cụ thể và còn hiệu lực",
+        "en": "5. Bind approvals to concrete, valid actions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Khi policy cần human review, hiển thị exact target/recipient, amount/content diff, consequences và relevant preconditions. Bind decision vào run/action ID, principal/tenant, canonical payload hash, resource version và expiration/scope. Không dùng một boolean approved tồn tại mãi cho mọi write. Nếu payload hoặc target thay đổi, kiểm lại approval binding; không tái dùng approval cho một action khác chỉ vì tool name giống nhau.",
+          "en": "When review is required, present concrete targets, amounts/content changes, consequences and preconditions. Bind decisions to identities, canonical payload hashes, resource versions, validity and scope. A persistent global approval flag is inadequate; changed payloads or targets require appropriate revalidation."
+        },
+        {
+          "vi": "Approval không thay authorization và không bypass current business rules. Sau một ngày chờ, resource có thể đổi state, principal bị revoke hoặc quota giảm; revalidate trước dispatch. Không nhất thiết bắt user duyệt mọi read/write: policy có thể cho phép bounded low-risk actions theo authorization đã có. Điều quan trọng là explicit delegation, reviewable risky actions và quyền dừng/revoke phù hợp với product.",
+          "en": "Approval does not replace authorization or current business rules. Waiting can change resources, privileges and quotas, requiring revalidation before dispatch. Policies may preauthorize bounded low-risk actions rather than prompting for every operation; delegation, concrete risk review and revocation must remain explicit."
+        }
+      ]
+    },
+    {
+      "id": "experiment",
+      "title": {
+        "vi": "6. Mô phỏng loop: budgets, errors và approval wait",
+        "en": "6. Simulate loops, budgets, errors and approval waits"
+      },
+      "paragraphs": [
+        {
+          "vi": "Lab dùng fixed task đọc ticket/order và issue một refund minh họa. Read timeout có bounded retries; write chỉ được execute sau auth và approval. Config change tạo một scenario mới, không tiếp tục live run. Chú ý khi token budget hết ngay sau write: state có thể chưa DONE nhưng committed effect vẫn bằng 1. UI hoặc caller không được diễn giải mọi non-DONE là “chưa có gì xảy ra”.",
+          "en": "The lab runs a fixed ticket/order/refund script. Reads have bounded retries; writes require authority and approval. Configuration changes create new scenarios rather than resuming live runs. If budget expires after a write, the run can be unfinished with one committed effect; non-completion must not be treated as no effect."
+        }
+      ],
+      "experiment": "agent-loop"
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "7. Runtime, policy, checkpoint và external systems",
+        "en": "7. Runtime, policy, checkpoints and external systems"
+      },
+      "paragraphs": [
+        {
+          "vi": "Coordinator sở hữu run transitions nhưng không sở hữu atomic transaction của external tool. Policy/executor kiểm capability và effect contract; checkpoints giữ resumable evidence; resource server giữ authoritative outcome. Một graph có mũi tên giữa các node không tự làm các writes atomic. Xem recovery trace để thấy response có thể mất giữa sink commit và local checkpoint.",
+          "en": "Coordinators own run transitions without owning external transactions. Policies/executors enforce capabilities and effects, checkpoints preserve resumable evidence and resource servers own authoritative outcomes. Graph connections do not make writes atomic; recovery traces expose the commit/checkpoint gap."
+        }
+      ],
+      "diagram": {
+        "id": "agent-runtime-effect-boundaries",
+        "title": {
+          "vi": "Model đề xuất, runtime kiểm soát execution",
+          "en": "Models propose; runtimes control execution"
+        },
+        "caption": {
+          "vi": "Theo dõi read, write approval, lost-response recovery, context recall và cancellation. Các boundaries giữ quyền, durable intent và external effects tách biệt với model output.",
+          "en": "Trace reads, write approvals, lost-response recovery, recall and cancellation. Authority, durable intent and external effects remain separate from model output."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "user",
+            "label": {
+              "vi": "Task / principal",
+              "en": "Task / principal"
+            },
+            "detail": {
+              "vi": "User intent, allowed scope, run identity và completion criteria.",
+              "en": "User intent, authorized scope, run identities and completion criteria."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "runtime",
+            "label": {
+              "vi": "Run coordinator",
+              "en": "Run coordinator"
+            },
+            "detail": {
+              "vi": "State machine, model turns, budgets, leases và cancellation.",
+              "en": "Own state machines, model turns, budgets, leases and cancellation."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "model",
+            "label": {
+              "vi": "Model call",
+              "en": "Model call"
+            },
+            "detail": {
+              "vi": "Nhận bounded context, trả text/tool proposals; không tự có quyền.",
+              "en": "Consume bounded context and propose text/tools without granting authority."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "model"
+          },
+          {
+            "id": "policy",
+            "label": {
+              "vi": "Validation / policy",
+              "en": "Validation / policy"
+            },
+            "detail": {
+              "vi": "Schema, principal/resource auth, business rules và current preconditions.",
+              "en": "Check schemas, resource authorization, business rules and current preconditions."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "memory",
+            "label": {
+              "vi": "Scoped memory",
+              "en": "Scoped memory"
+            },
+            "detail": {
+              "vi": "Working summaries và retrieved facts có provenance, ACL và expiry.",
+              "en": "Scope summaries and recalled facts by provenance, access and expiry."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "checkpoint",
+            "label": {
+              "vi": "Durable run state",
+              "en": "Durable run state"
+            },
+            "detail": {
+              "vi": "Intent/key/payload hash, pending approval, step receipts và revisions.",
+              "en": "Persist intent identities/hashes, approvals, receipts and revisions."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "approval",
+            "label": {
+              "vi": "Approval decision",
+              "en": "Approval decision"
+            },
+            "detail": {
+              "vi": "Bind exact action/principal/target/amount/version và validity window.",
+              "en": "Bind exact actions, principals, targets, amounts, versions and validity."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "client"
+          },
+          {
+            "id": "tools",
+            "label": {
+              "vi": "Tool executor",
+              "en": "Tool executor"
+            },
+            "detail": {
+              "vi": "Timeouts, limits, credentials, effect classes và receipt reconciliation.",
+              "en": "Enforce bounds/credentials and reconcile effect receipts."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "reads",
+            "label": {
+              "vi": "Authorized data API",
+              "en": "Authorized data API"
+            },
+            "detail": {
+              "vi": "Read cũng có data scope, quotas, freshness và privacy cost.",
+              "en": "Reads also have data scope, quotas, freshness and privacy implications."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "sink",
+            "label": {
+              "vi": "Effect / receipt API",
+              "en": "Effect / receipt API"
+            },
+            "detail": {
+              "vi": "Atomic effect + receipt theo supported idempotency contract.",
+              "en": "Atomically bind supported effects and receipts under idempotency contracts."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "outcome",
+            "label": {
+              "vi": "Outcome / audit",
+              "en": "Outcome / audit"
+            },
+            "detail": {
+              "vi": "Verify actual state, minimal trace, uncertainty và escalation.",
+              "en": "Verify actual state and record minimal traces, uncertainty and escalation."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "store"
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Stop / revoke",
+              "en": "Stop / revoke"
+            },
+            "detail": {
+              "vi": "Dừng future work, reconcile in-flight effects, không tự undo commit.",
+              "en": "Stop future work and reconcile in-flight effects without undoing commits."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "edge"
+          }
+        ],
+        "traces": [
+          {
+            "id": "read",
+            "label": {
+              "vi": "Một read có authorization",
+              "en": "An authorized read"
+            },
+            "steps": [
+              {
+                "from": "user",
+                "to": "runtime",
+                "description": {
+                  "vi": "Bind task/principal và allowed tool/data scope.",
+                  "en": "Bind tasks/principals to authorized tools and data."
+                }
+              },
+              {
+                "from": "runtime",
+                "to": "model",
+                "description": {
+                  "vi": "Build context có provenance và bounded tool descriptions.",
+                  "en": "Build provenance-aware bounded contexts and tool descriptions."
+                }
+              },
+              {
+                "from": "model",
+                "to": "policy",
+                "description": {
+                  "vi": "Validate structured proposal, không lấy lời model làm auth.",
+                  "en": "Validate proposals without treating model assertions as authorization."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "tools",
+                "description": {
+                  "vi": "Issue scoped credentials và enforce timeout/output bounds.",
+                  "en": "Scope credentials and bound time/output."
+                }
+              },
+              {
+                "from": "tools",
+                "to": "reads",
+                "description": {
+                  "vi": "Query permitted rows/resources, giữ explicit freshness metadata.",
+                  "en": "Query permitted resources with explicit freshness metadata."
+                }
+              },
+              {
+                "from": "reads",
+                "to": "runtime",
+                "description": {
+                  "vi": "Return observation là data, không được nâng thành instructions.",
+                  "en": "Return observations as data rather than new authority."
+                }
+              }
+            ]
+          },
+          {
+            "id": "write",
+            "label": {
+              "vi": "Intent và approval trước effect",
+              "en": "Intent and approval before effects"
+            },
+            "steps": [
+              {
+                "from": "model",
+                "to": "policy",
+                "description": {
+                  "vi": "Check tool args, business cap và current resource version.",
+                  "en": "Check arguments, business limits and resource versions."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "checkpoint",
+                "description": {
+                  "vi": "Persist intent/key/payload hash trước dispatch.",
+                  "en": "Persist intent identity and payload hashes before dispatch."
+                },
+                "async": true
+              },
+              {
+                "from": "checkpoint",
+                "to": "approval",
+                "description": {
+                  "vi": "Present exact action nếu policy cần human decision.",
+                  "en": "Present exact actions when policy requires human decisions."
+                }
+              },
+              {
+                "from": "approval",
+                "to": "policy",
+                "description": {
+                  "vi": "Verify decision binding, freshness và current authorization.",
+                  "en": "Verify decision binding, freshness and current authorization."
+                }
+              },
+              {
+                "from": "policy",
+                "to": "tools",
+                "description": {
+                  "vi": "Dispatch authorized, approved intent không mutate payload.",
+                  "en": "Dispatch authorized approved intents without payload mutation."
+                }
+              },
+              {
+                "from": "tools",
+                "to": "sink",
+                "description": {
+                  "vi": "Sink atomically commit effect và receipt theo key/hash.",
+                  "en": "Commit effects and receipts atomically under keys/hashes."
+                }
+              }
+            ]
+          },
+          {
+            "id": "recover",
+            "label": {
+              "vi": "Response mất sau external commit",
+              "en": "Recover a lost response after commit"
+            },
+            "steps": [
+              {
+                "from": "sink",
+                "to": "checkpoint",
+                "description": {
+                  "vi": "Response có thể mất trước local receipt checkpoint.",
+                  "en": "Responses can be lost before local receipt checkpoints."
+                },
+                "async": true
+              },
+              {
+                "from": "checkpoint",
+                "to": "runtime",
+                "description": {
+                  "vi": "New worker resume durable unresolved intent, giữ identity.",
+                  "en": "Resume unresolved durable intents with stable identity."
+                }
+              },
+              {
+                "from": "runtime",
+                "to": "tools",
+                "description": {
+                  "vi": "Lookup hoặc retry cùng intent theo sink contract.",
+                  "en": "Look up or retry the same intent under the sink contract."
+                }
+              },
+              {
+                "from": "tools",
+                "to": "sink",
+                "description": {
+                  "vi": "Existing receipt trả prior result, không tạo effect mới.",
+                  "en": "Existing receipts return prior results without new effects."
+                }
+              },
+              {
+                "from": "sink",
+                "to": "outcome",
+                "description": {
+                  "vi": "Verify result và record evidence; unsupported lookup cần reconcile.",
+                  "en": "Verify outcomes or reconcile when lookup is unsupported."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "recall",
+            "label": {
+              "vi": "Recall và context compaction",
+              "en": "Recall and compact context"
+            },
+            "steps": [
+              {
+                "from": "runtime",
+                "to": "memory",
+                "description": {
+                  "vi": "Retrieve authorized relevant facts; không tải mọi run history.",
+                  "en": "Retrieve authorized relevant facts rather than all history."
+                }
+              },
+              {
+                "from": "memory",
+                "to": "runtime",
+                "description": {
+                  "vi": "Return bounded snippets, provenance/version và uncertainty.",
+                  "en": "Return bounded snippets with provenance, versions and uncertainty."
+                }
+              },
+              {
+                "from": "runtime",
+                "to": "checkpoint",
+                "description": {
+                  "vi": "Keep critical approvals/intent/results ngoài lossy summaries.",
+                  "en": "Keep critical approvals, intents and results outside lossy summaries."
+                },
+                "async": true
+              },
+              {
+                "from": "runtime",
+                "to": "model",
+                "description": {
+                  "vi": "Assemble current context theo token/data policy.",
+                  "en": "Assemble current contexts under token/data policies."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cancel",
+            "label": {
+              "vi": "Cancel không rollback external commit",
+              "en": "Cancellation does not roll back effects"
+            },
+            "steps": [
+              {
+                "from": "cancel",
+                "to": "runtime",
+                "description": {
+                  "vi": "Mark stop requested, revoke further admission theo policy.",
+                  "en": "Request stop and revoke further admission under policy."
+                }
+              },
+              {
+                "from": "runtime",
+                "to": "checkpoint",
+                "description": {
+                  "vi": "Persist cancellation/fencing generation và in-flight identities.",
+                  "en": "Persist cancellation/fencing generations and in-flight identities."
+                },
+                "async": true
+              },
+              {
+                "from": "runtime",
+                "to": "tools",
+                "description": {
+                  "vi": "Stop undispatched work; cancel request không chứng minh remote abort.",
+                  "en": "Stop undispatched work without assuming remote cancellation succeeded."
+                }
+              },
+              {
+                "from": "tools",
+                "to": "sink",
+                "description": {
+                  "vi": "Reconcile in-flight receipts, không tạo blind replacement action.",
+                  "en": "Reconcile in-flight receipts rather than blind replacement actions."
+                }
+              },
+              {
+                "from": "sink",
+                "to": "outcome",
+                "description": {
+                  "vi": "Record committed prior effect hoặc unresolved outcome cần owner.",
+                  "en": "Record prior effects or owner-assigned unresolved outcomes."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "durable",
+      "title": {
+        "vi": "8. Durable execution và crash window của side effects",
+        "en": "8. Durable execution and side-effect crash windows"
+      },
+      "paragraphs": [
+        {
+          "vi": "Persist task/config versions, current step, pending intents, approval state, effect receipts và completion evidence. Durable write cần thực sự hoàn tất theo chosen store contract trước dispatch nếu đó là recovery invariant; async checkpoint có crash-loss window. Khi worker resume, deterministic orchestration/replay và version compatibility phải được kiểm. In-memory checkpoint mất khi process restart không phải durable storage.",
+          "en": "Persist task/config revisions, steps, intents, approvals, receipts and completion evidence. If recovery requires intent durability before dispatch, await the selected storage boundary. Asynchronous checkpoints can lose state on crashes; resumptions also need replay/version compatibility. In-memory state is not restart durability."
+        },
+        {
+          "vi": "External API có thể commit rồi response mất trước checkpoint. Stable intent ID/payload hash persist trước dispatch giúp recovery lookup/retry cùng logical action. Sink cần atomic dedup/receipt theo contract và retention đủ dài; local key không có tác dụng nếu sink bỏ qua. Nếu external API không hỗ trợ, dùng business unique key, reconciliation hoặc manual review/compensation phù hợp; không hứa universal exactly-once bằng cách checkpoint sau mỗi tool.",
+          "en": "External APIs may commit before responses or checkpoints arrive. Persisted intent identities/hashes permit consistent lookup/retry, but sinks must enforce atomic receipts under sufficient retention. Unsupported APIs require suitable business keys, reconciliation or review/compensation. Checkpointing after tools does not deliver universal exactly-once effects."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Tách intent, effect và receipt",
+          "en": "Separate intents, effects and receipts"
+        },
+        "caption": {
+          "vi": "Crash có thể xảy ra giữa mọi hai bước; recovery cần hiểu boundary đã qua.",
+          "en": "Crashes can occur between steps, so recovery must identify crossed boundaries."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Persist intent",
+              "en": "Persist intents"
+            },
+            "detail": {
+              "vi": "Stable action ID và exact payload hash.",
+              "en": "Persist stable action identities and payload hashes."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Dispatch",
+              "en": "Dispatch"
+            },
+            "detail": {
+              "vi": "Validate current auth/approval/preconditions.",
+              "en": "Revalidate authority, approvals and preconditions."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "External commit",
+              "en": "External commit"
+            },
+            "detail": {
+              "vi": "Effect và sink receipt atomic nếu supported.",
+              "en": "Atomically bind effects and receipts where supported."
+            },
+            "icon": "check"
+          },
+          {
+            "title": {
+              "vi": "Record / reconcile",
+              "en": "Record / reconcile"
+            },
+            "detail": {
+              "vi": "Lookup/replay receipt thay tạo action mới.",
+              "en": "Look up or replay receipts rather than inventing new actions."
+            },
+            "icon": "inspect"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recovery",
+      "title": {
+        "vi": "9. Mô phỏng response mất, dedup và cancellation",
+        "en": "9. Simulate lost responses, deduplication and cancellation"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tắt durable intent nhưng giữ sink dedup: recovery tạo key mới, sink xem là request khác và có thể tạo effect thứ hai. Giữ key nhưng tắt sink dedup cũng có thể duplicate. Khi cancel sau commit, stop future dispatch nhưng reconcile prior receipt; cancellation không refund/undo tự động. Unknown outcome cần explicit owner/status, không suy “timeout = failed” hoặc blind retry bằng key khác.",
+          "en": "Without durable intent, recovery can create a new key that bypasses sink deduplication. Stable keys without sink enforcement can also duplicate effects. Cancellation after commit stops future dispatch but requires reconciliation; timeouts and cancellation do not undo effects. Unknown outcomes need explicit ownership rather than replacement keys or assumed failure."
+        }
+      ],
+      "experiment": "agent-effect"
+    },
+    {
+      "id": "budgets",
+      "title": {
+        "vi": "10. Budgets, loop detection và concurrent admission",
+        "en": "10. Budgets, loop detection and concurrent admission"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bound model turns, tokens, wall time, tool requests, external spending và resource concurrency. Reserve trước admission, reconcile measured usage/receipts sau completion và giữ uncertain exposure nếu response chưa rõ. Với parallel tools/child runs, central atomic budget hoặc partitioned quotas phải tránh hai workers cùng tiêu phần budget cuối. Một counter chỉ kiểm sau tool call không ngăn overspend đã xảy ra.",
+          "en": "Bound turns, tokens, time, requests, spending and concurrency. Reserve before admission, reconcile actual usage and retain uncertain exposure. Parallel tools/child runs need atomic shared budgets or sound partitioning; checking a counter only after execution cannot prevent prior overspend."
+        },
+        {
+          "vi": "Detect repeated failing (tool, normalized args, relevant state) và max consecutive errors; nhưng cùng args không luôn là loop vô ích, ví dụ bounded polling khi job state đang thay đổi. Dùng progress/state signals, backoff/jitter, error taxonomy và cancellation. Retry read timeout không đồng nghĩa retry arbitrary write; auth/validation failure thường không tự hết khi gọi lại y hệt. Escalation cần preserve partial results và unresolved effects.",
+          "en": "Detect repeated failures with normalized arguments and relevant state, while recognizing legitimate bounded polling. Use progress signals, backoff, error types and cancellation. Read retries do not imply safe write retries, and repeated authorization/validation failures need correction. Escalations preserve partial work and unresolved effects."
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "title": {
+        "vi": "11. Working context, summaries, run state và long-term memory",
+        "en": "11. Separate context, summaries, run state and memory"
+      },
+      "paragraphs": [
+        {
+          "vi": "Model call chỉ dùng information available trong selected context/state của serving interface. Conversation APIs có thể giữ server-side state; không vì vậy mà model tự nhớ mọi run/tenant. Runtime phải biết context assembly contract, truncation/compaction và exact evidence được gửi. Working context là bounded prompt; summaries là lossy representations; durable run state giữ authoritative action/approval/effect data; long-term memory là external records được retrieve theo scope.",
+          "en": "Calls use information available through the serving interface’s selected context/state. Conversation services may retain state without granting unlimited cross-run memory. Understand assembly, truncation and actual evidence. Distinguish bounded working context, lossy summaries, authoritative run state and scoped external memory."
+        },
+        {
+          "vi": "Không để approval, spending ledger hoặc receipt ID chỉ tồn tại trong summary do model viết. Khi compress, giữ provenance, unresolved questions, resource versions và facts cần kiểm lại. Memory retrieval có ACL, freshness, deletion/retention và poisoning risks; user preference cũ không tự override instruction/authorization hiện tại. Compaction tốt về token count vẫn có thể giảm task quality.",
+          "en": "Do not store approvals, budget ledgers or receipts only in model-written summaries. Preserve provenance, unresolved questions, revisions and revalidation needs. Recalled memory needs access, freshness, deletion and poisoning controls; old preferences do not override current authority. Token-efficient compaction can still reduce task quality."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Working context",
+            "en": "Working context"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Input mà model thấy ở turn hiện tại.",
+              "en": "Inputs available to the current call."
+            },
+            {
+              "vi": "Có token limit và context-selection trade-offs.",
+              "en": "Subject to token and selection limits."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Durable run state",
+            "en": "Durable run state"
+          },
+          "icon": "check",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Intent IDs, receipts, approvals và versions.",
+              "en": "Store intents, receipts, approvals and revisions."
+            },
+            {
+              "vi": "Code kiểm invariants; không dựa vào summary text.",
+              "en": "Enforce invariants independently of summaries."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Retrieved memory",
+            "en": "Retrieved memory"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Facts/preferences/episodes được scope theo task.",
+              "en": "Scope recalled facts, preferences and episodes."
+            },
+            {
+              "vi": "Kiểm freshness, ACL và provenance.",
+              "en": "Check freshness, authority and provenance."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "context",
+      "title": {
+        "vi": "12. Context growth và total token accounting",
+        "en": "12. Context growth and total token accounting"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu mỗi turn gửi full prior history, base context b và mỗi completed turn thêm h tokens, n turns có input tổng n×b+h×n(n−1)/2. Đây là quadratic growth dưới giả định history tăng đều và không compact, không là universal cost law cho mọi agent. Bounded windows, summaries, retrieval và provider-managed context thay arithmetic; caching có thể giảm billed input cost mà logical context vẫn lớn.",
+          "en": "With base b and h new history tokens per completed turn, resending full history for n calls gives n×b+h×n(n−1)/2 total input. Quadratic growth follows those assumptions rather than a universal agent-cost law. Windows, summaries, retrieval and managed contexts alter the arithmetic; caching can change billing without shrinking logical inputs."
+        },
+        {
+          "vi": "Output/tool/model-reasoning usage, retries, workers và storage cũng có costs; latency không suy trực tiếp từ total input tokens vì prefill/cache/decode/hardware khác nhau. So sánh cost per successful task với cùng success definition và distribution; tiết kiệm tokens nhưng tăng wrong actions hoặc failures chưa là product win. Lab chỉ tính input inventory với explicit parameters.",
+          "en": "Outputs, tools, reasoning usage, retries, workers and storage add costs. Token totals do not directly predict latency across caching and hardware differences. Compare matched cost per successful task without hiding failures or harmful actions. The worksheet inventories inputs only."
+        }
+      ],
+      "experiment": "agent-context"
+    },
+    {
+      "id": "mcp",
+      "title": {
+        "vi": "13. MCP: interoperability, capability và trust boundary",
+        "en": "13. MCP: interoperability, capabilities and trust"
+      },
+      "paragraphs": [
+        {
+          "vi": "MCP là protocol client–host–server dùng JSON-RPC để trao đổi capabilities/context. Host quản clients, mỗi client kết nối một server; servers có thể expose tools, resources và prompts theo negotiated capabilities. Standard transports trong specification đã đối chiếu gồm stdio cho subprocess và Streamable HTTP cho remote/local service; implementation/version support cần kiểm trước integration. MCP không buộc mọi app có cùng approval UI hoặc mọi tool dùng cùng side-effect semantics.",
+          "en": "MCP uses a client–host–server JSON-RPC protocol for capabilities and context. Hosts manage clients connected to servers, whose negotiated features can include tools, resources and prompts. The examined specification defines stdio and Streamable HTTP; validate actual implementation support. Interoperability does not impose one approval UI or uniform effect semantics."
+        },
+        {
+          "vi": "Local stdio server là code được launch trên machine theo sandbox/OS permissions; remote server nhận data/credentials theo delegation được cấu hình. Cả tool descriptions/outputs và endpoint metadata cần trust review. Enforce minimal scope, audience/token validation, transport/auth policy, safe endpoint discovery và server identity; không dùng token passthrough tùy tiện. Capability negotiation không tự là end-user consent hoặc authorization cho mọi resource.",
+          "en": "Local servers execute under host OS/sandbox permissions; remote services receive data and delegated authority under configuration. Review descriptions, results and endpoint metadata. Enforce scope, token audiences, transport authentication, endpoint safety and identity. Capability negotiation does not establish blanket user consent or resource authorization."
+        }
+      ]
+    },
+    {
+      "id": "patterns",
+      "title": {
+        "vi": "14. Routing, workers và evaluator loops có overhead",
+        "en": "14. Routing, workers and evaluator loops have overhead"
+      },
+      "paragraphs": [
+        {
+          "vi": "Routing chọn specialized model/tool path; parallel independent workers có thể giảm critical path; orchestrator–workers cho phép decomposition động; evaluator–optimizer lặp theo rubric/tests rõ. Những patterns này có thể là workflows hoặc bounded agents tùy quyền chọn control flow. Không mặc định thêm agents luôn tăng accuracy: shared blind spots, handoff loss và inconsistent state có thể làm tệ hơn.",
+          "en": "Routing selects specialized paths, parallel workers can shorten independent work, dynamic orchestration decomposes tasks and evaluator loops iterate against explicit criteria. These patterns can mix workflows and agents. More agents do not automatically improve accuracy; shared blind spots, handoff loss and state conflicts can degrade results."
+        },
+        {
+          "vi": "Child tasks cần narrow scope, result schema/provenance, bounded budget và cancellation propagation. Shared writes cần ownership/version/fencing thay để workers sửa cùng resource không điều phối. Parent phải kiểm kết quả và authoritative effects, không coi worker nói “done” là proof. Measure duplication of context, synthesis cost, tail latency và failure recovery trước chọn multi-agent topology.",
+          "en": "Scope child work with contracts, provenance, budgets and cancellation. Coordinate shared writes through ownership/version/fencing, and verify outcomes rather than trusting completion claims. Measure duplicated context, synthesis, tails and recovery before choosing a topology."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Pattern",
+            "en": "Pattern"
+          },
+          {
+            "vi": "Hợp khi",
+            "en": "Useful when"
+          },
+          {
+            "vi": "Cần kiểm",
+            "en": "Validate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Routing",
+              "en": "Routing"
+            },
+            {
+              "vi": "Task categories tương đối rõ",
+              "en": "Task categories are identifiable"
+            },
+            {
+              "vi": "Misroute, fallback và permission differences",
+              "en": "Misrouting, fallbacks and permissions"
+            }
+          ],
+          [
+            {
+              "vi": "Independent workers",
+              "en": "Independent workers"
+            },
+            {
+              "vi": "Subtasks độc lập, parallel được",
+              "en": "Subtasks are independently parallelizable"
+            },
+            {
+              "vi": "Context duplication, merge và budgets",
+              "en": "Duplicated context, merging and budgets"
+            }
+          ],
+          [
+            {
+              "vi": "Dynamic orchestrator",
+              "en": "Dynamic orchestrator"
+            },
+            {
+              "vi": "Subtasks chỉ lộ sau khi inspect task",
+              "en": "Subtasks emerge during inspection"
+            },
+            {
+              "vi": "Coordination, resource ownership và stop rules",
+              "en": "Coordination, ownership and stop rules"
+            }
+          ],
+          [
+            {
+              "vi": "Evaluator loop",
+              "en": "Evaluator loop"
+            },
+            {
+              "vi": "Criteria rõ và revision có measurable value",
+              "en": "Criteria are clear and revisions measurably help"
+            },
+            {
+              "vi": "Correlated grading errors và max iterations",
+              "en": "Correlated grader errors and iteration bounds"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "evaluation",
+      "title": {
+        "vi": "15. Đánh giá outcome, trajectory và attempted violations",
+        "en": "15. Evaluate outcomes, trajectories and attempted violations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Sandbox fixtures cần expected final resource state, allowed/forbidden effects, recovery scenarios, latency/cost bounds và adversarial observations. Đánh giá task success, effect correctness, authorization/preconditions, duplicate count, blocked attempts, tool errors và escalation appropriateness. Trajectory không bắt buộc giống một golden sequence duy nhất nếu có nhiều valid plans; enforce invariants và useful progress thay vì phạt mọi alternative hợp lệ.",
+          "en": "Fixtures need expected states, effect constraints, recovery cases, budgets and adversarial observations. Evaluate success, effect correctness, authority, duplication, blocked attempts, errors and escalation. Multiple valid trajectories may exist: grade invariants and useful progress rather than requiring one literal plan."
+        },
+        {
+          "vi": "Thử crash trước/giữa/sau external commit, response loss, stale approval, credential revocation, conflicting writes và cancellation. Report cost per successful task cùng overall failure/severity, không chỉ cost trên subset thành công. Bắt đầu shadow/read-only hoặc bounded actions theo risk, widen autonomy sau evidence gates; rollout cần stop/reconcile/rollback phù hợp với effects không đảo ngược.",
+          "en": "Inject crashes, lost responses, stale approvals, revocation, conflicts and cancellation. Report cost per success alongside failure/severity rather than hiding failed work. Expand autonomy under evidence gates with suitable stopping, reconciliation and rollback limits for irreversible effects."
+        }
+      ]
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "16. Run, approval và action receipt APIs minh họa",
+        "en": "16. Teaching run, approval and action-receipt APIs"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các internal contracts minh họa tách run execution khỏi external effect. Không triển khai live agent trong bài. Idempotency key được scope theo tenant/principal/action và payload binding; server-side policy không lấy approved=true từ request body làm trust decision.",
+          "en": "These teaching contracts separate run orchestration and effects without executing live agents. Bind scoped idempotency keys to payloads, and do not trust client-provided approval booleans."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/agent-runs",
+          "description": {
+            "vi": "Tạo scoped run có budget và task version.",
+            "en": "Create scoped runs with budgets and task revisions."
+          },
+          "request": "{ taskId, taskRevision, idempotencyKey, toolProfile, budgetProfile }",
+          "response": "202 { runId, state: \"QUEUED\", manifestHash }"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/agent-runs/{runId}/decisions",
+          "description": {
+            "vi": "Record exact action decision sau authenticated review.",
+            "en": "Record concrete decisions after authenticated review."
+          },
+          "request": "{ actionId, expectedPayloadHash, expectedResourceVersion, decision: \"approve | reject\" }",
+          "response": "200 { decisionId, boundActionId, expiresAt, principalScope }",
+          "notes": [
+            {
+              "vi": "Current auth/preconditions vẫn được kiểm trước execution.",
+              "en": "Recheck current authority and preconditions before execution."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/internal/action-receipts/{actionId}",
+          "description": {
+            "vi": "Lookup authoritative receipt hoặc explicit unknown.",
+            "en": "Look up authoritative receipts or explicit unknown states."
+          },
+          "response": "200 { actionId, payloadHash, state: \"COMMITTED | REJECTED | UNKNOWN\", externalReceiptRef?, observedAt }",
+          "notes": [
+            {
+              "vi": "UNKNOWN không tự được retry bằng một action ID mới.",
+              "en": "Unknown outcomes do not justify new replacement action identities."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/internal/agent-runs/{runId}/cancel",
+          "description": {
+            "vi": "Dừng new admission và reconcile in-flight actions.",
+            "en": "Stop new admission and reconcile in-flight actions."
+          },
+          "request": "{ expectedRunRevision, reasonCode }",
+          "response": "202 { runId, state: \"CANCEL_REQUESTED\", unresolvedActionIds }",
+          "notes": [
+            {
+              "vi": "Cancel requested không chứng minh remote tool đã abort hoặc committed effect bị undo.",
+              "en": "Requested cancellation does not establish remote abort or effect rollback."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "17. Luyện giải thích thiết kế agent runtime",
+        "en": "17. Practice agent-runtime design decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Agent đọc ticket và có thể refund: thiết kế guardrails thế nào?",
+            "en": "How would you control a ticket agent that can refund?"
+          },
+          "answer": [
+            {
+              "vi": "Tách deterministic classification/fetch/draft workflow và bounded dynamic step khi cần. Server enforce principal/order ownership, eligibility, amount caps, current version và approval policy. Persist exact intent; dùng supported sink receipts và reconcile unknown outcome. Sandbox/evaluate outcome, trajectory, injection và cost trước widen autonomy.",
+              "en": "Combine bounded exploration with deterministic policy boundaries. Enforce ownership, eligibility, amounts, versions and approvals; persist intents and reconcile receipts. Evaluate outcomes, injection and costs before expanding autonomy."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tool timeout sau refund: gọi lại được không?",
+            "en": "A refund times out: can it be retried?"
+          },
+          "answer": [
+            {
+              "vi": "Timeout không chứng minh refund chưa commit. Lookup/retry cùng persisted identity theo actual sink contract, kiểm payload binding và retention. Nếu không có reliable dedup/lookup, giữ unresolved và reconcile/manual review; không tạo key mới cho cùng logical action.",
+              "en": "Timeouts do not establish non-commit. Reuse persisted identities under actual receipt/retention contracts, or reconcile unknown outcomes rather than generating replacement keys."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Checkpoint sau mỗi tool có đủ exactly-once không?",
+            "en": "Does checkpointing after every tool establish exactly-once effects?"
+          },
+          "answer": [
+            {
+              "vi": "Không vì sink commit và local checkpoint là hai boundaries. Response/crash gap có thể replay effect. Cần durable intent trước dispatch và effect-side dedup/lookup hoặc design phù hợp; phải nói rõ guarantee scope thay universal exactly-once.",
+              "en": "No: external commits and local checkpoints are separate. Use durable intents and effect-side replay/reconciliation contracts, stating their scope."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Approval hôm qua còn dùng được khi amount đổi không?",
+            "en": "Can yesterday’s approval authorize a changed amount?"
+          },
+          "answer": [
+            {
+              "vi": "Không tự được. Verify exact payload/principal/target/version, scope và expiry; changed action cần policy/review phù hợp. Authorization và business rules hiện tại vẫn độc lập, kể cả approval còn khớp.",
+              "en": "Revalidate payload, identities, resources, scope and expiry, with appropriate review for changed actions. Current authorization and business rules remain independent."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Budget hết sau write có nghĩa task không tác động gì không?",
+            "en": "Does budget exhaustion after a write mean nothing happened?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Dừng future turns không undo prior effect. Return partial state/receipt và unresolved actions; final narrative chưa tạo được không làm committed action biến mất. Reconcile rồi escalate theo policy.",
+              "en": "No: stopping future calls does not undo effects. Return receipts and partial/unresolved state, reconcile and escalate appropriately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao chi phí tăng khi thêm vài turns?",
+            "en": "Why can extra turns sharply increase cost?"
+          },
+          "answer": [
+            {
+              "vi": "Nếu resend growing full history, input tổng có quadratic term; nhưng cần trace turns, context sizes, outputs, retries, cache rates và tool costs trước kết luận. Bounded context/caching đổi arithmetic và billing; kiểm quality khi compact.",
+              "en": "Growing full-history inputs can add a quadratic term, but inspect actual turns, inputs, outputs, retries, caching and tools. Bounded context and caches alter the result, with compaction quality evaluated separately."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "MCP server nói read-only thì có thể tin không?",
+            "en": "Can a server’s read-only claim be trusted?"
+          },
+          "answer": [
+            {
+              "vi": "Annotation/description không thay implementation/credential review. Read có thể disclosure, endpoint hoặc tool outputs có malicious content. Enforce auth/scope, validate server/transport và data boundaries; interoperability không tạo trust.",
+              "en": "Descriptions do not replace implementation and credential review. Reads can disclose data and outputs can be malicious; enforce identities, scope and boundaries."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Cancel một run đang gọi external tool thì sao?",
+            "en": "How do you cancel a run with an in-flight external tool?"
+          },
+          "answer": [
+            {
+              "vi": "Persist stop state, block future admission và propagate cancellation khi supported. Không suy request cancel = remote abort. Reconcile in-flight receipts, fence stale workers khi resource hỗ trợ và báo prior effects/unknowns. Compensation là action riêng theo policy, không automatic undo.",
+              "en": "Persist stopping, block new work and propagate supported cancellation. Reconcile receipts and fence stale workers where supported; remote abort and compensation are separate contracts."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

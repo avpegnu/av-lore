@@ -1,0 +1,1238 @@
+{
+  "id": "ai-evals",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Evaluation & Quality Gates: đo chất lượng và hiểu uncertainty",
+    "en": "Evaluation & Quality Gates: measure quality and understand uncertainty"
+  },
+  "summary": {
+    "vi": "Xây eval sets có version, chọn metrics theo failure mode, calibrate LLM judges, so sánh paired outcomes và kiểm tra per-slice gates trước canary. Có mô phỏng bootstrap, judge bias và release evidence.",
+    "en": "Build versioned evaluation sets, select failure-specific metrics, calibrate model judges, compare paired outcomes and qualify per-slice evidence before canaries. Explore bootstrap, judge bias and release evidence interactively."
+  },
+  "prerequisites": [
+    "ai-rag",
+    "ai-prompting",
+    "ai-fine-tuning"
+  ],
+  "relatedTopics": [
+    "testing",
+    "observability",
+    "system-design"
+  ],
+  "takeaways": [
+    {
+      "vi": "Eval suite là operational acceptance contract có giới hạn; nó không bao phủ toàn bộ product intent hoặc chứng minh không còn unknown failures.",
+      "en": "Evaluation suites are bounded operational acceptance contracts rather than complete product intent or proof of no unknown failures."
+    },
+    {
+      "vi": "Giữ dataset/splits/rubrics và mọi dependency có version; không drop timeout/error cases khỏi denominator một cách im lặng.",
+      "en": "Version datasets, splits, rubrics and dependencies; never silently remove timeouts or errors from denominators."
+    },
+    {
+      "vi": "Judge agreement, answer-order consistency và correctness là các đại lượng khác nhau.",
+      "en": "Judge agreement, answer-order consistency and correctness are different quantities."
+    },
+    {
+      "vi": "Paired bootstrap giữ cùng case ở cả hai phiên bản; clustering, sampling bias và degenerate samples vẫn cần xử lý.",
+      "en": "Paired bootstrap preserves matched cases, while clustering, sampling bias and degenerate samples require additional treatment."
+    },
+    {
+      "vi": "Điểm trung bình tăng không bù được disclosure nghiêm trọng hoặc regression ở critical slice.",
+      "en": "Higher averages do not offset severe disclosures or critical-slice regressions."
+    },
+    {
+      "vi": "Offline qualification chỉ cho phép thử online có kiểm soát; product outcomes, guardrails và rollback vẫn phải hoạt động.",
+      "en": "Offline qualification permits controlled online trials, with product outcomes, guardrails and rollback still required."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ yêu cầu chất lượng đến evidence duy trì được",
+      "en": "From quality requirements to maintainable evidence"
+    },
+    "caption": {
+      "vi": "Mỗi bước trả lời một câu khác nhau: đo gì, đo trên ai, phép đo đáng tin đến đâu và lúc nào phải dừng rollout.",
+      "en": "Each step addresses a different question: what to measure, whom it represents, how reliable the measurement is and when to stop rollout."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Define acceptance",
+          "en": "Define acceptance"
+        },
+        "detail": {
+          "vi": "Task outcomes, error severity, slices và exclusions.",
+          "en": "Define outcomes, severity, slices and exclusions."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Version cases",
+          "en": "Version cases"
+        },
+        "detail": {
+          "vi": "Representative samples, labels/rubrics và protected holdout.",
+          "en": "Version representative samples, labels/rubrics and holdouts."
+        },
+        "icon": "scope"
+      },
+      {
+        "title": {
+          "vi": "Run / score",
+          "en": "Run / score"
+        },
+        "detail": {
+          "vi": "Matched baseline/candidate, code checks và calibrated judges.",
+          "en": "Match candidate/baseline runs with code checks and calibrated judges."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Qualify evidence",
+          "en": "Qualify evidence"
+        },
+        "detail": {
+          "vi": "Paired intervals, per-slice gates và missing-data checks.",
+          "en": "Review intervals, slices and missing evidence."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Expose / learn",
+          "en": "Expose / learn"
+        },
+        "detail": {
+          "vi": "Bounded canary, outcomes, rollback và incident review.",
+          "en": "Bound exposure and learn from outcomes, rollback and incidents."
+        },
+        "icon": "route"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "acceptance",
+      "title": {
+        "vi": "1. Eval suite làm rõ điều gì, và chưa chứng minh điều gì?",
+        "en": "1. What does an evaluation suite establish?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một support assistant có thể tạo câu trả lời trôi chảy nhưng sai chính sách hoàn tiền, tiết lộ dữ liệu tenant khác hoặc không biết chuyển cho nhân viên khi thiếu evidence. Vì vậy “quality = nghe có vẻ hay” không đủ thành acceptance contract. Ghi rõ task, users, available evidence, allowed actions, refusal/escalation rules và những lỗi có mức độ nghiêm trọng khác nhau. Chuyển từng yêu cầu quan trọng thành case, metric, rubric hoặc runtime invariant có owner.",
+          "en": "A support assistant can sound fluent while misapplying refund policy, disclosing another tenant’s data or failing to escalate when evidence is missing. Define tasks, users, available evidence, permitted actions, refusal/escalation rules and error severity. Give important requirements owned cases, metrics, rubrics or runtime invariants rather than treating fluency as acceptance."
+        },
+        {
+          "vi": "Eval suite là cách operationalize một phần product specification. Nó có blind spots, label errors và coverage hữu hạn; pass suite không chứng minh system đúng trên mọi input. Unit/integration tests, threat modeling, human research và runtime authorization vẫn có vai trò riêng. Ví dụ test 100 benign prompts không chứng minh không có prompt injection hoặc privacy leak.",
+          "en": "A suite operationalizes part of a product specification but has finite coverage, imperfect labels and blind spots. Passing does not prove universal correctness. Unit/integration tests, threat modeling, human research and runtime authorization retain distinct roles; benign prompt tests do not establish resistance to adversarial inputs."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Task outcome",
+            "en": "Task outcome"
+          },
+          "icon": "target",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Hoàn thành đúng yêu cầu với evidence và allowed actions.",
+              "en": "Complete tasks correctly using available evidence and allowed actions."
+            },
+            {
+              "vi": "Tách correctness, helpfulness và user preference khi cần.",
+              "en": "Separate correctness, helpfulness and preference when needed."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Hard constraint",
+            "en": "Hard constraint"
+          },
+          "icon": "shield",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Không disclosure trái phép hoặc effect ngoài quyền.",
+              "en": "Prevent unauthorized disclosures and effects."
+            },
+            {
+              "vi": "Không cho aggregate score bù severity.",
+              "en": "Do not offset severity with aggregate scores."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Operational constraint",
+            "en": "Operational constraint"
+          },
+          "icon": "gauge",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Latency, availability, cost và fallback behavior.",
+              "en": "Define latency, availability, cost and fallbacks."
+            },
+            {
+              "vi": "Đo cùng task mix và denominator.",
+              "en": "Use matched task mixes and denominators."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "datasets",
+      "title": {
+        "vi": "2. Xây eval set: coverage, labels và protected holdout",
+        "en": "2. Build datasets with coverage, labels and protected holdouts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Kết hợp production samples đã được phép sử dụng, expert cases, incident regressions và synthetic cases được review. Random traffic samples giúp ước lượng phân bố thường gặp; targeted hard cases giúp tìm lỗi hiếm nhưng không tự đại diện prevalence ngoài production. Giữ hai mục đích và báo cáo tách bạch hoặc dùng trọng số được định trước. Không lấy một bộ red-team cố tình khó để suy trực tiếp tỷ lệ lỗi của toàn bộ users.",
+          "en": "Combine authorized production samples, expert cases, incident regressions and reviewed synthetic data. Random traffic sampling helps characterize common workloads; targeted hard cases expose weaknesses without automatically representing production prevalence. Report these purposes separately or use predefined weights. Adversarial challenge sets do not directly estimate population failure rates."
+        },
+        {
+          "vi": "Version case IDs, task/context snapshot, labels hoặc acceptable-answer criteria, locale, tenant/task slices, provenance, owner và permission scope. References cũng có thể lỗi hoặc lỗi thời: adjudicate disagreements và lưu rationale có thể kiểm chứng, thay vì coi “golden” là tuyệt đối đúng. Với câu mở, có thể cần nhiều valid answers hoặc rubric dimensions thay vì một chuỗi duy nhất.",
+          "en": "Version identities, task/context snapshots, labels or acceptable-answer criteria, slices, provenance, owners and permissions. References can be wrong or stale: adjudicate disagreements and preserve checkable rationales. Open-ended tasks may require multiple valid answers or rubric dimensions instead of one literal string."
+        },
+        {
+          "vi": "Tách train/development/regression/holdout theo entity, conversation hoặc time khi sự phụ thuộc yêu cầu như vậy; dedup near-duplicates trước split. Holdout dùng cho finalist theo access policy, không để người tuning nhìn từng lỗi rồi tiếp tục tối ưu mãi trên cùng tập. Refresh khi distribution thay đổi, giữ benchmark bridge để phân biệt hệ thống tốt hơn với việc bộ đề dễ hơn.",
+          "en": "Split by entities, conversations or time when dependence requires it, deduplicating near-duplicates first. Govern finalist access to holdouts rather than repeatedly tuning against their detailed failures. Refresh for distribution changes while preserving bridge evaluations that distinguish system improvements from easier datasets."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Nguồn cases",
+            "en": "Case source"
+          },
+          {
+            "vi": "Giá trị",
+            "en": "Value"
+          },
+          {
+            "vi": "Cần kiểm",
+            "en": "Validate"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Production samples",
+              "en": "Production samples"
+            },
+            {
+              "vi": "Input và task mix thực",
+              "en": "Real inputs and task mixes"
+            },
+            {
+              "vi": "Consent/access, privacy, skew và drift",
+              "en": "Authorization, privacy, skew and drift"
+            }
+          ],
+          [
+            {
+              "vi": "Incident cases",
+              "en": "Incident cases"
+            },
+            {
+              "vi": "Giữ lỗi đã xảy ra không quay lại",
+              "en": "Prevent known regressions"
+            },
+            {
+              "vi": "Dedup và severity; không suy prevalence",
+              "en": "Deduplication and severity; not prevalence estimates"
+            }
+          ],
+          [
+            {
+              "vi": "Expert cases",
+              "en": "Expert cases"
+            },
+            {
+              "vi": "Rubric và edge cases có chủ đích",
+              "en": "Intentional rubrics and edge cases"
+            },
+            {
+              "vi": "Reviewer agreement và domain scope",
+              "en": "Reviewer agreement and domain scope"
+            }
+          ],
+          [
+            {
+              "vi": "Synthetic cases",
+              "en": "Synthetic cases"
+            },
+            {
+              "vi": "Mở rộng scenario coverage",
+              "en": "Expand scenario coverage"
+            },
+            {
+              "vi": "Realism, label correctness và contamination",
+              "en": "Realism, label correctness and contamination"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "metrics",
+      "title": {
+        "vi": "3. Chọn metric theo failure mode, không theo độ hiện đại",
+        "en": "3. Match metrics to failures rather than novelty"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dùng deterministic checks cho contract mà code kiểm được: JSON parse, schema, allowed enum, calculations, unit tests, API preconditions và tool effects. Schema-valid chưa có nghĩa nội dung đúng; citation ID tồn tại chưa có nghĩa citation hỗ trợ claim. Không dùng một LLM judge thay authorization check hoặc arithmetic khi có trusted deterministic implementation phù hợp.",
+          "en": "Use deterministic checks for contracts code can verify: parsing, schemas, enums, arithmetic, unit tests, preconditions and effects. Valid schemas do not establish semantic correctness, and existing citation IDs do not establish support. Do not substitute model judges for authorization or suitable trusted computations."
+        },
+        {
+          "vi": "Reference-based metrics như exact match hoặc fact coverage hữu ích với task rõ nhưng có thể phạt paraphrase đúng hoặc thưởng câu giống reference sai. Model-graded rubrics linh hoạt hơn nhưng thêm grader uncertainty/bias; human review có domain expertise nhưng cũng có disagreements và cost. Kết hợp theo risk, báo cáo từng dimension trước khi tạo weighted aggregate. Nếu tạo score tổng, giải thích weights và giữ hard constraints riêng.",
+          "en": "Reference-based checks can help well-defined tasks while penalizing valid paraphrases or rewarding incorrect references. Model rubrics add flexibility with grader error; humans add expertise with disagreement and cost. Combine by risk, report dimensions separately and justify any aggregate weights without blending away hard constraints."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Code / execution",
+            "en": "Code / execution"
+          },
+          "icon": "check",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Rẻ và cụ thể cho machine-checkable contract.",
+              "en": "Concrete checks for machine-verifiable contracts."
+            },
+            {
+              "vi": "Tests hữu hạn; test pass không chứng minh mọi behavior.",
+              "en": "Finite tests do not establish all behavior."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "References / evidence",
+            "en": "References / evidence"
+          },
+          "icon": "inspect",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Fact coverage, retrieval labels, acceptable-answer sets.",
+              "en": "Use facts, retrieval labels and acceptable answers."
+            },
+            {
+              "vi": "Kiểm reference quality và valid alternatives.",
+              "en": "Validate references and legitimate alternatives."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Model / human rubric",
+            "en": "Model / human rubric"
+          },
+          "icon": "users",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Tách factuality, relevance, tone và policy dimensions.",
+              "en": "Separate factuality, relevance, tone and policy."
+            },
+            {
+              "vi": "Calibrate, blind review và giữ disagreement.",
+              "en": "Calibrate, blind review and preserve disagreement."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rag",
+      "title": {
+        "vi": "4. RAG và agents cần đánh giá nhiều tầng",
+        "en": "4. Evaluate RAG and agents at multiple boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Retrieval recall@k cần labels về relevant evidence và denominator phù hợp; ANN recall so với exact vector neighbors không đồng nghĩa recall của evidence cần cho câu hỏi. Context precision/recall phụ thuộc định nghĩa relevant chunks hoặc claims. Kiểm riêng query rewrite, candidate retrieval, rerank và prompt packing, vì relevant chunk có trong candidates nhưng bị drop trước generation vẫn là failure.",
+          "en": "Evidence recall needs relevance labels and explicit denominators; ANN recall against exact vector neighbors measures a different quantity. Context metrics depend on chunk/claim definitions. Evaluate rewriting, candidates, reranking and packing separately: evidence retrieved but omitted from the final prompt can still cause failure."
+        },
+        {
+          "vi": "Generation cần correctness, claim support/faithfulness, citation attribution, completeness và abstention khi thiếu evidence. Faithful với một context sai không đảm bảo đúng với thế giới; answer đúng tình cờ không chứng minh grounded. Với agents, kiểm final task outcome, intermediate tool arguments, authorization, side-effect count, budget/loop termination và recovery. Một final answer đẹp có thể che việc tool đã sửa nhầm ticket.",
+          "en": "Generation requires correctness, support, attribution, completeness and appropriate abstention. Faithfulness to incorrect context does not establish truth, while lucky correctness does not establish grounding. Agents also need tool-argument, authorization, effect-count, budget, termination and recovery checks; polished final prose can conceal incorrect effects."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Phân tách diagnosis thay vì một score duy nhất",
+          "en": "Separate diagnosis instead of one opaque score"
+        },
+        "caption": {
+          "vi": "Mỗi tầng có input/output contract và metric riêng.",
+          "en": "Give each boundary its own inputs, outputs and metrics."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Retrieve",
+              "en": "Retrieve"
+            },
+            "detail": {
+              "vi": "Relevant evidence có vào candidate set không?",
+              "en": "Did relevant evidence enter the candidate set?"
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Pack",
+              "en": "Pack"
+            },
+            "detail": {
+              "vi": "Evidence còn trong context và được phép dùng không?",
+              "en": "Did authorized evidence survive packing?"
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Generate / act",
+              "en": "Generate / act"
+            },
+            "detail": {
+              "vi": "Claims, citations, tools và side effects có đúng không?",
+              "en": "Are claims, citations, tools and effects correct?"
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Resolve",
+              "en": "Resolve"
+            },
+            "detail": {
+              "vi": "Task hoàn thành, abstain hoặc escalate đúng không?",
+              "en": "Was the task completed, declined or escalated appropriately?"
+            },
+            "icon": "target"
+          }
+        ]
+      }
+    },
+    {
+      "id": "judges",
+      "title": {
+        "vi": "5. Thiết kế LLM-as-judge có rubric và calibration",
+        "en": "5. Design model judges with rubrics and calibration"
+      },
+      "paragraphs": [
+        {
+          "vi": "Rubric cần task context, evidence mà judge được phép xem, scoring dimensions, anchored examples, tie/unknown rules và structured verdict. Pin judge model/revision khi có thể, prompt/rubric version, temperature/settings, reference versions và parser. Trộn lỗi judge timeout/parse với “candidate sai” hoặc silently bỏ chúng sẽ làm score khó diễn giải; lưu cả grading coverage và scoring failures.",
+          "en": "Provide task context, authorized evidence, scoring dimensions, anchored examples, tie/unknown rules and structured verdicts. Pin available judge revisions, rubric/prompts, settings, references and parsers. Judge timeouts and parsing failures must not be silently dropped or casually conflated with candidate errors; retain grading coverage and failures."
+        },
+        {
+          "vi": "Dùng blinded human-labeled sample theo task/language/risk slices để đo agreement, disagreement types và false acceptance của lỗi nghiêm trọng. Aggregate agreement cao có thể đến từ nhiều easy cases; kiểm confusion matrix theo label và slice, reviewer consistency và adjudication policy. Không giả định một strong judge luôn đúng hoặc kết quả calibration chuyển nguyên vẹn sang domain mới.",
+          "en": "Calibrate against blinded human labels by task, language and risk. Inspect agreement, systematic errors and severe false acceptance. High aggregate agreement may reflect easy-case imbalance; examine label/slice confusion patterns, reviewer consistency and adjudication. Strong judges are not infallible, and calibration need not transfer to new domains."
+        },
+        {
+          "vi": "Answer text và retrieved content là untrusted data đối với judge. Delimit boundaries, loại instructions trong answer khỏi grader authority, giới hạn tools/network access và test grader prompt injection. Không gửi secrets/raw customer traces sang external grader ngoài data policy. Exact isolation không được chứng minh chỉ bằng thêm một câu “ignore instructions”.",
+          "en": "Answers and retrieved material are untrusted grader inputs. Separate data from grading authority, restrict tools/network access and test grader injection. Respect data policy before using external graders. Adding an instruction to ignore embedded instructions does not prove isolation."
+        }
+      ]
+    },
+    {
+      "id": "bias",
+      "title": {
+        "vi": "6. Position, verbosity và style bias: đổi thứ tự chưa đủ",
+        "en": "6. Position, verbosity and style bias: swapping is insufficient"
+      },
+      "paragraphs": [
+        {
+          "vi": "Judge có thể ưu ái answer đứng trước, answer dài hơn hoặc style quen thuộc; mức độ phụ thuộc model/task/rubric. Blind model identities, randomize/balance orders, kiểm length-controlled cases và calibrate trên human labels. Hai lần cùng chọn B chỉ chứng minh consistency trong phép đo đó, không chứng minh B thật sự đúng. Cả judge và humans đều có thể đồng ý về một answer sai.",
+          "en": "Judges can favor positions, length or familiar styles depending on task/model/rubric. Blind identities, balance orders, inspect controlled cases and calibrate against humans. Repeated preference establishes consistency under those measurements rather than correctness; humans and models can agree on incorrect answers."
+        },
+        {
+          "vi": "Khi AB và BA mâu thuẫn, ghi unresolved và review theo policy. Gọi đó là tie của evaluation protocol được, nhưng không suy hai answers ngang chất lượng. Nếu chỉ báo B wins / consistent subset, denominator đã đổi; cần báo cả consistent B, consistent A và unresolved trên toàn pairs. Discarding disagreements có thể selection-bias và không tự loại mọi bias.",
+          "en": "Record conflicting order judgments as unresolved under a declared adjudication policy. A protocol tie is not evidence of equal answer quality. Consistent-only win rates change denominators: also report consistent B, consistent A and unresolved outcomes over all pairs. Dropping disagreement can introduce selection bias and does not remove all bias."
+        }
+      ],
+      "experiment": "eval-judge"
+    },
+    {
+      "id": "platform",
+      "title": {
+        "vi": "7. Trace một evaluation platform",
+        "en": "7. Trace an evaluation platform"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một reproducible run pin candidate, baseline, dataset, task environment, rubric/scorer, sampling configuration và code versions. Lưu item-level outcomes trước aggregate để truy về exact failing case. Với generation stochastic, seed nếu có hỗ trợ không luôn đảm bảo bitwise reproducibility trên backend/hardware/revisions khác; lưu outputs thực tế và phân biệt randomness giữa runs với sampling uncertainty giữa cases.",
+          "en": "Pin candidates, baselines, datasets, environments, graders, sampling settings and code. Preserve item outcomes before aggregation to recover exact failures. Seeds do not universally guarantee bitwise reproduction across backends or revisions; preserve actual outputs and distinguish generation variability from case-sampling uncertainty."
+        }
+      ],
+      "diagram": {
+        "id": "evaluation-evidence-platform",
+        "title": {
+          "vi": "Một thay đổi đi qua những evidence boundaries nào?",
+          "en": "Which evidence boundaries does a change cross?"
+        },
+        "caption": {
+          "vi": "Chọn trace offline, judge calibration, regression, canary hoặc incident feedback. Run hoàn tất chưa có nghĩa candidate vượt gates; trace payload cũng phải tuân theo privacy/access policy.",
+          "en": "Follow offline runs, judge calibration, regression decisions, canaries or incident feedback. Completed runs do not establish gate success; trace data remains subject to privacy and access policies."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "change",
+            "label": {
+              "vi": "Candidate manifest",
+              "en": "Candidate manifest"
+            },
+            "detail": {
+              "vi": "Pin model/prompt/retriever/code, sampling config và dependency revisions.",
+              "en": "Pin models, prompts, retrievers, code, sampling settings and dependencies."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "dataset",
+            "label": {
+              "vi": "Versioned eval set",
+              "en": "Versioned eval set"
+            },
+            "detail": {
+              "vi": "Case IDs, task slices, labels/rubrics, split policy và data scope.",
+              "en": "Case identities, task slices, labels/rubrics, splits and data scope."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "store"
+          },
+          {
+            "id": "runner",
+            "label": {
+              "vi": "Paired run harness",
+              "en": "Paired run harness"
+            },
+            "detail": {
+              "vi": "Baseline/candidate trên matched inputs; giữ timeout/error/refusal records.",
+              "en": "Match baseline/candidate inputs while retaining timeout, error and refusal records."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "worker"
+          },
+          {
+            "id": "system",
+            "label": {
+              "vi": "System under test",
+              "en": "System under test"
+            },
+            "detail": {
+              "vi": "Model/RAG/agent trong sandbox; side effects bị chặn hoặc kiểm soát.",
+              "en": "Run models, RAG or agents in sandboxes with controlled side effects."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "scorer",
+            "label": {
+              "vi": "Metric / judge workers",
+              "en": "Metric / judge workers"
+            },
+            "detail": {
+              "vi": "Code checks, reference metrics, pinned rubric/judge và explicit denominators.",
+              "en": "Use code checks, references, pinned judges/rubrics and explicit denominators."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "worker"
+          },
+          {
+            "id": "human",
+            "label": {
+              "vi": "Human calibration",
+              "en": "Human calibration"
+            },
+            "detail": {
+              "vi": "Blind review, independent labels, disagreements và adjudication.",
+              "en": "Blind independent review, disagreements and adjudication."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "evidence",
+            "label": {
+              "vi": "Result / trace store",
+              "en": "Result / trace store"
+            },
+            "detail": {
+              "vi": "Immutable run IDs, item results, revisions, redacted traces và retention.",
+              "en": "Keep immutable runs, item outcomes, revisions and appropriately retained redacted traces."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "gate",
+            "label": {
+              "vi": "Evidence gates",
+              "en": "Evidence gates"
+            },
+            "detail": {
+              "vi": "Per-slice quality, uncertainty, disclosure, latency/cost và missing evidence.",
+              "en": "Check slices, uncertainty, disclosure, latency/cost and missing evidence."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "canary",
+            "label": {
+              "vi": "Bounded online exposure",
+              "en": "Bounded online exposure"
+            },
+            "detail": {
+              "vi": "Pinned rollout, monitoring window, stop criteria và rollback path.",
+              "en": "Pin bounded rollouts, monitoring windows, stop criteria and rollback paths."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "edge"
+          },
+          {
+            "id": "monitor",
+            "label": {
+              "vi": "Online outcomes",
+              "en": "Online outcomes"
+            },
+            "detail": {
+              "vi": "Product metrics, guardrails, sampled traces và drift.",
+              "en": "Track product outcomes, guardrails, sampled traces and drift."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "incident",
+            "label": {
+              "vi": "Incident / label review",
+              "en": "Incident / label review"
+            },
+            "detail": {
+              "vi": "Review new failures trước khi thêm vào regression corpus.",
+              "en": "Review new failures before admitting them to regression corpora."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "holdout",
+            "label": {
+              "vi": "Protected holdout",
+              "en": "Protected holdout"
+            },
+            "detail": {
+              "vi": "Quản quyền truy cập và refresh policy để giảm adaptive overfitting.",
+              "en": "Control access and refresh policies to limit adaptive overfitting."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "offline",
+            "label": {
+              "vi": "Chạy baseline và candidate",
+              "en": "Run baseline and candidate"
+            },
+            "steps": [
+              {
+                "from": "change",
+                "to": "runner",
+                "description": {
+                  "vi": "Freeze manifest và declared comparison trước khi xem scores.",
+                  "en": "Freeze manifests and comparisons before inspecting scores."
+                }
+              },
+              {
+                "from": "dataset",
+                "to": "runner",
+                "description": {
+                  "vi": "Load approved case set, labels/slices và denominator contract.",
+                  "en": "Load approved cases, labels/slices and denominators."
+                }
+              },
+              {
+                "from": "runner",
+                "to": "system",
+                "description": {
+                  "vi": "Run matched cases với bounded retries/timeouts và sandbox.",
+                  "en": "Run matched cases under bounded retries/timeouts and sandboxing."
+                }
+              },
+              {
+                "from": "system",
+                "to": "evidence",
+                "description": {
+                  "vi": "Save outputs và failures thay vì chỉ giữ successful responses.",
+                  "en": "Record failures as well as successful outputs."
+                },
+                "async": true
+              },
+              {
+                "from": "evidence",
+                "to": "scorer",
+                "description": {
+                  "vi": "Grade bằng metric phù hợp; preserve input/output revisions.",
+                  "en": "Grade with suitable metrics while preserving revisions."
+                }
+              },
+              {
+                "from": "scorer",
+                "to": "evidence",
+                "description": {
+                  "vi": "Persist item-level outcomes, judge versions và costs.",
+                  "en": "Persist item outcomes, judge versions and costs."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "calibrate",
+            "label": {
+              "vi": "Calibrate judge theo task",
+              "en": "Calibrate judges for the task"
+            },
+            "steps": [
+              {
+                "from": "dataset",
+                "to": "human",
+                "description": {
+                  "vi": "Sample task slices và blind labels theo rubric.",
+                  "en": "Sample task slices and collect blinded rubric-based labels."
+                }
+              },
+              {
+                "from": "evidence",
+                "to": "scorer",
+                "description": {
+                  "vi": "Judge pinned answer pairs theo cả hai orders.",
+                  "en": "Judge pinned answer pairs in both orders."
+                }
+              },
+              {
+                "from": "scorer",
+                "to": "human",
+                "description": {
+                  "vi": "Compare agreement, systematic disagreements và unsafe misgrades.",
+                  "en": "Review agreement, systematic disagreement and consequential misgrading."
+                }
+              },
+              {
+                "from": "human",
+                "to": "evidence",
+                "description": {
+                  "vi": "Version adjudication/rubric, giữ unresolved cases.",
+                  "en": "Version adjudications/rubrics while retaining unresolved cases."
+                },
+                "async": true
+              }
+            ]
+          },
+          {
+            "id": "gate",
+            "label": {
+              "vi": "Quyết định regression",
+              "en": "Decide regression gates"
+            },
+            "steps": [
+              {
+                "from": "evidence",
+                "to": "gate",
+                "description": {
+                  "vi": "Aggregate paired differences và slices với denominator rõ.",
+                  "en": "Aggregate paired differences and slices with explicit denominators."
+                }
+              },
+              {
+                "from": "holdout",
+                "to": "runner",
+                "description": {
+                  "vi": "Chạy finalist một cách có kiểm soát trên independent holdout.",
+                  "en": "Run finalists under controlled access to independent holdouts."
+                }
+              },
+              {
+                "from": "runner",
+                "to": "gate",
+                "description": {
+                  "vi": "Missing/failed runs không tự trở thành PASS; review uncertainty.",
+                  "en": "Missing or failed runs do not become passes; review uncertainty."
+                }
+              },
+              {
+                "from": "gate",
+                "to": "change",
+                "description": {
+                  "vi": "BLOCKED hoặc INSUFFICIENT cần sửa gap trước rollout.",
+                  "en": "Blocked or insufficient evidence requires follow-up before rollout."
+                }
+              }
+            ]
+          },
+          {
+            "id": "online",
+            "label": {
+              "vi": "Canary sau offline qualification",
+              "en": "Canary after offline qualification"
+            },
+            "steps": [
+              {
+                "from": "gate",
+                "to": "canary",
+                "description": {
+                  "vi": "Chỉ expose candidate đã qua declared evidence gates, có rollback.",
+                  "en": "Expose qualified candidates under declared gates and rollback plans."
+                }
+              },
+              {
+                "from": "canary",
+                "to": "monitor",
+                "description": {
+                  "vi": "Observe product outcomes, severity, latency và cost theo window.",
+                  "en": "Observe windowed product outcomes, severity, latency and cost."
+                },
+                "async": true
+              },
+              {
+                "from": "monitor",
+                "to": "gate",
+                "description": {
+                  "vi": "Stop/rollback nếu guardrails fail; canary không tự là causal A/B proof.",
+                  "en": "Stop or roll back on guardrail failures; canaries are not automatic causal A/B evidence."
+                }
+              }
+            ]
+          },
+          {
+            "id": "learn",
+            "label": {
+              "vi": "Từ incident về regression suite",
+              "en": "Turn incidents into regression coverage"
+            },
+            "steps": [
+              {
+                "from": "monitor",
+                "to": "incident",
+                "description": {
+                  "vi": "Triage failure với minimal authorized trace và owner.",
+                  "en": "Triage failures using minimal authorized traces and owners."
+                },
+                "async": true
+              },
+              {
+                "from": "incident",
+                "to": "dataset",
+                "description": {
+                  "vi": "Review labels, dedup, data scope và stable case IDs trước add.",
+                  "en": "Review labels, duplication, data scope and stable identities before admission."
+                },
+                "async": true
+              },
+              {
+                "from": "dataset",
+                "to": "runner",
+                "description": {
+                  "vi": "Rerun relevant regressions và preserved baselines.",
+                  "en": "Rerun relevant regressions and preserved baselines."
+                }
+              },
+              {
+                "from": "incident",
+                "to": "holdout",
+                "description": {
+                  "vi": "Refresh holdout theo governed policy, không leak tuning feedback.",
+                  "en": "Refresh holdouts under governance without leaking tuning feedback."
+                },
+                "async": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "paired",
+      "title": {
+        "vi": "8. Paired comparisons: cùng inputs, giữ cả gains và regressions",
+        "en": "8. Pair comparisons and retain both gains and regressions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cho mỗi case i, đặt A_i và B_i là pass/fail của baseline và candidate; d_i=B_i−A_i thuộc {−1,0,+1}. Delta trung bình là (gains−losses)/n. Không chỉ giữ score tổng: hai systems đều pass 58% và 62% có thể có rất ít hoặc rất nhiều discordant cases, dẫn tới uncertainty khác nhau. Pairing kiểm soát một phần biến thiên giữa inputs, nhưng không chữa được labels thiên lệch hay unrepresentative sampling.",
+          "en": "For case i, let binary outcomes A_i and B_i define d_i=B_i−A_i in {−1,0,+1}. Mean difference is (gains−losses)/n. Identical marginal pass rates can arise from very different discordance patterns and uncertainty. Pairing controls some between-input variation without correcting biased labels or sampling."
+        },
+        {
+          "vi": "Ví dụ n=100, both pass=50, gain=12, loss=8, both fail=30: A=58%, B=62%, delta=+4 percentage points. “Tăng 4 điểm phần trăm” khác relative improvement 4/58≈6,9%; ghi units rõ. Nếu bỏ các cases candidate timeout khỏi n nhưng giữ chúng ở baseline, comparison không còn matched. Định trước cách xử lý retry, incomplete output, refusals và non-applicable cases.",
+          "en": "For 100 cases with 50 shared passes, 12 gains, 8 losses and 30 shared failures, baseline is 58%, candidate 62% and difference +4 percentage points. This differs from a roughly 6.9% relative improvement. Predefine timeouts, retries, refusals, incomplete outputs and non-applicable cases; unequal silent filtering breaks matched comparison."
+        }
+      ],
+      "experiment": "eval-pairs"
+    },
+    {
+      "id": "uncertainty",
+      "title": {
+        "vi": "9. Đọc intervals và tránh lời kết luận quá mạnh",
+        "en": "9. Interpret intervals without overclaiming"
+      },
+      "paragraphs": [
+        {
+          "vi": "Paired percentile bootstrap lấy n original case indices có hoàn lại cho mỗi resample, dùng cùng indices ở A và B, rồi lấy quantiles của paired mean differences. Đây là nonparametric procedure, không phải assumption-free: cần sampling/resampling units phù hợp, representative observations và đủ variation. Nhiều requests từ cùng user/document hoặc repeated runs trên cùng case thường cần cluster/hierarchical design; không giả coi mọi row độc lập.",
+          "en": "Paired percentile bootstrap resamples original case indices with replacement, using identical indices for both versions before taking difference quantiles. Nonparametric does not mean assumption-free: sampling units, representativeness and variation matter. Requests clustered by user/document or repeated per case may need cluster or hierarchical procedures."
+        },
+        {
+          "vi": "Khoảng 95% mô tả long-run coverage của procedure dưới assumptions, không phải sau khi thấy data có 95% xác suất fixed true delta nằm trong interval theo frequentist interpretation. Interval chứa 0 không chứng minh equivalence; interval loại 0 không tự chứng minh effect hữu ích về sản phẩm. Với non-inferiority, định practical margin δ trước và dùng one-sided bound/design phù hợp; không dùng “không significant” để tuyên bố không regression.",
+          "en": "A frequentist 95% interval describes repeated-procedure coverage under assumptions, not a post-data probability for a fixed parameter. Including zero does not establish equivalence, and excluding it does not establish practical value. Predefine non-inferiority margins and suitable one-sided methods rather than treating nonsignificance as proof of no regression."
+        },
+        {
+          "vi": "Với một pass rate đơn lẻ 70/100, Wilson 95% interval xấp xỉ [60,4%;78,1%], cho thấy 70% không là một con số chính xác vô hạn. Nếu không có observed discordance, percentile bootstrap của paired delta có thể ra [0,0]; đó là sample degeneracy, không phải đã chứng minh systems tương đương trên mọi future inputs. Boundary/rare-event cases cần phương pháp và evidence phù hợp hơn.",
+          "en": "A single rate of 70/100 has an approximately [60.4%,78.1%] Wilson 95% interval. With no observed discordance, paired percentile bootstrap can yield [0,0], reflecting sample degeneracy rather than universal equivalence. Boundaries and rare events require suitable additional methods and evidence."
+        }
+      ]
+    },
+    {
+      "id": "selection",
+      "title": {
+        "vi": "10. Sample size, power và multiple comparisons",
+        "en": "10. Sample size, power and adaptive comparisons"
+      },
+      "paragraphs": [
+        {
+          "vi": "Không có universal “150 cases đủ” hoặc “+3 điểm luôn là noise”. Precision/power phụ thuộc baseline, paired discordance, effect size cần phát hiện, clustering, grader reliability, tails và error budgets. Một critical slice ít data có thể cần targeted collection; nhiều easy examples không thay được coverage của slice đó. Power analysis hoặc simulation phải dùng assumptions có lý và sensitivity checks.",
+          "en": "No universal sample count or score gain settles adequacy. Precision and power depend on rates, paired discordance, relevant effect sizes, clustering, grader reliability, tails and error budgets. More easy examples cannot replace critical-slice coverage; design analyses or simulations with defensible assumptions and sensitivity checks."
+        },
+        {
+          "vi": "Nếu thử 20 prompts rồi chỉ báo winner trên cùng small dev set, score thắng có thể chứa selection luck. Separate exploratory development và confirmatory evaluation, kiểm finalist trên independent holdout, predefine primary metrics/gates và xét multiplicity khi diễn giải nhiều tests/slices. Bootstrap interval sau selection không tự điều chỉnh adaptive overfitting. Không lặp peek A/B mỗi giờ rồi dừng đúng lúc significant trừ khi dùng sequential design phù hợp.",
+          "en": "Selecting the best of many prompts on a small development set introduces selection optimism. Separate exploration from confirmation, protect holdouts, predeclare primary metrics/gates and account for multiple comparisons. A post-selection bootstrap interval does not automatically correct adaptive overfitting, and repeated unplanned A/B peeking can invalidate inference."
+        }
+      ]
+    },
+    {
+      "id": "gates",
+      "title": {
+        "vi": "11. Regression gates: hard failures, slices và missing evidence",
+        "en": "11. Gate regressions, hard failures and missing evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Gate config cần metric definition, direction, units, scope/slices, minimum evidence, uncertainty rule, comparison baseline, severity và owner. Hard disclosure hoặc unauthorized side effect không được bù bằng helpfulness. Quality non-inferiority có thể dùng lower bound của paired delta so với −δ; latency/cost có denominators và windows riêng. Thresholds minh họa trong bài không phải chuẩn chung cho mọi ứng dụng.",
+          "en": "Gate configurations need definitions, directions, units, scopes, evidence requirements, uncertainty rules, baselines, severity and owners. Helpfulness does not offset unauthorized disclosure or effects. Quality non-inferiority can compare paired lower bounds to a predefined margin, while latency/cost require their own windows and denominators. Teaching thresholds are not universal standards."
+        },
+        {
+          "vi": "Missing results, judge errors hoặc thiếu data trong một slice phải thành explicit insufficient/failed evidence theo policy, không mặc định PASS. Zero observed privacy failures chỉ nói về cases đã test, không chứng minh true failure probability bằng 0. Quyết định canary vẫn phải xét residual risk, rollback và operational controls.",
+          "en": "Missing outcomes, grader errors and insufficient slices require explicit policy states rather than default passes. Zero observed privacy failures do not imply zero population risk. Canary decisions still require residual-risk review, rollback and operational controls."
+        }
+      ],
+      "experiment": "eval-gates"
+    },
+    {
+      "id": "online",
+      "title": {
+        "vi": "12. Shadow, canary và A/B trả lời những câu khác nhau",
+        "en": "12. Shadow, canary and A/B answer different questions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Shadow chạy candidate trên live inputs mà không dùng outputs phục vụ user, giúp kiểm workload và integration behavior; vẫn có compute/data exposure và phải chặn real side effects. Canary giới hạn blast radius và giúp rollback, nhưng trước/sau hoặc một tỷ lệ traffic không randomized không tự là causal experiment. A/B cần assignment unit phù hợp, stable exposure, sufficient duration/sample size và kiểm interference giữa users/tenants.",
+          "en": "Shadowing evaluates live inputs without serving candidate outputs, yet still incurs compute and data exposure and must control effects. Canaries bound exposure and aid rollback without automatically establishing causality. A/B experiments require appropriate assignment units, stable exposure, sufficient duration and attention to interference."
+        },
+        {
+          "vi": "Đo task resolution, escalation appropriateness, user outcomes và guardrails như disclosure, harmful actions, latency tails và cost. Copy/regenerate/edit/abandonment là signals cần interpretation: user có thể copy answer sai hoặc regenerate vì style. Feedback tự nguyện có selection bias. Kết hợp sampled expert review, randomized comparisons khi phù hợp và trace-based diagnosis; không tối ưu click/copy rate như ground truth correctness.",
+          "en": "Track task resolution, appropriate escalation and user outcomes alongside disclosure, harmful effects, latency tails and cost. Copying, regeneration, editing and abandonment require interpretation; users can copy incorrect answers or regenerate for style. Voluntary feedback is selected. Combine expert sampling, appropriate experiments and trace diagnosis rather than treating clicks as correctness."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Exposure có kiểm soát",
+          "en": "Controlled exposure"
+        },
+        "caption": {
+          "vi": "Mỗi bước có stopping rule, owner và data policy.",
+          "en": "Give every step stop rules, owners and data policies."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Shadow",
+              "en": "Shadow"
+            },
+            "detail": {
+              "vi": "Ẩn candidate outputs, không commit real tools.",
+              "en": "Hide candidate outputs and prevent real tool commits."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Bounded canary",
+              "en": "Bounded canary"
+            },
+            "detail": {
+              "vi": "Giới hạn traffic, monitor severity và rollback.",
+              "en": "Bound traffic, monitor severity and support rollback."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Experiment",
+              "en": "Experiment"
+            },
+            "detail": {
+              "vi": "Randomization và analysis plan cho causal question.",
+              "en": "Use randomization and planned analysis for causal questions."
+            },
+            "icon": "compare"
+          },
+          {
+            "title": {
+              "vi": "Maintain",
+              "en": "Maintain"
+            },
+            "detail": {
+              "vi": "Theo dõi drift, incidents và refresh suites.",
+              "en": "Track drift, incidents and suite refreshes."
+            },
+            "icon": "route"
+          }
+        ]
+      }
+    },
+    {
+      "id": "traces",
+      "title": {
+        "vi": "13. Traces giúp diagnosis nhưng không tự là ground truth",
+        "en": "13. Traces enable diagnosis without becoming ground truth"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một trace hữu ích gắn run/case/principal scope, input revision, query rewrite, retrieved IDs/scores, packed evidence IDs, prompt/config hashes, model/tool attempts, committed effects, latency, token/cost accounting và outcome. Không cần ghi mọi raw secret hoặc private chain-of-thought. Dùng access control, redaction/minimization, encryption, bounded retention và deletion/audit policy; hash IDs cũng không tự vô danh hóa dữ liệu.",
+          "en": "Useful traces link run/case/scope, input revisions, rewrites, retrieved IDs/scores, packed evidence, configuration hashes, attempts/effects, latency, usage and outcomes. They need not contain secrets or private reasoning. Apply access controls, minimization, retention and deletion/audit policies; hashing identities does not automatically anonymize data."
+        },
+        {
+          "vi": "Trace cho thấy relevant evidence bị bỏ ở packing có thể định vị một failure, nhưng không đảm bảo root cause duy nhất. Retrieval miss có thể đi cùng stale permission hoặc wrong labels. Keep versioned minimal fixtures để reproduce trong sandbox và thêm incident cases sau review, không tự ingest mọi complaint vào golden labels. Drift monitoring phải xét traffic/task changes và provider behavior, không chỉ model version string.",
+          "en": "Traces can locate missing packed evidence without proving a unique cause. Retrieval, permissions and labels can fail together. Preserve minimal versioned sandbox fixtures and review incidents before turning complaints into labels. Monitor traffic and provider behavior rather than relying only on model-version strings."
+        }
+      ]
+    },
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "14. Run, result và release contracts minh họa",
+        "en": "14. Teaching run, result and release contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Các internal APIs dưới đây minh họa evidence platform, không gọi external graders hoặc điều khiển production rollout. Tách run completion, scoring coverage và gate decision. Baseline/candidate results phải giữ stable case IDs, status và revision mapping; request retries cần stable idempotency key và expected manifest hash.",
+          "en": "These internal APIs illustrate an evidence platform rather than calling external graders or changing production. Separate run completion, grading coverage and gate decisions. Preserve stable case identities, statuses and revision mappings, and bind retries to idempotency keys and manifests."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/evaluation-runs",
+          "description": {
+            "vi": "Tạo run pin dataset, systems và scorers.",
+            "en": "Create runs with pinned datasets, systems and scorers."
+          },
+          "request": "{ idempotencyKey, datasetRevision, baselineManifest, candidateManifest, graderRevision, samplingConfig, sandboxProfile }",
+          "response": "202 { runId, manifestHash, state: \"QUEUED\" }",
+          "notes": [
+            {
+              "vi": "202 không chứng minh cases/scoring/gates đã xong.",
+              "en": "Acceptance does not establish completed cases, scoring or gates."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/internal/evaluation-runs/{runId}/results",
+          "description": {
+            "vi": "Lấy outcomes có denominator và failures rõ.",
+            "en": "Read outcomes with explicit denominators and failures."
+          },
+          "response": "200 { runId, manifestHash, expectedCases, completedCases, gradingFailures, slices, pairedOutcomes, traceRefs }",
+          "notes": [
+            {
+              "vi": "Missing records giữ explicit status; không loại khỏi metric một cách im lặng.",
+              "en": "Keep missing records explicit rather than silently excluding them."
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/internal/evaluation-decisions",
+          "description": {
+            "vi": "Ghi decision dựa trên pinned evidence và policy.",
+            "en": "Record decisions against pinned evidence and policies."
+          },
+          "request": "{ runId, expectedManifestHash, gatePolicyRevision, holdoutEvidenceRef, reviewerDecision }",
+          "response": "200 { decisionId, state: \"BLOCKED | INSUFFICIENT_EVIDENCE | CANARY_CANDIDATE\", failedGates, evidenceRefs }",
+          "notes": [
+            {
+              "vi": "Decision không tự deploy; online exposure thuộc rollout controller riêng.",
+              "en": "Decisions do not deploy; exposure belongs to a separate rollout controller."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ownership",
+      "title": {
+        "vi": "15. Duy trì evals như một sản phẩm có owner",
+        "en": "15. Maintain evaluations as owned products"
+      },
+      "paragraphs": [
+        {
+          "vi": "Dataset/rubric/judge đều cần owner, review cadence và change history. Khi sửa label sai, chạy bridge comparison để biết score đổi vì system hay benchmark. Giữ evaluation budget gồm model calls, human review, storage/access và incident triage; expensive judge có thể chỉ chạy risk-based sample, nhưng phải biết sampling rule và coverage. Không so một score chạy full corpus với score chạy selected successful samples mà không chú thích.",
+          "en": "Assign ownership, review schedules and histories to datasets, rubrics and graders. Bridge label changes to distinguish benchmark changes from system changes. Budget model calls, humans, storage and triage. Risk-based grading samples need explicit sampling rules and coverage; do not compare full-corpus results to selected successful cases without disclosure."
+        },
+        {
+          "vi": "Đặt feedback loop từ production drift/incidents về reviewed regression set và governed holdout refresh. Access vào holdout và customer traces theo least privilege; evaluation runner dùng sandbox với resource quotas. Người chịu trách nhiệm rollout cần xem limitations/missing evidence cùng scores, không chỉ một badge xanh trong CI.",
+          "en": "Feed reviewed production failures and drift into regressions and governed holdout refresh. Restrict holdout/trace access and sandbox runners under quotas. Release owners need limitations and missing evidence alongside scores rather than a single green CI badge."
+        }
+      ]
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "16. Luyện giải thích quyết định evaluation",
+        "en": "16. Practice evaluation decisions"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Candidate tăng 3 điểm trên 150 cases: ship chưa?",
+            "en": "A candidate gains 3 points on 150 cases: ship?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa kết luận từ hai con số. Xem paired outcomes/uncertainty, sampling unit, slices và practical margin; không mặc định +3 luôn significant hoặc luôn noise. Kiểm label/judge quality, leakage, latency/cost, severity và independent holdout. Nếu đạt declared evidence gates thì thử canary có rollback, không gọi đó là proof mọi future inputs đều tốt hơn.",
+              "en": "Inspect paired uncertainty, sampling units, slices and practical margins rather than assuming significance or noise. Check graders, leakage, operations, severity and holdouts, then use qualified bounded exposure."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tại sao AB và BA cùng chọn B vẫn có thể sai?",
+            "en": "Why can both answer orders prefer B incorrectly?"
+          },
+          "answer": [
+            {
+              "vi": "Consistency khác correctness. Judge có thể sai factuality, ưu style/length hoặc bị instructions trong answer tác động ở cả hai orders. Calibrate với blinded task labels/evidence, kiểm systematic errors và giữ unresolved denominator.",
+              "en": "Consistency differs from correctness: content errors, style bias or injection can persist across orders. Calibrate against blinded task evidence and retain unresolved denominators."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bỏ conflicting judge pairs có giải quyết bias không?",
+            "en": "Does dropping conflicting pairs solve bias?"
+          },
+          "answer": [
+            {
+              "vi": "Không đảm bảo. Bạn đã chọn một subset theo judge behavior; consistent-only score có denominator khác và có thể lệch khỏi all-pair preference. Báo consistent A/B/unresolved trên toàn pairs, giải thích adjudication policy và kiểm bằng human-labeled samples.",
+              "en": "No guarantee: judge-selected subsets change denominators and can be biased. Report all-pair consistent and unresolved mass with adjudication and human calibration."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Average +6 pp nhưng enterprise −30 pp thì sao?",
+            "en": "What if average improves 6 pp but enterprise falls 30 pp?"
+          },
+          "answer": [
+            {
+              "vi": "Average có thể bị majority slice chi phối. Critical-slice gate không được aggregate bù trừ; block hoặc thu thập/diagnose theo evidence policy. Kiểm sample size/labels/uncertainty và severity trước kết luận, không tự loại enterprise khỏi target users để ship.",
+              "en": "Majority slices can dominate averages. Apply critical-slice policies, inspect evidence and diagnose rather than offsetting the regression or quietly removing users."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Bootstrap [0,0] có chứng minh equivalent không?",
+            "en": "Does a [0,0] bootstrap interval establish equivalence?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Nếu không observed discordance, resampling empirical sample không tạo được unseen failure modes. Cần coverage/representative data, phương pháp cho boundary cases và predefined equivalence/non-inferiority design phù hợp.",
+              "en": "No: resampling unvarying observed differences cannot create unseen failures. Use representative coverage and suitable boundary/equivalence methods."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Faithfulness cao có chứng minh answer đúng không?",
+            "en": "Does high faithfulness establish correctness?"
+          },
+          "answer": [
+            {
+              "vi": "Không nếu context sai hoặc stale; code kiểm citation ID tồn tại cũng chưa chứng minh entailment. Đo retrieval relevance, context freshness, claim support và correctness theo appropriate evidence; kiểm abstention khi không đủ căn cứ.",
+              "en": "Not with incorrect or stale context. Existing citation IDs do not establish entailment. Separate relevance, freshness, support, correctness and abstention."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Shadow có hoàn toàn không rủi ro không?",
+            "en": "Is shadowing risk-free?"
+          },
+          "answer": [
+            {
+              "vi": "Không: candidate vẫn đọc live data, tạo costs và có thể gọi tool nếu không sandbox. Chặn real writes/notifications/payments, áp access/retention policy và quotas. Shadow cũng không trực tiếp đo user outcome của candidate outputs chưa hiển thị.",
+              "en": "No: live data, costs and possible tool effects remain. Sandbox writes, enforce data policies/quotas and distinguish hidden-output checks from user outcomes."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Eval runner timeout 10% cases, score phần còn lại cao thì sao?",
+            "en": "What if 10% of cases time out but scored cases perform well?"
+          },
+          "answer": [
+            {
+              "vi": "Báo run coverage/failures và end-to-end denominator theo contract; không silently remove timeouts. Phân biệt candidate failures với infrastructure/grader failures, retry theo bounded policy, giữ initial attempts nếu metric cần và declare insufficient evidence khi không đủ matched outcomes.",
+              "en": "Report coverage and end-to-end denominators. Distinguish candidate, infrastructure and grader failures, retain suitable attempt records and declare missing matched evidence explicitly."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

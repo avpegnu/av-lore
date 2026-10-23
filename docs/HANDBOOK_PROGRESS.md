@@ -4,10 +4,10 @@ Cập nhật23/10/2026. Chủ sở hữu đã quay lại và yêu cầu tiếp t
 
 ## Trạng thái hiện tại
 
-- **58/73 bài có nội dung Việt–Anh**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories và 8 AI Systems. **58 bài đã build và kiểm tra browser local.**
-- Tất cả 58 bài `status: review`, **0 complete**. Còn vòng đối chiếu độc lập về độ phủ, kỹ thuật, diễn giải/English và mục đích của hình/tương tác; tests/counts không thay vòng review.
-- **15 mục chưa biên soạn**: 7 AI Systems, 3 Practice và 5 Interview tools. Tiếp theo `ai-evals`: đã đọc chapter, demos và primary research; models/tests mới có, chưa UI/canonical/wiring/build.
-- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local58. Hai bài mới `/ai-systems/ai-rag/`, `/ai-systems/ai-fine-tuning/` và bản `/en/` tương ứng.
+- **60/73 bài có nội dung Việt–Anh**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories và 10 AI Systems. **60 bài đã build và kiểm tra browser local.**
+- Tất cả 60 bài `status: review`, **0 complete**. Còn vòng đối chiếu độc lập về độ phủ, kỹ thuật, diễn giải/English và mục đích của hình/tương tác; tests/counts không thay vòng review.
+- **13 mục chưa biên soạn**: 5 AI Systems, 3 Practice và 5 Interview tools. Tiếp theo `ai-production`: đã đọc full chapter/demo/model và primary streaming/cache/retry/telemetry docs; models/tests mới có, chưa UI/canonical/wiring/build.
+- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local60. Các bài mới `/ai-systems/ai-rag/`, `/ai-systems/ai-fine-tuning/`, `/ai-systems/ai-evals/`, `/ai-systems/ai-agents/` và bản `/en/` tương ứng.
 - Giữ 198 chương/15 lộ trình, 31 Notes & Interview topics, stable IDs, localStorage keys và 9 themes. Không portfolio.
 
 ## Mốc đã push
@@ -247,3 +247,19 @@ Mainpreview nếu đã tắt sau shutdown có thể restart tại rootAVLore:`np
 - Build đầu bắt 4 SSR matrix strings thiếu identity dictionary; thêm các shape strings, sửa NF4/FP32 spacing và rebuild thành công. Không gọi dịch vụ dịch online. Logs `fine-tune-final-{build,verify,check,unit}.log`, `fine-tune-{browser,generic-browser}.log`; screenshots/report `artifacts/fine-tune-*`.
 - Main4322 publish58; stage4323 stopped. RAG57 + Fine-tuning58 chuẩn bị checkpoint; toàn bộ vẫn review/0 complete.
 - `ai-evals`59: full chapter + judge/harness demos đã đọc, đối chiếu primary judge-bias papers, Wilson intervals, paired bootstrap documentation. Models/tests mới có: paired case resampling (degenerate warning), exact order/accuracy probabilities with unresolved mass, gates rejecting slice/privacy regressions or missing evidence. Chưa UI/canonical/schema/dictionary/browser/build59; không commit partial59 cùng checkpoint58.
+
+## Checkpoint58 đã push; Evaluation59 đã validate local
+
+- AV Lore `f4aa167`, IT Basic `f9fa25b` push thành công. Pages https://github.com/avpegnu/av-lore/actions/runs/39890767270 success; IT VPS https://github.com/avpegnu/it-basic/actions/runs/39890768695 failed. Không chỉnh Settings/workflow/secrets; preserve unrelated Test/Python/test.py.
+- `ai-evals.json`: 16 sections/5 traces/3 internal APIs/3 labs/8 worked questions; Việt–Anh, review. Dataset/split/provenance, deterministic/reference/judge/human metrics, RAG/agent outcomes, calibration/order bias, paired bootstrap, Wilson, clustering/degeneracy, multiplicity/power, evidence gates, online experiments, traces/privacy và ownership.
+- 291 source files/0 diagnostics; 175 tests. Build/verify 628 pages/281518 links/assets; localization0missing. Dedicated 3labs VIEN/keyboard/mobile9themes và generic2routes/static2pages pass; screenshots desktop/mobile đã xem. Static59:120HTML1410links. Main4322publish59;stage4323stopped.
+- First unit run caught invalid visual icon names, replaced with established schema icons. First dedicated harness failed ambiguous role=status (range output also has status role); selector narrowed to p[role=status], rerun passed. Không suppress app errors. Logs `evaluation-{build,verify,final-check,final-unit,final-browser,generic-browser,legacy-browser}.log`; screenshots/report `artifacts/evaluation-*`.
+- 59 chưa commit/push; GitHub HEAD vẫn checkpoint58. Canonical đã sửa icon sau author helper: không rerun creation helper. Next60 full reference + demo đã đọc, primary ReAct/Toolformer, workflow/agents, checkpoint/replay/durability và MCP security đã kiểm. Corrections: checkpoint-after-tool không tự exactly-once; reads cũng có auth/privacy/cost; approvals bind exact payload/principal/expiry; model memory là context+external state, không khẳng định mọi API stateless; growth quadratic chỉ dưới full-history assumptions; approval waits vẫn storage/operations cost; MCP interoperability không là trust boundary.
+
+## Local60: Agents & Tool Use — đã validate/publish local
+
+- `ai-agents.json`:17sections/5traces/4internalAPIs/3labs/8workedquestions; VIENstatusreview. Workflow/agent/hybrid, tool semantics, auth/business/prompt-injection boundaries, action-bound approvals, durable intent/receipts, cancellation, budgets/concurrent admission, memory/context, MCP, coordination và trajectory/outcome evals.
+- Model loop reserves before turns; pending/rejected/current auth independent; post-write budget stop retains committed effect. Lost-response fixture requires persisted intent identity AND atomic sink receipt/dedup; cancellation does not undo prior effects. Context worksheet computes full/window input inventories, no fabricated pricing/latency/quality.
+- Release60check295files0diagnostics179tests. Finalbuild/verify630pages283040links/assets,localization0missing. Dedicated3labsVIENkeyboard/mobile9themes và generic2routes finalpass sau sliderlabelgap polish; screenshots desktop/mobile đã xem. Static60:122HTML1434links/static2pagespass. Main4322publish60;stage4323stopped.
+- First unit run caught invalid prerequisite queues-streams→messaging, fixed before build. Logs `agent-final-{build,verify,check,unit,browser,generic-browser}.log`, static`agent-legacy-browser.log`;screenshots/report`artifacts/agent-runtime-*`. All60review/0complete;13unwritten.
+- Next61: fullchapter/costdemo/model đọc; primary WHATWG SSE, AWSretry/backoff, prompt-prefixcache và currentOTelGenAIrepo checked. `production-app-models.ts` +4tests mới có local, chưaUI/canonical/wiring/CSS/dictionary/browser/static/build61. Models: synthetic stream with heartbeat vs first-content timeout, explicit generation restart vs unsafe splice, cancellation unconfirmed usage; exact/semantic cache fixture with tenant/dependency/current ACL guards and false-positive intent; conditional-hit inventory + prefix-read input discount + output/embedding costs/falsehits. Giá là fictional assumptions, không marketpricing hoặclatencybenchmark. Không commit partial61 cùng checkpoint60.
