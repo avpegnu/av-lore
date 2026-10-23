@@ -1,0 +1,1071 @@
+{
+  "id": "ai-prompting",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Prompting & Structured Output: contract, schema và tool boundary",
+    "en": "Prompting & Structured Output: contracts, schemas and tool boundaries"
+  },
+  "summary": {
+    "vi": "Quản lý prompt như một versioned interface; hiểu few-shot, token masks, response envelopes, schema/business validation, bounded repairs và tool execution được authorize bằng code.",
+    "en": "Manage prompts as versioned interfaces; understand few-shot examples, token masks, response envelopes, validation, bounded repairs and code-authorized tool execution."
+  },
+  "prerequisites": [
+    "ai-serving",
+    "ai-inference"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "security",
+    "testing"
+  ],
+  "takeaways": [
+    {
+      "vi": "Prompt là một phần của contract có input, owner, revisions, consumers và eval gates.",
+      "en": "Prompts participate in contracts with inputs, owners, revisions, consumers and evaluation gates."
+    },
+    {
+      "vi": "Roles/delimiters giúp biểu đạt instructions/data nhưng không thay authorization hoặc loại bỏ prompt injection.",
+      "en": "Roles/delimiters clarify instructions/data without replacing authorization or eliminating injection."
+    },
+    {
+      "vi": "Syntax, supported schema, source truth và permission là các lớp kiểm tra khác nhau.",
+      "en": "Syntax, supported schemas, source truth and permissions are distinct checks."
+    },
+    {
+      "vi": "Grammar mask lọc token pieces theo parser state; truncation/refusal vẫn cần xử lý ở envelope.",
+      "en": "Grammar masks filter pieces using parser state; envelopes still handle truncation/refusal."
+    },
+    {
+      "vi": "Tool calls là proposals; side effects cần scoped authorization, validation và durable idempotency contract.",
+      "en": "Tool calls propose actions; effects need scoped authorization, validation and durable idempotency."
+    },
+    {
+      "vi": "Temperature 0, majority votes hoặc retry không tự tạo correctness/determinism; cần evidence và bounded budgets.",
+      "en": "Greedy decoding, voting and retries do not automatically establish correctness or determinism."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Một request có nhiều contract boundaries",
+      "en": "A request crosses several contract boundaries"
+    },
+    "caption": {
+      "vi": "Không chuyển quyền từ model text sang application chỉ vì JSON parse thành công.",
+      "en": "Successful JSON parsing does not transfer authority from model text to applications."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Assemble",
+          "en": "Assemble"
+        },
+        "detail": {
+          "vi": "Pin prompt/model/schema và provenance của input.",
+          "en": "Pin revisions and input provenance."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Generate",
+          "en": "Generate"
+        },
+        "detail": {
+          "vi": "Supported constraints, context/output/deadline budgets.",
+          "en": "Use supported constraints and explicit budgets."
+        },
+        "icon": "route"
+      },
+      {
+        "title": {
+          "vi": "Validate",
+          "en": "Validate"
+        },
+        "detail": {
+          "vi": "Envelope → parse → schema → task rules.",
+          "en": "Check envelopes, parsing, schemas and task rules."
+        },
+        "icon": "inspect"
+      },
+      {
+        "title": {
+          "vi": "Consume / authorize",
+          "en": "Consume or authorize"
+        },
+        "detail": {
+          "vi": "Typed data, scoped tools, effect/receipt và audit.",
+          "en": "Use typed data, scoped tools, effects/receipts and audits."
+        },
+        "icon": "shield"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "contracts",
+      "title": {
+        "vi": "1. Prompt là versioned interface",
+        "en": "1. Prompts are versioned interfaces"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một prompt package gồm task instructions, input template, examples, tool definitions, output contract và failure policy. Model revision, tokenizer/chat template, schema dialect/backend và sampling settings cũng ảnh hưởng behavior. Version một câu instruction nhưng không biết model/template đang dùng thì chưa đủ reproduce hoặc audit. Lưu immutable revisions, owner, rationale và eval suite cho mỗi contract.",
+          "en": "Prompt packages contain instructions, templates, examples, tools, output contracts and failure policies. Model revisions, tokenizers/templates, schema backends and sampling also affect behavior. Versioning instructions alone is insufficient for reproducibility or auditing. Store immutable revisions, ownership, rationale and evaluation suites."
+        },
+        {
+          "vi": "Log contract identifiers và relevant configuration trên mỗi logical request/attempt, không mặc định log toàn bộ sensitive input. Một one-word change có thể đổi outputs ở nhiều task slices. Rollout qua offline eval, canary với quality/error/cost thresholds và rollback; migration nhiều call sites cần compatible inputs/outputs và explicit deprecation.",
+          "en": "Record contract identifiers/configuration by request and attempt without automatically logging sensitive inputs. Small edits can alter many task slices. Use offline evaluations, bounded canaries, thresholds and rollback; multi-client migrations need compatibility and explicit deprecation."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Lifecycle của prompt contract",
+          "en": "Prompt-contract lifecycle"
+        },
+        "caption": {
+          "vi": "Version behavior, không chỉ version string literal.",
+          "en": "Version behavior rather than string literals alone."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Registry",
+              "en": "Registry"
+            },
+            "detail": {
+              "vi": "Owner, immutable revision và inputs/outputs.",
+              "en": "Define ownership, immutable revisions and interfaces."
+            },
+            "icon": "scope"
+          },
+          {
+            "title": {
+              "vi": "Eval gate",
+              "en": "Evaluation gate"
+            },
+            "detail": {
+              "vi": "Cases thường gặp, edge cases và untrusted data.",
+              "en": "Test common, edge and untrusted-data cases."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Canary",
+              "en": "Canary"
+            },
+            "detail": {
+              "vi": "Bounded traffic, quality/cost và rollback.",
+              "en": "Bound traffic and observe quality/cost with rollback."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Observe",
+              "en": "Observe"
+            },
+            "detail": {
+              "vi": "Trace revisions, attempts và outcomes.",
+              "en": "Trace revisions, attempts and outcomes."
+            },
+            "icon": "chart"
+          }
+        ]
+      }
+    },
+    {
+      "id": "roles",
+      "title": {
+        "vi": "2. Roles và trust boundaries",
+        "en": "2. Roles and trust boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chat APIs có thể cung cấp system/developer, user, assistant và tool channels với naming/priority khác nhau theo contract. Durable instructions nên đặt ở privileged channel được engine/provider hỗ trợ; user text, retrieved documents và tool output được coi là untrusted data. Không chèn chúng vào privileged instruction template chỉ vì đã escape dấu ngoặc.",
+          "en": "Chat APIs can expose system/developer, user, assistant and tool channels with contract-specific naming/priority. Place durable instructions in supported privileged channels; treat user text, retrieved documents and tool results as untrusted data. Escaping delimiters does not make them privileged instructions."
+        },
+        {
+          "vi": "Clear delimiters, typed templates và provenance giúp model phân biệt task/data và giúp người đọc debug. Chúng không là sandbox, không guarantee model bỏ instructions nằm trong document và không thay permission checks. XML escaping chống delimiter collision ở presentation layer, còn prompt injection là vấn đề semantic trust rộng hơn. Secrets và privileged tools chỉ được cấp theo application policy, không dựa vào model tự nói “được phép”.",
+          "en": "Delimiters, typed templates and provenance help distinguish tasks/data and support debugging. They are neither sandboxes nor guarantees against document-borne instructions. Escaping avoids delimiter collisions but injection is a broader semantic-trust problem. Applications control secrets and privileged tools rather than trusting a model’s permission claims."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Privileged rules",
+            "en": "Privileged rules"
+          },
+          "icon": "shield",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Version instructions và tool scope ở server-controlled template.",
+              "en": "Version instructions/tool scope in server-controlled templates."
+            },
+            {
+              "vi": "Không đưa secret không cần cho task vào context.",
+              "en": "Exclude secrets unnecessary for the task."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Task data",
+            "en": "Task data"
+          },
+          "icon": "scope",
+          "tone": "neutral",
+          "items": [
+            {
+              "vi": "User/retrieved/tool text có provenance và bounded size.",
+              "en": "Bound user/retrieved/tool data and retain provenance."
+            },
+            {
+              "vi": "Quote/delimit để rõ ngữ cảnh; vẫn giữ untrusted status.",
+              "en": "Quote/delimit for clarity while retaining untrusted status."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Execution authority",
+            "en": "Execution authority"
+          },
+          "icon": "decision",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Principal, resource và action do backend xác minh.",
+              "en": "Backends verify principals, resources and actions."
+            },
+            {
+              "vi": "Model chỉ đề xuất tool/arguments, không cấp quyền.",
+              "en": "Models propose tools/arguments without granting authority."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "examples",
+      "title": {
+        "vi": "3. Zero-shot, few-shot và dynamic examples",
+        "en": "3. Zero-shot, few-shot and dynamic examples"
+      },
+      "paragraphs": [
+        {
+          "vi": "Zero-shot dùng instructions không có task demonstrations; few-shot thêm labeled examples trong context mà không cập nhật weights; dynamic few-shot chọn examples từ một approved pool. Examples có thể làm rõ label boundaries, output formatting và abstention, nhưng cũng tốn context/latency và có thể làm model copy irrelevant surface patterns. Không có số examples luôn tối ưu cho mọi model/task.",
+          "en": "Zero-shot uses instructions without demonstrations; few-shot adds contextual labeled examples without weight updates; dynamic few-shot retrieves from approved pools. Examples can clarify labels, formats and abstention but consume context and can encourage irrelevant copying. No example count is universally optimal."
+        },
+        {
+          "vi": "Chọn examples cover ambiguous/negative/edge cases, cân label mix và không leak test answers. Dynamic retrieval cần tenant access, freshness/version và separation giữa training examples và evaluation cases. Đánh giá zero/fixed/dynamic trên cùng task suite và total token budget, thay assume retrieval luôn tốt hơn. Input schema cần units, null/unknown policy và task-specific meaning để tránh model phải đoán.",
+          "en": "Cover ambiguous, negative and edge cases without leaking test answers. Retrieved examples need tenant access, freshness and separation from evaluations. Compare zero/fixed/dynamic approaches on matched suites and budgets rather than assuming retrieval wins. Define units, unknown/null policies and field meanings instead of forcing guesses."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Cách",
+            "en": "Approach"
+          },
+          {
+            "vi": "Ưu điểm có thể có",
+            "en": "Potential advantage"
+          },
+          {
+            "vi": "Chi phí / failure mode",
+            "en": "Cost or failure mode"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Zero-shot",
+              "en": "Zero-shot"
+            },
+            {
+              "vi": "Ít context, template đơn giản",
+              "en": "Small context and simple templates"
+            },
+            {
+              "vi": "Instructions vẫn có thể ambiguous",
+              "en": "Instructions can remain ambiguous"
+            }
+          ],
+          [
+            {
+              "vi": "Fixed few-shot",
+              "en": "Fixed few-shot"
+            },
+            {
+              "vi": "Nhất quán examples và label boundaries",
+              "en": "Stable examples and label boundaries"
+            },
+            {
+              "vi": "Extra tokens; overfit/copy examples",
+              "en": "Extra tokens and copying/overfitting"
+            }
+          ],
+          [
+            {
+              "vi": "Dynamic examples",
+              "en": "Dynamic examples"
+            },
+            {
+              "vi": "Coverage theo input domain",
+              "en": "Input-dependent domain coverage"
+            },
+            {
+              "vi": "Retrieval latency, contamination và access scope",
+              "en": "Retrieval latency, contamination and access scopes"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "explanations",
+      "title": {
+        "vi": "4. Giải thích và reasoning cần mục tiêu đo được",
+        "en": "4. Explanations and reasoning need measurable goals"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một số tasks multi-step hưởng lợi từ intermediate demonstrations hoặc planning, nhưng không suy ra mọi model cần yêu cầu “think step by step” ở mọi call. Explicit reasoning có thể tăng cost/latency và tạo rationale nghe hợp lý cho answer sai. Với code consumers, yêu cầu concise justification hoặc externally verifiable evidence khi có ích; giữ machine-readable final output contract riêng.",
+          "en": "Some multistep tasks benefit from intermediate demonstrations/planning, but not every model/call needs a step-by-step instruction. Explicit explanations cost tokens/time and can rationalize wrong answers. Request concise justifications or externally verifiable evidence when useful, keeping machine-readable final contracts distinct."
+        },
+        {
+          "vi": "Đo answer accuracy/task success, evidence validity và latency thay chấm độ dài giải thích. Model-generated rationale không là proof và không cấp quyền thực thi. Nếu lookup, parser hoặc deterministic rule giải chính xác task, dùng nó thay thêm probabilistic generation chỉ vì có LLM trong hệ thống.",
+          "en": "Measure task success, evidence validity and latency rather than explanation length. Generated rationales are neither proofs nor execution authority. Prefer accurate lookups/parsers/rules when they solve the task without probabilistic generation."
+        }
+      ]
+    },
+    {
+      "id": "guarantees",
+      "title": {
+        "vi": "5. Ba lớp structure và một lớp truth",
+        "en": "5. Structural guarantees are separate from truth"
+      },
+      "paragraphs": [
+        {
+          "vi": "Asking for JSON chỉ là instruction; JSON-constrained mode nhắm JSON syntax; schema-constrained decoding áp supported schema/grammar subset. Mode names và guarantees phụ thuộc backend/version. Cần test unsupported keywords, enum, additional fields, optional/null và envelope outcomes. Không hứa every response parses: refusals, cancellation, output limits và transport errors cần handling ngoài domain schema.",
+          "en": "Asking for JSON is an instruction; JSON-constrained modes target syntax; schema-constrained decoding enforces supported grammar/schema subsets. Names and guarantees vary by backend/version. Test keywords, enums, extra fields, nullability and envelopes. Refusals, limits, cancellation and transport failures still need handling outside the domain schema."
+        },
+        {
+          "vi": "Một output {\"status\":\"closed\"} có thể đúng syntax và schema mà sai source facts vì ticket còn open. Schema có thể express một số rules nhưng không tự có external world state hoặc business authorization. Typed output giúp downstream code rõ hơn; correctness vẫn cần source evidence, domain rules, quality evals và explicit unknown/abstain behavior.",
+          "en": "A closed status can match syntax/schema while contradicting an open source ticket. Schemas can express some rules but do not automatically possess external state or authority. Types clarify downstream code, while correctness needs evidence, domain checks, evaluations and explicit unknown/abstention behavior."
+        }
+      ]
+    },
+    {
+      "id": "grammar",
+      "title": {
+        "vi": "6. Token mask hoạt động theo generated prefix",
+        "en": "6. Token masks follow generated prefixes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Grammar matcher theo dõi output prefix và xác định token pieces nào vẫn có thể dẫn tới permitted completion. Disallowed logits có thể bị set−∞ trước sampling/renormalization. Một model token không nhất thiết trùng JSON terminal: piece có thể chứa closing quote, comma và phần key tiếp theo. Tokenizer byte representation, escaping, vocabulary padding và EOS handling phải match engine; grammar compiler/cache cũng có compile cost và memory limits.",
+          "en": "Matchers track generated prefixes and permit pieces compatible with completion. Disallowed logits can become−∞ before sampling/renormalization. Pieces can span quotes, commas and following keys rather than matching individual grammar terminals. Tokenizer bytes, escaping, padded vocabularies and EOS must match the engine; compilers/caches also consume time and memory."
+        },
+        {
+          "vi": "Lab dùng finite language gồm sáu exact strings, không compile full JSON Schema. Nhìn một piece đi qua nhiều boundaries, compare free generation với masked generation và giảm step budget để thấy valid prefix chưa đủ complete output. Đây là scripted logits/greedy choice, không model benchmark; local masking chỉ mô tả allowed structure, không proof về truth hoặc exact global conditional distribution của mọi constrained sampler.",
+          "en": "The lab uses six exact strings instead of a full schema compiler. Observe pieces spanning boundaries, compare free/masked generation and shorten budgets to distinguish valid prefixes from complete output. Scripted greedy logits are not benchmarks; local masks demonstrate structure rather than truth or universal global conditional-sampling guarantees."
+        }
+      ],
+      "experiment": "prompt-grammar"
+    },
+    {
+      "id": "schema",
+      "title": {
+        "vi": "7. Viết schema và parser contract rõ",
+        "en": "7. Specify schemas and parsing precisely"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trong JSON Schema, properties mô tả known fields nhưng không làm chúng required. required khai báo fields bắt buộc; additionalProperties:false chặn unknown fields trong scope của schema đó. null khác missing và cần allowed type nếu hợp lệ. allOf không đơn giản merge object declarations; oneOf yêu cầu đúng một branch, anyOf ít nhất một branch. Pin dialect và supported backend subset trước dùng recursion hoặc complex combinations.",
+          "en": "Properties describe fields without requiring them; required makes presence mandatory. additionalProperties:false rejects unknown fields within its schema scope. Null differs from missing. allOf does not simply merge object declarations; oneOf requires exactly one matching branch, anyOf at least one. Pin dialects and supported subsets before using recursive/complex combinations."
+        },
+        {
+          "vi": "Strict JSON không có preamble/Markdown fences, NaN/Infinity hoặc trailing commas. Duplicate keys có interoperability risks và parser behavior khác nhau; nếu application cần reject thì dùng parser/check có khả năng đó trước khi duplicate bị mất trong object mapping. Đặt byte/depth/array limits trước expensive parsing/validation. Không salvage tùy ý bằng “lấy từ dấu{đầu đến}cuối” để âm thầm đổi contract.",
+          "en": "Strict JSON excludes preambles/fences, NaN/Infinity and trailing commas. Duplicate keys have inconsistent parser behavior; rejecting them requires detection before object conversion loses duplicates. Bound bytes, depth and arrays before expensive validation. Do not silently change contracts through arbitrary brace-based salvage."
+        }
+      ],
+      "code": {
+        "language": "json",
+        "content": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"ticket_id\": {\n      \"type\": \"string\"\n    },\n    \"status\": {\n      \"enum\": [\n        \"open\",\n        \"closed\"\n      ]\n    },\n    \"priority\": {\n      \"type\": \"integer\",\n      \"minimum\": 1,\n      \"maximum\": 3\n    }\n  },\n  \"required\": [\n    \"ticket_id\",\n    \"status\",\n    \"priority\"\n  ],\n  \"additionalProperties\": false\n}",
+        "caption": {
+          "vi": "Schema của validation fixture; source truth không nằm trong schema này.",
+          "en": "Validation-fixture schema; source truth is outside this schema."
+        }
+      }
+    },
+    {
+      "id": "validation",
+      "title": {
+        "vi": "8. Envelope → parse → schema → trusted evidence",
+        "en": "8. Validate envelopes, syntax, schemas and evidence"
+      },
+      "paragraphs": [
+        {
+          "vi": "Thử các outputs có extra field, string thay integer, missing field, semantic mismatch và refusal/truncation. Pipeline phân loại envelope trước parse, structural validation trước source comparison. Mismatch với trusted fixture là evidence cụ thể; nếu không có trustworthy source, validator không tự biết answer đúng và không nên báo semantic pass chỉ vì JSON hợp lệ.",
+          "en": "Try extra fields, wrong types, missing fields, semantic mismatches and refusals/truncation. Classify envelopes before parsing and structure before source comparison. A trusted fixture supplies specific evidence; without trustworthy sources, valid JSON cannot justify semantic approval."
+        }
+      ],
+      "experiment": "prompt-validation"
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "9. Theo dõi từng boundary của một prompt platform",
+        "en": "9. Trace prompt-platform boundaries"
+      },
+      "paragraphs": [
+        {
+          "vi": "Prompt assembler ghép approved instructions với bounded data; output consumer chỉ nhận typed result sau validation. Tool dispatcher có authority boundary riêng và repair loop có resource budget riêng. Traces bên dưới cũng cho thấy version rollout thuộc evaluation/control plane, không phải model tự sửa prompt production mỗi lần lỗi.",
+          "en": "Assemblers combine approved instructions with bounded data; consumers receive validated typed results. Tool dispatch has a separate authority boundary and repairs have separate budgets. Rollout belongs to evaluation/control planes rather than models rewriting production prompts after each error."
+        }
+      ],
+      "diagram": {
+        "id": "prompt-contract-boundaries",
+        "title": {
+          "vi": "Từ prompt revision tới output và authorized effect",
+          "en": "From prompt revisions to outputs and authorized effects"
+        },
+        "caption": {
+          "vi": "Chọn trace cho structured extraction, tool proposal, bounded repair, incomplete/refusal hoặc rollout. Trust boundaries do application code giữ, không do dấu phân cách trong prompt.",
+          "en": "Trace extraction, tools, bounded repair, incomplete/refused outputs or rollouts. Application code enforces trust boundaries; prompt delimiters do not."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "caller",
+            "label": {
+              "vi": "Caller / tenant",
+              "en": "Caller / tenant"
+            },
+            "detail": {
+              "vi": "Task input, identity, deadline và permissions đã xác minh.",
+              "en": "Task input, verified identity, deadlines and permissions."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "assemble",
+            "label": {
+              "vi": "Request assembler",
+              "en": "Request assembler"
+            },
+            "detail": {
+              "vi": "Typed inputs, pinned revisions, provenance và context budgets.",
+              "en": "Typed inputs, pinned revisions, provenance and context budgets."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "model",
+            "label": {
+              "vi": "Model / engine",
+              "en": "Model / engine"
+            },
+            "detail": {
+              "vi": "Instructions + data + supported constrained decoder; không trusted executor.",
+              "en": "Instructions, data and supported constraints; not a trusted executor."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "model"
+          },
+          {
+            "id": "envelope",
+            "label": {
+              "vi": "Response envelope",
+              "en": "Response envelope"
+            },
+            "detail": {
+              "vi": "Completion, refusal, truncation, tool-call identity và error status.",
+              "en": "Completion, refusal, truncation, tool-call identity and errors."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "registry",
+            "label": {
+              "vi": "Prompt / schema registry",
+              "en": "Prompt / schema registry"
+            },
+            "detail": {
+              "vi": "Immutable prompt/model/template/schema/tool versions, owner và rollout state.",
+              "en": "Immutable prompt/model/template/schema/tool versions, ownership and rollout state."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "context",
+            "label": {
+              "vi": "Untrusted context",
+              "en": "Untrusted context"
+            },
+            "detail": {
+              "vi": "User/retrieved/tool text có provenance, bounds và sanitization theo use case.",
+              "en": "User/retrieved/tool text with provenance, bounds and use-case handling."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "repair",
+            "label": {
+              "vi": "Repair budget",
+              "en": "Repair budget"
+            },
+            "detail": {
+              "vi": "Bounded attempts/deadline; errors không tự cấp thêm quyền.",
+              "en": "Bounded attempts/deadlines; errors do not grant new privileges."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "validate",
+            "label": {
+              "vi": "Parse / schema / rules",
+              "en": "Parse / schema / rules"
+            },
+            "detail": {
+              "vi": "Strict parsing, supported schema và explicit business checks.",
+              "en": "Strict parsing, supported schemas and explicit business checks."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "eval",
+            "label": {
+              "vi": "Eval / canary gate",
+              "en": "Eval / canary gate"
+            },
+            "detail": {
+              "vi": "Representative cases, adversarial data, versions, cost và rollout evidence.",
+              "en": "Representative cases, adversarial data, versions, costs and rollout evidence."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "consumer",
+            "label": {
+              "vi": "Typed consumer",
+              "en": "Typed consumer"
+            },
+            "detail": {
+              "vi": "Chỉ validated domain outputs; permission không lấy từ model text.",
+              "en": "Validated domain outputs; model text does not supply permissions."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "client"
+          },
+          {
+            "id": "authorize",
+            "label": {
+              "vi": "Tool authorization",
+              "en": "Tool authorization"
+            },
+            "detail": {
+              "vi": "Principal/resource scope, version, limits và operation fingerprint.",
+              "en": "Principal/resource scopes, versions, limits and operation fingerprints."
+            },
+            "x": 820,
+            "y": 700,
+            "kind": "service"
+          },
+          {
+            "id": "effects",
+            "label": {
+              "vi": "Effect + receipt",
+              "en": "Effect + receipt"
+            },
+            "detail": {
+              "vi": "Atomic durable decision/result cho supported operation; safe retry/reconcile.",
+              "en": "Atomic durable decisions/results for supported operations and safe retries."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "store"
+          }
+        ],
+        "traces": [
+          {
+            "id": "extract",
+            "label": {
+              "vi": "Structured extraction",
+              "en": "Structured extraction"
+            },
+            "steps": [
+              {
+                "from": "caller",
+                "to": "assemble",
+                "description": {
+                  "vi": "Validate typed input và principal; pin task contract.",
+                  "en": "Validate typed inputs/principals and pin task contracts."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "assemble",
+                "description": {
+                  "vi": "Resolve exact prompt/schema/model/template revisions.",
+                  "en": "Resolve exact prompt/schema/model/template revisions."
+                }
+              },
+              {
+                "from": "context",
+                "to": "assemble",
+                "description": {
+                  "vi": "Gắn provenance và đưa bounded untrusted data vào đúng input channel.",
+                  "en": "Attach provenance and bounded untrusted data to appropriate channels."
+                }
+              },
+              {
+                "from": "assemble",
+                "to": "model",
+                "description": {
+                  "vi": "Generate trong token/deadline budget với supported constraints.",
+                  "en": "Generate within budgets using supported constraints."
+                }
+              },
+              {
+                "from": "model",
+                "to": "envelope",
+                "description": {
+                  "vi": "Inspect outcome trước khi coi text là domain JSON.",
+                  "en": "Inspect outcomes before treating text as domain JSON."
+                }
+              },
+              {
+                "from": "envelope",
+                "to": "validate",
+                "description": {
+                  "vi": "Chỉ parse intended complete payload; validate types/rules.",
+                  "en": "Parse intended complete payloads and validate types/rules."
+                }
+              },
+              {
+                "from": "validate",
+                "to": "consumer",
+                "description": {
+                  "vi": "Deliver typed result hoặc explicit fallback/error.",
+                  "en": "Deliver typed results or explicit fallbacks/errors."
+                }
+              }
+            ]
+          },
+          {
+            "id": "tool",
+            "label": {
+              "vi": "Tool proposal tới effect",
+              "en": "From tool proposals to effects"
+            },
+            "steps": [
+              {
+                "from": "model",
+                "to": "envelope",
+                "description": {
+                  "vi": "Model proposes tool name/arguments; chưa là execution permission.",
+                  "en": "Models propose tool names/arguments without execution authority."
+                }
+              },
+              {
+                "from": "envelope",
+                "to": "validate",
+                "description": {
+                  "vi": "Validate completion/call identity, schema và business constraints.",
+                  "en": "Validate completion/call identity, schemas and business constraints."
+                }
+              },
+              {
+                "from": "validate",
+                "to": "authorize",
+                "description": {
+                  "vi": "Authorize current principal đối với resource/action trong server code.",
+                  "en": "Authorize the principal/resource/action in server code."
+                }
+              },
+              {
+                "from": "authorize",
+                "to": "effects",
+                "description": {
+                  "vi": "Check operation identity/version, commit effect và durable receipt theo transaction contract.",
+                  "en": "Check operation identity/versions and atomically commit effects/receipts under the transaction contract."
+                }
+              },
+              {
+                "from": "effects",
+                "to": "assemble",
+                "description": {
+                  "vi": "Return sanitized result có call identity; repeated delivery không tạo effect mới.",
+                  "en": "Return scoped results with call identity; replay does not create a new effect."
+                }
+              }
+            ]
+          },
+          {
+            "id": "repair",
+            "label": {
+              "vi": "Validation failure và bounded repair",
+              "en": "Validation failures and bounded repair"
+            },
+            "steps": [
+              {
+                "from": "validate",
+                "to": "repair",
+                "description": {
+                  "vi": "Classify structural/business error, redact unnecessary data và check remaining budget.",
+                  "en": "Classify errors, redact unnecessary data and check remaining budgets."
+                }
+              },
+              {
+                "from": "repair",
+                "to": "assemble",
+                "description": {
+                  "vi": "Only allowed repair context; không mở rộng tools hoặc principal permissions.",
+                  "en": "Supply allowed repair context without expanding tools or privileges."
+                }
+              },
+              {
+                "from": "assemble",
+                "to": "model",
+                "description": {
+                  "vi": "One bounded new attempt dưới same logical task contract.",
+                  "en": "Run a bounded new attempt under the same logical task contract."
+                }
+              },
+              {
+                "from": "model",
+                "to": "envelope",
+                "description": {
+                  "vi": "Re-check completion/refusal thay assume repaired output hợp lệ.",
+                  "en": "Recheck outcomes rather than assuming repairs are valid."
+                }
+              }
+            ]
+          },
+          {
+            "id": "incomplete",
+            "label": {
+              "vi": "Truncation hoặc refusal",
+              "en": "Truncation or refusal"
+            },
+            "steps": [
+              {
+                "from": "model",
+                "to": "envelope",
+                "description": {
+                  "vi": "Generation limit/refusal/cancel được phân loại riêng.",
+                  "en": "Classify limits, refusals and cancellations separately."
+                }
+              },
+              {
+                "from": "envelope",
+                "to": "repair",
+                "description": {
+                  "vi": "Policy chọn retry/reduce context/fallback trong bounded budget; không salvage tùy ý.",
+                  "en": "Choose bounded retry/context reduction/fallback without arbitrary salvage."
+                }
+              },
+              {
+                "from": "repair",
+                "to": "consumer",
+                "description": {
+                  "vi": "Trả explicit error/fallback khi không có complete validated result.",
+                  "en": "Return explicit errors/fallbacks when no validated result exists."
+                }
+              }
+            ]
+          },
+          {
+            "id": "rollout",
+            "label": {
+              "vi": "Version và rollout prompt",
+              "en": "Version and roll out prompts"
+            },
+            "steps": [
+              {
+                "from": "registry",
+                "to": "eval",
+                "description": {
+                  "vi": "Evaluate candidate revision trên pinned representative/adversarial cases.",
+                  "en": "Evaluate candidate revisions on pinned representative/adversarial cases."
+                },
+                "async": true
+              },
+              {
+                "from": "eval",
+                "to": "registry",
+                "description": {
+                  "vi": "Approve canary/rollback gate bằng quality/cost/error evidence.",
+                  "en": "Approve canary/rollback gates using quality, cost and error evidence."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "assemble",
+                "description": {
+                  "vi": "Resolve immutable approved revision; log version và schema/tool contract.",
+                  "en": "Resolve immutable approved revisions and record schema/tool contracts."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "tools",
+      "title": {
+        "vi": "10. Function calling là proposal interface",
+        "en": "10. Function calling exposes proposal interfaces"
+      },
+      "paragraphs": [
+        {
+          "vi": "Tool definitions khai báo name, description và argument schema giúp model đề xuất operation. Dispatcher phải allowlist tool name/version, validate complete arguments, bind verified principal, authorize resource/action và áp dụng limits/state preconditions. Tool description “chỉ dùng cho owner” giúp model hiểu, không ngăn unauthorized backend call. Tool results cũng là untrusted context khi đưa lại vào model.",
+          "en": "Tool definitions describe names, purposes and schemas for proposals. Dispatchers allowlist names/versions, validate complete arguments, bind verified principals and enforce resource permissions, limits and state preconditions. An owner-only description is guidance rather than backend enforcement. Tool results remain untrusted model context."
+        },
+        {
+          "vi": "Side effects cần stable logical operation identity và idempotency semantics do backend enforce. Một arbitrary key do model bịa không tự deduplicate retries; scope/fingerprint, durable result, key reuse/expiry và atomicity với effect phải rõ. Nếu effect ở external system, local receipt một mình không giải ambiguous outcome; cần cooperating idempotency/reconcile protocol. Không execute partial streamed arguments hoặc unverified drafts.",
+          "en": "Effects need stable operation identity and backend-enforced idempotency. Arbitrary model-invented keys do not deduplicate retries: define scope, fingerprints, durable results, expiry and effect atomicity. External effects need cooperating idempotency/reconciliation for ambiguous outcomes. Do not execute partial streamed arguments or unverified drafts."
+        }
+      ],
+      "experiment": "prompt-tools"
+    },
+    {
+      "id": "repair",
+      "title": {
+        "vi": "11. Bounded repair và failure taxonomy",
+        "en": "11. Bound repairs using failure categories"
+      },
+      "paragraphs": [
+        {
+          "vi": "Parse/schema errors có thể repair khi policy cho phép; gửi bounded sanitized error/context, không thêm privileges. Business/auth denial không nên retry mù để model tìm cách bypass. Output limit có thể cần smaller scope hoặc larger allowed budget; refusal có handling riêng. Mỗi attempt dùng overall deadline/token/cost cap và logs cùng logical request; repair success rate phải đo chứ không hứa một lần sửa là đủ.",
+          "en": "Policies can permit bounded repairs for structural failures using sanitized errors/context without new privileges. Blind retries must not bypass business/authorization denials. Limits may need smaller scopes or permitted budgets, while refusals need distinct handling. Bound total deadlines/tokens/costs and measure repair success rather than promising one repair suffices."
+        },
+        {
+          "vi": "Sau budget exhaustion, chọn explicit typed error, deterministic fallback, quarantine/review hoặc abstention theo application. Không crash cả batch vì một malformed item, không default “ok” để che lỗi và không execute tools trong repair/shadow attempts chưa được authorize. Preserve error reason và attempt count để distinguish model-quality issue với unavailable engine hoặc incompatible schema.",
+          "en": "After exhaustion, return typed errors, deterministic fallbacks, quarantine/review or abstention as appropriate. Avoid batch crashes, silent success defaults and unauthorized repair/shadow tool effects. Preserve reasons/attempts to distinguish quality failures from unavailable engines or incompatible schemas."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Một loop có điểm dừng",
+          "en": "A loop with a stopping boundary"
+        },
+        "caption": {
+          "vi": "Repair không được mở rộng authority hoặc bỏ qua validation.",
+          "en": "Repairs cannot expand authority or bypass checks."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Classify",
+              "en": "Classify"
+            },
+            "detail": {
+              "vi": "Envelope, parse, schema, business hay auth failure.",
+              "en": "Distinguish envelope, syntax, schema, business and authorization failures."
+            },
+            "icon": "inspect"
+          },
+          {
+            "title": {
+              "vi": "Budget",
+              "en": "Budget"
+            },
+            "detail": {
+              "vi": "Remaining deadline/tokens/attempts/cost.",
+              "en": "Check remaining time, tokens, attempts and cost."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Allowed repair",
+              "en": "Permitted repair"
+            },
+            "detail": {
+              "vi": "Only eligible errors với scoped context.",
+              "en": "Repair eligible errors using scoped context."
+            },
+            "icon": "route"
+          },
+          {
+            "title": {
+              "vi": "Revalidate / stop",
+              "en": "Revalidate or stop"
+            },
+            "detail": {
+              "vi": "Same boundaries hoặc explicit fallback/error.",
+              "en": "Reapply boundaries or return explicit fallbacks/errors."
+            },
+            "icon": "flag"
+          }
+        ]
+      }
+    },
+    {
+      "id": "variance",
+      "title": {
+        "vi": "12. Temperature, seeds và caching không tạo truth",
+        "en": "12. Temperatures, seeds and caching do not establish truth"
+      },
+      "paragraphs": [
+        {
+          "vi": "Temperature 0 thường chọn greedy token theo engine contract, nhưng tiny numerical differences/near ties, batch-dependent kernels hoặc changed revisions có thể đổi output. Seed có semantics riêng theo backend và không universal bitwise reproducibility. Pin revisions/settings và đo variation; reproducibility yêu cầu kiểm cả execution environment nếu task cần mức đó.",
+          "en": "Greedy decoding depends on engine contracts; numerical differences, near ties, batching or revision changes can alter outputs. Seed semantics are backend-specific rather than universally reproducible. Pin configurations and measure variation, controlling execution environments when stronger reproducibility is required."
+        },
+        {
+          "vi": "Response cache có thể giúp repeatability nhưng key cần tenant/access scope, normalized input có semantics an toàn, prompt/model/adapter/template/schema/tool versions và relevant data freshness. Không normalize làm mất meaning hoặc dùng cache cross-tenant để lộ outputs. Majority voting tăng cost và có thể lặp correlated errors; không thay correctness evidence hoặc permission checks.",
+          "en": "Caches can improve repeatability but need tenant/access scope, meaning-preserving input identities, relevant revisions and data freshness. Unsafe normalization or cross-tenant reuse can corrupt meanings or leak outputs. Voting costs resources and can repeat correlated errors rather than replacing evidence or permissions."
+        }
+      ]
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "13. Đưa prompt changes qua eval và canary",
+        "en": "13. Evaluate and canary prompt changes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Eval matrix nên có normal/ambiguous/negative cases, null/missing, long inputs, multilingual data, injected instructions, unsupported schema, refusals, truncation và retry/cancel. Đo parse/schema rates riêng field-level/source accuracy, abstention, unauthorized proposal/execution rates, tool correctness, cost và latency tails. Một schema-valid rate 100% không che semantic regressions.",
+          "en": "Evaluate normal, ambiguous, negative, missing/null, long, multilingual and injected inputs, unsupported schemas, refusals, limits and retries/cancellation. Separate structural rates from field/source accuracy, abstention, unauthorized proposals/executions, tool correctness, cost and tails. Perfect schema rates cannot hide semantic regressions."
+        },
+        {
+          "vi": "Mỗi call site cần typed adapter và exact contract revision; consumer migration tránh silently treating new labels như old semantics. Canary có bounded traffic/cost, per-slice gates và rollback về approved version. Telemetry phải privacy-aware, đủ trace model/prompt/schema/tool revisions và logical attempt nhưng không expose secrets/tool credentials. Prompt platform là software lifecycle với probabilistic component, không tập string literals rời rạc.",
+          "en": "Call sites need typed adapters and exact revisions, with migrations that preserve label meanings. Bound canary traffic/costs, use slice-level gates and retain approved rollbacks. Trace revisions and attempts under privacy limits without exposing secrets/credentials. A prompt platform is a software lifecycle around a probabilistic component."
+        }
+      ]
+    },
+    {
+      "id": "questions",
+      "title": {
+        "vi": "14. Câu hỏi và lời giải",
+        "en": "14. Questions with worked answers"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Invalid JSON làm downstream crash thì sửa ở đâu?",
+            "en": "Where should invalid JSON crashes be addressed?"
+          },
+          "answer": [
+            {
+              "vi": "Dùng supported structured generation nếu phù hợp, nhưng consumer vẫn kiểm envelope/parse/schema và domain rules. Bound repair rồi typed fallback/quarantine; đo field accuracy riêng structural rate. Không assume invalid 2% là toàn bộ lỗi quality.",
+              "en": "Use supported constraints where appropriate while keeping consumer envelope, syntax, schema and domain checks. Bound repairs and use typed fallback/quarantine, measuring field accuracy separately from structure. Visible syntax failures do not describe all quality problems."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Vì sao valid prefix có thể không parse được?",
+            "en": "Why can a valid prefix fail JSON parsing?"
+          },
+          "answer": [
+            {
+              "vi": "Grammar cho prefix còn có đường tới completion, nhưng max tokens/cancel có thể dừng trước closing structure. Check finish envelope và không consume partial streamed object như complete result. EOS cần matcher state phù hợp.",
+              "en": "A viable prefix can still end early due to budgets/cancellation. Check completion envelopes rather than consuming partial objects, and allow EOS only under compatible matcher states."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Escaping ticket text có chặn prompt injection không?",
+            "en": "Does escaping ticket text prevent prompt injection?"
+          },
+          "answer": [
+            {
+              "vi": "Escaping/delimiters giúp presentation và tránh delimiter collision, không guarantee instruction hierarchy được tuân thủ. Giữ untrusted provenance, limited tools và server authorization. Permissions phải chặn effect ngay cả khi model bị tác động.",
+              "en": "Escaping/delimiters help presentation rather than guaranteeing instruction adherence. Preserve provenance, restrict tools and enforce permissions so effects remain bounded even when model behavior is manipulated."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có properties thì fields đã bắt buộc chưa?",
+            "en": "Do properties declarations require fields?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. required kiểm presence; additionalProperties quản unknown fields trong schema scope. null khác missing và phải hợp allowed type. Pin dialect/backend subset, test combinations thay giả định allOf merge fields như object spread.",
+              "en": "No. required checks presence, additionalProperties controls unknown fields within scope, and null requires allowed typing. Pin dialect/backend support and test combinations rather than treating allOf like object spread."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Tool call có schema đúng thì execute được chưa?",
+            "en": "Is a schema-valid tool call ready to execute?"
+          },
+          "answer": [
+            {
+              "vi": "Chưa. Bind principal đã verify, allowlist tool/version, authorize resource/action, kiểm state/version/limits và operation identity. Proposal không cấp quyền; partial arguments hoặc discarded attempts không được tạo side effects.",
+              "en": "Not yet. Bind verified principals, allowlist tools/versions and check permissions, state, limits and operation identity. Proposals do not grant authority; partial/discarded attempts cannot trigger effects."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Commit thành công nhưng response mất thì retry ra sao?",
+            "en": "How should a lost commit response be retried?"
+          },
+          "answer": [
+            {
+              "vi": "Retry same logical key/fingerprint trong proper scope để đọc durable result. Effect+receipt cần atomic hoặc cooperating external idempotency/reconcile contract. New arbitrary key có thể bỏ dedup; reused key khác arguments phải reject.",
+              "en": "Use the same scoped logical key/fingerprint to obtain durable results. Effects/receipts need atomicity or cooperating external reconciliation. New keys bypass deduplication, while reused keys with changed arguments must be rejected."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Temperature 0 và seed có đủ để test exact output không?",
+            "en": "Are greedy decoding and a seed enough for exact-output tests?"
+          },
+          "answer": [
+            {
+              "vi": "Không universal. Pin model/template/settings, kiểm backend/environment guarantees và numerical variation. Test semantic/domain properties khi exact token equality không là contract; cache không tự sửa answer sai hoặc stale data.",
+              "en": "Not universally. Pin configurations and verify backend/environment guarantees. Test semantic/domain properties when token identity is not contracted; caches do not repair wrong answers or stale data."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Muốn migrate 50call sites sang prompt registry thì làm gì?",
+            "en": "How would fifty call sites migrate to a prompt registry?"
+          },
+          "answer": [
+            {
+              "vi": "Inventory inputs/consumers, tạo typed versioned contracts và baseline evals. Thêm adapters/capability checks, migrate từng cohort sau canary, trace revisions và giữ rollback. Đo quality/cost/error theo slice; không chỉ move string vào database rồi gọi là versioning.",
+              "en": "Inventory consumers, define typed versioned contracts and baseline evaluations, then add adapters/capability checks. Migrate cohorts through canaries with tracing/rollback and slice-level measurements rather than merely moving strings into a database."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

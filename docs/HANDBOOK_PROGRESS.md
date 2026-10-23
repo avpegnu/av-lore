@@ -4,15 +4,15 @@ Cập nhật23/10/2026. Chủ sở hữu đã quay lại và yêu cầu tiếp t
 
 ## Trạng thái hiện tại
 
-- **54/73 bài có nội dung Việt–Anh trong source**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories và 4 AI Systems. **54 bài đã build/browser local.**
-- Tất cả 54 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
-- **19 mục chưa biên soạn**: 11 AI Systems, 3 Practice và 5 Interview tools. Tiếp theo `ai-serving`; đã research, chưa implementation.
-- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local54. Bài mới `/ai-systems/ai-parallelism/` có bản `/en/` tương ứng.
+- **56/73 bài có nội dung Việt–Anh trong source**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories và 6 AI Systems. **56 bài đã build/browser local.**
+- Tất cả 56 bài `status: review`, **0 complete**. Build/tests/counts không thay vòng review độc lập về coverage, kỹ thuật, diễn giải/English và visual learning purposes.
+- **17 mục chưa biên soạn**: 9 AI Systems, 3 Practice và 5 Interview tools. Tiếp theo `ai-rag`; có models/tests, chưa UI/canonical.
+- Main preview **http://127.0.0.1:4322/av-lore/** đã publish local56. Bài mới `/ai-systems/ai-prompting/` có bản `/en/` tương ứng.
 - Giữ198 chương/15 lộ trình,31 Notes & Interview topics, stable IDs, localStorage keys và9 themes. Không portfolio.
 
 ## Mốc đã push
 
-- **Checkpoint51 đã push:** AV Lore `5b4043d`, IT Basic `c957138`. Pages https://github.com/avpegnu/av-lore/actions/runs/39882720793 thành công; IT VPS https://github.com/avpegnu/it-basic/actions/runs/39882722183 failed. Checkpoint52–54 đã kiểm tra và chuẩn bị commit/push trong lượt tiếp tục23/10.
+- **Checkpoint51 đã push:** AV Lore `5b4043d`, IT Basic `c957138`. Pages https://github.com/avpegnu/av-lore/actions/runs/39882720793 thành công; IT VPS https://github.com/avpegnu/it-basic/actions/runs/39882722183 failed. Checkpoint52–54 đã push AV Lore `a5015af`, IT Basic `baba703`; Pages39885948851 thành công, IT VPS39885950249 failed. Nội dung ai-serving55 đang phát triển local.
 
 - Checkpoint33: AV Lore `3f3974547036498387b2bab2d6fcbe58aa581916`, IT Basic `996c995f1ec763944fe9d5bc53efc52d74861ef2`. Pages thành công39721870116.
 - Checkpoint40: AV Lore `243167f548a0a2a6add8a9adf6c98d9e263f8f4a`, IT Basic `4cd80c94c25287d217e12e5fb53c0a4cf50836af`. Pages thành công https://github.com/avpegnu/av-lore/actions/runs/39740983441 . IT VPS39740981336 failed `ssh-keyscan`, vẫn failed sau1retry.
@@ -180,3 +180,31 @@ Mainpreview nếu đã tắt sau shutdown có thể restart tại rootAVLore:`np
 -Dedicated đầu scenario pass nhưng axe harness lỗi vìbrowser.newPage; sửa explicitbrowser.newContext/newPage rồi chạy lại dedicatedpass. Không sửa app để bỏ qua check. Test/logs `parallel-*`; screenshots/reports`artifacts/parallel-*`.
 -Main4322publish54;stage4323stopped. Chuẩn bị checkpoint52–54 stable, chưa hoàn thành scope. Còn11AI+8Practice/Interview chưa author; toàn bộ54bài vẫnstatusreview,0complete.
 -Tiếp theo`ai-serving`: fullchapter+cascade model đã đọc; primarycurrentvLLMLoRA/OpenAIcompatible, SGLang, TensorRT-LLM, Triton, TGImaintenanceREADME, llama.cpp, S-LoRA/Punica/RouteLLM đã kiểm. Corrections: engine/server-layer taxonomy overlapping; APIcompatibility không fullsemanticparity; schema validation không semanticconfidence; fallback có thể làm đáp án đúng thành sai; costformula cần3600 và không double utilization; arbitraryfullfinetunes không tự thànhLoRA; adapterauth/revision/pinning/cacheidentity phải rõ.
+
+## Checkpoint54 đã push / local55 đang phát triển
+
+- AV Lore `a5015af`, IT Basic `baba703` push thành công. Pages https://github.com/avpegnu/av-lore/actions/runs/39885948851 success; ITVPS https://github.com/avpegnu/it-basic/actions/runs/39885950249 failed. Không đổi Settings/workflow/secrets; không suy deploy từ push.
+- `ai-serving.json` source55 đã author15sections/5traces/5internalAPIs/3labs/8workedquestions, VIENstatusreview. `serving-stack-models.ts` và tests/UI đã có: jointoutcomescascade (falseescalation có thể regression), compatibleadapterauth/base/pinned eviction, wholewindowvsbusycostvàSLOdenominator. Chưa build/browser/verify55; main vẫn54.
+- Primaryengine/LoRA/routerdocs đã đọc; chưa gọi online translator. Bản English/runtime mappings biên tập tay. Cần hoàn tất validation, syncstatic, screenshots và cập nhật actualprogress trước tính55validated.
+
+## Local55: Serving Stacks & Model Routing — đã publish local
+
+`ai-serving.json`:15sections/5traces/5internalAPIs/3labs/8workedquestions, VIENstatusreview. Engineevaluation/capabilitycontracts, compatiblemultiLoRA, auth/base/pin-awareadmission, jointoutcomescascade, streamingcommit/sideeffects, wholewindowcost/SLOdenominators và fleetplanning. Primaryprojectcapabilities kiểm23/10/2026; không benchmark/không providerpricing.
+
+-275sourcefiles0diagnostics159tests;620pages275488links/assets,localization0missing. Dedicated3labs/VIEN/keyboard/mobile/9themes và generic4routes(ai-serving+ai-parallelism)pass; prosepolishspacing xong rebuild/verify, rerun dedicated+generic2routes/static2pagespass. Đã xem desktop/mobile screenshots.
+-Static55:112HTML1322internal links. Main4322publish55;stage4323stopped. Logs`serving-stack-{polish-build,polish-verify,final-browser,final-generic-browser,final-legacy-browser}.log`; screenshots`artifacts/serving-stack-*`. Local55 chưa push; checkpoint54 vẫnGitHubHEAD.
+-Tiếp theo56`ai-prompting`: fullchapter/toymodel và primaryRFC/JSONSchema/XGrammar/vLLM/fewshot/CoT/guidedgeneration đã đọc. `prompt-contract-models.ts`, tests4passed và unwired`PromptContractPlayground.tsx` local. Chưa canonical/schema/renderer/CSS/dictionary/browserscript/static/build56. Models: six-string prefix masks với multigrammar-boundary pieces và EOS/truncation; parse/schema/trusted-source ladder; close-ticket auth/version/blockers/atomicreceipt-idempotency. Không generalgrammarcompiler, tokenizer, JSONschemalibrary hoặc securityimplementation. Cần hoàn thiện rồi validate; không rerun author55 vì canonical đã polish sau helper.
+
+## Local56 đang kiểm tra cuối — Prompting & Structured Output
+
+- Canonical`ai-prompting.json`:14sections/5traces/3labs/8workedquestions, VIENstatusreview. Đã nối schema/renderer/CSS/dictionary/package và `prompt-contract-browser-check.mjs`. Không rerun creation helper: canonical đã polish number spacing trực tiếp.
+- Sourcecheck latest279files0diagnostics,163tests. Build/verify đầu56:622pages276984links,localization0missing; dedicated3labs/VIENkeyboard/mobile9themes và generic2routes/static2pages pass. Static56:114HTML1342links. Screenshots desktop/mobile đã xem.
+- Sau screenshot review đã đổi generic stepper/result/reset labels sang VI đúng UI và dictionaryEN tương ứng. Finalbuild/verify đang chạy `.cache/handbook-preview/`, logs`prompt-final-{build,verify}.log`; session80938 nếu còn. Stage server4323stopped. Main4322vẫn55; **chưa publish56 sau polish**, cần đợi exit0, startstage, rerun dedicated+generic và screenshots cuối rồi publish. Không nhầm first pass với final build.
+- Models use six exact strings, vocab25; defaultmasked output`{"status":"ok","count":0}`5steps inclEOS, stepbudget2LIMIT, free`Sure!`2stepsEOS. Validation defaultsemanticmismatch; presetsparse/schema/refusal/incomplete. Tooldefaultatomiccommit+lostresponse, samekeyreplay1effect, changedargsKEY_MISMATCH, newkeystaleVERSION_CONFLICT; auth/businessgates độc lập. Fixed toy logits để free greedy choice đúng highestscore; tests validate that.
+- RAG57 research: đã đọc fullchapter, retrievalmodel vàANNdemo; primaryRAG2005.11401,HNSW1603.09320,FaissIVF+memorydocs,RRF2009,BM25review,reranker1901.04085,HyDE2212.10496,LostMiddle2307.03172,Anthropiccontextualretrieval,Azurefilterdocs. Chưa57source. Corrections: retrievalmiss không mặc định là phần lớn mọi lỗi; ANNrecall vs relevance khác nhau; exactscan không luôn quá chậm; metric/normalization/encoderpair phải hợp training; reembedding compatibility needsmeasured migration; postfilter không tự noleaks nếu unauthorized content đi reranker/log/provider; querytimeACL+freshfetch/revalidation/cache scope; no automaticbest reranker/hybrid/longcontext thresholds.
+
+## Local56 đã hoàn tất validation và publish local
+
+- Finalpolish sourcecheck279files0diagnostics,163tests; finalbuild/verify622pages276984links/assets,localization0missing. Dedicated3labs/VIENkeyboard/mobile9themes và generic2routes pass sau UIlabelsVI/ENpolish; screenshots đã xem. Shared static114HTML1342links/static2pagespass.
+- Main4322publish56;stage4323stopped. Logs`prompt-final-*`; screenshots`artifacts/prompt-contract-*`. Source55+56 ổn định chuẩn bị checkpoint, toàn bộ56vẫnstatusreview/0complete. Còn9AI+8tools chưa author rồi independentreview.
+- RAG57 mới có `rag-learning-models.ts`, `tests/rag-learning-models.test.ts`4tests pass; **chưa UI/canonical/schema/dictionary/browser/static/build57**. Fused fixedlists8docs với eligible/relevance annotations, candidateceiling/rerank và filterstarvation; actual48-point2DIVF/nprobe/exacttop4 comparisons, payloadmemory + PQcodebooks; generation4 latebuild so generation5 current/delete, finalquerypermissionguard. Không fabricated latency/recall curves; rerank outputs precomputedfixture không realneuralmodel. Không commit source57 partial cùng checkpoint56.

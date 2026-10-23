@@ -1,0 +1,1200 @@
+{
+  "id": "ai-serving",
+  "group": "ai",
+  "status": "review",
+  "title": {
+    "vi": "Serving Stacks & Model Routing: engine, adapters và chi phí",
+    "en": "Serving Stacks & Model Routing: engines, adapters and cost"
+  },
+  "summary": {
+    "vi": "Chọn serving engine bằng workload thật, giữ API contract rõ, dùng multi-LoRA có isolation, đánh giá router/cascade bằng quality evidence và tính chi phí theo đúng SLO/measurement window.",
+    "en": "Choose serving engines using real workloads, preserve API contracts, isolate multi-LoRA workloads, evaluate routers/cascades with quality evidence and price serving under explicit SLOs and measurement windows."
+  },
+  "prerequisites": [
+    "ai-inference",
+    "ai-kv-cache",
+    "ai-batching",
+    "ai-parallelism"
+  ],
+  "relatedTopics": [
+    "system-design",
+    "observability",
+    "security",
+    "distributed"
+  ],
+  "takeaways": [
+    {
+      "vi": "Engine quản model loop; gateway, routing và control plane có trách nhiệm riêng dù một sản phẩm có thể gộp nhiều lớp.",
+      "en": "Engines manage model loops; gateways, routing and control planes have distinct responsibilities even when products combine them."
+    },
+    {
+      "vi": "OpenAI-compatible API không tự đảm bảo giống tokenizer, templates, tools, streaming hoặc sampling semantics.",
+      "en": "An OpenAI-compatible API does not establish identical tokenizers, templates, tools, streaming or sampling semantics."
+    },
+    {
+      "vi": "Multi-LoRA chỉ chia sẻ base khi adapters tương thích; authorization và active revision pinning đi trước cache hit.",
+      "en": "Multi-LoRA shares compatible bases; authorization and active revision pinning precede cache hits."
+    },
+    {
+      "vi": "Routing chọn trước; cascade chạy nhiều attempts. Verifier có false accepts/rejections và fallback có thể đổi đáp án đúng thành sai.",
+      "en": "Routing selects upfront; cascades execute several attempts. Verifiers make errors and fallbacks can turn correct answers into wrong ones."
+    },
+    {
+      "vi": "Chi phí mỗi triệu tokens phải nêu input/output, counting window, SLO qualification và overhead; không nhân busy fraction hai lần.",
+      "en": "Per-million-token costs need input/output definitions, windows, SLO qualification and overhead without double-counted busy fractions."
+    },
+    {
+      "vi": "Rollout engine, adapter và routing policy cần evals, canary, traceable revisions và bounded fallback.",
+      "en": "Engine, adapter and policy rollouts need evaluations, canaries, traceable revisions and bounded fallbacks."
+    }
+  ],
+  "overview": {
+    "title": {
+      "vi": "Từ engine tới chi phí phục vụ có thể giải thích",
+      "en": "From engines to explainable serving costs"
+    },
+    "caption": {
+      "vi": "Tối ưu một metric không được làm mất quality, isolation hoặc delivery contract.",
+      "en": "Optimizing one metric must preserve quality, isolation and delivery contracts."
+    },
+    "steps": [
+      {
+        "title": {
+          "vi": "Đặt contract",
+          "en": "Define contracts"
+        },
+        "detail": {
+          "vi": "Models, templates, tools, output và deadlines.",
+          "en": "Specify models, templates, tools, outputs and deadlines."
+        },
+        "icon": "target"
+      },
+      {
+        "title": {
+          "vi": "Chọn và profile engine",
+          "en": "Select and profile engines"
+        },
+        "detail": {
+          "vi": "Replay length mix, concurrency, reuse và adapters.",
+          "en": "Replay lengths, concurrency, reuse and adapters."
+        },
+        "icon": "gauge"
+      },
+      {
+        "title": {
+          "vi": "Route có evidence",
+          "en": "Route using evidence"
+        },
+        "detail": {
+          "vi": "Task-specific quality, calibrated checks và eligible pools.",
+          "en": "Use task quality, calibrated checks and eligible pools."
+        },
+        "icon": "decision"
+      },
+      {
+        "title": {
+          "vi": "Đo unit economics",
+          "en": "Measure unit economics"
+        },
+        "detail": {
+          "vi": "Whole-window spend, qualifying work và failed attempts.",
+          "en": "Measure window-level spend, qualifying work and failed attempts."
+        },
+        "icon": "chart"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "id": "layers",
+      "title": {
+        "vi": "1. Engine, server và gateway làm những việc gì?",
+        "en": "1. What do engines, servers and gateways do?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Serving engine thực hiện model execution: scheduling/batching, KV management, kernels, distributed ranks và sampling. Server/API layer nhận requests, stream output và expose metrics. Gateway bổ sung identity, tenant budgets, routing và application policy; control plane quản artifact/revision, placement và rollout. Đây là phân chia trách nhiệm, không phải nhãn độc quyền: một project có thể cung cấp cả engine lẫn HTTP server.",
+          "en": "A serving engine handles scheduling, KV, kernels, distributed execution and sampling. Server/API layers accept requests, stream output and expose metrics. Gateways add identity, budgets, routing and application policies, while control planes manage artifacts, placement and rollouts. These are responsibilities rather than exclusive product categories; one project can provide several layers."
+        },
+        {
+          "vi": "Đừng tự viết GPU engine nếu existing engine đáp ứng requirements và bạn không có lý do/kernel expertise cần thiết. Tuy nhiên không có một engine luôn tốt nhất: model architecture, supported hardware, precision, adapters, output constraints và workload shape có thể thay đổi kết quả. Số tokens/s từ một benchmark khác không thay cho profile cùng revision/quality trên traffic của mình.",
+          "en": "Existing engines are usually a sensible starting point unless requirements justify specialized execution work. No engine wins universally: architecture, hardware, precision, adapters, output constraints and traffic shape matter. Benchmark token rates under other conditions cannot replace profiling matched revisions and quality on representative traffic."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Data plane",
+            "en": "Data plane"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Requests, model loop, KV và delivery đi trong latency budget.",
+              "en": "Requests, model execution, KV and delivery share latency budgets."
+            },
+            {
+              "vi": "Cancel/timeout phải dừng hoặc fence outstanding work đúng contract.",
+              "en": "Cancellation/timeouts must stop or fence outstanding work correctly."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Control plane",
+            "en": "Control plane"
+          },
+          "icon": "scope",
+          "tone": "positive",
+          "items": [
+            {
+              "vi": "Artifacts/revisions, capability registry, deployment và health.",
+              "en": "Manage artifacts/revisions, capabilities, deployments and health."
+            },
+            {
+              "vi": "Admin load/unload APIs không tự là public tenant endpoints.",
+              "en": "Administrative load/unload APIs are not automatically public tenant endpoints."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Evaluation plane",
+            "en": "Evaluation plane"
+          },
+          "icon": "inspect",
+          "tone": "caution",
+          "items": [
+            {
+              "vi": "Task labels, policy versions, calibrated quality và drift.",
+              "en": "Track task labels, policy versions, calibration and drift."
+            },
+            {
+              "vi": "Shadow work có cost, privacy constraints và không được lặp side effects.",
+              "en": "Shadow work costs resources, respects privacy and avoids repeated side effects."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "landscape",
+      "title": {
+        "vi": "2. Landscape: chọn theo capabilities, không chỉ theo tên",
+        "en": "2. Compare capabilities rather than product names"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bảng này là orientation theo project capabilities đã kiểm ở tháng 10/2026, không phải benchmark hoặc khuyến nghị một phiên bản cụ thể. Luôn pin release/container, model commit và runtime/hardware profile. Support matrix có thể khác giữa backends trong cùng engine; một feature được hỗ trợ không có nghĩa dùng được với mọi model, quantization hoặc parallel layout.",
+          "en": "This is a capability orientation checked in October 2026 rather than a benchmark or release recommendation. Pin releases/containers, model commits and runtime/hardware profiles. Backends within one engine can have different support matrices; supported features are not universal across models, quantization and parallel layouts."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Project/lớp",
+            "en": "Project/layer"
+          },
+          {
+            "vi": "Phạm vi nổi bật",
+            "en": "Typical scope"
+          },
+          {
+            "vi": "Cần kiểm bằng workload",
+            "en": "Validate on your workload"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "vLLM",
+              "en": "vLLM"
+            },
+            {
+              "vi": "LLM engine + serving API; batching, paged KV, prefix reuse và adapters",
+              "en": "LLM engine and API with batching, paged KV, prefix reuse and adapters"
+            },
+            {
+              "vi": "Model/backend/layout support; adapters, token semantics và tuning",
+              "en": "Model/backend/layout support, adapters, token semantics and tuning"
+            }
+          ],
+          [
+            {
+              "vi": "SGLang",
+              "en": "SGLang"
+            },
+            {
+              "vi": "Serving framework với RadixAttention/prefix reuse và distributed execution",
+              "en": "Serving framework with RadixAttention/prefix reuse and distributed execution"
+            },
+            {
+              "vi": "Actual model/output-constraint/backend path của release đã pin",
+              "en": "Pinned-release model, constrained-output and backend paths"
+            }
+          ],
+          [
+            {
+              "vi": "TensorRT-LLM",
+              "en": "TensorRT-LLM"
+            },
+            {
+              "vi": "NVIDIA-oriented optimized LLM execution; nhiều runtime/deployment paths",
+              "en": "NVIDIA-oriented optimized LLM execution with multiple runtime/deployment paths"
+            },
+            {
+              "vi": "GPU generation, backend/build profiles, precision và operational workflow",
+              "en": "GPU generations, backends/build profiles, precision and operations"
+            }
+          ],
+          [
+            {
+              "vi": "Triton Inference Server",
+              "en": "Triton Inference Server"
+            },
+            {
+              "vi": "General model server với nhiều backends, gồm LLM backends",
+              "en": "General model server with multiple backends including LLM engines"
+            },
+            {
+              "vi": "Backend scheduler/feature semantics; tránh nhầm server với kernel engine",
+              "en": "Backend scheduling/features rather than equating the server with one kernel engine"
+            }
+          ],
+          [
+            {
+              "vi": "TGI",
+              "en": "TGI"
+            },
+            {
+              "vi": "Integrated text-generation serving system; maintenance notice trong project README",
+              "en": "Integrated text-generation serving system with a project maintenance notice"
+            },
+            {
+              "vi": "Support/lifecycle, security updates và migration needs của deployment hiện có",
+              "en": "Lifecycle, security updates and migration needs of existing deployments"
+            }
+          ],
+          [
+            {
+              "vi": "llama.cpp",
+              "en": "llama.cpp"
+            },
+            {
+              "vi": "C/C++ inference, GGUF, CPU/GPU backends và server; local/edge cũng là use cases",
+              "en": "C/C++ inference, GGUF, CPU/GPU backends and server, including local/edge use cases"
+            },
+            {
+              "vi": "Memory bandwidth, quantization, context/concurrency và hardware fit",
+              "en": "Memory bandwidth, quantization, context/concurrency and hardware fit"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "selection",
+      "title": {
+        "vi": "3. Engine evaluation phải giữ quality và traffic mix",
+        "en": "3. Engine evaluation preserves quality and traffic mix"
+      },
+      "paragraphs": [
+        {
+          "vi": "Xây replay suite gồm prompt/output lengths, arrival bursts, concurrency, prefix reuse, multimodal payloads nếu có và adapter churn. Đo queue-inclusive TTFT, inter-token gaps/TPOT, goodput theo targets, peak memory, cold start và error/cancel behavior. Open-loop arrival tests giúp phát hiện overload; closed-loop clients tự chậm có thể che queue pressure. Đặt giới hạn để test không chỉ tạo OOM rồi đo những requests sống sót.",
+          "en": "Replay lengths, arrival bursts, concurrency, reuse, applicable multimodal payloads and adapter churn. Measure queue-inclusive TTFT, token gaps/TPOT, target-qualified goodput, memory peaks, cold starts and cancellation/errors. Open-loop arrivals reveal overload that self-throttling closed-loop clients can hide. Bound workloads rather than reporting only requests that survive OOM."
+        },
+        {
+          "vi": "So sánh cùng model revision, template/tokenizer, sampling policy, precision/quality target và hardware allocation. Chạy evals cho outputs/structured/tool semantics; khác numerical kernels có thể không token-identical dù quality phù hợp. Ghi supported feature failures thay silently drop fields. Chọn candidate bằng Pareto trade-offs giữa quality, latency, cost và operability; rollback path phải có trước rollout.",
+          "en": "Match revisions, templates/tokenizers, sampling, quality/precision and hardware allocation. Evaluate output, structured and tool semantics; numerical kernels need not yield identical tokens despite acceptable quality. Report unsupported features instead of silently dropping fields. Choose among quality, latency, cost and operational trade-offs with rollback prepared before rollout."
+        }
+      ]
+    },
+    {
+      "id": "contract",
+      "title": {
+        "vi": "4. Compatible HTTP API cần semantic contract riêng",
+        "en": "4. Compatible HTTP APIs still need semantic contracts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Một JSON shape quen thuộc giúp client tích hợp, nhưng compatibility phải kiểm theo features được dùng. Chat template và special tokens thay prompt; tool calls cần parser/delivery rules; JSON schema support có thể chỉ là syntax constraints; seed, stop strings, reasoning fields và usage accounting có thể khác. Unknown fields cần explicit reject hoặc documented handling, không silently accept để tạo cảm giác parity.",
+          "en": "Familiar JSON shapes ease integration but compatibility needs feature-level tests. Templates/special tokens change prompts; tools require parsers/delivery rules; JSON support can be syntactic only. Seeds, stops, reasoning fields and usage can differ. Reject unsupported fields or document handling rather than silently suggesting parity."
+        },
+        {
+          "vi": "Dưới đây là internal API minh họa của hệ thống, không phải exact API của một engine hoặc provider. Request pin logical model/adapter revision, contract version và overall deadline. Gateway dịch sang engine-specific requests rồi normalize chỉ những semantics đã test. Tenant authorization, model capabilities, input/output limits, attempt IDs và cancellation cần giữ xuyên suốt.",
+          "en": "The following teaching API is internal to this architecture rather than an engine/provider API. Requests pin logical model/adapter revisions, contract versions and overall deadlines. Gateways translate to engine calls and normalize only tested semantics, preserving authorization, capabilities, limits, attempts and cancellation."
+        }
+      ],
+      "api": [
+        {
+          "method": "POST",
+          "path": "/internal/v1/generate",
+          "description": {
+            "vi": "Generate theo logical model capability contract, stream hoặc buffered.",
+            "en": "Generate under a logical capability contract with streaming or buffering."
+          },
+          "request": "{requestId, contractVersion, modelRevision, adapterRevision?, messages, outputLimit, deadlineAt, stream}",
+          "response": "200 {requestId,attemptId,modelRevision,output,finishReason,usage} OR ordered stream events",
+          "notes": [
+            {
+              "vi": "Model/adapter không nằm trong allowed set thì reject trước compute; không cho arbitrary artifact path.",
+              "en": "Reject unauthorized model/adapters before computation; do not accept arbitrary artifact paths."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/internal/v1/models/{revision}/capabilities",
+          "description": {
+            "vi": "Discover tested tools/schema/context/precision semantics theo revision.",
+            "en": "Discover tested tool/schema/context/precision semantics by revision."
+          },
+          "response": "200 {revision,templateVersion,tokenizerVersion,features,limits,contractVersion}"
+        },
+        {
+          "method": "POST",
+          "path": "/internal/v1/requests/{requestId}/cancel",
+          "description": {
+            "vi": "Authenticated cancellation, không khẳng định mọi GPU kernel đã dừng ngay.",
+            "en": "Authenticated cancellation without claiming all kernels have already stopped."
+          },
+          "response": "202 {requestId,cancellationAcceptedAt}"
+        },
+        {
+          "method": "POST",
+          "path": "/admin/v1/adapters/register",
+          "description": {
+            "vi": "Trusted control-plane operation: approved artifact và base/revision metadata.",
+            "en": "Trusted control-plane registration of approved artifacts/base metadata."
+          },
+          "request": "{adapterRevision,baseRevision,checksum,format,targetModules,rank,owner,artifactRef}",
+          "response": "202 {adapterRevision,state:\"validating\"}",
+          "notes": [
+            {
+              "vi": "Admin scope riêng; readiness sau validation/load policy, không sau một HTTP 202.",
+              "en": "Separate administrative scope; readiness follows validation/load policy rather than an HTTP 202."
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/internal/v1/requests/{requestId}/attempts",
+          "description": {
+            "vi": "Tenant-scoped diagnostics/usage, không lộ prompts hoặc other-tenant artifacts.",
+            "en": "Tenant-scoped attempts/usage without exposing prompts or other tenants’ artifacts."
+          },
+          "response": "200 {requestId,attempts:[{attemptId,route,modelRevision,state,usage}],selectedAttemptId}"
+        }
+      ]
+    },
+    {
+      "id": "lora",
+      "title": {
+        "vi": "5. Multi-LoRA: chia sẻ base, không trộn adapters",
+        "en": "5. Multi-LoRA shares bases without mixing adapters"
+      },
+      "paragraphs": [
+        {
+          "vi": "LoRA cập nhật một weight matrix bằng low-rank factors: với W∈R^(d_out×d_in), ΔW = scale×B×A, A có shape r×d_in và B có shape d_out×r. Parameter delta là r(d_in+d_out) thay d_in×d_out của full matrix. Ví dụ matrix 4096× 4096 ởBF 16 cần 32 MiB; rank 16 delta có 131072 parameters, tương đương 256 KiB trước metadata. Đây là một matrix minh họa, không size của cả adapter hay mọi model.",
+          "en": "LoRA represents an update using low-rank factors: ΔW = scale×B×A for W of shape d_out×d_in, with A shaped r×d_in and B shaped d_out×r. The delta has r(d_in+d_out) parameters. A hypothetical 4096× 4096 BF16 matrix uses 32 MiB, while a rank 16 delta has 131072 parameters or 256 KiB before metadata. This is one matrix rather than a full adapter or universal size."
+        },
+        {
+          "vi": "Multi-LoRA keeps một compatible base resident và áp dụng adapter đúng request. Specialized batching/kernels có thể ghép nhiều adapters trong một batch mà không merge tất cả deltas vào một global weight state. Full fine-tunes tùy ý không tự biến thành small LoRA adapters; cần retraining/conversion có quality validation nếu muốn đổi representation. Base commit, tokenizer/template, target modules, rank, dtype/quantization và backend support đều cần compatibility evidence.",
+          "en": "Multi-LoRA retains a compatible base and applies the correct request-specific adapter. Specialized batching/kernels can serve multiple adapters without globally merging all deltas. Arbitrary full fine-tunes do not automatically become small adapters; representation changes need supported retraining/conversion and quality validation. Check base commits, tokenizer/templates, target modules, rank, precision and backend support."
+        },
+        {
+          "vi": "Shared base tiết kiệm weights nhưng không miễn phí: adapter memory, load churn, rank-dependent kernels, KV và tenant scheduling vẫn tốn tài nguyên. Prefix/KV reuse phải key theo model/adapter/context identity phù hợp, không dùng token prefix giống nhau để bỏ qua adapter effect. Strict-isolation tenants có thể cần dedicated pools hoặc reservations; shared compute không tự đáp ứng mọi isolation requirement.",
+          "en": "Shared bases save weights but still require adapter memory/loading, rank-sensitive kernels, KV and tenant scheduling. Prefix/KV reuse must include relevant model/adapter/context identity rather than matching token prefixes alone. Strong isolation can require separate pools or reservations; shared computation does not meet every isolation requirement."
+        }
+      ]
+    },
+    {
+      "id": "residency",
+      "title": {
+        "vi": "6. Adapter admission và active references",
+        "en": "6. Adapter admission and active references"
+      },
+      "paragraphs": [
+        {
+          "vi": "Artifact registry nên cấp approved immutable revision với checksum, owner và base compatibility metadata. Public request chỉ resolve ID được authorize, không gửi filesystem path hoặc tự load code. Sau resolve/validation mới kiểm residency. Unload/update phải chờ active references và safe kernel boundaries; reuse một numeric slot cho revision mới khi old kernel còn chạy có thể tính sai request.",
+          "en": "Registries issue approved immutable revisions with checksums, owners and compatibility metadata. Public requests resolve authorized identities instead of arbitrary paths/code loads. Residency follows validation. Unloading/updating waits for active references and safe kernel boundaries; reusing a slot for a new revision while old kernels run can corrupt requests."
+        },
+        {
+          "vi": "Bài thử là một admission snapshot, không cache server đang chạy. Thay caller/target để thấy tenant mismatch hoặc base mismatch được reject dù cache memory có sẵn. Khi tất cả eviction candidates bị pin, WAIT giữ snapshot; không evict một nửa rồi mới phát hiện thiếu room. Loading time minh họa tách adapter payload khỏi full cold start.",
+          "en": "This is an admission snapshot rather than a running cache server. Change caller/target to see tenant/base mismatches rejected even when memory is available. Pinned candidates force WAIT without partial destructive eviction. Illustrative loading time separates payload transfer from full cold starts."
+        }
+      ],
+      "experiment": "stack-adapters"
+    },
+    {
+      "id": "architecture",
+      "title": {
+        "vi": "7. Các luồng routing, cascade và shadow khác nhau",
+        "en": "7. Routing, cascades and shadowing follow different paths"
+      },
+      "paragraphs": [
+        {
+          "vi": "Router chọn eligible model trước generation; cascade thử candidate rồi decide escalation; shadow runs tạo evaluation evidence nhưng không được tác động user result hoặc external side effects. Gateway còn phải giữ routing policy version, overall deadline và request generation qua retries. Chọn trace để thấy đâu là user-critical path và đâu là background evidence.",
+          "en": "Routers choose eligible models before generation; cascades evaluate candidates before escalation; shadow work gathers evidence without changing user output or triggering side effects. Gateways preserve policy versions, overall deadlines and request generations across retries. The traces distinguish user-critical paths from background evidence."
+        }
+      ],
+      "diagram": {
+        "id": "stack-routing-lifecycle",
+        "title": {
+          "vi": "Routing là quyết định model; serving còn cần state, quality và delivery",
+          "en": "Routing selects models; serving also manages state, quality and delivery"
+        },
+        "caption": {
+          "vi": "Theo dõi direct routing, buffered cascade, adapter admission, engine failure hoặc shadow evaluation. Đây là kiến trúc minh họa, không gửi requests tới dịch vụ AI bên ngoài.",
+          "en": "Trace direct routing, buffered cascades, adapter admission, engine failures or shadow evaluation. This teaching architecture sends no requests to external AI services."
+        },
+        "width": 1300,
+        "height": 810,
+        "nodes": [
+          {
+            "id": "client",
+            "label": {
+              "vi": "Client / stream",
+              "en": "Client / stream"
+            },
+            "detail": {
+              "vi": "Request identity, deadline, output contract và cancellation.",
+              "en": "Request identity, deadlines, output contracts and cancellation."
+            },
+            "x": 140,
+            "y": 100,
+            "kind": "client"
+          },
+          {
+            "id": "gateway",
+            "label": {
+              "vi": "Gateway / policy",
+              "en": "Gateway / policy"
+            },
+            "detail": {
+              "vi": "Auth, tenant limits, allowed models/adapters và capability validation.",
+              "en": "Authentication, tenant limits, allowed models/adapters and capability checks."
+            },
+            "x": 480,
+            "y": 100,
+            "kind": "edge"
+          },
+          {
+            "id": "router",
+            "label": {
+              "vi": "Model router",
+              "en": "Model router"
+            },
+            "detail": {
+              "vi": "Versioned rules/classifier, task features, quality budgets và capacity.",
+              "en": "Versioned rules/classifiers, task features, quality budgets and capacity."
+            },
+            "x": 820,
+            "y": 100,
+            "kind": "service"
+          },
+          {
+            "id": "large",
+            "label": {
+              "vi": "Large-model pool",
+              "en": "Large-model pool"
+            },
+            "detail": {
+              "vi": "Compatible engine/model groups, admission và cancellation.",
+              "en": "Compatible model/engine groups, admission and cancellation."
+            },
+            "x": 1160,
+            "y": 100,
+            "kind": "model"
+          },
+          {
+            "id": "registry",
+            "label": {
+              "vi": "Model / adapter registry",
+              "en": "Model / adapter registry"
+            },
+            "detail": {
+              "vi": "Pinned base/adapters, checksums, ownership, approved formats và capabilities.",
+              "en": "Pinned bases/adapters, checksums, ownership, approved formats and capabilities."
+            },
+            "x": 140,
+            "y": 400,
+            "kind": "store"
+          },
+          {
+            "id": "adapter",
+            "label": {
+              "vi": "Adapter admission",
+              "en": "Adapter admission"
+            },
+            "detail": {
+              "vi": "Authorization, base compatibility, residency và active references.",
+              "en": "Authorization, base compatibility, residency and active references."
+            },
+            "x": 480,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "small",
+            "label": {
+              "vi": "Small-model pool",
+              "en": "Small-model pool"
+            },
+            "detail": {
+              "vi": "Base weights + request-scoped adapters, batching và KV.",
+              "en": "Base weights, request-scoped adapters, batching and KV."
+            },
+            "x": 820,
+            "y": 400,
+            "kind": "model"
+          },
+          {
+            "id": "verify",
+            "label": {
+              "vi": "Verifier / gate",
+              "en": "Verifier / gate"
+            },
+            "detail": {
+              "vi": "Schema, task checks hoặc calibrated classifier; có false accept/reject.",
+              "en": "Schema/task checks or calibrated classifiers with false accepts/rejections."
+            },
+            "x": 1160,
+            "y": 400,
+            "kind": "service"
+          },
+          {
+            "id": "audit",
+            "label": {
+              "vi": "Decision / usage log",
+              "en": "Decision / usage log"
+            },
+            "detail": {
+              "vi": "Policy/model revisions, route, attempts, usage và privacy-aware telemetry.",
+              "en": "Policy/model revisions, routes, attempts, usage and privacy-aware telemetry."
+            },
+            "x": 140,
+            "y": 700,
+            "kind": "queue"
+          },
+          {
+            "id": "eval",
+            "label": {
+              "vi": "Offline / shadow eval",
+              "en": "Offline / shadow eval"
+            },
+            "detail": {
+              "vi": "Representative labeled tasks, route slices, drift và rollout gates.",
+              "en": "Representative labeled tasks, route slices, drift and rollout gates."
+            },
+            "x": 480,
+            "y": 700,
+            "kind": "worker"
+          },
+          {
+            "id": "commit",
+            "label": {
+              "vi": "Output commit boundary",
+              "en": "Output commit boundary"
+            },
+            "detail": {
+              "vi": "Buffered choice hoặc explicit provisional protocol; side effects riêng.",
+              "en": "Buffered selection or explicit provisional protocols; separate side effects."
+            },
+            "x": 1160,
+            "y": 700,
+            "kind": "service"
+          }
+        ],
+        "traces": [
+          {
+            "id": "direct",
+            "label": {
+              "vi": "Upfront routing",
+              "en": "Upfront routing"
+            },
+            "steps": [
+              {
+                "from": "client",
+                "to": "gateway",
+                "description": {
+                  "vi": "Validate tenant, capabilities, bounds và deadline.",
+                  "en": "Validate tenants, capabilities, bounds and deadlines."
+                }
+              },
+              {
+                "from": "gateway",
+                "to": "router",
+                "description": {
+                  "vi": "Áp dụng pinned routing policy với privacy-safe features.",
+                  "en": "Apply pinned routing policies with privacy-safe features."
+                }
+              },
+              {
+                "from": "router",
+                "to": "large",
+                "description": {
+                  "vi": "Chọn một eligible pool theo task và capacity; không luôn chạy cả hai.",
+                  "en": "Choose one eligible pool using task/capacity evidence rather than always running both."
+                }
+              },
+              {
+                "from": "large",
+                "to": "commit",
+                "description": {
+                  "vi": "Return output theo stream/finish contract và current request generation.",
+                  "en": "Return output under streaming/finish contracts and current request generations."
+                }
+              },
+              {
+                "from": "commit",
+                "to": "client",
+                "description": {
+                  "vi": "Deliver committed output với stable sequencing.",
+                  "en": "Deliver committed output with stable sequencing."
+                }
+              }
+            ]
+          },
+          {
+            "id": "cascade",
+            "label": {
+              "vi": "Buffered cascade",
+              "en": "Buffered cascade"
+            },
+            "steps": [
+              {
+                "from": "router",
+                "to": "small",
+                "description": {
+                  "vi": "Thử small model trong overall deadline/budget.",
+                  "en": "Try the small model within overall deadlines/budgets."
+                }
+              },
+              {
+                "from": "small",
+                "to": "verify",
+                "description": {
+                  "vi": "Buffer candidate và chạy checks phù hợp task.",
+                  "en": "Buffer candidates and run task-appropriate checks."
+                }
+              },
+              {
+                "from": "verify",
+                "to": "large",
+                "description": {
+                  "vi": "Escalate khi policy cho phép và còn budget; trả thêm cost/latency.",
+                  "en": "Escalate only within policy/budget, paying additional cost/latency."
+                }
+              },
+              {
+                "from": "large",
+                "to": "commit",
+                "description": {
+                  "vi": "Chốt selected answer; không coi large answer luôn đúng.",
+                  "en": "Commit the selected answer without assuming large-model infallibility."
+                }
+              },
+              {
+                "from": "commit",
+                "to": "client",
+                "description": {
+                  "vi": "Emit final selected output; attempts không tự là user-visible streams.",
+                  "en": "Emit selected output rather than exposing every attempted stream."
+                }
+              }
+            ]
+          },
+          {
+            "id": "adapter",
+            "label": {
+              "vi": "Admit request có LoRA",
+              "en": "Admit a LoRA request"
+            },
+            "steps": [
+              {
+                "from": "gateway",
+                "to": "registry",
+                "description": {
+                  "vi": "Resolve approved adapter ID/revision và caller access.",
+                  "en": "Resolve approved adapter identities/revisions and caller access."
+                }
+              },
+              {
+                "from": "registry",
+                "to": "adapter",
+                "description": {
+                  "vi": "Verify exact base/layout/tokenizer compatibility và artifact integrity.",
+                  "en": "Verify base/layout/tokenizer compatibility and artifact integrity."
+                }
+              },
+              {
+                "from": "adapter",
+                "to": "small",
+                "description": {
+                  "vi": "Load compatible adapter nếu có room; pin revision qua outstanding kernels.",
+                  "en": "Load within residency budgets and pin revisions through outstanding kernels."
+                }
+              },
+              {
+                "from": "small",
+                "to": "commit",
+                "description": {
+                  "vi": "Keep request/adapter/KV identity; release refs ở safe completion.",
+                  "en": "Preserve request/adapter/KV identity and release references safely."
+                }
+              }
+            ]
+          },
+          {
+            "id": "failure",
+            "label": {
+              "vi": "Engine failure / fallback",
+              "en": "Engine failure and fallback"
+            },
+            "steps": [
+              {
+                "from": "small",
+                "to": "router",
+                "description": {
+                  "vi": "Failure hoặc timeout được phân loại; giữ attempt/output boundary.",
+                  "en": "Classify failures/timeouts and preserve attempt/output boundaries."
+                }
+              },
+              {
+                "from": "router",
+                "to": "large",
+                "description": {
+                  "vi": "Chỉ fallback tới eligible revision/capabilities trong remaining budget.",
+                  "en": "Fallback only to eligible capabilities/revisions within remaining budgets."
+                }
+              },
+              {
+                "from": "large",
+                "to": "audit",
+                "description": {
+                  "vi": "Record both attempts/usage, cancellation và selected result.",
+                  "en": "Record attempts, usage, cancellation and selected results."
+                },
+                "async": true
+              },
+              {
+                "from": "large",
+                "to": "commit",
+                "description": {
+                  "vi": "Sau emitted output cần explicit restart/resume contract, không ghép hai đáp án tùy ý.",
+                  "en": "Visible output requires explicit restart/resume rather than arbitrary answer concatenation."
+                }
+              }
+            ]
+          },
+          {
+            "id": "shadow",
+            "label": {
+              "vi": "Shadow evaluation",
+              "en": "Shadow evaluation"
+            },
+            "steps": [
+              {
+                "from": "router",
+                "to": "audit",
+                "description": {
+                  "vi": "Record sampled policy features/route với retention và tenant scope.",
+                  "en": "Record sampled features/routes under retention and tenant scopes."
+                },
+                "async": true
+              },
+              {
+                "from": "audit",
+                "to": "eval",
+                "description": {
+                  "vi": "Replay eligible samples vào compared models; không execute tools/side effects.",
+                  "en": "Replay eligible samples without executing tools or side effects."
+                },
+                "async": true
+              },
+              {
+                "from": "eval",
+                "to": "router",
+                "description": {
+                  "vi": "Review per-task quality/calibration/cost rồi rollout policy version mới.",
+                  "en": "Review task quality, calibration and costs before rolling out a policy revision."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "routing",
+      "title": {
+        "vi": "8. Router và verifier cần đánh giá khác nhau",
+        "en": "8. Routers and verifiers need different evaluations"
+      },
+      "paragraphs": [
+        {
+          "vi": "Upfront router có thể dùng task rules, features hoặc learned classifier để chọn small/large/other eligible model. Prompt length là cost feature, không reliable measure of semantic difficulty. Tenant tier là product policy chứ không tự là quality evidence. Router accuracy về easy/hard cũng chưa là final answer quality: cần biết model nào giải đúng từng task slice và routing mistakes tác động ra sao.",
+          "en": "Upfront routing can use rules, features or classifiers to choose eligible models. Prompt length describes cost rather than reliably measuring semantic difficulty. Tenant tier is a product rule rather than quality evidence. Easy/hard classification accuracy alone does not establish answer quality; evaluate model outcomes and routing errors by task slice."
+        },
+        {
+          "vi": "Cascade dùng checks sau small-model output. JSON parsing/schema validation chỉ chứng minh cấu trúc, không chứng minh facts hoặc business rules đúng. Self-reported confidence cần calibration; verifier model cũng có false accepts/rejections, cost và correlated blind spots. Large-model fallback không phải oracle: có tasks small đúng mà large sai. Tối ưu gate trên held-out task data với quality/latency constraints, không đặt ngưỡng dựa trên cảm giác.",
+          "en": "Cascades apply post-generation checks. JSON/schema validation establishes structure rather than factual or business correctness. Self-confidence needs calibration, and verifier models have cost, errors and correlated blind spots. Large fallbacks are not oracles: small models can be correct when larger ones fail. Tune gates on held-out tasks under explicit quality/latency constraints."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Joint outcome",
+            "en": "Joint outcome"
+          },
+          {
+            "vi": "Giữ small output",
+            "en": "Keep small output"
+          },
+          {
+            "vi": "Escalate rồi chọn large",
+            "en": "Escalate and select large"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Both correct",
+              "en": "Both correct"
+            },
+            {
+              "vi": "Correct",
+              "en": "Correct"
+            },
+            {
+              "vi": "Correct nhưng tốn thêm cost",
+              "en": "Correct with extra cost"
+            }
+          ],
+          [
+            {
+              "vi": "Small-only correct",
+              "en": "Small-only correct"
+            },
+            {
+              "vi": "Correct",
+              "en": "Correct"
+            },
+            {
+              "vi": "Regression nếu replace bằng large output",
+              "en": "Regression when replaced by the large output"
+            }
+          ],
+          [
+            {
+              "vi": "Large-only correct",
+              "en": "Large-only correct"
+            },
+            {
+              "vi": "Wrong",
+              "en": "Wrong"
+            },
+            {
+              "vi": "Recovered nếu verifier nhận ra cần escalate",
+              "en": "Recovered when the verifier escalates"
+            }
+          ],
+          [
+            {
+              "vi": "Both wrong",
+              "en": "Both wrong"
+            },
+            {
+              "vi": "Wrong",
+              "en": "Wrong"
+            },
+            {
+              "vi": "Vẫn wrong dù chạy thêm model",
+              "en": "Still wrong after extra generation"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cascade-lab",
+      "title": {
+        "vi": "9. Thử policy bằng joint outcomes và latency budget",
+        "en": "9. Explore policies using joint outcomes and latency budgets"
+      },
+      "paragraphs": [
+        {
+          "vi": "Toy evaluation dưới đây khai báo joint outcomes thay giả định small success luôn là subset của large success. Với defaults 70% easy, small accuracy 76,5%, large 89,1%; verifier recall 80% và false escalation 10% cho cascade 91,13%. Cascade có thể giữ một số small-only successes và recover large-only failures, nhưng điều đó chỉ đúng fixture, không kết quả đo của model thật. Giảm verifier quality để thấy accuracy có thể tệ hơn small-only.",
+          "en": "This toy evaluation declares joint outcomes instead of assuming every small-model success is also a large-model success. Default 70% easy traffic yields 76.5% small and 89.1% large accuracy. Recall 80% with 10% false escalations yields 91.13% cascade accuracy by retaining some small-only successes and recovering large-only failures. These are synthetic results; degraded verification can perform worse than small-only."
+        },
+        {
+          "vi": "Cột latency là buffered full-answer completion, không TTFT hay token gaps. Escalated request trả serial small+check+large nên p 95 có thể vượt budget dù mean đẹp. Runtime không được biết ground-truth labels mà bài thử dùng để tính exact expected accuracy. Khi traffic drift, joint distribution và gate error rates có thể đổi cùng nhau; một slider không đại diện cho model đã calibrate production.",
+          "en": "Latency measures buffered full-answer completion rather than TTFT/token gaps. Serial small+check+large execution can miss p 95 budgets despite good means. Real runtimes do not know the ground truth used for exact expected accuracy here. Drift can change joint outcomes and gate errors together; sliders are not calibrated production models."
+        },
+        {
+          "vi": "Fixture còn giả định gate rates giống nhau giữa các joint outcomes có cùng small-model correctness. Một measured recall tổng quát không đủ suy ra recovered mass nếu verifier bắt large-only failures khác với both-wrong cases. Production evaluation cần per-slice joint evidence; output labels trong bài thử không được dùng để chọn route ở runtime.",
+          "en": "The fixture applies identical gate rates to joint outcomes sharing small-model correctness. Aggregate recall alone cannot determine recovery when the gate treats large-only failures differently from both-wrong cases. Production evaluation needs joint evidence by slice; these labels are not runtime routing inputs."
+        }
+      ],
+      "experiment": "stack-routing"
+    },
+    {
+      "id": "streaming",
+      "title": {
+        "vi": "10. Streaming đặt output commit boundary ở đâu?",
+        "en": "10. Where does streaming commit an answer?"
+      },
+      "paragraphs": [
+        {
+          "vi": "Nếu small-model tokens đã hiện lên màn hình, verifier cuối cùng không thể lặng lẽ thu hồi chúng. Một lựa chọn là buffer candidate đến khi checks xong, đổi TTFT lấy ability chọn output; một lựa chọn khác là chọn route trước rồi stream trực tiếp. Product có thể thiết kế provisional/replacement events nhưng client phải hiểu protocol, screen readers/history phải nhất quán và usage/latency phải đo thật. Không nối small output với fallback large output thành một answer như thể cùng generation.",
+          "en": "Visible small-model tokens cannot silently be recalled by a final verifier. Buffering allows output selection at higher TTFT; upfront routing can stream one selected path. Provisional/replacement events require an explicit client protocol, consistent accessibility/history and honest usage/latency measurement. Do not concatenate small and fallback outputs as one generation."
+        },
+        {
+          "vi": "Tool calls và external effects cần commit/idempotency policy riêng. Shadow hoặc discarded attempts không được execute tool side effects chỉ vì text có dạng tool call. Overall deadline giới hạn cả attempts, retries, queues và verification; cancel phải propagate tới in-flight work theo safe boundaries. Log attempted work và delivered output riêng để billing/cost/error analysis không bỏ các attempts đã tốn compute.",
+          "en": "Tools and side effects need separate commit/idempotency policies. Shadow/discarded attempts must not execute actions merely because output resembles tool calls. Overall deadlines include attempts, retries, queues and checks; cancellation propagates safely. Record attempted work separately from delivered output so cost/error analysis includes spent computation."
+        }
+      ]
+    },
+    {
+      "id": "economics",
+      "title": {
+        "vi": "11. Cost mỗi triệu tokens: tử số và mẫu số phải cùng window",
+        "en": "11. Token costs need matching spend and output windows"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cách tổng quát: costPerMillion = spendInWindow / countedTokensInWindow ×1.000.000. Nếu dùng hourly spend và busy-throughput T với busy duty u, counted output/hour = T× 3600×u. Nếu T đã là measured whole-window throughput, u đã nằm trong rate và không nhân lần hai. Duty fraction này không phải metric GPU utilization; bandwidth-bound decode vẫn có cost dù utilization number thấp.",
+          "en": "Generally, costPerMillion = windowSpend/windowTokens× 1,000,000. Hourly spend with busy-throughput T and duty fraction u gives T× 3600×u counted output tokens/hour. Whole-window throughput already includes duty, so applying u again double counts it. Duty is not GPU utilization; bandwidth-bound decoding still costs money at low utilization readings."
+        },
+        {
+          "vi": "Ví dụ 8 GPU, giả định $3/GPU-hour cho spend $24/h; busy output 10000 tokens/s và duty 40% cho 14,4Moutputtokens/h, cost≈$1,67/1M. Nếu chỉ 80% output thuộc requests đạt SLO đã nêu, denominator 11,52M và cost≈$2,08/1Mqualifying outputtokens. CPU/network/idle reservation/support và failed retries có thể tăng spend; input tokens/prefill phải báo riêng chứ cộng vào denominator để làm rẻ output cost.",
+          "en": "Eight GPUs at an assumed $3/GPU-hour cost $24/hour. Busy output of 10,000 tokens/s at 40% duty yields 14.4M output tokens/hour, or≈$1.67/million. If 80% of output belongs to SLO-qualified requests, the denominator is 11.52M and cost≈$2.08/million qualified output tokens. Include other infrastructure/idle/retry costs and report input/prefill separately rather than padding the output denominator."
+        },
+        {
+          "vi": "Token counts giữa models có tokenizer khác không luôn comparable cho cùng user task. Routing sang model ngắn gọn hơn có thể giảm output tokens nhưng task success và request cost mới là điều product cần. Báo thêm cost/successful task và task-quality distributions; provider API pricing, internal GPU economics và billable usage là ba khái niệm khác nhau.",
+          "en": "Different tokenizers make token counts non-equivalent across models for the same task. Shorter outputs can reduce tokens while task success and per-request cost remain product concerns. Report cost per successful task and quality distributions, distinguishing provider prices, internal infrastructure costs and billable usage."
+        }
+      ],
+      "code": {
+        "language": "text",
+        "content": "windowOutputTPS = busyTPS * busyDuty  // only for a busy-period rate\nhourlySpend = gpuCount * gpuHourlyPrice + otherHourlyCost\ncostPer1MOutput = hourlySpend / (windowOutputTPS * 3600) * 1_000_000\nsloOutputTPS = windowOutputTPS * shareOfOutputFromQualifiedRequests\n// If windowOutputTPS was measured directly, do not multiply busyDuty again.",
+        "caption": {
+          "vi": "Định nghĩa counting boundary trước khi tính; denominator 0 nghĩa không có finite unit cost.",
+          "en": "Define counting boundaries first; a zero denominator has no finite unit cost."
+        }
+      }
+    },
+    {
+      "id": "economics-lab",
+      "title": {
+        "vi": "12. Thử busy rate, window rate và SLO-qualified denominator",
+        "en": "12. Explore busy/window rates and SLO-qualified denominators"
+      },
+      "paragraphs": [
+        {
+          "vi": "Chuyển basis để thấy duty fraction chỉ áp dụng khi input là busy-period rate. Nếu cùng observed 4000 tokens/s, nhập 10000 busy TPS với 40% duty hoặc 4000 window TPS phải ra cùng cost. Khác biệt giữa hai basis là ý nghĩa input, không optimization tạo thêm throughput. Khi duty 0 hoặc qualifying 0, bài thử hiện NONE thay chia 0 hoặc đưa con số miễn phí.",
+          "en": "Switch bases to see that duty applies only to busy-period inputs. The same observed 4,000 tokens/s comes from 10,000 busy TPS at 40% duty or 4,000 window TPS, producing equal cost. Basis changes redefine inputs rather than increasing capacity. Zero duty/qualification yields NONE instead of division by zero or a free-service claim."
+        }
+      ],
+      "experiment": "stack-economics"
+    },
+    {
+      "id": "capacity",
+      "title": {
+        "vi": "13. Capacity planning vẫn cần tách prefill và decode",
+        "en": "13. Capacity planning still separates prefill and decoding"
+      },
+      "paragraphs": [
+        {
+          "vi": "Bắt đầu từ request mix và peak arrival process. Peak requests/s×average input tokens cho input-token demand; cùng rate×average output tokens cho decode demand. Hai resources không có cùng cost/token; attention context, prefix cache, adapters và batching làm performance nonlinear. Chỉ tổng input+output tokens rồi chia peak tokens/s có thể sai. Benchmark group với joint workload hoặc dùng measured prefill/decode capacity model đã validate.",
+          "en": "Start with request mixes and peak arrivals. Requests/s times mean input/output lengths gives separate prefill/decode demands. Their costs differ, with nonlinear effects from context, reuse, adapters and batching. Dividing combined input+output tokens by a peak rate can mislead. Use realistic joint-load benchmarks or validated capacity models."
+        },
+        {
+          "vi": "Sau measured goodput, tính replicas với peak/headroom, N−1/failure domains, readiness delay và warm capacity. Khi routing policy đổi, demand mỗi pool và adapter locality đổi theo; verifier cũng là một service có queue/capacity. Batch background work có thể lấp idle periods nhưng phải preempt/budget để không phá interactive SLO và không assume KV/graphs của mọi jobs đổi được tức thì.",
+          "en": "Then size replicas for peaks, headroom, failures, readiness delays and warm capacity. Routing changes shift demand and adapter locality across pools; verifiers have queues and capacity too. Background batches can use idle periods only with priorities/preemption/budgets that protect interactive targets, without assuming instantaneous state/graph changes."
+        }
+      ],
+      "flow": {
+        "title": {
+          "vi": "Bốn bước lập capacity",
+          "en": "Four capacity-planning steps"
+        },
+        "caption": {
+          "vi": "Giữ quality, traffic mix và SLO nhất quán giữa measurement và forecast.",
+          "en": "Keep quality, traffic mixes and SLOs consistent between measurements and forecasts."
+        },
+        "steps": [
+          {
+            "title": {
+              "vi": "Demand mix",
+              "en": "Demand mix"
+            },
+            "detail": {
+              "vi": "Input/output lengths, arrivals, task classes và tenant scope.",
+              "en": "Track lengths, arrivals, tasks and tenant scope."
+            },
+            "icon": "chart"
+          },
+          {
+            "title": {
+              "vi": "Measured pools",
+              "en": "Measured pools"
+            },
+            "detail": {
+              "vi": "Model/adapters, queues, verifier và compatible hardware.",
+              "en": "Measure models/adapters, queues, verifiers and hardware."
+            },
+            "icon": "gauge"
+          },
+          {
+            "title": {
+              "vi": "Ready capacity",
+              "en": "Ready capacity"
+            },
+            "detail": {
+              "vi": "Peak + failure reserve + startup/drain constraints.",
+              "en": "Budget peaks, failures, startup and draining."
+            },
+            "icon": "shield"
+          },
+          {
+            "title": {
+              "vi": "Price and evaluate",
+              "en": "Price and evaluate"
+            },
+            "detail": {
+              "vi": "Unit cost và task success, không chỉ tokens/s.",
+              "en": "Compare unit costs and task success, not token rates alone."
+            },
+            "icon": "decision"
+          }
+        ]
+      }
+    },
+    {
+      "id": "operations",
+      "title": {
+        "vi": "14. Observability, drift và rollout có giới hạn",
+        "en": "14. Observe drift and bound rollouts"
+      },
+      "paragraphs": [
+        {
+          "vi": "Trace request ID, policy version, model/base/adapter revisions, capabilities, route reason, attempt sequence, queue/compute/verification time, cancellation và selected output boundary. Privacy-aware sampling/retention không có nghĩa log nguyên prompts theo mặc định. Per-tenant/request metadata phải access-controlled; cache keys và adapter IDs không được làm lộ data qua tenants. Limit admin artifact endpoints và validate formats/revisions trước publish.",
+          "en": "Trace policy/model/adapter versions, capabilities, routing reasons, attempts, queue/compute/check times, cancellations and output boundaries. Privacy-aware sampling does not imply logging raw prompts by default. Control metadata access and prevent cross-tenant leaks through caches/adapters. Restrict artifact administration and validate formats/revisions before publication."
+        },
+        {
+          "vi": "Quality dashboards cần per-task/tenant/model slices, false accept/reject rates trên labeled samples, disagreement/drift, escalations và cost/request. Monitor fallback storms và verifier saturation; áp dụng overall budget, bounded retries và circuit policy cho eligible fallback. Engine/adapter/router upgrades chạy offline regression, canary/shadow có cost limit rồi rollout/rollback. Một quality score trung bình không che được regression ở small but important task slice.",
+          "en": "Monitor task/tenant/model slices, labeled gate errors, disagreement/drift, escalations and request costs. Bound fallback storms and verifier saturation with deadlines, retries and eligible circuit policies. Engine/adapter/router upgrades need offline regression, bounded canaries/shadows and rollback. Average quality must not hide regressions in important slices."
+        }
+      ]
+    },
+    {
+      "id": "interview",
+      "title": {
+        "vi": "15. Câu hỏi và lời giải luyện tư duy",
+        "en": "15. Questions with worked reasoning"
+      },
+      "paragraphs": [],
+      "questions": [
+        {
+          "question": {
+            "vi": "Có thể đổi vLLM sang engine khác vì đều có compatible API không?",
+            "en": "Can compatible APIs make engine replacement automatic?"
+          },
+          "answer": [
+            {
+              "vi": "Không. Kiểm capabilities và semantics đang dùng: template/tokenizer, tools/structured outputs, sampling/stops, stream chunks, cancellation, usage và errors. Pin release/model revisions; replay quality/load suites, canary rồi rollback được. Familiar JSON shape chỉ giảm integration work ở transport layer.",
+              "en": "No. Test templates/tokenizers, tools/constraints, sampling/stops, stream chunks, cancellation, usage and errors under pinned versions. Replay quality/load suites and canary with rollback. Familiar JSON only reduces part of integration work."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "200 khách hàng có full fine-tunes riêng thì multi-LoRA giải quyết ngay được không?",
+            "en": "Does multi-LoRA immediately consolidate two hundred full fine-tunes?"
+          },
+          "answer": [
+            {
+              "vi": "Chỉ khi có compatible LoRA representation trên shared base hoặc retraining/conversion đạt quality yêu cầu. Full fine-tunes khác base/tokenizer/modules không tự compatible. Phân nhóm eligible adapters, giữ reserved/dedicated capacity khi cần isolation, đo churn/KV/cost và enforce tenant ownership.",
+              "en": "Only with compatible adapters on a shared base, or supported retraining/conversion that passes quality checks. Different bases/tokenizers/modules are not automatically compatible. Group eligible adapters, reserve/isolate capacity where needed and measure churn, KV and costs with tenant ownership enforced."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Schema-valid JSON có đủ để verifier accept answer không?",
+            "en": "Does schema-valid JSON justify accepting an answer?"
+          },
+          "answer": [
+            {
+              "vi": "Nó chứng minh một số structural constraints, không facts hoặc business semantics. Thêm task-specific validation/evals và calibrated gate với known false accept/reject rates. Một số tasks không có cheap reliable verifier; khi đó cascade savings/quality assumptions phải đổi.",
+              "en": "It establishes structural constraints rather than factual/business correctness. Use task checks and calibrated gates with measured errors. Some tasks lack cheap reliable verifiers, changing cascade economics and quality assumptions."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Có trường hợp escalate làm kết quả tệ hơn không?",
+            "en": "Can escalation make results worse?"
+          },
+          "answer": [
+            {
+              "vi": "Có: small-only correct cases bị false escalation và thay bằng wrong large output. Với joint masses, cascade quality = bothCorrect + smallOnly×(1−falseEscalation) + largeOnly×recall, dưới assumptions của fixture. Không giả định large luôn đúng hoặc dùng self-confidence như oracle.",
+              "en": "Yes: falsely escalating small-only-correct cases can replace them with wrong outputs. Under fixture assumptions, quality = bothCorrect + smallOnly×(1−falseEscalation) + largeOnly×recall. Larger models and self-confidence are not oracles."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Giảm cost 50% mà giữ quality thì bắt đầu từ đâu?",
+            "en": "How would a fifty-percent cost reduction preserve quality?"
+          },
+          "answer": [
+            {
+              "vi": "Đo baseline spend, task success, route slices và SLO trước; xác định cheaper model giải được tasks nào. Test router/gate trên held-out data, gồm verifier cost và escalated p 95. Shadow/canary có budget, guard regression và rollback. Không hứa 50% trước evidence về feasible quality-cost frontier.",
+              "en": "Measure spend, task success, slices and SLOs, then identify tasks cheaper models solve. Validate routers/gates on held-out data with check costs and escalation tails. Bound shadows/canaries and roll back regressions; do not promise fifty percent before evidence."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "8 GPU×$3/h,10000 busy TPS,duty 40% thì cost/1Moutput?",
+            "en": "What is output cost for eight $3/hour GPUs at 10,000 busy TPS and 40% duty?"
+          },
+          "answer": [
+            {
+              "vi": "Spend $24/h. Whole-window output 4000 tokens/s, tương đương 14,4M/h. Cost 24/14,4≈$1,67/1Moutput, chưa other costs. Nếu 4000 TPS đã đo trực tiếp trên window thì không nhân 40% lần nữa. Qualifying 80% output cho denominator 11,52M và cost≈$2,08/1M.",
+              "en": "Spend is $24/hour;4,000 window TPS yields 14.4M/hour and≈$1.67/million output tokens before other costs. A directly measured 4,000 window TPS needs no additional duty factor. At 80% qualifying output,11.52M/hour gives≈$2.08/million."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Adapter đang active mà memory đầy thì evict được không?",
+            "en": "May an active adapter be evicted when memory fills?"
+          },
+          "answer": [
+            {
+              "vi": "Không bỏ referenced weights khi kernels còn cần chúng. Pin exact revision, plan residency và admission, chờ safe completion hoặc queue/reject theo budget. Tenant/base validation đi trước HIT; unload/update không được reuse slot cũ trong khi stale references còn sống.",
+              "en": "Do not remove weights still referenced by kernels. Pin exact revisions, plan residency/admission and wait or queue/reject under budgets. Authorization/base validation precede hits; slot reuse waits for old references to become safe."
+            }
+          ]
+        },
+        {
+          "question": {
+            "vi": "Small output đã stream thì fallback large trả thế nào?",
+            "en": "How should fallback behave after small-model output has streamed?"
+          },
+          "answer": [
+            {
+              "vi": "Cần explicit protocol: fail/restart, supported resume hoặc provisional/replacement semantics mà client hiểu. Không ghép hai generation thành một câu trả lời ngầm. Nếu cần final verifier chọn toàn answer trước, buffer candidate và tính thêm TTFT; tool side effects chỉ commit theo policy riêng.",
+              "en": "Use explicit restart, supported resumption or provisional/replacement semantics understood by clients. Do not silently concatenate generations. Final-answer selection can buffer candidates at added TTFT, with tool effects committed under separate policies."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
