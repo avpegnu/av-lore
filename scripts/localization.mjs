@@ -52,7 +52,7 @@ export function collectStrings() {
     collectHTML(fs.readFileSync(f, 'utf8'), add);
   for (const f of [
     ...walk(path.join(site, 'src/components')),
-    ...['study.ts', 'scenarios.ts', 'models.ts'].map((name) => path.join(site, 'src/lib', name)),
+    ...['study.ts', 'scenarios.ts', 'models.ts', 'learning.ts'].map((name) => path.join(site, 'src/lib', name)),
     ...walk(path.join(site, 'public/course-labs')),
   ].filter((f) => /\.(tsx?|js)$/.test(f))) {
     const source = ts.createSourceFile(f, fs.readFileSync(f, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -80,6 +80,7 @@ export function collectStrings() {
   for (const f of walk(path.join(site, 'src/content/topics')).filter((f) => f.endsWith('.json'))) {
     const t = JSON.parse(fs.readFileSync(f, 'utf8'));
     dynamic(t.title);
+    dynamic(t.description);
     for (const n of t.notes) dynamic(n.title);
     for (const q of t.questions)
       for (const k of ['question', 'answer', 'explanation', 'followUp', 'level']) dynamic(q[k]);
