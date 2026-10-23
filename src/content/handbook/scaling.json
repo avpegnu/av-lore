@@ -36,7 +36,7 @@
     {
       "id": "baseline",
       "title": {
-        "vi": "1. Phiên nhỏ nhất đáp ứng yêu cầu",
+        "vi": "1. Bản thiết kế đơn giản nhất đáp ứng yêu cầu",
         "en": "1. Start with the smallest adequate system"
       },
       "paragraphs": [
@@ -64,6 +64,10 @@
         {
           "vi": "CPU saturation gợi ý parallelism hoặc giảm compute; DB lock wait gợi ý contention và transaction scope; high disk IO có thể cần index/data layout hoặc RAM; high network fan-out cần batch và giảm hops. Các tín hiệu có thể liên quan: app CPU thấp không đồng nghĩa còn capacity nếu mọi worker đang chờ downstream và pool đã cạn.",
           "en": "CPU saturation suggests parallelism or less computation; lock waits suggest contention/transaction scope; disk IO may need indexes, layouts or RAM; network fan-out needs batching and fewer hops. Signals interact: low application CPU does not imply spare capacity when workers wait on downstreams and pools are exhausted."
+        },
+        {
+          "vi": "Trong worksheet M/M/1 bên dưới, service rate là 10 job/s và service time trung bình 100 ms. Arrival 8 job/s cho mean residence time 500 ms; 9 job/s cho 1.000 ms. Hệ chỉ tăng arrival 12,5% nhưng thời gian trung bình ở hệ tăng gấp đôi trong mô hình này. Không suy ra mọi hệ production đều chậm theo cùng tỷ lệ hoặc phải giữ CPU dưới một mức cố định; chọn operating point bằng workload, SLO và kịch bản failure đã đo.",
+          "en": "In the M/M/1 worksheet below, service capacity is ten jobs/s and mean service time is 100 ms. Eight arrivals/s gives 500 ms mean residence; nine gives 1,000 ms. A 12.5% arrival increase doubles mean time in this model. This does not imply identical production behavior or a universal CPU limit; choose an operating point using measured workloads, SLOs and failure scenarios."
         }
       ],
       "table": {
@@ -321,42 +325,1247 @@
             "en": "One modular backend"
           },
           "description": {
-            "vi": "Transaction và ownership đơn giản; đo query, index và resource baseline.",
-            "en": "Simple transactions and ownership; measure queries, indexes and resources."
+            "vi": "Bắt đầu với một đường request đo được và state có owner rõ. Các hộp logic có thể cùng máy ở quy mô nhỏ.",
+            "en": "Begin with a measurable request path and explicit state owners. Logical boxes may share one small deployment."
+          },
+          "problem": {
+            "vi": "Chưa có bottleneck đã đo; ưu tiên ship đúng tính năng và giữ invariant.",
+            "en": "No measured bottleneck yet; prioritize correct features and invariants."
+          },
+          "decision": {
+            "vi": "Giữ transaction tại một database, module hóa code và phục vụ file qua đường phù hợp.",
+            "en": "Keep transactions in one database, modularize code and use an appropriate file-serving path."
+          },
+          "tradeoff": {
+            "vi": "Một deployment nhỏ dễ debug nhưng app/DB có thể tranh tài nguyên và cùng failure domain.",
+            "en": "A small deployment is easy to debug, but app and database can compete for resources and share a failure domain."
+          },
+          "nextPressure": {
+            "vi": "Chỉ tách tài nguyên khi contention hoặc yêu cầu availability chứng minh cần thiết.",
+            "en": "Separate resources when contention or availability requirements justify it."
           },
           "exitCriteria": {
             "vi": "Đã có SLO, load test và backup restore thử được.",
             "en": "SLOs, load tests and tested backup restoration exist."
+          },
+          "diagram": {
+            "id": "scaling-single",
+            "title": {
+              "vi": "Request và nguồn dữ liệu ban đầu",
+              "en": "Initial request and data authority"
+            },
+            "caption": {
+              "vi": "Đây là boundary logic, không phải ba máy bắt buộc. Database cần backup và chính sách phục hồi ngay từ đầu.",
+              "en": "These are logical boundaries, not three mandatory machines. Backups and recovery policies are needed from the start."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "app",
+                "label": {
+                  "vi": "Modular backend",
+                  "en": "Modular backend"
+                },
+                "kind": "service",
+                "x": 380.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Các module dùng contract và transaction boundary rõ; không bắt buộc tách process.",
+                  "en": "Modules have explicit contracts and transaction boundaries without mandatory process separation."
+                }
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Database",
+                  "en": "Database"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Giữ dữ liệu và constraint; đo access pattern, locks và working set.",
+                  "en": "Owns data and constraints; measure access patterns, locks and working sets."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "request",
+                "label": {
+                  "vi": "Đọc/ghi cơ bản",
+                  "en": "Basic read/write"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "app",
+                    "description": {
+                      "vi": "Xác thực, kiểm tra input và quyền trên resource.",
+                      "en": "Authenticate and check input and resource permission."
+                    }
+                  },
+                  {
+                    "from": "app",
+                    "to": "db",
+                    "description": {
+                      "vi": "Query hoặc transaction theo contract.",
+                      "en": "Execute a query or transaction under the contract."
+                    }
+                  },
+                  {
+                    "from": "db",
+                    "to": "app",
+                    "description": {
+                      "vi": "Trả kết quả sau mốc commit/đọc đã định nghĩa.",
+                      "en": "Return after the declared read or commit point."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "isolate-data",
+          "title": {
+            "vi": "Tách tài nguyên app và DB",
+            "en": "Isolate application and database resources"
+          },
+          "description": {
+            "vi": "Cấp capacity và vận hành hai tầng theo workload khác nhau.",
+            "en": "Size and operate the two tiers for their different workloads."
+          },
+          "problem": {
+            "vi": "App và DB tranh CPU/RAM/IO hoặc cần maintenance độc lập.",
+            "en": "Application and database compete for CPU/RAM/IO or need independent maintenance."
+          },
+          "decision": {
+            "vi": "Chuyển DB sang tài nguyên riêng; giữ connection pool có giới hạn và network policy.",
+            "en": "Move the database to separate resources with bounded connection pools and network policy."
+          },
+          "tradeoff": {
+            "vi": "Có thêm network hop và failure modes; tách máy không sửa query hoặc loại bỏ single writer.",
+            "en": "Adds a network hop and failure modes; separate hardware does not fix queries or remove a single writer."
+          },
+          "nextPressure": {
+            "vi": "Đo xem bottleneck còn ở compute app hay dữ liệu; không scale cả hai theo cùng một chỉ số.",
+            "en": "Measure whether compute or data remains limiting instead of scaling both from one metric."
+          },
+          "exitCriteria": {
+            "vi": "Latency, pool wait, restore và deadline đã được thử với đường mạng mới.",
+            "en": "Test latency, pool waits, restoration and deadlines over the new network path."
+          },
+          "diagram": {
+            "id": "scaling-isolate",
+            "title": {
+              "vi": "Pool và database là hai ngân sách",
+              "en": "Pools and databases have separate budgets"
+            },
+            "caption": {
+              "vi": "Tách tài nguyên cho phép tuning riêng; network và pool trở thành phần phải đo.",
+              "en": "Resource isolation enables independent tuning while adding network and pool measurements."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "app",
+                "label": {
+                  "vi": "API + pool",
+                  "en": "API + pool"
+                },
+                "kind": "service",
+                "x": 380.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Pool giới hạn active queries; timeout và queue không được vượt end-to-end deadline.",
+                  "en": "The pool bounds active queries; timeouts and queues stay within the end-to-end deadline."
+                }
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Database",
+                  "en": "Database"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Giữ dữ liệu và constraint; đo access pattern, locks và working set.",
+                  "en": "Owns data and constraints; measure access patterns, locks and working sets."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "request",
+                "label": {
+                  "vi": "Query có giới hạn",
+                  "en": "Bounded query"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "app",
+                    "description": {
+                      "vi": "Request đi vào app với total deadline.",
+                      "en": "The request enters with a total deadline."
+                    }
+                  },
+                  {
+                    "from": "app",
+                    "to": "db",
+                    "description": {
+                      "vi": "Lấy connection trong budget rồi gửi query.",
+                      "en": "Acquire a connection within budget and send the query."
+                    }
+                  },
+                  {
+                    "from": "db",
+                    "to": "app",
+                    "description": {
+                      "vi": "Đọc kết quả và trả connection về pool.",
+                      "en": "Read the result and return the connection to the pool."
+                    }
+                  }
+                ]
+              }
+            ]
           }
         },
         {
           "id": "replicas",
           "title": {
-            "vi": "Stateless API + replica/cache",
-            "en": "Stateless APIs + replicas/caches"
+            "vi": "Stateless API sau load balancer",
+            "en": "Stateless APIs behind a load balancer"
           },
           "description": {
-            "vi": "Chia read/compute load, giữ session và object storage có owner.",
-            "en": "Distribute reads/compute while retaining session and object ownership."
+            "vi": "Bất kỳ API replica phù hợp nào cũng nhận request; session và file cần chia sẻ có owner ngoài instance.",
+            "en": "Any suitable API replica can serve requests; shared sessions and files have owners outside an instance."
+          },
+          "problem": {
+            "vi": "Một API node hết compute hoặc deploy làm gián đoạn mọi user.",
+            "en": "One API node exhausts compute or deployments interrupt every user."
+          },
+          "decision": {
+            "vi": "Thêm replicas sau LB, readiness và draining; không giữ authoritative state chỉ ở local RAM/disk.",
+            "en": "Add replicas behind balancing, readiness and draining; do not keep authoritative state only in local memory or disk."
+          },
+          "tradeoff": {
+            "vi": "LB, session store và DB vẫn là dependency; cần capacity sau mất node/AZ.",
+            "en": "Balancing, session stores and databases remain dependencies; retain capacity after node/AZ loss."
+          },
+          "nextPressure": {
+            "vi": "Nếu shared DB đang nghẽn, thêm API có thể làm tải DB nặng hơn.",
+            "en": "If the shared database is limiting, more APIs can worsen its load."
           },
           "exitCriteria": {
-            "vi": "Chịu mất một API node và cache miss storm có giới hạn.",
-            "en": "Tolerate an API-node loss and bound cache-miss storms."
+            "vi": "Chịu mất một API node và giới hạn concurrency về shared stores.",
+            "en": "Tolerate an API-node loss and bound shared-store concurrency."
+          },
+          "diagram": {
+            "id": "scaling-api",
+            "title": {
+              "vi": "Một request có thể tới API khác",
+              "en": "A request can use another API"
+            },
+            "caption": {
+              "vi": "Sơ đồ mô tả request mới khi đổi instance; reconnect, idempotency và capacity degraded vẫn cần được kiểm thử.",
+              "en": "This shows new-request rerouting; reconnects, idempotency and degraded capacity still need testing."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "edge",
+                "label": {
+                  "vi": "LB / routing",
+                  "en": "LB / routing"
+                },
+                "kind": "edge",
+                "x": 285.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Kiểm tra readiness, giới hạn admission và drain khi đổi instance.",
+                  "en": "Checks readiness, bounds admission and drains instances during changes."
+                }
+              },
+              {
+                "id": "api1",
+                "label": {
+                  "vi": "API A",
+                  "en": "API A"
+                },
+                "kind": "service",
+                "x": 475.0,
+                "y": 120,
+                "detail": {
+                  "vi": "Không giữ session quan trọng chỉ ở RAM; áp deadline và resource authorization.",
+                  "en": "Does not keep essential sessions only in RAM; enforces deadlines and resource authorization."
+                }
+              },
+              {
+                "id": "api2",
+                "label": {
+                  "vi": "API B",
+                  "en": "API B"
+                },
+                "kind": "service",
+                "x": 475.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Replica API khác nhận được cùng request; shared stores vẫn có capacity riêng.",
+                  "en": "Another API replica can serve the request; shared stores retain their own capacity limits."
+                }
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Shared state",
+                  "en": "Shared state"
+                },
+                "kind": "store",
+                "x": 665.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Database/session/object storage là các owner logic, không buộc một store dùng cho tất cả.",
+                  "en": "Database, session and object stores are logical owners; one store need not serve them all."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "normal",
+                "label": {
+                  "vi": "Routing bình thường",
+                  "en": "Normal routing"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "edge",
+                    "description": {
+                      "vi": "LB nhận request và chọn instance ready.",
+                      "en": "The balancer selects a ready instance."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "api1",
+                    "description": {
+                      "vi": "API A xử lý cùng contract.",
+                      "en": "API A handles the contract."
+                    }
+                  },
+                  {
+                    "from": "api1",
+                    "to": "db",
+                    "description": {
+                      "vi": "Đọc/ghi state qua owner phù hợp.",
+                      "en": "Access state through the appropriate owner."
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "reroute",
+                "label": {
+                  "vi": "A bị drain: request mới qua B",
+                  "en": "A drains: new requests use B"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "edge",
+                    "description": {
+                      "vi": "Connection cũ được drain trong deadline.",
+                      "en": "Drain old connections within a deadline."
+                    }
+                  },
+                  {
+                    "from": "edge",
+                    "to": "api2",
+                    "description": {
+                      "vi": "Request mới được route sang API B.",
+                      "en": "Route new requests to API B."
+                    }
+                  },
+                  {
+                    "from": "api2",
+                    "to": "db",
+                    "description": {
+                      "vi": "B truy cập được state mà không phụ thuộc RAM của A.",
+                      "en": "B accesses state without depending on A’s RAM."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "read-replica",
+          "title": {
+            "vi": "Replica cho truy vấn đọc",
+            "en": "Replicas for read queries"
+          },
+          "description": {
+            "vi": "Chia read load sau khi đã tối ưu access pattern; giữ write authority rõ.",
+            "en": "Distribute reads after access-pattern improvements while retaining explicit write authority."
+          },
+          "problem": {
+            "vi": "Repeated reads chiếm tài nguyên primary; workload cho phép một mức stale nhất định.",
+            "en": "Repeated reads consume primary resources and the workload permits bounded staleness."
+          },
+          "decision": {
+            "vi": "Replicate log và route các loại read theo freshness policy.",
+            "en": "Replicate the log and route reads by freshness policy."
+          },
+          "tradeoff": {
+            "vi": "Lag, read-your-writes và promotion phức tạp hơn; replicas không nhân write capacity.",
+            "en": "Lag, read-your-writes and promotion become more complex; replicas do not multiply write capacity."
+          },
+          "nextPressure": {
+            "vi": "Theo dõi lag, query saturation và write pressure riêng; hot write key vẫn cần xử lý ở owner.",
+            "en": "Track lag, query saturation and writes separately; hot write keys still need owner-side handling."
+          },
+          "exitCriteria": {
+            "vi": "Đã kiểm tra read-your-writes và failover có fencing/durability contract.",
+            "en": "Validate read-your-writes and failover fencing/durability."
+          },
+          "diagram": {
+            "id": "scaling-reads",
+            "title": {
+              "vi": "Write commit và replica freshness",
+              "en": "Write commits and replica freshness"
+            },
+            "caption": {
+              "vi": "Async replication không hứa mọi replica thấy ngay write vừa ACK.",
+              "en": "Asynchronous replication does not promise immediate visibility of acknowledged writes at every replica."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "API router",
+                  "en": "API router"
+                },
+                "kind": "service",
+                "x": 380.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Chọn primary hoặc replica theo yêu cầu freshness và identity của request.",
+                  "en": "Selects a primary or replica by request freshness and identity."
+                }
+              },
+              {
+                "id": "primary",
+                "label": {
+                  "vi": "Write owner",
+                  "en": "Write owner"
+                },
+                "kind": "store",
+                "x": 665.0,
+                "y": 120,
+                "detail": {
+                  "vi": "Chốt transaction trong authority boundary; ACK theo durability contract.",
+                  "en": "Commits transactions in its authority boundary; acknowledges under the durability contract."
+                }
+              },
+              {
+                "id": "replica",
+                "label": {
+                  "vi": "Read replica",
+                  "en": "Read replica"
+                },
+                "kind": "store",
+                "x": 665.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Áp dụng log; chỉ route đọc cần freshness khi đã đạt version/position phù hợp.",
+                  "en": "Applies logs; serve freshness-sensitive reads only after reaching the required version/position."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "write",
+                "label": {
+                  "vi": "Write và replication",
+                  "en": "Write and replication"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "User gửi write với logical intent ID khi cần retry.",
+                      "en": "The user writes with an intent identity when retries require it."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "primary",
+                    "description": {
+                      "vi": "Primary kiểm tra invariant và commit.",
+                      "en": "The primary checks invariants and commits."
+                    }
+                  },
+                  {
+                    "from": "primary",
+                    "to": "replica",
+                    "description": {
+                      "vi": "Replica nhận log theo policy; ACK trước hay sau cần contract riêng.",
+                      "en": "The replica receives logs under its policy; acknowledgement timing has a separate contract."
+                    },
+                    "async": true
+                  }
+                ]
+              },
+              {
+                "id": "read",
+                "label": {
+                  "vi": "Read có kiểm tra freshness",
+                  "en": "Freshness-aware read"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Read mang yêu cầu version nếu cần read-your-writes.",
+                      "en": "Reads carry required versions when needed for read-your-writes."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "replica",
+                    "description": {
+                      "vi": "Chỉ đọc nếu replica đủ mới; nếu không, chờ có giới hạn hoặc route primary.",
+                      "en": "Read only if fresh enough; otherwise wait within a bound or route to the primary."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "cache",
+          "title": {
+            "vi": "Cache repeated reads",
+            "en": "Cache repeated reads"
+          },
+          "description": {
+            "vi": "Offload read có reuse và freshness contract phù hợp.",
+            "en": "Offload reusable reads with an appropriate freshness contract."
+          },
+          "problem": {
+            "vi": "Nhiều request đọc lại cùng dữ liệu làm query latency và tải nguồn tăng.",
+            "en": "Repeated reads of the same data increase source load and query latency."
+          },
+          "decision": {
+            "vi": "Cache-aside với scoped key, TTL/invalidation và coalescing; đo hit theo request và byte.",
+            "en": "Use scoped cache-aside entries, TTL/invalidation and coalescing; measure both request and byte hits."
+          },
+          "tradeoff": {
+            "vi": "Stale fills, stampede và cold start; không fallback vào DB không giới hạn.",
+            "en": "Stale fills, stampedes and cold starts; do not allow unbounded database fallback."
+          },
+          "nextPressure": {
+            "vi": "Nếu working set vượt memory hoặc ít reuse, sửa policy trước khi cứ tăng cache.",
+            "en": "If the working set exceeds memory or reuse is poor, revisit policy before adding memory."
+          },
+          "exitCriteria": {
+            "vi": "Có admission/fallback budget khi cache chết; dữ liệu private không dùng shared URL-only key.",
+            "en": "Set outage admission/fallback budgets and avoid URL-only shared keys for private data."
+          },
+          "diagram": {
+            "id": "scaling-cache",
+            "title": {
+              "vi": "Cache hit và miss khác đường đi",
+              "en": "Cache hits and misses take different paths"
+            },
+            "caption": {
+              "vi": "Cache-aside cơ bản cần thêm policy chống race; TTL riêng không chứng minh mọi read fresh.",
+              "en": "Basic cache-aside needs race-handling policy; TTL alone does not prove freshness."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "API",
+                  "en": "API"
+                },
+                "kind": "service",
+                "x": 380.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Xác thực và authorize trước khi sử dụng cache key phù hợp; giới hạn miss concurrency.",
+                  "en": "Authorizes access, uses appropriately scoped cache keys and bounds miss concurrency."
+                }
+              },
+              {
+                "id": "cache",
+                "label": {
+                  "vi": "Cache entries",
+                  "en": "Cache entries"
+                },
+                "kind": "store",
+                "x": 665.0,
+                "y": 100,
+                "detail": {
+                  "vi": "Entry gồm key scope, value/version và TTL; cache không tự thành nguồn sự thật.",
+                  "en": "Entries include scoped keys, values/versions and TTLs; a cache is not automatically authoritative."
+                }
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "Data authority",
+                  "en": "Data authority"
+                },
+                "kind": "store",
+                "x": 665.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Đọc nguồn theo deadline; version/generation có thể ngăn stale cache publication.",
+                  "en": "Read under deadlines; versions/generations can prevent stale cache publication."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "hit",
+                "label": {
+                  "vi": "Cache hit",
+                  "en": "Cache hit"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Request đọc resource.",
+                      "en": "Request a resource."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Tra key sau kiểm tra scope/freshness.",
+                      "en": "Look up the key with scope/freshness checks."
+                    }
+                  },
+                  {
+                    "from": "cache",
+                    "to": "api",
+                    "description": {
+                      "vi": "Trả cached value nếu còn hợp lệ.",
+                      "en": "Return a still-valid cached value."
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "miss",
+                "label": {
+                  "vi": "Cache miss",
+                  "en": "Cache miss"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Nhận request cùng deadline.",
+                      "en": "Receive the request and deadline."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Miss; coalesce các request cùng key khi phù hợp.",
+                      "en": "On a miss, coalesce same-key requests where appropriate."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "db",
+                    "description": {
+                      "vi": "Đọc nguồn với concurrency cap.",
+                      "en": "Read the source under a concurrency cap."
+                    }
+                  },
+                  {
+                    "from": "db",
+                    "to": "api",
+                    "description": {
+                      "vi": "Trả value cùng version khi có.",
+                      "en": "Return the value and version when available."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "cache",
+                    "description": {
+                      "vi": "Publish có điều kiện để tránh stale fill sau update.",
+                      "en": "Publish conditionally to avoid a stale fill after an update."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "edge-media",
+          "title": {
+            "vi": "CDN cho asset và media",
+            "en": "CDN delivery for assets and media"
+          },
+          "description": {
+            "vi": "Đưa bytes có thể cache tới gần người dùng, tách khỏi metadata API.",
+            "en": "Move cacheable bytes closer to users and separate them from metadata APIs."
+          },
+          "problem": {
+            "vi": "Egress và RTT tới origin chi phối trải nghiệm xem ảnh/video hoặc tải asset.",
+            "en": "Origin egress and round trips dominate media or asset delivery."
+          },
+          "decision": {
+            "vi": "Dùng versioned URL/cache key phù hợp và origin có request coalescing.",
+            "en": "Use versioned URLs and suitable cache keys with origin request coalescing."
+          },
+          "tradeoff": {
+            "vi": "Edge egress vẫn tốn tài nguyên; invalidation, quyền truy cập và miss storm cần policy.",
+            "en": "Edge egress remains real work; invalidation, authorization and miss storms need policies."
+          },
+          "nextPressure": {
+            "vi": "Đo byte hit, geography, cold start và chi phí; cần thêm regions chỉ khi bài toán yêu cầu.",
+            "en": "Measure byte hits, geography, cold starts and cost; add regions only when required."
+          },
+          "exitCriteria": {
+            "vi": "Quyền truy cập/private cache được kiểm tra; origin chịu được miss theo budget.",
+            "en": "Validate private access/cache policy and budget origin miss capacity."
+          },
+          "diagram": {
+            "id": "scaling-cdn",
+            "title": {
+              "vi": "Media hit ở edge, miss về origin",
+              "en": "Edge media hits and origin misses"
+            },
+            "caption": {
+              "vi": "Hit giảm origin work nhưng không xóa bytes từ edge tới người xem.",
+              "en": "A hit reduces origin work, not edge-to-viewer bytes."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "cdn",
+                "label": {
+                  "vi": "CDN edge",
+                  "en": "CDN edge"
+                },
+                "kind": "edge",
+                "x": 380.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Cache representation phù hợp theo version, variant và access scope.",
+                  "en": "Caches eligible representations by version, variant and access scope."
+                }
+              },
+              {
+                "id": "origin",
+                "label": {
+                  "vi": "Object origin",
+                  "en": "Object origin"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Giữ media gốc/variants; metadata API và authorization có contract riêng.",
+                  "en": "Owns originals/variants; metadata APIs and authorization have separate contracts."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "hit",
+                "label": {
+                  "vi": "Media hit",
+                  "en": "Media hit"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Yêu cầu object/variant được phép xem.",
+                      "en": "Request an authorized object/variant."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "client",
+                    "description": {
+                      "vi": "Trả object hợp lệ từ cache tại edge.",
+                      "en": "Return an eligible cached object from the edge."
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "miss",
+                "label": {
+                  "vi": "Media miss",
+                  "en": "Media miss"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Request chưa có representation phù hợp trong cache.",
+                      "en": "No suitable representation is cached."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "origin",
+                    "description": {
+                      "vi": "Fetch có giới hạn/coalescing; không bỏ authorization.",
+                      "en": "Fetch with bounds/coalescing without bypassing authorization."
+                    }
+                  },
+                  {
+                    "from": "origin",
+                    "to": "cdn",
+                    "description": {
+                      "vi": "Trả object và cache policy theo contract.",
+                      "en": "Return the object and its cache policy."
+                    }
+                  },
+                  {
+                    "from": "cdn",
+                    "to": "client",
+                    "description": {
+                      "vi": "Phân phối bytes tới người xem.",
+                      "en": "Deliver bytes to the viewer."
+                    }
+                  }
+                ]
+              }
+            ]
           }
         },
         {
           "id": "async",
           "title": {
-            "vi": "Queue và shard có chủ đích",
-            "en": "Intentional queues and shards"
+            "vi": "Queue và worker có durable intent",
+            "en": "Queues and workers with durable intent"
           },
           "description": {
-            "vi": "Tách async latency và partition theo invariant/access pattern.",
-            "en": "Separate asynchronous latency and partition by invariants/access patterns."
+            "vi": "Tách công việc có thể hoàn tất sau khỏi synchronous request.",
+            "en": "Separate deferrable work from synchronous requests."
+          },
+          "problem": {
+            "vi": "Email, thumbnails hoặc indexing giữ request lâu; burst vượt capacity tức thì.",
+            "en": "Email, thumbnails or indexing prolong requests; bursts exceed immediate capacity."
+          },
+          "decision": {
+            "vi": "Commit resource và event intent qua outbox/CDC khi phù hợp, rồi worker xử lý có idempotency.",
+            "en": "Commit resources and event intent through suitable outbox/CDC, then process idempotently."
+          },
+          "tradeoff": {
+            "vi": "ACK không đồng nghĩa async work xong; cần retries, DLQ, replay và completion visibility.",
+            "en": "An ACK does not mean async work finished; retries, dead letters, replay and completion visibility are required."
+          },
+          "nextPressure": {
+            "vi": "Backlog dài hạn tăng nghĩa là cần giảm arrival hoặc tăng effective service, không chỉ tăng queue size.",
+            "en": "Sustained backlog growth needs lower arrival or higher effective service, not merely a larger queue."
           },
           "exitCriteria": {
-            "vi": "Retry/replay, hot shard và backfill không làm hỏng correctness.",
-            "en": "Retries/replays, hot shards and backfills preserve correctness."
+            "vi": "Durable ACK, duplicate handling, oldest-job age và recovery đã được thử.",
+            "en": "Test durable acknowledgement, duplicates, oldest-job age and recovery."
+          },
+          "diagram": {
+            "id": "scaling-async",
+            "title": {
+              "vi": "Từ transaction tới công việc nền",
+              "en": "From transaction to background work"
+            },
+            "caption": {
+              "vi": "Mũi tên async thể hiện completion tách khỏi request; queue không tạo thêm capacity downstream.",
+              "en": "Async arrows separate completion from requests; queues do not create downstream capacity."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "API",
+                  "en": "API"
+                },
+                "kind": "service",
+                "x": 285.0,
+                "y": 130,
+                "detail": {
+                  "vi": "Trả theo mốc durable acceptance đã hứa, không claim worker đã xong.",
+                  "en": "Returns at its declared durable-acceptance point without claiming worker completion."
+                }
+              },
+              {
+                "id": "db",
+                "label": {
+                  "vi": "DB + outbox",
+                  "en": "DB + outbox"
+                },
+                "kind": "store",
+                "x": 475.0,
+                "y": 130,
+                "detail": {
+                  "vi": "Resource và event intent được ghi cùng transaction khi dùng outbox.",
+                  "en": "An outbox records resource changes and event intent in one transaction."
+                }
+              },
+              {
+                "id": "queue",
+                "label": {
+                  "vi": "Queue / log",
+                  "en": "Queue / log"
+                },
+                "kind": "queue",
+                "x": 475.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Giữ event theo retention/ordering contract; relay có thể gửi lặp.",
+                  "en": "Retains events under ordering/retention contracts; a relay may duplicate delivery."
+                }
+              },
+              {
+                "id": "worker",
+                "label": {
+                  "vi": "Workers",
+                  "en": "Workers"
+                },
+                "kind": "worker",
+                "x": 665.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Dedup logical intent, cập nhật sink và ACK theo contract; backpressure có giới hạn.",
+                  "en": "Deduplicates intents, updates sinks and acknowledges under bounded backpressure."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "accept",
+                "label": {
+                  "vi": "Chấp nhận và xử lý",
+                  "en": "Accept and process"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Submit công việc có identity.",
+                      "en": "Submit identified work."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "db",
+                    "description": {
+                      "vi": "Commit resource và outbox trong một transaction.",
+                      "en": "Commit the resource and outbox in one transaction."
+                    }
+                  },
+                  {
+                    "from": "db",
+                    "to": "queue",
+                    "description": {
+                      "vi": "Relay/CDC chuyển durable intent; có thể gửi lặp.",
+                      "en": "Relay/CDC publishes durable intent, possibly more than once."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "queue",
+                    "to": "worker",
+                    "description": {
+                      "vi": "Consumer xử lý idempotent và cập nhật trạng thái hoàn tất.",
+                      "en": "Consumers process idempotently and update completion state."
+                    },
+                    "async": true
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "shards",
+          "title": {
+            "vi": "Shard theo invariant và access pattern",
+            "en": "Shard by invariants and access patterns"
+          },
+          "description": {
+            "vi": "Chia ownership khi một owner không còn đáp ứng volume hoặc throughput.",
+            "en": "Partition ownership when one owner cannot meet volume or throughput needs."
+          },
+          "problem": {
+            "vi": "Một primary tối ưu rồi vẫn hết capacity, hoặc residency/volume đòi partition.",
+            "en": "An optimized primary is exhausted, or residency/volume requires partitioning."
+          },
+          "decision": {
+            "vi": "Dùng directory/virtual shards hoặc partition rule có version; co-locate invariant khi có thể.",
+            "en": "Use versioned directories/virtual shards or partition rules, colocating invariants where possible."
+          },
+          "tradeoff": {
+            "vi": "Cross-shard queries/transactions, hot tenants và resharding tăng độ phức tạp.",
+            "en": "Cross-shard queries/transactions, hot tenants and resharding add complexity."
+          },
+          "nextPressure": {
+            "vi": "Nếu một key vẫn hot, thêm shard khác không tự chia được contention của key đó.",
+            "en": "Extra shards do not automatically split contention on one hot key."
+          },
+          "exitCriteria": {
+            "vi": "Snapshot/catch-up/cutover có fencing, verification và rollback; tải backfill được giới hạn.",
+            "en": "Use fenced, verified snapshot/catch-up/cutover and rollback with bounded backfill load."
+          },
+          "diagram": {
+            "id": "scaling-shards",
+            "title": {
+              "vi": "Routing theo owner hiện hành",
+              "en": "Route to the current owner"
+            },
+            "caption": {
+              "vi": "Sơ đồ thể hiện logical routing, không hứa dữ liệu hoặc traffic tự phân phối đều.",
+              "en": "This is logical routing, not a guarantee of balanced data or traffic."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "router",
+                "label": {
+                  "vi": "Shard directory",
+                  "en": "Shard directory"
+                },
+                "kind": "service",
+                "x": 380.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Map logical key tới owner cùng routing epoch; stale routing phải bị phát hiện.",
+                  "en": "Maps logical keys to owners and routing epochs; stale routing must be detected."
+                }
+              },
+              {
+                "id": "s1",
+                "label": {
+                  "vi": "Shard A",
+                  "en": "Shard A"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 120,
+                "detail": {
+                  "vi": "Chỉ nhận write trong ownership scope và epoch hiện hành.",
+                  "en": "Accepts writes only within the current ownership scope and epoch."
+                }
+              },
+              {
+                "id": "s2",
+                "label": {
+                  "vi": "Shard B",
+                  "en": "Shard B"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Dữ liệu khác có owner khác; cross-shard invariant cần protocol riêng.",
+                  "en": "Owns other data; cross-shard invariants require a separate protocol."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "a",
+                "label": {
+                  "vi": "Key thuộc A",
+                  "en": "Key owned by A"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "router",
+                    "description": {
+                      "vi": "Request chứa key đã validate và actor được phép.",
+                      "en": "The request carries a validated key and authorized actor."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "s1",
+                    "description": {
+                      "vi": "Route tới A với epoch hiện hành.",
+                      "en": "Route to A using the current epoch."
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "b",
+                "label": {
+                  "vi": "Key thuộc B",
+                  "en": "Key owned by B"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "router",
+                    "description": {
+                      "vi": "Tra ownership của key khác; không broadcast mọi query.",
+                      "en": "Look up another key without broadcasting every query."
+                    }
+                  },
+                  {
+                    "from": "router",
+                    "to": "s2",
+                    "description": {
+                      "vi": "Route tới B; kiểm tra authority trước commit.",
+                      "en": "Route to B and verify authority before commit."
+                    }
+                  }
+                ]
+              }
+            ]
           }
         },
         {
@@ -366,12 +1575,307 @@
             "en": "Regions and recovery"
           },
           "description": {
-            "vi": "Route theo ownership, replication position và failover policy.",
-            "en": "Route by ownership, replication positions and failover policy."
+            "vi": "Chọn write ownership, freshness và disaster-recovery contract theo từng dữ liệu.",
+            "en": "Choose per-data write ownership, freshness and disaster-recovery contracts."
+          },
+          "problem": {
+            "vi": "Latency địa lý, residency hoặc mất region không thể đáp ứng chỉ trong một vùng.",
+            "en": "Geographic latency, residency or region loss exceeds a single-region design."
+          },
+          "decision": {
+            "vi": "Ví dụ này giữ một write owner và replicate sang vùng dự phòng; chỉ promote theo authority/fencing protocol.",
+            "en": "This example keeps one write owner and replicates to a standby, promoted only under an authority/fencing protocol."
+          },
+          "tradeoff": {
+            "vi": "Async lag có thể tạo data loss khi promote; sync cross-region tăng latency/coordination.",
+            "en": "Asynchronous lag may lose data on promotion; synchronous cross-region coordination adds latency."
+          },
+          "nextPressure": {
+            "vi": "Đo RPO/RTO và dependency failure domains; active-active chỉ khi có conflict/invariant protocol phù hợp.",
+            "en": "Measure RPO/RTO and dependency failure domains; use active-active only with suitable conflict/invariant protocols."
           },
           "exitCriteria": {
             "vi": "RPO/RTO được đo và old writer được fencing khi failover.",
             "en": "RPO/RTO are measured and failover fences old writers."
+          },
+          "diagram": {
+            "id": "scaling-global",
+            "title": {
+              "vi": "Single-writer cross-region recovery",
+              "en": "Single-writer cross-region recovery"
+            },
+            "caption": {
+              "vi": "Chọn luồng recovery không tự thực hiện failover; preconditions và dữ liệu mất phải được kiểm chứng bằng drill.",
+              "en": "Selecting the recovery trace does not perform failover; drills must verify preconditions and possible data loss."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "routing",
+                "label": {
+                  "vi": "Authority + routing",
+                  "en": "Authority + routing"
+                },
+                "kind": "edge",
+                "x": 380.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Biết owner hiện hành; DNS đổi không đủ để fence writer cũ.",
+                  "en": "Knows the current owner; DNS changes alone do not fence old writers."
+                }
+              },
+              {
+                "id": "home",
+                "label": {
+                  "vi": "Region A writer",
+                  "en": "Region A writer"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 120,
+                "detail": {
+                  "vi": "Owner hiện tại chốt write; cần bị fence trước khi owner mới nhận authority.",
+                  "en": "The current owner commits writes and must be fenced before authority transfers."
+                }
+              },
+              {
+                "id": "standby",
+                "label": {
+                  "vi": "Region B standby",
+                  "en": "Region B standby"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Áp dụng replicated state; cần xác minh recovery point trước promotion.",
+                  "en": "Applies replicated state; verify the recovery point before promotion."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "normal",
+                "label": {
+                  "vi": "Writer và replication",
+                  "en": "Writer and replication"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "routing",
+                    "description": {
+                      "vi": "Route write theo authority, không chỉ region gần nhất.",
+                      "en": "Route writes by authority, not proximity alone."
+                    }
+                  },
+                  {
+                    "from": "routing",
+                    "to": "home",
+                    "description": {
+                      "vi": "Commit tại write owner đã chọn.",
+                      "en": "Commit at the selected write owner."
+                    }
+                  },
+                  {
+                    "from": "home",
+                    "to": "standby",
+                    "description": {
+                      "vi": "Replicate theo policy durability và lag đã chốt.",
+                      "en": "Replicate under the declared durability and lag policy."
+                    },
+                    "async": true
+                  }
+                ]
+              },
+              {
+                "id": "recovery",
+                "label": {
+                  "vi": "Sau chuyển authority an toàn",
+                  "en": "After a safe authority transfer"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "routing",
+                    "description": {
+                      "vi": "Luồng này giả định fencing/promotion đã hoàn tất; có thể có downtime trước đó.",
+                      "en": "This path assumes fencing/promotion completed; earlier downtime is possible."
+                    }
+                  },
+                  {
+                    "from": "routing",
+                    "to": "standby",
+                    "description": {
+                      "vi": "Chỉ B có authority mới nhận write; client stale route phải bị reject/reroute.",
+                      "en": "Only B with new authority accepts writes; reject or reroute stale clients."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "operations",
+          "title": {
+            "vi": "Observability và thay đổi an toàn",
+            "en": "Observability and safe change"
+          },
+          "description": {
+            "vi": "Khả năng quan sát, backup và rollout áp dụng từ đầu ở mọi quy mô, không phải phần thưởng cuối lộ trình.",
+            "en": "Observability, backups and rollout safety apply from the start at every scale, not only at the final stage."
+          },
+          "problem": {
+            "vi": "Không biết bottleneck nằm đâu, deploy khó rollback hoặc recovery chỉ có trên tài liệu.",
+            "en": "Bottlenecks are opaque, rollback is difficult or recovery exists only on paper."
+          },
+          "decision": {
+            "vi": "Nối user-facing SLI với metrics/logs/traces; dùng canary, guardrails và runbook có owner.",
+            "en": "Connect user-facing SLIs with metrics/logs/traces and use owned canaries, guardrails and runbooks."
+          },
+          "tradeoff": {
+            "vi": "Telemetry có chi phí/cardinality và dữ liệu nhạy cảm; guardrail sai có thể che lỗi hoặc rollback nhầm.",
+            "en": "Telemetry has cost, cardinality and privacy concerns; poor guardrails can hide faults or trigger bad rollbacks."
+          },
+          "nextPressure": {
+            "vi": "Ưu tiên rủi ro có evidence và chuẩn bị migration trước khi runway cạn.",
+            "en": "Prioritize evidenced risks and prepare migrations before runway expires."
+          },
+          "exitCriteria": {
+            "vi": "Có thử restore, rollback và failure drill; signal phản ánh đúng trải nghiệm user.",
+            "en": "Rehearse restoration, rollback and failures with signals reflecting user experience."
+          },
+          "diagram": {
+            "id": "scaling-ops",
+            "title": {
+              "vi": "Đo ảnh hưởng trước khi tăng rollout",
+              "en": "Measure impact before expanding a rollout"
+            },
+            "caption": {
+              "vi": "Đây là vòng kiểm soát vận hành, không phải synchronous dependency của mỗi request.",
+              "en": "This is an operational control loop, not a synchronous dependency of every request."
+            },
+            "width": 760,
+            "height": 480,
+            "nodes": [
+              {
+                "id": "client",
+                "label": {
+                  "vi": "Client",
+                  "en": "Client"
+                },
+                "kind": "client",
+                "x": 95.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Gửi request; timeout không chứng minh side effect chưa chạy.",
+                  "en": "Sends requests; a timeout does not prove a side effect did not run."
+                }
+              },
+              {
+                "id": "api",
+                "label": {
+                  "vi": "Service / canary",
+                  "en": "Service / canary"
+                },
+                "kind": "service",
+                "x": 380.0,
+                "y": 120,
+                "detail": {
+                  "vi": "Nhận phần traffic có phạm vi và gắn version vào telemetry.",
+                  "en": "Receives scoped traffic and attaches deployment versions to telemetry."
+                }
+              },
+              {
+                "id": "signals",
+                "label": {
+                  "vi": "SLI + traces",
+                  "en": "SLI + traces"
+                },
+                "kind": "store",
+                "x": 646.0,
+                "y": 240,
+                "detail": {
+                  "vi": "Định nghĩa denominator/window và giữ sampling/cardinality trong budget.",
+                  "en": "Defines denominators/windows and budgets sampling/cardinality."
+                }
+              },
+              {
+                "id": "owner",
+                "label": {
+                  "vi": "Rollout owner",
+                  "en": "Rollout owner"
+                },
+                "kind": "worker",
+                "x": 380.0,
+                "y": 360,
+                "detail": {
+                  "vi": "Đánh giá evidence, dừng hoặc rollback theo policy; không tự động bỏ qua correctness.",
+                  "en": "Evaluates evidence and stops or rolls back under policy without ignoring correctness."
+                }
+              }
+            ],
+            "traces": [
+              {
+                "id": "observe",
+                "label": {
+                  "vi": "Quan sát và quyết định",
+                  "en": "Observe and decide"
+                },
+                "steps": [
+                  {
+                    "from": "client",
+                    "to": "api",
+                    "description": {
+                      "vi": "Canary phục vụ luồng người dùng theo scope đã chọn.",
+                      "en": "The canary serves user flows within the selected scope."
+                    }
+                  },
+                  {
+                    "from": "api",
+                    "to": "signals",
+                    "description": {
+                      "vi": "Phát metric/log/trace không chứa secret.",
+                      "en": "Emit metrics/logs/traces without secrets."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "signals",
+                    "to": "owner",
+                    "description": {
+                      "vi": "So user impact và invariant với baseline.",
+                      "en": "Compare user impact and invariants against the baseline."
+                    },
+                    "async": true
+                  },
+                  {
+                    "from": "owner",
+                    "to": "api",
+                    "description": {
+                      "vi": "Tiếp tục, dừng hoặc rollback có kiểm soát.",
+                      "en": "Continue, stop or roll back deliberately."
+                    }
+                  }
+                ]
+              }
+            ]
           }
         }
       ]
@@ -390,6 +1894,62 @@
         {
           "vi": "Migration được thiết kế như feature: schema expand trước, backfill có rate limit, dual-read/shadow verification theo phạm vi, cutover có rollback và chỉ contract schema cũ sau khi client đã chuyển. Chọn một chỉ số user impact và một invariant để làm guardrail. Không xem việc “thêm cluster mới” là đã hoàn thành scale nếu không chuyển dữ liệu và traffic an toàn.",
           "en": "Treat migration as a feature: expand schemas first, rate-limit backfills, scope dual/shadow verification, cut over with rollback and contract old schemas only after clients migrate. Use user-impact and invariant guardrails. Adding a cluster is not complete scaling until data and traffic move safely."
+        }
+      ],
+      "cards": [
+        {
+          "title": {
+            "vi": "Quyết định khó đổi",
+            "en": "Costly-to-change decisions"
+          },
+          "icon": "decision",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Shard key, public API và ID có thể đi vào dữ liệu cùng nhiều client.",
+              "en": "Shard keys, public APIs and IDs can become embedded in data and many clients."
+            },
+            {
+              "vi": "Viết giả định, lối migration và versioning trước khi phụ thuộc lan rộng.",
+              "en": "Record assumptions, migration paths and versioning before dependencies spread."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Thay đổi có thể trì hoãn",
+            "en": "Changes that can wait"
+          },
+          "icon": "gauge",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Thêm cache hoặc replica khi số đo cho thấy lợi ích; vẫn tính invalidation, lag và cache outage.",
+              "en": "Add caches or replicas when measurements justify them, including invalidation, lag and cache-outage behavior."
+            },
+            {
+              "vi": "Đặt trigger theo SLO, workload và thời gian chuẩn bị, không theo số user bất kỳ.",
+              "en": "Set triggers using SLOs, workloads and preparation lead time rather than arbitrary user counts."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Capacity gồm cả người vận hành",
+            "en": "Capacity includes operators"
+          },
+          "icon": "users",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Cluster mới cần owner, dashboard, backup/restore và trực sự cố.",
+              "en": "New clusters need owners, dashboards, backup/restore and incident response."
+            },
+            {
+              "vi": "So chi phí tiền, on-call và migration với lợi ích; thử rollback trước khi cutover.",
+              "en": "Compare spend, on-call and migration costs with benefits; rehearse rollback before cutover."
+            }
+          ]
         }
       ]
     },
@@ -448,6 +2008,46 @@
               "en": "Only where ownership, isolation or independent scaling benefits are clear. Service splits add network latency, versioning, tracing and distributed consistency. Replicate a modular monolith first and separate evidenced bottlenecks later."
             }
           ]
+        },
+        {
+          "question": {
+            "vi": "Ứng dụng chậm khi đạt 50.000 user: bạn sẽ làm gì trước?",
+            "en": "An app slows at 50,000 users: what do you do first?"
+          },
+          "answer": [
+            {
+              "vi": "Làm rõ 50.000 là đăng ký, DAU hay concurrent user; xác định endpoint, thời điểm và SLO bị ảnh hưởng. So traffic mix, payload, latency và error trước/sau thay đổi. Dùng trace cùng query plan, query count, pool wait, CPU/IO và lock wait để phân biệt query xấu, contention, downstream chậm hay thiếu capacity. Không suy ra cần shard từ một con số user.",
+              "en": "Clarify whether 50,000 means registered, daily active or concurrent users, then identify affected endpoints, times and SLOs. Compare traffic mix, payloads, latency and errors before and after the change. Inspect traces, plans, query counts, pool waits, CPU/IO and locks to distinguish bad queries, contention, slow dependencies and capacity limits. A user count alone does not justify sharding."
+            },
+            {
+              "vi": "Ví dụ query list tạo N+1 và scan lớn: sửa batching/index có thể giảm công việc mà không thêm distributed boundary. Nếu bottleneck thực là compute độc lập, scale API stateless; nếu repeated reads chiếm tải, thử cache hoặc replica với freshness policy. Khi một write owner thực sự hết khả năng sau tối ưu, mới đánh giá partition key, invariant và migration. Mỗi thử nghiệm phải có số đo cải thiện, correctness guardrail và rollback.",
+              "en": "For an N+1 list query with large scans, batching or an index may reduce work without another distributed boundary. Scale stateless APIs for independent compute pressure, or evaluate caches/replicas with a freshness policy for repeated reads. If an optimized write owner is still exhausted, evaluate partition keys, invariants and migration. Every experiment needs measured benefits, correctness guardrails and rollback."
+            }
+          ],
+          "followup": {
+            "vi": "Số đo nào giúp phân biệt thiếu capacity với contention trên một hot key?",
+            "en": "Which measurements distinguish aggregate capacity limits from contention on one hot key?"
+          }
+        },
+        {
+          "question": {
+            "vi": "Khi nào multi-region đáng chi phí và RPO/RTO phải được kiểm chứng ra sao?",
+            "en": "When is multi-region worth its cost, and how are RPO/RTO validated?"
+          },
+          "answer": [
+            {
+              "vi": "Bắt đầu từ nhu cầu latency theo địa lý, khả năng phục hồi khi mất region hoặc residency; chọn rõ dữ liệu nào và write owner nào. Remote reads có thể dùng replica/CDN, còn write nhiều vùng cần coordination hoặc conflict semantics theo invariant. Đồng bộ trong một region không tự bảo đảm RPO = 0 khi cả region mất; async cross-region có nguy cơ mất phần chưa replicate khi failover.",
+              "en": "Start with geographic latency, region-loss recovery or residency requirements, and identify the affected data and write owners. Replicas/CDNs may serve remote reads; multi-region writes need coordination or conflict semantics that preserve invariants. Synchronous replication inside one region does not establish RPO zero for region loss; asynchronous cross-region failover risks losing unreplicated changes."
+            },
+            {
+              "vi": "RPO là mức mất dữ liệu tối đa chấp nhận được theo contract; RTO là mục tiêu thời gian khôi phục. Trong drill, ghi nhận durable acknowledgements trước lỗi, xác minh các write còn tồn tại sau recovery và đo thời gian tới khi luồng người dùng hoạt động đúng, không chỉ DNS đổi xong. Kiểm tra fencing writer cũ, quyền promote, stale connections, event/cache lag, backup restore và failback. Replication lag quan sát lúc bình thường không phải bảo đảm RPO trong mọi sự cố.",
+              "en": "RPO is the maximum acceptable data-loss window under the contract; RTO is the recovery-time objective. During drills, record durable acknowledgements, verify writes surviving recovery and measure time until user flows work correctly, not merely until DNS changes. Exercise old-writer fencing, promotion authority, stale connections, event/cache lag, backup restoration and failback. Normal observed replication lag is not a guaranteed RPO for every failure."
+            }
+          ],
+          "followup": {
+            "vi": "Nếu không thể fence writer cũ khi network partition, hệ có được phép promote writer mới không?",
+            "en": "If a network partition prevents fencing the old writer, is a new writer allowed to be promoted?"
+          }
         }
       ]
     }

@@ -192,6 +192,20 @@
               "vi": "1 TiB",
               "en": "1 TiB"
             }
+          ],
+          [
+            {
+              "vi": "2^50",
+              "en": "2^50"
+            },
+            {
+              "vi": "1,125,899,906,842,624",
+              "en": "1,125,899,906,842,624"
+            },
+            {
+              "vi": "1 PiB",
+              "en": "1 PiB"
+            }
           ]
         ]
       }
@@ -258,6 +272,87 @@
           "en": "A CDN reduces origin traffic at good hit rates, while edge egress still exists. Use byte hit rates for bandwidth planning: a 99% request hit rate does not imply 99% of bytes are cached if misses are huge objects. Upload/transcoding planning includes ingress and multiple renditions, not only originals."
         }
       ]
+    },
+    {
+      "id": "working-set",
+      "title": {
+        "vi": "4a. Cache: tính working set, không nhân mọi lượt đọc",
+        "en": "4a. Cache: size the working set, not every read"
+      },
+      "paragraphs": [
+        {
+          "vi": "Cache lưu các key/value còn được giữ, không lưu thêm một bản cho mỗi lượt đọc. Một triệu lượt đọc cùng một key có thể chỉ cần một entry. Ước lượng từ số key phân biệt cần giữ trong cửa sổ tái sử dụng, kích thước value và overhead của key, metadata, allocator; sau đó áp replication và headroom theo thiết kế. TTL, eviction và phân phối truy cập quyết định working set thực tế.",
+          "en": "A cache retains entries, not a new copy for every read. A million reads of one key may require only one entry. Estimate distinct retained keys over the reuse window, value sizes and key, metadata and allocator overhead, then apply the chosen replication and headroom. TTLs, eviction and access distribution determine the actual working set."
+        },
+        {
+          "vi": "Ví dụ giả định: 2 triệu key phân biệt × 1 KB/value = 2 GB payload. Nếu key/metadata/allocator thêm 50% thì một bản cần khoảng 3 GB; hai bản cần khoảng 6 GB tổng bộ nhớ trước headroom. Đây là tổng cả cụm, không phải 6 GB trên mỗi node. Replica layout, shard skew, hot key và mức sử dụng an toàn vẫn quyết định số máy.",
+          "en": "For illustration, two million distinct keys × 1 KB/value gives 2 GB of payload. With 50% extra for keys, metadata and allocation, one copy needs about 3 GB; two copies need about 6 GB in aggregate before headroom. This is cluster-wide memory, not 6 GB per node. Replica layout, shard skew, hot keys and safe utilization still determine node counts."
+        },
+        {
+          "vi": "Không suy ra hit rate chỉ từ việc “cache 20% dữ liệu”. Cần đo reuse distance, tần suất truy cập và TTL; một workload quét một lần có thể ít hit dù cache lớn. Khi cache mất hoặc khởi động lạnh, giới hạn traffic về nguồn bằng admission, request coalescing và warm-up có kiểm soát. Cache có thể cần thiết cho capacity nhưng vẫn phải có chính sách suy giảm an toàn.",
+          "en": "Caching 20% of the dataset does not establish a hit ratio. Measure reuse distance, access frequency and TTLs; a one-pass scan may have few hits despite a large cache. On cache loss or cold start, protect the origin with admission, request coalescing and controlled warm-up. A capacity-critical cache still needs a safe degradation policy."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Phép đo cache",
+            "en": "Cache measurement"
+          },
+          {
+            "vi": "Dùng để suy ra",
+            "en": "Used to estimate"
+          },
+          {
+            "vi": "Không được đánh đồng",
+            "en": "Do not equate with"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Key phân biệt còn giữ",
+              "en": "Distinct retained keys"
+            },
+            {
+              "vi": "Payload và overhead bộ nhớ",
+              "en": "Memory payload and overhead"
+            },
+            {
+              "vi": "Tổng lượt đọc trong ngày",
+              "en": "Total daily reads"
+            }
+          ],
+          [
+            {
+              "vi": "Request hit ratio",
+              "en": "Request hit ratio"
+            },
+            {
+              "vi": "Tỷ lệ request tránh đọc nguồn",
+              "en": "Fraction of requests avoiding origin reads"
+            },
+            {
+              "vi": "Byte hit ratio khi object khác kích thước",
+              "en": "Byte hit ratio for differently sized objects"
+            }
+          ],
+          [
+            {
+              "vi": "Byte hit ratio",
+              "en": "Byte hit ratio"
+            },
+            {
+              "vi": "Lượng byte được offload khỏi nguồn",
+              "en": "Bytes offloaded from the origin"
+            },
+            {
+              "vi": "Xóa toàn bộ chi phí edge egress",
+              "en": "Elimination of all edge egress costs"
+            }
+          ]
+        ]
+      }
     },
     {
       "id": "concurrency",
@@ -412,6 +507,10 @@
         {
           "vi": "Hash partition phân phối key không đồng nghĩa phân phối traffic. Một hot tenant hoặc URL viral có thể chiếm một shard trong khi các shard còn rảnh. Ước lượng p99 per-key rate, đọc fan-out, cacheability và khả năng split key. Việc thêm shard chỉ có tác dụng khi load thực sự chuyển được sang chúng.",
           "en": "Hash partitioning spreads keys, not necessarily traffic. A hot tenant or viral URL can saturate one shard while others are idle. Estimate high-percentile per-key rates, read fan-out, cacheability and key-splitting options. Adding shards helps only if the load can move to them."
+        },
+        {
+          "vi": "Nếu chịu mất một trong ba AZ có capacity ngang nhau, hai AZ còn lại phải gánh toàn bộ peak mà không đợi autoscaling. Ví dụ peak 1 triệu request/s và benchmark giả định 10.000 request/s/node tại SLO đã chọn: cần tối thiểu 100 node còn sống, tức 50 node/AZ hay 150 node tổng trong mô hình chia tải đều. Đây mới là ngưỡng số học; thêm dự phòng cho recovery, skew và rollout khi benchmark chưa bao gồm chúng, và kiểm tra cả database/network ở trạng thái mất AZ.",
+          "en": "To tolerate losing one of three equal-capacity AZs, the surviving two must serve the full peak without waiting for autoscaling. At an illustrative one-million-request/s peak and a measured 10,000 requests/s/node under the chosen SLO, at least 100 nodes must survive: 50 per AZ, or 150 total with even routing. This is only an arithmetic minimum. Add recovery, skew and rollout allowance if absent from the benchmark, and validate databases and networks under AZ loss as well."
         }
       ]
     },
@@ -445,7 +544,99 @@
           "en": "For branched requests, wall time follows the critical path while resource work includes every branch. Parallelism can lower latency while increasing concurrency and tail amplification when all dependencies must finish. The percentile of a sum is not generally the sum of percentiles without distribution/correlation assumptions; measure end-to-end latency and trace causes."
         }
       ],
-      "experiment": "latency"
+      "experiment": "latency",
+      "table": {
+        "headers": [
+          {
+            "vi": "Mốc latency giả định",
+            "en": "Illustrative latency anchor"
+          },
+          {
+            "vi": "Thời gian giả định",
+            "en": "Assumed duration"
+          },
+          {
+            "vi": "So với RAM trong ví dụ",
+            "en": "Relative to RAM in this example"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "CPU cache access",
+              "en": "CPU cache access"
+            },
+            {
+              "vi": "1 ns",
+              "en": "1 ns"
+            },
+            {
+              "vi": "0.01×",
+              "en": "0.01×"
+            }
+          ],
+          [
+            {
+              "vi": "RAM access",
+              "en": "RAM access"
+            },
+            {
+              "vi": "100 ns",
+              "en": "100 ns"
+            },
+            {
+              "vi": "1×",
+              "en": "1×"
+            }
+          ],
+          [
+            {
+              "vi": "Random storage read",
+              "en": "Random storage read"
+            },
+            {
+              "vi": "100 µs",
+              "en": "100 µs"
+            },
+            {
+              "vi": "1,000×",
+              "en": "1,000×"
+            }
+          ],
+          [
+            {
+              "vi": "Same-datacenter RTT",
+              "en": "Same-datacenter RTT"
+            },
+            {
+              "vi": "1 ms",
+              "en": "1 ms"
+            },
+            {
+              "vi": "10,000×",
+              "en": "10,000×"
+            }
+          ],
+          [
+            {
+              "vi": "Cross-region RTT",
+              "en": "Cross-region RTT"
+            },
+            {
+              "vi": "80 ms",
+              "en": "80 ms"
+            },
+            {
+              "vi": "800,000×",
+              "en": "800,000×"
+            }
+          ]
+        ],
+        "caption": {
+          "vi": "Các số được chọn để so order of magnitude, không phải benchmark phần cứng hay lời hứa của network. Phải đo đường thật; cache/RAM access khác một RPC cache qua mạng.",
+          "en": "Values illustrate orders of magnitude, not hardware benchmarks or network guarantees. Measure actual paths; a cache/RAM access differs from a network cache RPC."
+        }
+      }
     },
     {
       "id": "availability",
@@ -461,9 +652,196 @@
         {
           "vi": "Hai dependency nối tiếp chỉ có availability bằng tích khi các giả định independence và success semantics phù hợp; shared failure domain thường phá giả định đó. Redundancy cũng không tự tạo independence khi cả hai replica cùng region, cùng bug deployment hoặc cùng credential bị revoke. Error budget hướng dẫn ưu tiên reliability với tốc độ thay đổi, không phải quyền được bỏ qua mọi sự cố cho tới khi hết budget.",
           "en": "Multiplying serial-dependency availability requires appropriate independence and success assumptions; shared failure domains often violate them. Redundancy does not create independence when replicas share regions, deployment bugs or revoked credentials. Error budgets guide reliability/change priorities, not permission to ignore incidents until the budget is exhausted."
+        },
+        {
+          "vi": "Ví dụ riêng với tám dependency bắt buộc, mỗi dependency thành công 99,9% và độc lập tại boundary đang xét: xác suất cả tám cùng thành công là 0,999^8 ≈ 99,203%. Đó không phải 99,9% cho toàn request. Nếu dependency tùy chọn có thể bỏ qua hoặc các failure tương quan, phải viết lại mô hình; không nhân các SLA của nhà cung cấp rồi coi đó là số đo end-to-end. Đo SLI từ góc nhìn người dùng và kiểm tra graceful degradation.",
+          "en": "For eight required dependencies, each independently successful with probability 99.9% at the selected boundary, all eight succeed with probability 0.999^8 ≈ 99.203%, not 99.9%. Optional dependencies or correlated failures require a different model. Multiplying vendor SLAs is not an end-to-end measurement; measure the user-facing SLI and test graceful degradation."
         }
       ],
       "experiment": "availability"
+    },
+    {
+      "id": "dependency-model",
+      "title": {
+        "vi": "8b.1. Thử dependency chain, redundancy và common cause",
+        "en": "8b.1. Explore dependency chains, redundancy and common causes"
+      },
+      "paragraphs": [
+        {
+          "vi": "Công cụ này so hai cấu trúc riêng: chain nối tiếp phải có mọi dependency, còn nhóm redundant chỉ cần một replica hoạt động. Số dependency không làm thay đổi nhóm redundant và số replica không làm thay đổi chain. Đổi từng giả định rồi giải thích vì sao kết quả thay đổi; không đọc hai cột như cùng một hệ thống đã kết hợp cả hai.",
+          "en": "This tool compares two separate structures: a serial chain requiring every dependency and a redundant group needing one available replica. Dependency count does not change the redundant group, and replica count does not change the chain. Vary assumptions and explain the changes; the two columns are not one combined architecture."
+        },
+        {
+          "vi": "Bật lỗi chung để thấy replication không vượt được giới hạn failure domain. Mô hình chỉ là xác suất với giả định độc lập có điều kiện; chưa tính capacity failover, thời gian phát hiện, health check, routing hoặc dữ liệu mất. Các yếu tố đó vẫn phải nằm trong thiết kế và phép đo SLI.",
+          "en": "Enable the common cause to see why replicas cannot escape a shared failure domain. This is a probability model with conditional independence assumptions, excluding failover capacity, detection, health checks, routing and data loss. Designs and SLI measurements still need those factors."
+        },
+        {
+          "vi": "Các phần trăm trong công cụ được làm tròn năm chữ số thập phân. Giá trị hiển thị 100,00000% sau làm tròn không chứng minh xác suất lỗi bằng 0; không suy ra SLA hay durability từ số đã làm tròn.",
+          "en": "Tool percentages are rounded to five decimal places. A displayed 100.00000% after rounding does not prove zero failure probability; rounded values do not establish an SLA or durability guarantee."
+        }
+      ],
+      "experiment": "dependency-availability"
+    },
+    {
+      "id": "worked-system",
+      "title": {
+        "vi": "8c. Ví dụ xuyên suốt: từ ứng dụng ảnh tới quyết định thiết kế",
+        "en": "8c. Worked example: from a photo app to design decisions"
+      },
+      "paragraphs": [
+        {
+          "vi": "Giả định cho bài tập, không phải số liệu của một sản phẩm: 20 triệu DAU; mỗi người xem 25 ảnh/ngày và tạo trung bình 0,05 upload/ngày. Mỗi upload được giữ thành 2 MB ảnh gốc + 0,5 MB các biến thể. Mỗi lượt xem tải đúng một ảnh 200 KB. Dùng đơn vị thập phân, giữ 30 ngày, ba bản sao; tạm bỏ metadata, compression bổ sung, protocol overhead và retry.",
+          "en": "These are exercise assumptions, not product measurements: twenty million DAU, twenty-five photo views and 0.05 uploads per active user per day. Each upload retains a 2 MB original plus 0.5 MB of variants. Each view transfers one 200 KB image. Use decimal units, thirty-day retention and three copies, initially excluding metadata, further compression, protocol overhead and retries."
+        },
+        {
+          "vi": "Phân biệt lượt tải ảnh với request API feed: một API có thể trả nhiều ảnh, nên không lấy photo-view rate làm feed API rate. Peak factor giả định 5× cho lượt xem và 3× cho upload chỉ áp cho rate tương ứng. Storage dùng số upload thực mỗi ngày, không nhân peak factor vào cả 24 giờ.",
+          "en": "Distinguish photo deliveries from feed API calls: one API call can return several photos, so the photo-view rate is not the feed API rate. Illustrative peak factors of five for views and three for uploads apply to those rates. Storage uses actual daily uploads; do not multiply an entire day by a peak factor."
+        },
+        {
+          "vi": "Nếu CDN đạt 95% byte hit cho workload này, origin phục vụ khoảng 5 TB/ngày, trung bình 57,9 MB/s, trong khi delivery tới người xem vẫn là 100 TB/ngày. Đây là baseline trung bình: cold start, object viral, cache invalidation và failover có thể làm miss peak lớn hơn nhiều. Thử payload hoặc lượt xem tăng gấp đôi để biết tài nguyên nào và chi phí nào tăng theo.",
+          "en": "At a 95% CDN byte hit ratio for this workload, the origin serves about 5 TB/day, averaging 57.9 MB/s, while viewer delivery remains 100 TB/day. These are average baselines: cold starts, viral objects, invalidation and failover can produce much larger miss peaks. Double payload size or view count to see which resources and costs grow."
+        }
+      ],
+      "table": {
+        "headers": [
+          {
+            "vi": "Đại lượng trong ví dụ ảnh",
+            "en": "Photo-example quantity"
+          },
+          {
+            "vi": "Phép tính với giả định trên",
+            "en": "Calculation under these assumptions"
+          },
+          {
+            "vi": "Kết quả đã làm tròn",
+            "en": "Rounded result"
+          }
+        ],
+        "rows": [
+          [
+            {
+              "vi": "Upload mỗi ngày / trung bình",
+              "en": "Daily / average uploads"
+            },
+            {
+              "vi": "20M × 0,05; ÷ 86.400",
+              "en": "20M × 0.05; ÷ 86,400"
+            },
+            {
+              "vi": "1M/ngày; 11,6/s",
+              "en": "1M/day; 11.6/s"
+            }
+          ],
+          [
+            {
+              "vi": "Lượt xem mỗi ngày / trung bình",
+              "en": "Daily / average photo views"
+            },
+            {
+              "vi": "20M × 25; ÷ 86.400",
+              "en": "20M × 25; ÷ 86,400"
+            },
+            {
+              "vi": "500M/ngày; 5.787/s",
+              "en": "500M/day; 5,787/s"
+            }
+          ],
+          [
+            {
+              "vi": "Peak xem / upload riêng",
+              "en": "Separate view / upload peaks"
+            },
+            {
+              "vi": "5.787 × 5; 11,574 × 3",
+              "en": "5,787 × 5; 11.574 × 3"
+            },
+            {
+              "vi": "28.935/s; 34,7/s",
+              "en": "28,935/s; 34.7/s"
+            }
+          ],
+          [
+            {
+              "vi": "Ảnh mới mỗi ngày",
+              "en": "New image bytes per day"
+            },
+            {
+              "vi": "1M × 2,5 MB",
+              "en": "1M × 2.5 MB"
+            },
+            {
+              "vi": "2,5 TB",
+              "en": "2.5 TB"
+            }
+          ],
+          [
+            {
+              "vi": "Giữ 30 ngày với ba bản",
+              "en": "Thirty days with three copies"
+            },
+            {
+              "vi": "2,5 TB × 30 × 3",
+              "en": "2.5 TB × 30 × 3"
+            },
+            {
+              "vi": "225 TB",
+              "en": "225 TB"
+            }
+          ],
+          [
+            {
+              "vi": "Delivery tới người xem",
+              "en": "Viewer delivery"
+            },
+            {
+              "vi": "500M × 200 KB",
+              "en": "500M × 200 KB"
+            },
+            {
+              "vi": "100 TB/ngày ≈ 1,157 GB/s ≈ 9,26 Gb/s",
+              "en": "100 TB/day ≈ 1.157 GB/s ≈ 9.26 Gb/s"
+            }
+          ]
+        ]
+      },
+      "cards": [
+        {
+          "title": {
+            "vi": "Quyết định về đường đọc",
+            "en": "Read-path decision"
+          },
+          "icon": "route",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Tách metadata API khỏi media delivery; đo riêng traffic của mỗi đường.",
+              "en": "Separate metadata APIs from media delivery and measure each path."
+            },
+            {
+              "vi": "Cân nhắc CDN theo địa lý và byte hit; vẫn dự phòng tải origin khi miss tăng.",
+              "en": "Evaluate edge delivery by geography and byte hits while allowing origin miss spikes."
+            }
+          ]
+        },
+        {
+          "title": {
+            "vi": "Quyết định về lưu trữ",
+            "en": "Storage decision"
+          },
+          "icon": "scope",
+          "tone": "accent",
+          "items": [
+            {
+              "vi": "Object storage giữ ảnh; database giữ metadata và quyền truy cập.",
+              "en": "Keep image objects in object storage and metadata/permissions in a database."
+            },
+            {
+              "vi": "So retention, lifecycle và redundancy với durability/repair cost; 225 TB chưa phải số disk đã chốt.",
+              "en": "Compare retention, lifecycle and redundancy against durability and repair cost; 225 TB is not a finalized disk allocation."
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "interview",
@@ -559,7 +937,7 @@
           },
           "answer": [
             {
-              "vi": "Bắt đầu từ uploads/day × average stored bytes/upload × retained days. Ví dụ 10 triệu ảnh/ngày, 2 MB/ảnh theo decimal và 1825 ngày cho khoảng36.5 PB logical bytes; “5 năm” ở đây dùng quy ước365 ngày/năm. Phải nói average size được đo hay giả định và có tính thumbnails/variants hay chưa. Nếu áp replication3× thì riêng phần bytes này khoảng109.5 PB trước overhead.",
+              "vi": "Bắt đầu từ uploads/day × số byte trung bình được giữ cho mỗi upload × số ngày giữ. Ví dụ 10 triệu ảnh/ngày, 2 MB/ảnh theo hệ thập phân và 1.825 ngày cho khoảng 36,5 PB dữ liệu logic; “5 năm” ở đây quy ước 365 ngày/năm. Nêu rõ kích thước là số đo hay giả định và đã gồm thumbnails/variants chưa. Ba bản sao làm riêng phần này tăng lên khoảng 109,5 PB trước overhead.",
               "en": "Start with uploads/day times average stored bytes per upload times retained days. Ten million daily photos at 2 MB decimal for 1825 days give about 36.5 PB logically; this illustration uses 365 days per year. State how average sizes were obtained and whether variants are included. Three-way replication makes these bytes 109.5 PB before overhead."
             },
             {
@@ -575,7 +953,7 @@
           },
           "answer": [
             {
-              "vi": "Nếu mọi viewer đồng thời nhận average5 megabits/s thì viewer egress là5 terabits/s, tương đương625 gigabytes/s theo decimal, chưa tính protocol overhead và retries. Đây là bandwidth tại delivery boundary; không phải số bytes lưu và không phải origin egress. Với95% byte hit, steady-state origin media egress lý tưởng khoảng250 gigabits/s nếu các assumptions còn lại phù hợp.",
+              "vi": "Nếu một triệu người xem đồng thời nhận trung bình 5 megabit/s mỗi người thì viewer egress là 5 terabit/s, tương đương 625 GB/s theo hệ thập phân, chưa tính protocol overhead và retry. Đây là bandwidth ở boundary phân phối, không phải dung lượng lưu hay origin egress. Với byte hit ratio 95%, origin media egress lý tưởng còn khoảng 250 gigabit/s nếu các giả định khác vẫn phù hợp.",
               "en": "One million simultaneous viewers averaging five megabits/s require five terabits/s of viewer egress, or 625 decimal gigabytes/s before overhead and retries. This is delivery bandwidth, not retained storage or necessarily origin traffic. An ideal 95% byte hit ratio would leave about 250 gigabits/s of origin media egress under otherwise compatible assumptions."
             },
             {
@@ -591,12 +969,12 @@
           },
           "answer": [
             {
-              "vi": "2^10=1024, 2^20=1048576 và 2^30=1073741824 hỗ trợ bit budgets, address spaces và binary memory units. 1 KiB=1024 bytes, 1 MiB=2^20 bytes; decimal1 kB=1000 bytes và1 GB=10^9 bytes. Ví dụ64 codesymbols cho6 bits/character, còn62 symbols cho log2(62)≈5.954 bits; không thay hai alphabet mà bỏ qua collision/uniqueness contract.",
+              "vi": "2^10 = 1.024, 2^20 = 1.048.576 và 2^30 = 1.073.741.824 giúp tính bit budget, không gian địa chỉ và đơn vị bộ nhớ nhị phân. 1 KiB = 1.024 byte, 1 MiB = 2^20 byte; kB thập phân dùng 1.000 byte và GB dùng 10^9 byte. Alphabet 64 ký hiệu biểu diễn 6 bit/ký tự, còn 62 ký hiệu biểu diễn log2(62) ≈ 5,954 bit; uniqueness và collision vẫn là bài toán riêng.",
               "en": "Powers of two help with bit budgets, address spaces and binary units:2^10=1024,2^20=1048576 and 2^30=1073741824. One KiB is 1024 bytes and one MiB is 2^20; decimal kB and GB use powers of 1000. A 64-symbol alphabet carries six bits per character, whereas 62 symbols carry about 5.954; uniqueness and collision handling remain separate concerns."
             },
             {
               "vi": "Latency anchors chỉ là thứ tự độ lớn có điều kiện, không là SLA: local memory, random storage access, cache lookup, same-region RPC và intercontinental RTT phụ thuộc hardware, contention, payload, network path và warm state. Khi không biết, cho một range có assumptions rồi xác nhận bằng benchmark đúng request mix; không cộng p99 các component để khẳng định p99 end-to-end.",
-              "en": "Latency anchors are conditional orders of magnitude rather than service guarantees. Memory, storage, cache, RPC and wide-area delays depend on hardware, contention, payload, routes and warm state. Give an assumed range and validate with the relevant workload; adding component p 99 values does not establish the end-to-end p 99."
+              "en": "Latency anchors are conditional orders of magnitude rather than service guarantees. Memory, storage, cache, RPC and wide-area delays depend on hardware, contention, payload, routes and warm state. Give an assumed range and validate with the relevant workload; adding component p99 values does not establish the end-to-end p99."
             }
           ]
         }
