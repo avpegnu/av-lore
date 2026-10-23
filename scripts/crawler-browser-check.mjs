@@ -1,17 +1,184 @@
-import {chromium} from '@playwright/test';import AxeBuilder from '@axe-core/playwright';import fs from 'node:fs';import assert from 'node:assert/strict';
-const base=process.env.PREVIEW_URL||'http://127.0.0.1:4322/av-lore',report=[],errors=[];fs.mkdirSync('artifacts',{recursive:true});
-const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
-try{
- const context=await browser.newContext({viewport:{width:1500,height:1000},reducedMotion:'reduce'}),page=await context.newPage();page.on('pageerror',e=>errors.push(String(e)));
- for(const locale of ['vi','en']){
-  await page.goto(base+(locale==='en'?'/en':'')+'/handbook/system-design/web-crawler/');if(locale==='en')await page.waitForFunction(()=>document.documentElement.dataset.languageReady==='true');
-  const labs=page.locator('.handbook-experiment');assert.equal(await labs.count(),2);for(const lab of await labs.all()){await lab.scrollIntoViewIfNeeded();await lab.locator('xpath=ancestor::astro-island[1]').evaluate(async el=>{if(el.dataset.uiReady==='true')return;await new Promise(r=>el.addEventListener('av-lore:island-ready',r,{once:true}));});}
-  const frontier=labs.first(),ranges=frontier.locator('input[type=range]'),policy=frontier.locator('input[type=checkbox]');assert.deepEqual(await frontier.locator('dd').allTextContents(),['10','7','0','13']);await ranges.last().focus();await page.keyboard.press('End');assert.equal(await frontier.locator('dd').nth(1).textContent(),'7');await policy.uncheck();assert.ok(Number(await frontier.locator('dd').nth(2).textContent())>0);await policy.check();await ranges.first().focus();await page.keyboard.press('End');assert.equal(await frontier.locator('dd').nth(1).textContent(),'16');assert.equal(await frontier.locator('dd').nth(2).textContent(),'0');assert.equal(await frontier.locator('svg rect').count(),10);await frontier.locator('details summary').click();assert.equal(await frontier.locator('details li').count(),10);
-  const bloom=labs.last(),controls=bloom.locator('input[type=range]');assert.equal(await bloom.locator('dd').first().textContent(),'12.50');const rate=Number(await bloom.locator('dd').nth(2).textContent());await controls.last().focus();await page.keyboard.press('End');assert.ok(Number(await bloom.locator('dd').nth(2).textContent())>rate);await controls.last().focus();await page.keyboard.press('Home');assert.equal(await bloom.locator('dd').nth(2).textContent(),'0.0000');await controls.first().focus();await page.keyboard.press('End');assert.equal(await bloom.locator('dd').first().textContent(),'25.00');
-  if(locale==='en')await page.waitForFunction(()=>![...document.querySelectorAll('.handbook-experiment')].some(el=>/[ăâđêôơưĂÂĐÊÔƠƯ\u1EA0-\u1EF9]/.test(el.innerText)));
-  for(const width of [1500,390]){await page.setViewportSize({width,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);for(let i=0;i<2;i++){await labs.nth(i).scrollIntoViewIfNeeded();await page.screenshot({path:`artifacts/crawler-${locale}-${i}-${width}.png`});}}
-  report.push({locale,scenarios:'passed'});await page.setViewportSize({width:1500,height:1000});
- }
- for(const theme of JSON.parse(fs.readFileSync('src/lib/themes.json'))){await page.evaluate(id=>document.documentElement.dataset.theme=id,theme.id);const result=await new AxeBuilder({page}).include('.rich-handbook').withTags(['wcag2a','wcag2aa']).analyze();report.push({theme:theme.id,violations:result.violations.map(v=>({id:v.id,nodes:v.nodes.map(n=>n.target)}))});}
-}finally{await browser.close();fs.writeFileSync('artifacts/crawler-browser-report.json',JSON.stringify({report,errors},null,2));}
-assert.deepEqual(errors,[]);assert.ok(report.every(r=>!r.violations?.length),JSON.stringify(report.filter(r=>r.violations?.length)));console.log('Crawler: host scheduling invariants, unsafe FIFO contrast, Bloom load/memory, text schedule, both locales, mobile and nine theme accessibility passed.');
+import { chromium, expect } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const base = process.env.PREVIEW_URL || 'http://127.0.0.1:4322/av-lore',
+  report = [],
+  errors = [];
+fs.mkdirSync('artifacts', { recursive: true });
+const browser = await chromium.launch({
+  executablePath:
+    process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  headless: true,
+});
+try {
+  const context = await browser.newContext({
+      viewport: { width: 1500, height: 1000 },
+      reducedMotion: 'reduce',
+    }),
+    page = await context.newPage();
+  page.on('pageerror', (e) => errors.push(String(e)));
+  for (const locale of ['vi', 'en']) {
+    await page.goto(base + (locale === 'en' ? '/en' : '') + '/handbook/system-design/web-crawler/');
+    if (locale === 'en')
+      await page.waitForFunction(() => document.documentElement.dataset.languageReady === 'true');
+    const labs = page.locator('.handbook-experiment');
+    assert.equal(await labs.count(), 2);
+    for (const lab of await labs.all()) {
+      await lab.scrollIntoViewIfNeeded();
+      await lab.locator('xpath=ancestor::astro-island[1]').evaluate(async (el) => {
+        if (el.dataset.uiReady === 'true') return;
+        await new Promise((r) => el.addEventListener('av-lore:island-ready', r, { once: true }));
+      });
+    }
+    const frontier = labs.first(),
+      ranges = frontier.locator('input[type=range]'),
+      policy = frontier.locator('input[type=checkbox]');
+    assert.deepEqual(await frontier.locator('dd').allTextContents(), ['10', '7', '0', '13']);
+    await ranges.last().focus();
+    await page.keyboard.press('End');
+    assert.equal(await frontier.locator('dd').nth(1).textContent(), '7');
+    await policy.uncheck();
+    assert.ok(Number(await frontier.locator('dd').nth(2).textContent()) > 0);
+    await policy.check();
+    await ranges.first().focus();
+    await page.keyboard.press('End');
+    assert.equal(await frontier.locator('dd').nth(1).textContent(), '16');
+    await ranges.last().focus();
+    await page.keyboard.press('Home');
+    await expect(ranges.last()).toHaveValue('1');
+    await expect(frontier.locator('dd').nth(1)).toHaveText('16');
+    await expect(frontier.locator('svg g title').nth(4)).toHaveText('B1: 1 → 3s');
+    assert.equal(
+      await frontier.locator('svg text').evaluateAll((elements) =>
+        elements.some((el) => {
+          const b = el.getBBox();
+          return b.x < 0 || b.x + b.width > 760 || b.y < 0 || b.y + b.height > 360;
+        }),
+      ),
+      false,
+      'Crawl timeline labels must fit at the slowest configuration',
+    );
+    await page.keyboard.press('End');
+    assert.equal(await frontier.locator('dd').nth(2).textContent(), '0');
+    assert.equal(await frontier.locator('svg rect').count(), 10);
+    await ranges.first().focus();
+    await page.keyboard.press('Home');
+    await ranges.last().focus();
+    await page.keyboard.press('Home');
+    assert.equal(await frontier.locator('dd').nth(1).textContent(), '13');
+    await page.keyboard.press('End');
+    assert.equal(await frontier.locator('dd').nth(1).textContent(), '6');
+    await ranges.first().focus();
+    await page.keyboard.press('End');
+    assert.equal(await frontier.locator('dd').nth(1).textContent(), '16');
+    await frontier.locator('details summary').click();
+    assert.equal(await frontier.locator('details li').count(), 10);
+    const bloom = labs.last(),
+      controls = bloom.locator('input[type=range]');
+    assert.equal(await bloom.locator('dd').first().textContent(), '12.50');
+    const rate = Number(await bloom.locator('dd').nth(2).textContent());
+    await controls.last().focus();
+    await page.keyboard.press('End');
+    assert.ok(Number(await bloom.locator('dd').nth(2).textContent()) > rate);
+    assert.equal(await bloom.locator('dd').nth(2).textContent(), '13.7782');
+    assert.equal(await bloom.locator('dd').last().textContent(), '137782');
+    await controls.last().focus();
+    await page.keyboard.press('Home');
+    assert.equal(await bloom.locator('dd').nth(2).textContent(), '0.0000');
+    await controls.first().focus();
+    await page.keyboard.press('End');
+    assert.equal(await bloom.locator('dd').first().textContent(), '25.00');
+    await page.keyboard.press('Home');
+    assert.equal(await bloom.locator('dd').first().textContent(), '5.00');
+    assert.equal(await bloom.locator('dd').nth(1).textContent(), '3');
+    for (let i = 0; i < 6; i++) await page.keyboard.press('ArrowRight');
+    await controls.last().focus();
+    await page.keyboard.press('End');
+    const explorer = page.locator('.architecture-explorer');
+    await explorer.scrollIntoViewIfNeeded();
+    await page.waitForFunction(
+      () =>
+        document.querySelector('.architecture-explorer')?.closest('astro-island')?.dataset
+          .uiReady === 'true',
+    );
+    assert.equal(await explorer.locator('.architecture-node').count(), 9);
+    assert.equal(
+      await explorer
+        .locator('.architecture-canvas')
+        .evaluate((el) => el.scrollWidth > el.clientWidth + 1),
+      false,
+    );
+    assert.equal(await explorer.locator('[role=tab]').count(), 4);
+    for (const tab of await explorer.locator('[role=tab]').all()) {
+      await tab.click();
+      for (const step of await explorer.locator('.architecture-steps button').all()) {
+        await step.click();
+        assert.equal(await explorer.locator('.architecture-steps [aria-current=step]').count(), 1);
+      }
+    }
+    if (locale === 'en')
+      await page.waitForFunction(
+        () =>
+          ![...document.querySelectorAll('.handbook-experiment')].some((el) =>
+            /[ăâđêôơưĂÂĐÊÔƠƯ\u1EA0-\u1EF9]/.test(el.innerText),
+          ),
+      );
+    for (const width of [1500, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      assert.equal(
+        await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1),
+        false,
+      );
+      for (let i = 0; i < 2; i++) {
+        await labs.nth(i).scrollIntoViewIfNeeded();
+        await page.screenshot({ path: `artifacts/crawler-${locale}-${i}-${width}.png` });
+      }
+      await page.addStyleTag({ content: '* {scroll-behavior:auto!important}' });
+      for (const [name, target] of [
+        ['map', explorer],
+        ['schedule', frontier],
+        ['bloom', bloom],
+        ['robots', page.locator('#robots')],
+      ]) {
+        await target.evaluate((el) =>
+          scrollTo({ top: el.getBoundingClientRect().top + scrollY - 100, behavior: 'instant' }),
+        );
+        await page.evaluate(() => document.activeElement?.blur());
+        await page.waitForTimeout(150);
+        await page.screenshot({ path: `artifacts/crawler-review-${locale}-${name}-${width}.png` });
+      }
+    }
+    for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json'))) {
+      await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
+      const result = await new AxeBuilder({ page })
+        .include('.rich-handbook')
+        .withTags(['wcag2a', 'wcag2aa'])
+        .analyze();
+      report.push({
+        locale,
+        theme: theme.id,
+        violations: result.violations.map((v) => ({
+          id: v.id,
+          nodes: v.nodes.map((n) => n.target),
+        })),
+      });
+    }
+    report.push({ locale, scenarios: 'passed' });
+    await page.setViewportSize({ width: 1500, height: 1000 });
+  }
+} finally {
+  await browser.close();
+  fs.writeFileSync(
+    'artifacts/crawler-browser-report.json',
+    JSON.stringify({ report, errors }, null, 2),
+  );
+}
+assert.deepEqual(errors, []);
+assert.ok(
+  report.every((r) => !r.violations?.length),
+  JSON.stringify(report.filter((r) => r.violations?.length)),
+);
+console.log(
+  'Crawler: host scheduling/extremes/unsafe FIFO, Bloom load/memory bounds, text schedule, nine-node/four-trace desktop-fit map, VI/EN/mobile/keyboard and18theme accessibility passed.',
+);

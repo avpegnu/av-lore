@@ -1,6 +1,7 @@
 import { useId, useState } from 'react';
 import { useIslandReady } from '../lib/use-island-ready';
 import { crawlSchedule, bloomSizing, crawlJobs } from '../lib/crawler-models';
+import '../styles/crawler-visuals.css';
 export default function CrawlerPlayground({ kind }: { kind: 'crawl-frontier' | 'bloom-budget' }) {
   const ref = useIslandReady(),
     id = 'crawler-' + useId().replace(/:/g, '');
@@ -10,7 +11,17 @@ export default function CrawlerPlayground({ kind }: { kind: 'crawl-frontier' | '
     [bits, setBits] = useState(10),
     [load, setLoad] = useState(100);
   const schedule = crawlSchedule(concurrency, delay, polite),
-    bloom = bloomSizing(bits, load / 100);
+    bloom = bloomSizing(bits, load / 100),
+    tickStep = schedule.makespan > 20 ? 5 : schedule.makespan > 10 ? 2 : 1,
+    ticks = [
+      ...new Set([
+        ...Array.from(
+          { length: Math.floor(schedule.makespan / tickStep) + 1 },
+          (_, i) => i * tickStep,
+        ),
+        schedule.makespan,
+      ]),
+    ];
   return (
     <section className="handbook-experiment" ref={ref} aria-labelledby={id}>
       <span className="eyebrow">CRAWLING / POLITENESS AND MEMBERSHIP BUDGETS</span>
@@ -54,7 +65,7 @@ export default function CrawlerPlayground({ kind }: { kind: 'crawl-frontier' | '
             tabIndex={0}
             aria-label="Timeline crawl theo host"
           >
-            <svg viewBox="0 0 960 360" role="img" aria-label="Lịch bắt đầu và kết thúc các fetch">
+            <svg viewBox="0 0 760 360" role="img" aria-label="Lịch bắt đầu và kết thúc các fetch">
               <title>Crawl schedule / seconds</title>
               {crawlJobs.map((job, i) => {
                 const r = schedule.rows.find((row) => row.job.id === job.id)!;
@@ -64,21 +75,21 @@ export default function CrawlerPlayground({ kind }: { kind: 'crawl-frontier' | '
                       {job.host} / {job.id}
                     </text>
                     <rect
-                      x={170 + (r.start / schedule.makespan) * 760}
+                      x={170 + (r.start / schedule.makespan) * 560}
                       y={10 + i * 29}
-                      width={(r.job.duration / schedule.makespan) * 760}
+                      width={(r.job.duration / schedule.makespan) * 560}
                       height={24}
                       rx={4}
                     />
-                    <text x={174 + (r.start / schedule.makespan) * 760} y={27 + i * 29}>
+                    <text x={174 + (r.start / schedule.makespan) * 560} y={27 + i * 29}>
                       {r.start}–{r.end}
                     </text>
                     <title>{`${r.job.id}: ${r.start} → ${r.end}s`}</title>
                   </g>
                 );
               })}
-              {Array.from({ length: Math.ceil(schedule.makespan) + 1 }, (_, t) => (
-                <text key={t} x={170 + (t / schedule.makespan) * 760} y={342}>
+              {ticks.map((t) => (
+                <text key={t} x={170 + (t / schedule.makespan) * 560} y={342}>
                   {t}
                 </text>
               ))}
