@@ -1,4 +1,5 @@
 import { useId, useState } from 'react';
+import SyncBoundaries from './SyncBoundaries';
 import { useIslandReady } from '../lib/use-island-ready';
 import { chunkDelta, syncConflict, syncEdits } from '../lib/file-sync-models';
 export default function FileSyncPlayground({ kind }: { kind: 'sync-chunks' | 'sync-conflict' }) {
@@ -96,6 +97,7 @@ export default function FileSyncPlayground({ kind }: { kind: 'sync-chunks' | 'sy
             chunk đổi. Re-export/compression/encryption có thể thay gần như mọi byte; không giả định
             delta luôn nhỏ.
           </p>
+          <SyncBoundaries />
         </>
       )}
       {kind === 'sync-conflict' && (
