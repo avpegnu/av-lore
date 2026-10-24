@@ -29,7 +29,8 @@ try {
     await el.focus();
     await page.keyboard.press('Home');
     const min = +(await el.getAttribute('min')),
-      step = +(await el.getAttribute('step'));
+      step = +((await el.getAttribute('step')) || 1);
+    assert.ok(Number.isFinite(step) && step > 0);
     for (let i = 0; i < Math.round((n - min) / step); i++) await page.keyboard.press('ArrowRight');
     assert.equal(+(await el.inputValue()), n);
   }
@@ -157,19 +158,20 @@ try {
         });
       }
     }
+    for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8'))) {
+      await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
+      const a = await new AxeBuilder({ page })
+        .include('.rich-handbook')
+        .withTags(['wcag2a', 'wcag2aa'])
+        .analyze();
+      report.push({
+        locale,
+        theme: theme.id,
+        violations: a.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
+      });
+    }
     report.push({ locale, scenarios: 'passed' });
     await page.setViewportSize({ width: 1500, height: 1100 });
-  }
-  for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8'))) {
-    await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
-    const a = await new AxeBuilder({ page })
-      .include('.rich-handbook')
-      .withTags(['wcag2a', 'wcag2aa'])
-      .analyze();
-    report.push({
-      theme: theme.id,
-      violations: a.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
-    });
   }
 } finally {
   await browser.close();
@@ -184,5 +186,5 @@ assert.ok(
   JSON.stringify(report.filter((r) => r.violations?.length)),
 );
 console.log(
-  'Prompt contracts: token masks/pieces/EOS/limits, envelope/parse/schema/truth ladder and authorized versioned idempotent tool effects; VI/EN, keyboard, mobile and nine themes passed.',
+  'Prompt contracts: token masks/pieces/EOS/limits, envelope/parse/schema/truth ladder and authorized versioned idempotent tool effects; VI/EN, keyboard, mobile and 18 theme/locale checks passed.',
 );
