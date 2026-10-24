@@ -5,7 +5,7 @@ Cập nhật 24/10/2026. Chủ sở hữu đã quay lại và yêu cầu tiếp 
 ## Trạng thái hiện tại
 
 - **73/73 bài có nội dung Việt–Anh**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories,15 AI Systems và3Practice +5Interview. **73 bài đã build và kiểm tra browser local.**
-- **56/73 bài đã hoàn tất review độc lập; 17 bài còn `review`.** Đã chốt 4 Foundations, 8 Building Blocks, toàn bộ26 Case Studies và toàn bộ 12 Build Stories. Đã chốt 6/15 AI Systems đầu tiên, tới Prompting; RAG là bài tiếp theo. Review kiểm độ phủ, kỹ thuật, diễn giải/English và mục đích hình/tương tác; tests/counts không thay review.
+- **57/73 bài đã hoàn tất review độc lập; 16 bài còn `review`.** Đã chốt 4 Foundations, 8 Building Blocks, toàn bộ26 Case Studies và toàn bộ 12 Build Stories. Đã chốt 7/15 AI Systems đầu tiên, tới RAG; Fine-tuning là bài tiếp theo. Review kiểm độ phủ, kỹ thuật, diễn giải/English và mục đích hình/tương tác; tests/counts không thay review.
 - **Không còn mục chưa biên soạn trong catalog73**; vẫn cần vòng review độc lập toàn bộ nội dung. Glossary68 đã có416original VIENentries/15groups (bao phủ332inventorytermnames/aliases +commonSQL/Frontend/OS/Git/K8s), canonical10sections/3traces/explorer/static fallback/term recall integration; đã validate và publish local; chuẩn bị checkpoint.
 - Main preview **http://127.0.0.1:4322/av-lore/** đã publish local73. Quiz: `/system-design/quiz/` và `/en/system-design/quiz/`. Question Bank: `/system-design/questions/` và `/en/system-design/questions/`. Mock Interview: `/system-design/mock/` và `/en/system-design/mock/`. Staff Signals: `/system-design/staff-signals/` và `/en/system-design/staff-signals/`. Visual Cheat Sheet: `/system-design/cheat-sheet/` và `/en/system-design/cheat-sheet/`. Glossary: `/system-design/glossary/` và `/en/system-design/glossary/`. Các bài mới `/ai-systems/ai-rag/`, `/ai-systems/ai-fine-tuning/`, `/ai-systems/ai-evals/`, `/ai-systems/ai-agents/`, `/ai-systems/ai-production/`, `/ai-systems/ai-safety/`, `/ai-systems/ai-case-rag/` và bản `/en/` tương ứng.
 - Giữ 198 chương/15 lộ trình, 31 Notes & Interview topics, stable IDs, localStorage keys và 9 themes. Không portfolio.
@@ -1189,3 +1189,15 @@ Mainpreview nếu đã tắt sau shutdown có thể restart tại rootAVLore:`np
 - Sourcecheck410/no diagnostics270tests; isolated build/verify656pages305510links/assets0missingEnglish. Dedicated three-lab scenarios, generic five traces/keyboard/mobile and18theme-locale checks passed. All22route occurrences bounded, VIEN graph labels unclipped, static14sections/eightanswers/three new tables+repair cards and148HTML5538links pass. EN main map and VI mobile tool retry history inspected. Completion build/publication next. RAG57 full review recorded above; one-use helper prepared for chunk span containment, candidate ceilings, IVF/memory example section, publication/access races and compact map. Fine-tuning58 canonical16sections/eightanswers/API/tables and own three models/tests read; main graph/UI/reference/primary review still pending. No fine-tuning source edits yet.
 
 - Batch56 completion build/verify passed656pages305510links/assets0missingEnglish; main4322 now serves56reviewed. RAG57 full review/helper recorded above. Fine-tuning58 full canonical/reference chapter/calculator/wizard/model/own three labs/model/tests/UI/main5traces/API/tables read; primary LoRA/QLoRA/DPO/distillation contracts checked. Numeric memory/cost/DPO examples verified. Planned clearer complete distillation trace, worked adaptation state, cost sensitivity and preference-loss tables; no source edits yet.
+
+
+## Batch57 review WIP
+
+- Batch56 committed AV7d73a94 / ITd52ae80; main4322 serves56reviewed. Added original chunk-window containment, candidate ceiling/filter/rerank, separate IVF/memory example section and content/access publication race tables. Compact12node map preserves five traces. Existing three models/labs unchanged; dedicated browser scans18theme-locale combinations. Restored BM25 k1/L2 notation and prose spacing. Status remains review pending validation.
+
+
+## Batch57 validated / completion build
+
+- Sourcecheck410/no diagnostics270tests; isolated build/verify656pages305512links/assets0missingEnglish. Dedicated three-lab scenarios, generic five traces/keyboard/mobile and18theme-locale checks passed. All24route occurrences bounded, VIEN graph labels unclipped, static19sections/tenanswers/four new worked tables and148HTML5538links pass. EN main map and VI mobile IVF/memory example inspected. Completion build/publication next. Fine-tuning58 full review/helper recorded above. Evaluation59 full canonical17sections/nineanswers/API/tables and own four models/tests read; main graph/UI/reference/primary verification still pending. No Evaluation edits yet.
+
+- Batch57 completion build/verify passed656pages305512links/assets0missingEnglish; main4322 serves57reviewed. Fine-tuning58 full review and one-use helper ready; Evaluation59 review continues.
