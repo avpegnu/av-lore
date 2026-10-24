@@ -158,17 +158,18 @@ try {
     }
     report.push({ locale, scenarios: 'passed' });
     await page.setViewportSize({ width: 1500, height: 1100 });
-  }
-  for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8'))) {
-    await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
-    const a = await new AxeBuilder({ page })
-      .include('.rich-handbook')
-      .withTags(['wcag2a', 'wcag2aa'])
-      .analyze();
-    report.push({
-      theme: theme.id,
-      violations: a.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
-    });
+    for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8'))) {
+      await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
+      const a = await new AxeBuilder({ page })
+        .include('.rich-handbook')
+        .withTags(['wcag2a', 'wcag2aa'])
+        .analyze();
+      report.push({
+        locale,
+        theme: theme.id,
+        violations: a.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
+      });
+    }
   }
   // Shared timeline enhancement must also work with earlier stages lacking the optional panels.
   await page.goto(base + '/en/episodes/ep-chatgpt/');
