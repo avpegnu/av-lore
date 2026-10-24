@@ -13,7 +13,7 @@ export default function HandbookExperiment({ kind }: { kind: 'feed-fanout' | 'kv
     followers, cachedIds: 500, bytesPerId: 16, peak: 3, pushFraction: push / 100 });
   const kv = kvCapacity({ layers: 32, kvHeads: 8, headDimension: 128, bytes: 2,
     tokens, sequences, memoryGB: 40 });
-  return <section className="handbook-experiment" ref={ref}>
+  return <section className="handbook-experiment" data-kind={kind} ref={ref}>
     <span className="eyebrow">WORKSHEET / WHAT IF?</span>
     {kind === 'feed-fanout' ? <>
       <h3>Thử thay đổi chi phí fan-out</h3>
@@ -48,6 +48,9 @@ export default function HandbookExperiment({ kind }: { kind: 'feed-fanout' | 'kv
         <div><dt>Total KV / GB</dt><dd>{kv.totalGB.toFixed(2)}</dd></div>
         <div><dt>Sequences / 40 GB</dt><dd>{kv.maxSequences}</dd></div>
       </dl>
+      <p className="worksheet-verdict" role="status">{kv.totalGB<=40
+        ? 'Payload KV nằm trong 40 GB đã dành riêng; chưa tính padding/sharing và chưa chứng minh đạt SLO.'
+        : 'Payload KV vượt 40 GB đã dành riêng: giảm live tokens/sequences hoặc đổi budget có kiểm chứng trước admission.'}</p>
       <p>Ước lượng chưa tính block padding, fragmentation, prefix sharing hoặc phân chia KV giữa các GPU. Đủ memory không đồng nghĩa đạt SLO latency.</p>
       <code>KV bytes = 2 × layers × KV heads × head dimension × bytes × tokens × sequences</code>
     </>}
