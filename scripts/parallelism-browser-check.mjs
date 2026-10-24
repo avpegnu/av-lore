@@ -29,7 +29,8 @@ try {
     await el.focus();
     const min = +(await el.getAttribute('min')),
       max = +(await el.getAttribute('max')),
-      step = +(await el.getAttribute('step'));
+      step = +((await el.getAttribute('step')) || 1);
+    assert.ok(Number.isFinite(step) && step > 0);
     const fromEnd = max - n < n - min;
     await page.keyboard.press(fromEnd ? 'End' : 'Home');
     for (let i = 0; i < Math.round((fromEnd ? max - n : n - min) / step); i++)
@@ -159,19 +160,20 @@ try {
     );
     await pipe.locator('.parallel-timeline').focus();
     await page.keyboard.press('ArrowRight');
+    for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8'))) {
+      await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
+      const a = await new AxeBuilder({ page })
+        .include('.rich-handbook')
+        .withTags(['wcag2a', 'wcag2aa'])
+        .analyze();
+      report.push({
+        locale,
+        theme: theme.id,
+        violations: a.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
+      });
+    }
     report.push({ locale, scenarios: 'passed' });
     await page.setViewportSize({ width: 1500, height: 1100 });
-  }
-  for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json', 'utf8'))) {
-    await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
-    const a = await new AxeBuilder({ page })
-      .include('.rich-handbook')
-      .withTags(['wcag2a', 'wcag2aa'])
-      .analyze();
-    report.push({
-      theme: theme.id,
-      violations: a.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
-    });
   }
 } finally {
   await browser.close();
@@ -186,5 +188,5 @@ assert.ok(
   JSON.stringify(report.filter((r) => r.violations?.length)),
 );
 console.log(
-  'Parallelism: placement/failure domains, collective costs, dependency timelines and expert routing/copies/capacity; VI/EN, keyboard, mobile and nine themes passed.',
+  'Parallelism: placement/failure domains, collective costs, dependency timelines and expert routing/copies/capacity; VI/EN, keyboard, mobile and 18 theme/locale checks passed.',
 );
