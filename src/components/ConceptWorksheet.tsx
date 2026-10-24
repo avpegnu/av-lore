@@ -1,15 +1,13 @@
 import { useId, useState } from 'react';
 import { useIslandReady } from '../lib/use-island-ready';
-import { availabilityBudget, contextBudget, decodeRoofline } from '../lib/handbook-models';
-export type WorksheetKind='context-budget'|'roofline'|'availability'|'latency';
+import { availabilityBudget, decodeRoofline } from '../lib/handbook-models';
+export type WorksheetKind='roofline'|'availability'|'latency';
 export default function ConceptWorksheet({kind}:{kind:WorksheetKind}){
   const ref=useIslandReady(),uid='worksheet-'+useId().replace(/:/g,'');
   const [batch,setBatch]=useState(16),[context,setContext]=useState(4096);
-  const [history,setHistory]=useState(12000),[evidence,setEvidence]=useState(8000),[output,setOutput]=useState(4096);
   const [target,setTarget]=useState(99.9);
   const [parallel,setParallel]=useState(false);
   const roof=decodeRoofline({parameters:8e9,weightBytes:2,batch,context,kvBytesPerToken:131072,bandwidthGBs:1000,computeTFLOPs:200,memoryGB:48});
-  const budget=contextBudget({window:32768,system:3072,history,evidence,tools:1024,output});
   const seconds=availabilityBudget(target,30);
   const chartX=(intensity:number)=>55+(Math.log2(intensity)+2)/12*640;
   const chartY=(teraflops:number)=>280-(Math.log2(teraflops)+2)/10*235;
@@ -33,15 +31,6 @@ export default function ConceptWorksheet({kind}:{kind:WorksheetKind}){
       <p className="worksheet-verdict" role="status">{roof.fits?'Payload còn trong ngân sách 48 GB; workspace và overhead vẫn cần dự phòng.':'Payload vượt 48 GB: cấu hình không vừa ngân sách; các ceiling hiển thị không phải throughput chạy được.'}</p>
       <p>Mô hình lấy max(memory time, compute time), bỏ qua attention FLOPs, launch overhead, communication và hiệu suất kernel. Kết quả là lower bound thời gian, tương ứng upper bound throughput; thực tế có thể chậm hơn đáng kể.</p>
       <code>step ≥ max((weightBytes + batch × context × KV/token) / bandwidth, 2 × params × batch / FLOPs)</code>
-    </>}
-    {kind==='context-budget'&&<>
-      <h3 id={uid}>Chia ngân sách context 32K</h3>
-      <p>Cửa sổ 32.768 token; system/template dùng 3.072 và dự phòng tool dùng 1.024. Output reserve phải tính cùng history và evidence.</p>
-      <div className="worksheet-inputs">{slider('History tokens',history,0,24000,500,setHistory)}{slider('Evidence tokens',evidence,0,24000,500,setEvidence)}{slider('Output reserve',output,1024,8192,1024,setOutput)}</div>
-      <meter min={0} max={32768} value={Math.min(budget.required,32768)} aria-label="Mức sử dụng context"/>
-      <dl className="worksheet-results" aria-live="polite"><div><dt>Required tokens</dt><dd>{budget.required}</dd></div><div><dt>Remaining tokens</dt><dd>{budget.remaining}</dd></div></dl>
-      <p className="worksheet-verdict" role="status">{budget.fits?'Còn đủ ngân sách theo giả định; cần đếm lại bằng tokenizer thật trước mỗi model call.':'Vượt context budget: giảm history/evidence hoặc đổi chiến lược trước khi gọi model.'}</p>
-      <p>Giảm output reserve có thể làm câu trả lời bị cắt. Summary có thể bỏ thông tin; retrieval quá ít có thể thiếu evidence. Chọn bằng chất lượng tác vụ, không chỉ làm thanh đo vừa khung.</p>
     </>}
     {kind==='availability'&&<>
       <h3 id={uid}>Error budget theo thời gian</h3><p>Tháng giả định có 30 ngày. Chọn mục tiêu để xem tổng thời gian không khả dụng cho phép; đây không phải số sự cố được phép xảy ra.</p>
