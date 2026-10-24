@@ -225,6 +225,27 @@ try {
       }
       await page.setViewportSize({ width: 1500, height: 1100 });
     }
+    // A mark created before the spacing correction still resolves through the pinned identity.
+    const previousQuestionKey =
+      'q/handbook/staff-signals/staff-interview-drill/d3d0b21542b3dfe15b01df58';
+    await page.evaluate(
+      ({ key, previousQuestionKey }) => {
+        const state = JSON.parse(localStorage.getItem(key));
+        state.known.push(previousQuestionKey);
+        localStorage.setItem(key, JSON.stringify(state));
+      },
+      { key, previousQuestionKey },
+    );
+    await page.reload();
+    await ready();
+    await select('Tìm câu hỏi và lời giải', 'Search questions and answers').fill('35%');
+    await select('Trạng thái câu hỏi', 'Question status').selectOption('known');
+    assert.equal(await tool.locator('.bank-list-item').count(), 1);
+    assert.equal(
+      await tool.locator('.bank-list-item').getAttribute('data-question-id'),
+      'handbook:staff-signals:staff-interview-drill:d3d0b21542b3dfe15b01df58',
+    );
+    assert.ok((await study()).known.includes(previousQuestionKey));
     // Corrupt existing storage is preserved and exportable; no automatic reset or wipe.
     await page.evaluate((key) => localStorage.setItem(key, '{broken study file'), key);
     await page.reload();

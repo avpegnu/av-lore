@@ -10,10 +10,10 @@ AV Lore là website học tập và tra cứu kiến thức công nghệ: từ n
 
 - **Lộ trình học:** 15 lộ trình với 198 chương, điều hướng theo chủ đề và chương học.
 - **Notes & Interview:** 31 topic, 147 notes và 387 câu hỏi chính cùng các câu hỏi đào sâu; câu hỏi liên kết với phần kiến thức tương ứng.
-- **System Design & AI:** nền tảng thiết kế hệ thống, Building Blocks, 26 Case Studies, cùng các bài Build Stories và AI Systems đang được mở rộng. Bài học kết hợp requirements, capacity estimation, API, data model, sơ đồ nhiều luồng, failure modes và trade-offs.
+- **System Design & AI:** 73 bài và công cụ, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories, 15 AI Systems, 3 Design Practice và 5 Interview Practice. Bài học kết hợp requirements, capacity estimation, API, data model, sơ đồ nhiều luồng, failure modes và trade-offs.
 - **Học trực quan:** sơ đồ có trace theo từng bước, tóm tắt ghi nhớ, bài thử theo topic và mô phỏng chuyên sâu để quan sát hành vi của hệ thống.
-- **Luyện tập:** lọc câu hỏi theo vai trò, xem gợi ý trả lời và đánh dấu nội dung cần ôn.
-- **Tra cứu:** tìm kiếm toàn văn với chỉ mục riêng cho từng ngôn ngữ, mục lục trong bài và breadcrumb.
+- **Luyện tập:** Question Bank tổng hợp 944 câu hỏi mở, Quiz gồm 91 câu với lời giải từng lựa chọn, Mock Interview có timer và checklist; Daily Review giúp ôn lại nội dung đã chọn.
+- **Tra cứu:** glossary 416 thuật ngữ, sơ đồ ghi nhớ, tìm kiếm toàn văn với chỉ mục riêng cho từng ngôn ngữ, mục lục trong bài và breadcrumb.
 - **Cá nhân hóa:** chín theme sáng/tối (mặc định GitHub Dark), bookmark, tiến độ chương và nhập/xuất dữ liệu học tập bằng JSON.
 - **Hai ngôn ngữ:** chuyển Việt/English ngay tại bài đang đọc, giữ đường dẫn và vị trí mục.
 
@@ -97,7 +97,7 @@ Notes và Interview dùng chung dữ liệu trong `src/content/topics/`; các b�
 
 Nội dung ưu tiên giải thích dễ hiểu bằng tiếng Việt và giữ các thuật ngữ chuyên ngành bằng English. Các số liệu và mô phỏng có giả định, bối cảnh, đơn vị và giới hạn áp dụng rõ.
 
-Các bài chuyên sâu lưu cặp `vi/en` cho nội dung, sơ đồ và lời giải; chúng vẫn cần vòng review tổng thể trước khi đánh dấu hoàn tất. Các chương học và Notes & Interview dùng từ điển English với nhãn giao diện/thuật ngữ được chỉnh riêng; chưa được rà soát thủ công toàn bộ. Từ điển nằm trong `src/i18n/en.json`; các chỉnh sửa trong `src/i18n/en-overrides.json` được ưu tiên. Build sử dụng từ điển đã lưu, không gọi dịch vụ dịch online, và báo lỗi nếu thiếu bản dịch.
+Các bài chuyên sâu lưu cặp `vi/en` cho nội dung, sơ đồ và lời giải. Phạm vi 73 bài/công cụ đã được rà soát độc lập về độ phủ, kỹ thuật, diễn giải Việt–Anh và cách trình bày trực quan; các ví dụ và mô phỏng vẫn áp dụng theo giả định đã nêu trong từng bài. Các chương học và Notes & Interview dùng từ điển English với nhãn giao diện/thuật ngữ được chỉnh riêng; chưa được rà soát thủ công toàn bộ. Từ điển nằm trong `src/i18n/en.json`; các chỉnh sửa trong `src/i18n/en-overrides.json` được ưu tiên. Build sử dụng từ điển đã lưu, không gọi dịch vụ dịch online, và báo lỗi nếu thiếu bản dịch.
 
 Sau khi cập nhật nội dung, kiểm tra bản dịch tương ứng rồi chạy:
 

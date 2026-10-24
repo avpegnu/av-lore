@@ -90,6 +90,7 @@ const sectionSchema = z.object({
   questions: z
     .array(
       z.object({
+        id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/).optional(),
         question: localizedText,
         answer: z.array(localizedText).min(1),
         followup: localizedText.optional(),

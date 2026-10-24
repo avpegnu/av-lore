@@ -95,6 +95,8 @@ export const mockSessionSchema = z
       ctx.addIssue({ code: 'custom', message: 'Paused session cannot have an end timestamp' });
     if (s.mode === 'review' && s.endedAt === null)
       ctx.addIssue({ code: 'custom', message: 'Review requires an end timestamp' });
+    if (s.endedAt !== null && s.endedAt < s.startedAt)
+      ctx.addIssue({ code: 'custom', message: 'End cannot precede start' });
   });
 export type MockSession = z.infer<typeof mockSessionSchema>;
 export const mockStoreSchema = z

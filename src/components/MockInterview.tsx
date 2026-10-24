@@ -268,10 +268,20 @@ export default function MockInterview({
   }
   function acceptImport() {
     if (!pending) return;
-    apply(pending.data);
-    setPending(null);
-    setSaving(true);
-    setStatus('Đã áp dụng bản nhập cho Mock. Các ratings và lịch ôn khác được giữ nguyên.');
+    try {
+      // Applying the reviewed replacement explicitly resolves a prior storage conflict.
+      // Persist first so a quota failure cannot report a successful replacement.
+      const serialized = JSON.stringify(pending.data);
+      localStorage.setItem(storeKey, serialized);
+      written.current = serialized;
+      apply(pending.data);
+      setPending(null);
+      setSaving(true);
+      setStatus('Đã áp dụng bản nhập cho Mock. Các ratings và lịch ôn khác được giữ nguyên.');
+    } catch {
+      setSaving(false);
+      setStatus('Không lưu được dữ liệu. Bản lưu cũ được giữ; hãy xuất bản nháp đang mở.');
+    }
   }
   function saveReview() {
     if (!current) return;

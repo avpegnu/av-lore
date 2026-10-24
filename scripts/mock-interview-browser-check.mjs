@@ -312,6 +312,58 @@ try {
       'Detected external changes are not overwritten',
     );
     await other.close();
+    const recovery = structuredClone(incoming);
+    recovery.current.notes.scope = 'Explicit replacement after another-tab conflict';
+    await inputFile('conflict-recovery.json', JSON.stringify(recovery));
+    await tool.locator('.mock-import-preview').waitFor();
+    await tool.locator('.mock-import-preview button').first().click();
+    await page.clock.fastForward(1000);
+    assert.equal(
+      (await saved()).current.notes.scope,
+      recovery.current.notes.scope,
+      'Explicitly applying a validated replacement resolves the prior write conflict',
+    );
+    await page.reload();
+    await ready();
+    assert.equal(
+      await tool.locator('.mock-scratchpad textarea').inputValue(),
+      recovery.current.notes.scope,
+    );
+    assert.equal(
+      await tool
+        .locator('.mock-clock button')
+        .textContent()
+        .then((t) => /Resume|Tiếp tục/.test(t)),
+      true,
+    );
+    const quotaImport = structuredClone(recovery);
+    quotaImport.current.notes.scope = 'Replacement after storage becomes writable';
+    await inputFile('quota-recovery.json', JSON.stringify(quotaImport));
+    await tool.locator('.mock-import-preview').waitFor();
+    await page.evaluate((key) => {
+      window.mockOriginalWrite = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (k, v) {
+        if (k === key) throw new DOMException('Fixture quota', 'QuotaExceededError');
+        return window.mockOriginalWrite.call(this, k, v);
+      };
+    }, key);
+    await tool.locator('.mock-import-preview button').first().click();
+    assert.equal(
+      await tool.locator('.mock-import-preview').count(),
+      1,
+      'A failed write retains the pending import',
+    );
+    assert.equal((await saved()).current.notes.scope, recovery.current.notes.scope);
+    assert.equal(
+      await tool.locator('.mock-scratchpad textarea').inputValue(),
+      recovery.current.notes.scope,
+    );
+    await page.evaluate(() => {
+      Storage.prototype.setItem = window.mockOriginalWrite;
+      delete window.mockOriginalWrite;
+    });
+    await tool.locator('.mock-import-preview button').first().click();
+    assert.equal((await saved()).current.notes.scope, quotaImport.current.notes.scope);
     await page.evaluate((k) => localStorage.setItem(k, 'broken-json'), key);
     await page.reload();
     await tool.scrollIntoViewIfNeeded();

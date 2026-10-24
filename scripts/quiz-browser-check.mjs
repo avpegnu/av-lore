@@ -278,6 +278,29 @@ try {
       await button(i + 1 === sqlCount ? 'Xem tổng kết lượt' : 'Câu tiếp theo →').click();
     }
     assert.equal(sqlSeen.size, sqlCount);
+    // Simulate a busy event loop: the click handler sees an expired monotonic deadline
+    // before the periodic timer callback has had an opportunity to update the UI.
+    await button('Chọn lượt Quiz mới').click();
+    await select('Nhóm câu hỏi').selectOption('all');
+    await select('Độ dài lượt luyện').selectOption('5');
+    await select('Thời gian mỗi câu').selectOption('30');
+    await button('Bắt đầu Quiz').click();
+    await panel.evaluate((el) => {
+      const now = performance.now.bind(performance);
+      Object.defineProperty(performance, 'now', { configurable: true, value: () => now() + 31000 });
+      try {
+        el.querySelector('button[data-option-id]').click();
+      } finally {
+        Object.defineProperty(performance, 'now', { configurable: true, value: now });
+      }
+    });
+    await panel.locator('.quiz-feedback').waitFor();
+    assert.equal(await panel.locator('.quiz-options [aria-pressed=true]').count(), 0);
+    await button('Kết thúc lượt tại đây').click();
+    assert.deepEqual(
+      (await tool.locator('.quiz-result-counts dd').allTextContents()).map(Number),
+      [0, 0, 0, 1, 4],
+    );
     for (const [key, value] of Object.entries(original))
       assert.equal(await page.evaluate((key) => localStorage.getItem(key), key), value, key);
     await page.reload();

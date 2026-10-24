@@ -87,6 +87,10 @@ test('mock import validation rejects unbounded, malformed and contradictory stat
   assert.throws(() => validateMock(note));
   assert.throws(() => validateMock({ ...store, arbitrary: 'field' }));
   assert.throws(() => validateMock({ ...store, history: Array(21).fill(store.current) }));
+  const backwards = structuredClone(store);
+  backwards.current!.mode = 'review';
+  backwards.current!.endedAt = 0;
+  assert.throws(() => validateMock(backwards));
 });
 
 test('authored mock prompts and coaching have bilingual text and resolvable authoritative references', async () => {

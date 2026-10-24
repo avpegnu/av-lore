@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { handbookQuestionIdentity } from './review-identities';
 import { topics } from './content';
 import { glossaryEntries } from './glossary';
 import { handbookLessons, handbookPath } from './handbook';
@@ -41,12 +42,13 @@ export function buildReviewDeck(): ReviewCard[] {
     for (const s of lesson.sections)
       for (const q of s.questions || []) {
         const answer = q.answer.map((p) => p.vi);
+        const questionId = handbookQuestionIdentity(q);
 
         cards.push({
-          id: `handbook:${lesson.id}:${s.id}:${hash(q.question.vi)}`,
+          id: `handbook:${lesson.id}:${s.id}:${questionId}`,
           revision: hash([q.question, q.answer, q.followup]),
           followUp: q.followup?.vi,
-          legacyKey: `q/handbook/${lesson.id}/${s.id}/${hash(q.question.vi)}`,
+          legacyKey: `q/handbook/${lesson.id}/${s.id}/${questionId}`,
           source: 'handbook',
           title: lesson.title.vi,
           question: q.question.vi,

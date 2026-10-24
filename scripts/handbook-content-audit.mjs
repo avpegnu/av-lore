@@ -21,7 +21,7 @@ const report={planned:catalog.length,authored:lessons.length,reviewed:lessons.fi
   visualInventory:lessons.map(l=>({id:l.id,overview:!!l.overview,flows:l.sections.filter(s=>s.flow).length,cardGroups:l.sections.filter(s=>s.cards).length,
     diagrams:l.sections.filter(s=>s.diagram).length+l.sections.reduce((sum,s)=>sum+(s.stages||[]).filter(stage=>stage.diagram).length,0),
     interactiveSections:l.sections.filter(s=>s.experiment||s.stages).length,
-    review:'Manual review of learning purpose, accuracy and screenshots is still required; counts do not establish completeness.'}))};
+    review:'Structural inventory only; independent content and visual review is recorded separately in lesson status.'}))};
 fs.mkdirSync('artifacts',{recursive:true});fs.writeFileSync('artifacts/handbook-content-audit.json',JSON.stringify(report,null,2));
 console.log(JSON.stringify(report,null,2));
 if(process.argv.includes('--require-complete'))assert.equal(report.reviewed,report.planned,'The agreed handbook scope is not complete; see missing/pendingReview.');
