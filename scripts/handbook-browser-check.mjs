@@ -52,7 +52,7 @@ for(const locale of ['','en/'])for(const route of routes){
     await worksheet.scrollIntoViewIfNeeded();
     await page.waitForFunction(index=>document.querySelectorAll('main .handbook-experiment')[index]?.closest('astro-island')?.getAttribute('data-ui-ready')==='true',i);
     const range=worksheet.locator('input[type=range]').first();
-    const before=await worksheet.innerHTML();
+    const before=await worksheet.evaluate(el=>JSON.stringify({html:el.innerHTML,controls:[...el.querySelectorAll('input,select,textarea')].map(control=>[control.value,control.checked])}));
     if(await range.count()){
       await range.focus();
       const direction=await range.evaluate(el=>Number(el.value)>=Number(el.max)?'ArrowLeft':'ArrowRight');
@@ -67,7 +67,7 @@ for(const locale of ['','en/'])for(const route of routes){
       if(await choices.count())await choices.last().click();
       else await worksheet.locator('button[data-action]:not([disabled])').first().click();
     }
-    await page.waitForFunction(({index,previous})=>document.querySelectorAll('main .handbook-experiment')[index]?.innerHTML!==previous,{index:i,previous:before});
+    await page.waitForFunction(({index,previous})=>{const el=document.querySelectorAll('main .handbook-experiment')[index];return el&&JSON.stringify({html:el.innerHTML,controls:[...el.querySelectorAll('input,select,textarea')].map(control=>[control.value,control.checked])})!==previous;},{index:i,previous:before});
   }
   const lesson=lessons.find(l=>route.endsWith('/'+l.id+'/'));
   if(lesson.overview)assert.equal(await page.locator('.lesson-overview li').count(),lesson.overview.steps.length,'Missing lesson map '+route);
