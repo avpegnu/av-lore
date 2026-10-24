@@ -6,13 +6,14 @@ export default function LeaderboardPlayground({ kind }: { kind: 'board-replay' |
     id = 'board-' + useId().replace(/:/g, '');
   const [steps, setSteps] = useState(2),
     [guarded, setGuarded] = useState(true),
+    [correction, setCorrection] = useState(false),
     [policy, setPolicy] = useState<RankPolicy>('ordinal'),
     [player, setPlayer] = useState('B'),
     [shards, setShards] = useState(3),
     [k, setK] = useState(3),
     [target, setTarget] = useState('P07'),
     [missing, setMissing] = useState(false);
-  const replay = scoreReplay(steps, guarded, policy),
+  const replay = scoreReplay(steps, guarded, policy, correction),
     selected = replay.rows.find((p) => p.id === player)!,
     around = replay.rows.slice(
       Math.max(0, selected.ordinal - 2),
@@ -36,7 +37,7 @@ export default function LeaderboardPlayground({ kind }: { kind: 'board-replay' |
               <input
                 type="range"
                 min="0"
-                max="6"
+                max={correction ? 7 : 6}
                 value={steps}
                 onChange={(e) => setSteps(+e.target.value)}
               />
@@ -50,6 +51,22 @@ export default function LeaderboardPlayground({ kind }: { kind: 'board-replay' |
             />
             Apply absolute score bằng monotonic source version
           </label>
+          <label className="worksheet-toggle">
+            <input
+              type="checkbox"
+              checked={correction}
+              onChange={(e) => {
+                setCorrection(e.target.checked);
+                if (!e.target.checked) setSteps((s) => Math.min(s, 6));
+              }}
+            />
+            Thêm correction v3: score C giảm từ 150 về 100
+          </label>
+          <p>
+            Correction có version mới hơn vẫn hợp lệ dù total giảm. Bật correction rồi đưa slider
+            tới 7 để so sánh source với projection; tắt correction sẽ trở lại stream sáu deliveries
+            ban đầu.
+          </p>
           <div className="worksheet-choices">
             {(['ordinal', 'competition', 'dense'] as const).map((p) => (
               <button

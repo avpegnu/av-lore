@@ -17,13 +17,21 @@ const updates = [
   { id: 'C', version: 2, total: 150, delta: 20 },
   { id: 'C', version: 1, total: 130, delta: 20 },
 ];
-export function scoreReplay(steps: number, guarded: boolean, policy: RankPolicy) {
-  if (!Number.isInteger(steps) || steps < 0 || steps > 6)
+export function scoreReplay(
+  steps: number,
+  guarded: boolean,
+  policy: RankPolicy,
+  includeCorrection = false,
+) {
+  if (!Number.isInteger(steps) || steps < 0 || steps > (includeCorrection ? 7 : 6))
     throw new RangeError('Invalid score replay');
   const current = new Map(initial.map((p) => [p.id, { ...p }])),
     truth = new Map(initial.map((p) => [p.id, { ...p }]));
   let skipped = 0;
-  const frames = updates.slice(0, steps).map((e) => {
+  const events = includeCorrection
+    ? [...updates, { id: 'C', version: 3, total: 100, delta: -50 }]
+    : updates;
+  const frames = events.slice(0, steps).map((e) => {
     const actual = truth.get(e.id)!;
     if (e.version > actual.version!) Object.assign(actual, { score: e.total, version: e.version });
     const player = current.get(e.id)!,
