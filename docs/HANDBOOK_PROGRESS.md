@@ -5,7 +5,7 @@ Cập nhật 24/10/2026. Chủ sở hữu đã quay lại và yêu cầu tiếp 
 ## Trạng thái hiện tại
 
 - **73/73 bài có nội dung Việt–Anh**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories,15 AI Systems và3Practice +5Interview. **73 bài đã build và kiểm tra browser local.**
-- **27/73 bài đã hoàn tất review độc lập; 46 bài còn `review`.** Đã chốt 4 Foundations, 8 Building Blocks và 15 Case Studies từ URL Shortener tới Metrics & Alerts. Maps & Routing là bài tiếp theo. Review kiểm độ phủ, kỹ thuật, diễn giải/English và mục đích hình/tương tác; tests/counts không thay review.
+- **29/73 bài đã hoàn tất review độc lập; 44 bài còn `review`.** Đã chốt 4 Foundations, 8 Building Blocks và 17 Case Studies từ URL Shortener tới Nearby Friends. Object Storage là bài tiếp theo. Review kiểm độ phủ, kỹ thuật, diễn giải/English và mục đích hình/tương tác; tests/counts không thay review.
 - **Không còn mục chưa biên soạn trong catalog73**; vẫn cần vòng review độc lập toàn bộ nội dung. Glossary68 đã có416original VIENentries/15groups (bao phủ332inventorytermnames/aliases +commonSQL/Frontend/OS/Git/K8s), canonical10sections/3traces/explorer/static fallback/term recall integration; đã validate và publish local; chuẩn bị checkpoint.
 - Main preview **http://127.0.0.1:4322/av-lore/** đã publish local73. Quiz: `/system-design/quiz/` và `/en/system-design/quiz/`. Question Bank: `/system-design/questions/` và `/en/system-design/questions/`. Mock Interview: `/system-design/mock/` và `/en/system-design/mock/`. Staff Signals: `/system-design/staff-signals/` và `/en/system-design/staff-signals/`. Visual Cheat Sheet: `/system-design/cheat-sheet/` và `/en/system-design/cheat-sheet/`. Glossary: `/system-design/glossary/` và `/en/system-design/glossary/`. Các bài mới `/ai-systems/ai-rag/`, `/ai-systems/ai-fine-tuning/`, `/ai-systems/ai-evals/`, `/ai-systems/ai-agents/`, `/ai-systems/ai-production/`, `/ai-systems/ai-safety/`, `/ai-systems/ai-case-rag/` và bản `/en/` tương ứng.
 - Giữ 198 chương/15 lộ trình, 31 Notes & Interview topics, stable IDs, localStorage keys và 9 themes. Không portfolio.
@@ -900,3 +900,21 @@ Mainpreview nếu đã tắt sau shutdown có thể restart tại rootAVLore:`np
 ## Batch26–27 locally published
 
 - Final text-spacing/completion build+verify656pages305486links/assets0missingEnglish passes, main4322 published27-reviewed release. Source404/no diagnostics265tests; dedicated and generic/browser/static evidence above retained. Explicitly stage only Reservation/Metrics changes and synchronized HTML; no Maps source edits yet. Next activate the prepared Maps helper once checkpoint commit completes, then continue Nearby. Do not rerun helpers over subsequent polish.
+
+
+## Batch28–29 WIP — Maps and Nearby
+
+- Batch26–27 AV5b5df99 / IT492a4ea committed, push started; main4322 serves27-reviewed release. Maps full canonical14sections/eightanswers, three own labs/models/tests and complete comparison chapter/tile+route models/demos read, primary OSRM/XYZ contracts checked. Added original parent/children/optional quadkeys explanation/table, ETA evidence flow/worked blend values and compact map; no model changes. Status review until validation.
+- Nearby full canonical14sections/eightanswers and own fanout/viewer/recovery models/tests read; own component, complete comparison chapter/simulation/model and canonical diagram still need review. Primary Redis lossy Pub/Sub and WebSocket origin/auth contracts checked. No Nearby edits yet. Preserve unrelated Python file.
+
+
+## Batch28–29 coverage review finished / validation pending
+
+- Maps full14sections/eightanswers, own three labs/models/tests and complete comparison chapter/tile+route demos/models reviewed; primary OSRM preparation/customization/matching and XYZ tile conventions checked. Preserved directed/turn-aware/time-snapshot qualifications, exact fixed-graph A* bounds, viewport wrapping/unique fetch semantics and bounded ETA blending. Added original optional quadkey/parent/child explanation/table, ETA evidence flow/worked values and compact11node map. No model/UI/study-ID changes.
+- Nearby full14sections/eightanswers/protocol/traces, own three labs/models/tests and complete comparison chapter/moving simulation/model reviewed. Primary Redis live-bus delivery and WebSocket origin versus authorization contracts checked. Existing material already corrects immediate revocation/TTL display, timestamp-only sequencing, next-update assumptions, generic geospatial bans and fixed broker-copy/server-count claims. Added reconnect/buffer/snapshot flow, same-fixture consent-versus-old-copy timeline table, transport comparison and compact10node map. Existing three labs retain distinct purposes; no new artificial lab or altered question IDs. Source/static/build/browser/screenshot validation pending; statuses remain review.
+
+
+## Review batch28–29 validated
+
+- AV5b5df99 / IT492a4ea pushes confirmed. Maps/Nearby complete comparison chapters, own models/components/tests and primary protocol contracts reviewed as recorded above. Both retain three distinct labs and stable IDs. Dedicated scenarios pass VI/EN, keyboard/mobile and18theme checks each; generic4routes/nine themes and static4pages pass. Sourcecheck404/no diagnostics265tests; full isolated build/verify656pages305486links/assets0missingEnglish; static148HTML5526links pass. Desktop/mobile screenshots inspected; shortened update-bus label after spotting a wrapped kind caption. Final completion/label build and additional table/flow screenshots pass; main4322 now serves29-reviewed release. Pages26–27 run40059047219 success; IT40059048050 failed (existing deploy issue; no workflow/settings changes).
+- Object Storage full16sections/eightanswers, own three models/UI/tests and complete comparison chapter/multipart+erasure demos/models read. Primary S3 consistency/multipart/completion contracts checked; no source edits yet. Planned targeted worked repair-cost table, multipart guard comparison, repair flow and compact architecture. Preserve unrelated IT Python file.

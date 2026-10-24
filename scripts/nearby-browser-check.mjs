@@ -112,17 +112,21 @@ try {
     }
     report.push({ locale, scenarios: 'passed' });
     await page.setViewportSize({ width: 1500, height: 1100 });
-  }
-  for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json'))) {
-    await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
-    const a = await new AxeBuilder({ page })
-      .include('.rich-handbook')
-      .withTags(['wcag2a', 'wcag2aa'])
-      .analyze();
-    report.push({
-      theme: theme.id,
-      violations: a.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
-    });
+    for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json'))) {
+      await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
+      const result = await new AxeBuilder({ page })
+        .include('.rich-handbook')
+        .withTags(['wcag2a', 'wcag2aa'])
+        .analyze();
+      report.push({
+        locale,
+        theme: theme.id,
+        violations: result.violations.map((v) => ({
+          id: v.id,
+          nodes: v.nodes.map((n) => n.target),
+        })),
+      });
+    }
   }
 } finally {
   await browser.close();
@@ -137,5 +141,5 @@ assert.ok(
   JSON.stringify(report.filter((r) => r.violations?.length)),
 );
 console.log(
-  'Nearby: exact gateway fanout, authorized audience filtering, viewer movement entries/exits, lost-revoke/epoch guards and independent client expiry, VI/EN/mobile/keyboard and nine theme accessibility passed.',
+  'Nearby: exact gateway fanout, authorized audience filtering, viewer movement entries/exits, lost-revoke/epoch guards and independent client expiry, VI/EN/mobile/keyboard and eighteen theme/locale accessibility passed.',
 );
