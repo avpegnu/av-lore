@@ -65,6 +65,15 @@ try {
     assert.equal(await cards.count(), 4);
     await query.fill('yeu cau');
     assert.ok((await cards.count()) > 0);
+    await query.fill('System Design Interview Framework');
+    assert.equal(
+      await tool.locator('[data-map-id="handbook:framework"]').count(),
+      1,
+      'English title is searchable in both locales',
+    );
+    await group.selectOption('notes');
+    await query.fill('Programming Fundamentals');
+    assert.equal(await cards.first().getAttribute('data-map-id'), 'topic:programming');
     await query.fill('[.*<script>');
     assert.equal(await cards.count(), 0);
     assert.equal(await tool.locator('.visual-empty').count(), 1);

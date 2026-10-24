@@ -12,6 +12,7 @@ const maps: RecallMap[] = [
       { title: 'Server', detail: 'service time', icon: 'gauge' },
     ],
     takeaways: ['Use matching boundaries'],
+    searchText: 'Latency and queue. Measure elapsed residence time.',
     href: '/a/',
   },
   {
@@ -29,6 +30,8 @@ const maps: RecallMap[] = [
 ];
 test('visual recall filtering searches complete map text with accent-insensitive AND words and independent category counts', () => {
   assert.equal(selectRecallMaps(maps, 'DO TRE').maps[0].id, 'a');
+  assert.equal(selectRecallMaps(maps, 'LATENCY residence').maps[0].id, 'a');
+  assert.equal(selectRecallMaps(maps, 'do tre residence').maps[0].id, 'a');
   assert.equal(selectRecallMaps(maps, 'network wait', 'notes').maps[0].id, 'b');
   assert.deepEqual(selectRecallMaps(maps, 'network wait', 'notes').counts, {
     foundation: 1,

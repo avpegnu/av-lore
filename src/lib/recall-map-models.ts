@@ -7,6 +7,8 @@ export type RecallMap = {
   steps: { title: string; detail: string; icon: string }[];
   takeaways: string[];
   analogy?: string;
+  /** Authored alternate-language text, indexed without changing displayed content. */
+  searchText?: string;
   href: string;
 };
 export function selectRecallMaps(maps: RecallMap[], query: string, group = 'all') {
@@ -17,6 +19,7 @@ export function selectRecallMaps(maps: RecallMap[], query: string, group = 'all'
         m.title,
         m.caption,
         m.analogy || '',
+        m.searchText || '',
         ...m.takeaways,
         ...m.steps.flatMap((s) => [s.title, s.detail]),
       ].join(' '),

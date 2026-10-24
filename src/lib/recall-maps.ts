@@ -2,6 +2,10 @@ import { topics } from './content';
 import { learning } from './learning';
 import { handbookLessons, handbookPath } from './handbook';
 import type { RecallMap } from './recall-map-models';
+import cache from '../i18n/en.json';
+import overrides from '../i18n/en-overrides.json';
+import { createTranslator } from './translate';
+const english = createTranslator({ ...cache, ...overrides });
 /** Reuse authored teaching maps. Never derive a fake model from arbitrary paragraphs. */
 export const recallMaps: RecallMap[] = [
   ...topics.map((t) => {
@@ -15,6 +19,9 @@ export const recallMaps: RecallMap[] = [
       steps: m.path.map((title) => ({ title, detail: '', icon: 'route' })),
       takeaways: m.takeaways,
       analogy: m.analogy,
+      searchText: [t.title, t.description, ...m.path, ...m.takeaways, m.analogy]
+        .map(english)
+        .join(' '),
       href: `/handbook/${t.id}/#quick`,
     };
   }),
@@ -31,6 +38,12 @@ export const recallMaps: RecallMap[] = [
         icon: s.icon,
       })),
       takeaways: l.takeaways.map((t) => t.vi),
+      searchText: [
+        l.title.en,
+        l.overview!.caption.en,
+        ...l.overview!.steps.flatMap((s) => [s.title.en, s.detail.en]),
+        ...l.takeaways.map((t) => t.en),
+      ].join(' '),
       href: handbookPath(l),
     })),
 ];
