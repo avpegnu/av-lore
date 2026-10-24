@@ -57,3 +57,24 @@ test('for-duration waits elapsed evaluation time, rejects brief spikes and reset
     }
   assert.throws(() => alertReplay(20, 5, 3, false));
 });
+
+test('burn rates use eligible request sums rather than average minute percentages and require both windows', async () => {
+  const { sloBurn } = await import('../src/lib/metrics-models');
+  assert.equal(sloBurn(1, 10000, 400).firing, false);
+  assert.equal(sloBurn(20, 10000, 400).firing, false);
+  const sustained = sloBurn(22, 10000, 400);
+  assert.equal(sustained.firing, true);
+  assert.equal(sustained.short.burn, 40);
+  const quiet = sloBurn(22, 1000, 400);
+  assert.equal(quiet.firing, false);
+  assert.ok(quiet.unweightedBurn > 14.4);
+  assert.ok(quiet.long.burn < 14.4);
+  for (let duration = 0; duration <= 60; duration++)
+    for (const requests of [1000, 10000]) {
+      const r = sloBurn(duration, requests, 400);
+      assert.ok(r.short.bad <= r.long.bad);
+      assert.equal(r.budgetPercentEstimate, (r.long.burn / 720) * 100);
+      assert.equal(r.firing, r.short.burn > 14.4 && r.long.burn > 14.4);
+    }
+  assert.throws(() => sloBurn(61, 10000, 400));
+});

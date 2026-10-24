@@ -1,4 +1,4 @@
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
@@ -25,7 +25,7 @@ try {
     if (locale === 'en')
       await page.waitForFunction(() => document.documentElement.dataset.languageReady === 'true');
     const labs = page.locator('.handbook-experiment');
-    assert.equal(await labs.count(), 3);
+    assert.equal(await labs.count(), 4);
     for (const lab of await labs.all()) {
       await lab.scrollIntoViewIfNeeded();
       await lab.locator('xpath=ancestor::astro-island[1]').evaluate(async (el) => {
@@ -88,6 +88,22 @@ try {
     assert.equal(await alert.locator('dd').nth(1).textContent(), '2');
     await alert.locator('summary').click();
     assert.equal(await alert.locator('li').count(), 20);
+    const burn = labs.last(),
+      burnRanges = burn.locator('input[type=range]');
+    await expect(burn.locator('dd')).toHaveText(['40.00', '14.79', 'FIRING', '2.05']);
+    await burnRanges.nth(1).focus();
+    await page.keyboard.press('Home');
+    await expect(burn.locator('dd').nth(1)).toHaveText('2.38');
+    await expect(burn.locator('dd').nth(2)).toHaveText('INACTIVE');
+    await burnRanges.first().focus();
+    await page.keyboard.press('Home');
+    await expect(burn.locator('dd').first()).toHaveText('0.20');
+    await burnRanges.first().focus();
+    await page.keyboard.press('End');
+    await burnRanges.last().focus();
+    await page.keyboard.press('End');
+    await expect(burn.locator('dd').first()).toHaveText('200.00');
+    await expect(burn.locator('dd').nth(2)).toHaveText('FIRING');
     if (locale === 'en')
       await page.waitForFunction(
         () =>
@@ -101,7 +117,7 @@ try {
         await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1),
         false,
       );
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 4; i++) {
         await labs.nth(i).evaluate((el) => el.scrollIntoView({ block: 'start' }));
         await page.evaluate(() => window.scrollBy(0, -96));
         await page.screenshot({ path: `artifacts/metrics-${locale}-${i}-${width}.png` });
@@ -117,17 +133,21 @@ try {
     }
     report.push({ locale, scenarios: 'passed' });
     await page.setViewportSize({ width: 1500, height: 1100 });
-  }
-  for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json'))) {
-    await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
-    const result = await new AxeBuilder({ page })
-      .include('.rich-handbook')
-      .withTags(['wcag2a', 'wcag2aa'])
-      .analyze();
-    report.push({
-      theme: theme.id,
-      violations: result.violations.map((v) => ({ id: v.id, nodes: v.nodes.map((n) => n.target) })),
-    });
+    for (const theme of JSON.parse(fs.readFileSync('src/lib/themes.json'))) {
+      await page.evaluate((id) => (document.documentElement.dataset.theme = id), theme.id);
+      const result = await new AxeBuilder({ page })
+        .include('.rich-handbook')
+        .withTags(['wcag2a', 'wcag2aa'])
+        .analyze();
+      report.push({
+        locale,
+        theme: theme.id,
+        violations: result.violations.map((v) => ({
+          id: v.id,
+          nodes: v.nodes.map((n) => n.target),
+        })),
+      });
+    }
   }
 } finally {
   await browser.close();
@@ -142,5 +162,5 @@ assert.ok(
   JSON.stringify(report.filter((r) => r.violations?.length)),
 );
 console.log(
-  'Metrics: cardinality/coverage bounds, uneven gauge rollups, extrema retention and elapsed alert duration/no-data replay, both locales, keyboard/mobile and nine theme accessibility passed.',
+  'Metrics: cardinality/coverage bounds, uneven gauge rollups, extrema retention and elapsed alert duration/no-data replay, both locales, keyboard/mobile and eighteen theme/locale accessibility passed.',
 );

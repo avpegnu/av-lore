@@ -1,10 +1,16 @@
 import { useId, useState } from 'react';
 import { useIslandReady } from '../lib/use-island-ready';
-import { cardinalityBudget, gaugeRollup, gaugeSamples, alertReplay } from '../lib/metrics-models';
+import {
+  cardinalityBudget,
+  gaugeRollup,
+  gaugeSamples,
+  alertReplay,
+  sloBurn,
+} from '../lib/metrics-models';
 export default function MetricsPlayground({
   kind,
 }: {
-  kind: 'metrics-cardinality' | 'metrics-rollup' | 'metrics-alert';
+  kind: 'metrics-cardinality' | 'metrics-rollup' | 'metrics-alert' | 'metrics-burn';
 }) {
   const ref = useIslandReady(),
     id = 'metrics-' + useId().replace(/:/g, '');
@@ -17,8 +23,12 @@ export default function MetricsPlayground({
     [clock, setClock] = useState(14),
     [threshold, setThreshold] = useState(5),
     [duration, setDuration] = useState(3),
-    [missing, setMissing] = useState(false);
-  const budget = cardinalityBudget(ids ? 10 ** exponent : 1, coverage, interval),
+    [missing, setMissing] = useState(false),
+    [incidentMinutes, setIncidentMinutes] = useState(22),
+    [incidentRequests, setIncidentRequests] = useState(10000),
+    [incidentBps, setIncidentBps] = useState(400);
+  const burn = sloBurn(incidentMinutes, incidentRequests, incidentBps),
+    budget = cardinalityBudget(ids ? 10 ** exponent : 1, coverage, interval),
     rollup = gaugeRollup(width),
     alert = alertReplay(clock, threshold, duration, missing),
     fmt = (v: number) => v.toLocaleString('en-US', { maximumFractionDigits: 2 });
@@ -29,6 +39,114 @@ export default function MetricsPlayground({
   return (
     <section className="handbook-experiment metrics-playground" ref={ref} aria-labelledby={id}>
       <span className="eyebrow">METRICS / IDENTITY, ROLLUPS AND ALERT EVIDENCE</span>
+      {kind === 'metrics-burn' && (
+        <>
+          <h3 id={id}>Cùng error percentage, request volume có đổi burn rate không?</h3>
+          <p>
+            Fixture 60 buckets một phút, SLO99,9% trong 30 ngày. Baseline có 10000 eligible requests
+            và 2 bad mỗi phút; incident chiếm các phút cuối. Mỗi control replay từ đầu. Cả 1h và 5m
+            phải có burn rate lớn hơn 14,4 mới FIRING; đây là rule snapshot, không mô phỏng pending
+            hoặc notification delivery.
+          </p>
+          <div className="worksheet-inputs">
+            {[
+              {
+                label: 'Incident minutes at end',
+                value: incidentMinutes,
+                min: 0,
+                max: 60,
+                step: 1,
+                set: setIncidentMinutes,
+              },
+              {
+                label: 'Eligible requests / incident minute',
+                value: incidentRequests,
+                min: 1000,
+                max: 10000,
+                step: 1000,
+                set: setIncidentRequests,
+              },
+              {
+                label: 'Incident errors / basis points',
+                value: incidentBps,
+                min: 0,
+                max: 2000,
+                step: 100,
+                set: setIncidentBps,
+              },
+            ].map((c) => (
+              <label key={c.label}>
+                {c.label}
+                <output>{c.value}</output>
+                <input
+                  type="range"
+                  min={c.min}
+                  max={c.max}
+                  step={c.step}
+                  value={c.value}
+                  onChange={(e) => c.set(+e.target.value)}
+                />
+              </label>
+            ))}
+          </div>
+          <p>
+            100 basis points = 1%; baseline error fraction = 0,02%. Mọi bucket có traffic và đủ
+            evidence trong fixture; zero traffic, partial query và telemetry outage cần policy
+            riêng.
+          </p>
+          <figure className="metrics-burn-bars">
+            <figcaption>Burn threshold: 14.4×</figcaption>
+            {[
+              { label: '5m / request-weighted', value: burn.short.burn },
+              { label: '1h / request-weighted', value: burn.long.burn },
+              { label: '1h / unsafe mean of minute percentages', value: burn.unweightedBurn },
+            ].map((r) => (
+              <div key={r.label}>
+                <span>
+                  {r.label}: {r.value.toFixed(2)}×
+                </span>
+                <div className="metrics-burn-track" aria-hidden="true">
+                  <span
+                    style={{
+                      width: `${(r.value / Math.max(14.4, burn.short.burn, burn.long.burn, burn.unweightedBurn)) * 100}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            ))}
+          </figure>
+          <dl className="worksheet-results" aria-live="polite">
+            <div>
+              <dt>5m burn rate</dt>
+              <dd>{burn.short.burn.toFixed(2)}</dd>
+            </div>
+            <div>
+              <dt>1h burn rate</dt>
+              <dd>{burn.long.burn.toFixed(2)}</dd>
+            </div>
+            <div>
+              <dt>Rule snapshot</dt>
+              <dd>{burn.firing ? 'FIRING' : 'INACTIVE'}</dd>
+            </div>
+            <div>
+              <dt>Estimated 30-day budget share / %</dt>
+              <dd>{burn.budgetPercentEstimate.toFixed(2)}</dd>
+            </div>
+          </dl>
+          <p>
+            Thử incident=22 phút, errors=400bps: volume10000/phút cho FIRING; giảm volume incident
+            xuống1000/phút thì long-window burn thấp hơn dù average minute percentages vẫn như cũ.
+            Đúng là sum(bad)/sum(eligible), không average các percentages khi denominators khác
+            nhau.
+          </p>
+          <p>
+            Budget estimate dùng request-based SLI và giả định total eligible requests toàn 30 ngày
+            tương đương 720 lần total giờ này. Traffic thực biến đổi thì phải dùng denominator của
+            SLO window thực tế; không coi phép đổi burn/720 là accounting chính xác cho mọi traffic
+            pattern.
+          </p>
+        </>
+      )}
       {kind === 'metrics-cardinality' && (
         <>
           <h3 id={id}>Thêm một label có thể tạo bao nhiêu series?</h3>

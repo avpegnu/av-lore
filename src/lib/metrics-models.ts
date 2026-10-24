@@ -104,3 +104,45 @@ export function alertReplay(
   });
   return { rows, state: state as AlertState, since, firstFiring, firingEvaluations, noData };
 }
+
+/** Equal-duration minute buckets, unequal request volumes; no missing/zero-volume buckets. */
+export function sloBurn(incidentMinutes: number, incidentRequests: number, incidentBps: number) {
+  if (
+    !Number.isInteger(incidentMinutes) ||
+    incidentMinutes < 0 ||
+    incidentMinutes > 60 ||
+    !Number.isInteger(incidentRequests) ||
+    incidentRequests < 1000 ||
+    incidentRequests > 10000 ||
+    incidentRequests % 1000 !== 0 ||
+    !Number.isInteger(incidentBps) ||
+    incidentBps < 0 ||
+    incidentBps > 2000 ||
+    incidentBps % 100 !== 0
+  )
+    throw new RangeError('Invalid burn fixture');
+  const rows = Array.from({ length: 60 }, (_, i) => {
+    const incident = i >= 60 - incidentMinutes;
+    return {
+      requests: incident ? incidentRequests : 10000,
+      bad: incident ? (incidentRequests * incidentBps) / 10000 : 2,
+    };
+  });
+  const window = (minutes: number) => {
+    const part = rows.slice(-minutes),
+      requests = part.reduce((n, r) => n + r.requests, 0),
+      bad = part.reduce((n, r) => n + r.bad, 0);
+    return { requests, bad, burn: bad / requests / 0.001 };
+  };
+  const short = window(5),
+    long = window(60),
+    threshold = 14.4;
+  return {
+    short,
+    long,
+    threshold,
+    firing: short.burn > threshold && long.burn > threshold,
+    unweightedBurn: rows.reduce((n, r) => n + r.bad / r.requests, 0) / 60 / 0.001,
+    budgetPercentEstimate: (long.burn / 720) * 100,
+  };
+}
