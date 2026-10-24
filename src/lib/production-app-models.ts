@@ -107,6 +107,7 @@ export function productionCacheCost(
   semanticFalseHit: number,
   prefixFraction: number,
   prefixReadShare: number,
+  semanticEnabled = true,
 ) {
   if (
     requests < 0 ||
@@ -117,7 +118,7 @@ export function productionCacheCost(
     throw new Error('Invalid cache cost inputs');
   // Hypothetical dollars/1M tokens, not provider pricing. 2000 input / 400 output per model call.
   const exact = requests * exactHit,
-    semantic = (requests - exact) * semanticHitOfMisses,
+    semantic = semanticEnabled ? (requests - exact) * semanticHitOfMisses : 0,
     calls = requests - exact - semantic;
   const inputPrice = 2,
     outputPrice = 8,
@@ -128,7 +129,7 @@ export function productionCacheCost(
     inputCost = (uncachedInput * inputPrice + prefixReadTokens * cachedReadPrice) / 1e6,
     outputCost = (outputTokens * outputPrice) / 1e6,
     // Every exact miss is embedded when semantic caching is enabled; query length is 80 tokens.
-    lookupCost = semanticHitOfMisses > 0 ? ((requests - exact) * 80 * 0.02) / 1e6 : 0;
+    lookupCost = semanticEnabled ? ((requests - exact) * 80 * 0.02) / 1e6 : 0;
   return {
     exact,
     semantic,

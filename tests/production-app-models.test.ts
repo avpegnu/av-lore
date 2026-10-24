@@ -70,3 +70,15 @@ test('conditional cache hits conserve request mass; prefix caching still generat
   assert.equal(all.total, 0);
   assert.equal(all.calls, 0);
 });
+test('enabled semantic lookup still costs money with zero hits; disabling it bypasses lookup and reuse', () => {
+  const misses = productionCacheCost(100000, 0.2, 0, 0.02, 0.6, 0.8);
+  const disabled = productionCacheCost(100000, 0.2, 0.6, 0.02, 0.6, 0.8, false);
+  assert.equal(misses.calls, 80000);
+  assert.equal(misses.semantic, 0);
+  assert.equal(misses.lookupCost, 0.128);
+  assert.equal(disabled.lookupCost, 0);
+  assert.equal(disabled.semantic, 0);
+  assert.equal(disabled.calls, 80000);
+  assert.equal(misses.inputCost, disabled.inputCost);
+  assert.ok(Math.abs(misses.total - disabled.total - 0.128) < 1e-10);
+});

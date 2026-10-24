@@ -26,6 +26,7 @@ export default function ProductionAppPlayground({
     [versions, setVersions] = useState(true),
     [permission, setPermission] = useState(true);
   const [requestK, setRequestK] = useState(100),
+    [semanticEnabled, setSemanticEnabled] = useState(true),
     [exact, setExact] = useState(0.2),
     [semanticHit, setSemanticHit] = useState(0.1),
     [falseHit, setFalseHit] = useState(0.02),
@@ -33,7 +34,15 @@ export default function ProductionAppPlayground({
     [prefixReads, setPrefixReads] = useState(0.8);
   const stream = productionStream(failure, policy, qualified, disconnect),
     cache = responseCacheDecision(scenario, semantic, threshold, tenant, versions, permission),
-    cost = productionCacheCost(requestK * 1000, exact, semanticHit, falseHit, prefix, prefixReads);
+    cost = productionCacheCost(
+      requestK * 1000,
+      exact,
+      semanticHit,
+      falseHit,
+      prefix,
+      prefixReads,
+      semanticEnabled,
+    );
   const format = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 2 }),
     money = (n: number) =>
       '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -245,6 +254,7 @@ export default function ProductionAppPlayground({
       )}
       {kind === 'prod-cost' && (
         <>
+          {toggle('Bật semantic lookup sau exact miss', semanticEnabled, setSemanticEnabled)}
           <div className="worksheet-inputs">
             {slider('Requests trong window (nghìn)', requestK, setRequestK, 0, 1000, 10)}
             {slider('Exact response hit / tất cả requests', exact, setExact, 0, 1, 0.1, true)}
@@ -333,7 +343,8 @@ export default function ProductionAppPlayground({
           </figure>
           <p className="worksheet-footnote">
             Semantic hit rate là conditional trên exact misses, không cộng trực tiếp hai hit
-            percentages. Prefix reuse không tránh output generation. Worksheet chưa tính cache
+            percentages. Lookup vẫn tốn phí khi bật nhưng không có hit; tắt lookup mới bỏ khoản phí
+            này. Prefix reuse không tránh output generation. Worksheet chưa tính cache
             writes/storage, invalidation, retrieval/rerank, retries, routing quality, provider
             minimums hoặc human review; giả định exact hits correct và semantic false-hit rate do
             bạn cung cấp. Không suy savings là quality approval.
