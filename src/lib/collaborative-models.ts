@@ -99,3 +99,35 @@ export function durableEditScenario(stage:number,durable:boolean,fence:boolean,r
     acknowledgedLoss:stage>=3&&!durable&&!replyLost,
     seen};
 }
+
+// Fixed two-client schedule: two local inserts, one remote insert, delayed ACKs.
+// A single outstanding operation is sent at a time; no network/storage benchmark.
+export function bufferedEditScenario(stage:number,rebaseBuffer:boolean){
+  if(!Number.isInteger(stage)||stage<0||stage>6)throw new RangeError('Invalid client-buffer timeline');
+  const first:TextEdit={kind:'insert',at:1,value:'X',actor:'A'},
+    second:TextEdit={kind:'insert',at:2,value:'Y',actor:'A'},
+    remote:TextEdit={kind:'insert',at:0,value:'Z',actor:'B'};
+  let local='CODE',server='CODE',serverRevision=0,confirmedRevision=0;
+  let outstanding:TextEdit|null=null,buffer:TextEdit|null=null,identity='—',sentBase:number|null=null;
+  if(stage>=1){local=applyTextEdit(local,first);outstanding=first;identity='A/1';sentBase=0;}
+  if(stage>=2){local=applyTextEdit(local,second);buffer=second;}
+  if(stage>=3){
+    server=applyTextEdit(server,remote);serverRevision=confirmedRevision=1;
+    // Both operations used to transform each other share the same context.
+    const throughFirst=rebasePair(remote,first);
+    outstanding=rebasePair(first,remote);
+    if(rebaseBuffer)buffer=rebasePair(second,throughFirst);
+    const throughBuffer=rebasePair(throughFirst,second);
+    local=applyTextEdit(local,throughBuffer);
+  }
+  if(stage>=4){server=applyTextEdit(server,rebasePair(first,remote));serverRevision=2;}
+  if(stage>=5){
+    confirmedRevision=2;outstanding=buffer;buffer=null;identity='A/2';sentBase=2;
+  }
+  if(stage>=6){
+    server=applyTextEdit(server,outstanding!);serverRevision=confirmedRevision=3;
+    outstanding=null;identity='—';sentBase=null;
+  }
+  return {local,server,serverRevision,confirmedRevision,outstanding,buffer,identity,sentBase,
+    pending:Number(!!outstanding)+Number(!!buffer),agree:local===server};
+}

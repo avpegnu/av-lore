@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {applyTextEdit,rebasePair,pairScenario,mergeTree,renderTree,treeSeed,tombstoneScenario,durableEditScenario,type TextEdit,type TreeOp} from '../src/lib/collaborative-models';
+import {bufferedEditScenario,applyTextEdit,rebasePair,pairScenario,mergeTree,renderTree,treeSeed,tombstoneScenario,durableEditScenario,type TextEdit,type TreeOp} from '../src/lib/collaborative-models';
 test('bounded concurrent single-edit pairs converge across both delivery orders and preserve targeted deletions',()=>{
  for(const base of ['', 'A','CODE']){
   const edits=(actor:'A'|'B'):TextEdit[]=>[
@@ -39,4 +39,13 @@ test('durable acceptance, recoverable dedup and writer fencing address independe
  assert.equal(durableEditScenario(5,true,true,true).committed,'CODE!');
  assert.equal(durableEditScenario(5,true,false,true).committed,'CODE!?');
  assert.equal(durableEditScenario(3,false,true,true).pending,true);
+});
+
+test('buffered local edits keep contexts across remote changes and delayed acknowledgements',()=>{
+ const waiting=bufferedEditScenario(2,true);assert.equal(waiting.local,'CXYODE');assert.equal(waiting.pending,2);assert.equal(waiting.sentBase,0);
+ const remote=bufferedEditScenario(3,true);assert.equal(remote.local,'ZCXYODE');assert.deepEqual(remote.outstanding,{kind:'insert',at:2,value:'X',actor:'A'});assert.deepEqual(remote.buffer,{kind:'insert',at:3,value:'Y',actor:'A'});assert.equal(remote.sentBase,0);
+ const delayed=bufferedEditScenario(4,true);assert.equal(delayed.serverRevision,2);assert.equal(delayed.confirmedRevision,1);assert.equal(delayed.pending,2);
+ const ack=bufferedEditScenario(5,true);assert.equal(ack.identity,'A/2');assert.equal(ack.sentBase,2);assert.equal(ack.pending,1);assert.equal(ack.buffer,null);
+ for(const guard of [true,false]){const done=bufferedEditScenario(6,guard);assert.equal(done.local,'ZCXYODE');assert.equal(done.server,guard?'ZCXYODE':'ZCYXODE');assert.equal(done.pending,0);assert.equal(done.agree,guard);assert.equal(done.confirmedRevision,3);}
+ for(const invalid of [-1,7,1.5])assert.throws(()=>bufferedEditScenario(invalid,true));
 });
