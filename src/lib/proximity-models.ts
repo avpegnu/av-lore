@@ -56,7 +56,10 @@ export function gridSearch(x: number, y: number, radius: number, size: number, c
   };
 }
 export type QuadLeaf = { x: number; y: number; size: number; depth: number; points: GeoPoint[] };
-export function quadPartition(points: GeoPoint[], capacity: number, maxDepth: number): QuadLeaf[] {
+export interface QuadNode extends QuadLeaf {
+  children: QuadNode[];
+}
+export function buildQuadTree(points: GeoPoint[], capacity: number, maxDepth: number): QuadNode {
   if (
     !Number.isInteger(capacity) ||
     capacity < 1 ||
@@ -78,25 +81,91 @@ export function quadPartition(points: GeoPoint[], capacity: number, maxDepth: nu
     )
   )
     throw new RangeError('Points outside half-open teaching region');
-  const leaves: QuadLeaf[] = [];
-  function split(x: number, y: number, size: number, depth: number, contained: GeoPoint[]) {
-    if (contained.length <= capacity || depth === maxDepth) {
-      leaves.push({ x, y, size, depth, points: contained });
-      return;
-    }
-    const half = size / 2;
+  function split(
+    x: number,
+    y: number,
+    size: number,
+    depth: number,
+    contained: GeoPoint[],
+  ): QuadNode {
+    if (contained.length <= capacity || depth === maxDepth)
+      return { x, y, size, depth, points: contained, children: [] };
+    const half = size / 2,
+      children: QuadNode[] = [];
     for (const dx of [0, half])
       for (const dy of [0, half])
-        split(
-          x + dx,
-          y + dy,
-          half,
-          depth + 1,
-          contained.filter(
-            (p) => p.x >= x + dx && p.x < x + dx + half && p.y >= y + dy && p.y < y + dy + half,
+        children.push(
+          split(
+            x + dx,
+            y + dy,
+            half,
+            depth + 1,
+            contained.filter(
+              (p) => p.x >= x + dx && p.x < x + dx + half && p.y >= y + dy && p.y < y + dy + half,
+            ),
           ),
         );
+    return { x, y, size, depth, points: [], children };
   }
-  split(0, 0, 10, 0, points);
-  return leaves;
+  return split(0, 0, 10, 0, points);
+}
+function quadInventory(root: QuadNode) {
+  const nodes: QuadNode[] = [];
+  const walk = (n: QuadNode) => {
+    nodes.push(n);
+    n.children.forEach(walk);
+  };
+  walk(root);
+  return nodes;
+}
+export function quadPartition(points: GeoPoint[], capacity: number, maxDepth: number): QuadLeaf[] {
+  return quadInventory(buildQuadTree(points, capacity, maxDepth)).filter((n) => !n.children.length);
+}
+export function quadQuery(
+  points: GeoPoint[],
+  capacity: number,
+  maxDepth: number,
+  x: number,
+  y: number,
+  radius: number,
+) {
+  if (
+    ![x, y, radius].every(Number.isFinite) ||
+    x < 0 ||
+    x > 10 ||
+    y < 0 ||
+    y > 10 ||
+    radius < 0 ||
+    radius > 5
+  )
+    throw new RangeError('Invalid bounded tree query');
+  const root = buildQuadTree(points, capacity, maxDepth),
+    nodes = quadInventory(root),
+    leaves = nodes.filter((n) => !n.children.length),
+    visited: QuadNode[] = [],
+    found: GeoPoint[] = [];
+  let checked = 0;
+  const intersects = (n: QuadNode) =>
+    Math.hypot(
+      Math.max(n.x, Math.min(x, n.x + n.size)) - x,
+      Math.max(n.y, Math.min(y, n.y + n.size)) - y,
+    ) <= radius;
+  const walk = (n: QuadNode) => {
+    if (!intersects(n)) return;
+    visited.push(n);
+    if (n.children.length) {
+      n.children.forEach(walk);
+      return;
+    }
+    for (const p of n.points) {
+      checked++;
+      if (Math.hypot(p.x - x, p.y - y) <= radius) found.push(p);
+    }
+  };
+  walk(root);
+  found.sort(
+    (a, b) =>
+      Math.hypot(a.x - x, a.y - y) - Math.hypot(b.x - x, b.y - y) || a.id.localeCompare(b.id),
+  );
+  return { leaves, visited, found, checked, totalNodes: nodes.length };
 }

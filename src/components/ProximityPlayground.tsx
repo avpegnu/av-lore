@@ -1,6 +1,8 @@
 import { useId, useState } from 'react';
+import GeohashEncoding from './GeohashEncoding';
+import '../styles/quad-query.css';
 import { useIslandReady } from '../lib/use-island-ready';
-import { geoPoints, clusteredPoints, gridSearch, quadPartition } from '../lib/proximity-models';
+import { geoPoints, clusteredPoints, gridSearch, quadQuery } from '../lib/proximity-models';
 export default function ProximityPlayground({ kind }: { kind: 'geo-cover' | 'geo-quadtree' }) {
   const ref = useIslandReady(),
     id = 'geo-' + useId().replace(/:/g, '');
@@ -14,7 +16,8 @@ export default function ProximityPlayground({ kind }: { kind: 'geo-cover' | 'geo
     [cluster, setCluster] = useState(false);
   const query = gridSearch(x, y, radius, size, centerOnly),
     points = cluster ? [...geoPoints, ...clusteredPoints] : geoPoints,
-    leaves = quadPartition(points, capacity, depth);
+    treeQuery = quadQuery(points, capacity, depth, x, y, radius),
+    leaves = treeQuery.leaves;
   const sx = (v: number) => 32 + v * 44,
     sy = (v: number) => 472 - v * 44;
   return (
@@ -155,6 +158,7 @@ export default function ProximityPlayground({ kind }: { kind: 'geo-cover' | 'geo
             stage đọc. Giảm cell size làm tăng cover count nhưng thường giảm candidate
             amplification; đây không phải benchmark latency.
           </p>
+          <GeohashEncoding />
         </>
       ) : (
         <>
@@ -194,24 +198,60 @@ export default function ProximityPlayground({ kind }: { kind: 'geo-cover' | 'geo
             />
             Thêm cluster 16 point gần nhau
           </label>
+          <div className="worksheet-inputs quad-query-controls">
+            {[
+              { name: 'Query X / km', value: x, min: 0, max: 10, step: 0.1, set: setX },
+              { name: 'Query Y / km', value: y, min: 0, max: 10, step: 0.1, set: setY },
+              { name: 'Radius / km', value: radius, min: 0.5, max: 5, step: 0.5, set: setRadius },
+            ].map((c) => (
+              <label key={c.name}>
+                {c.name}
+                <output>{c.value}</output>
+                <input
+                  type="range"
+                  min={c.min}
+                  max={c.max}
+                  step={c.step}
+                  value={c.value}
+                  onChange={(e) => c.set(+e.target.value)}
+                />
+              </label>
+            ))}
+          </div>
           <div className="geo-map">
             <svg viewBox="0 0 504 504" role="img" aria-label="Bounded quadtree leaf partition">
               <title>Adaptive quadtree leaves over a bounded planar region</title>
-              <rect x="32" y="32" width="440" height="440" className="geo-ground" />
-              {leaves.map((l) => (
-                <rect
-                  key={l.x + ',' + l.y + ',' + l.size}
-                  x={sx(l.x)}
-                  y={sy(l.y + l.size)}
-                  width={l.size * 44}
-                  height={l.size * 44}
-                  className="geo-cell"
-                  data-covered={l.points.length > 0}
-                />
-              ))}
-              {points.map((p) => (
-                <circle key={p.id} cx={sx(p.x)} cy={sy(p.y)} r="4" className="geo-point" />
-              ))}
+              <defs>
+                <clipPath id={id + '-quad-clip'}>
+                  <rect x="32" y="32" width="440" height="440" />
+                </clipPath>
+              </defs>
+              <g clipPath={'url(#' + id + '-quad-clip)'}>
+                <rect x="32" y="32" width="440" height="440" className="geo-ground" />
+                {leaves.map((l) => (
+                  <rect
+                    key={l.x + ',' + l.y + ',' + l.size}
+                    x={sx(l.x)}
+                    y={sy(l.y + l.size)}
+                    width={l.size * 44}
+                    height={l.size * 44}
+                    className="geo-cell"
+                    data-covered={l.points.length > 0}
+                    data-visited={treeQuery.visited.includes(l)}
+                  />
+                ))}
+                <circle cx={sx(x)} cy={sy(y)} r={radius * 44} className="geo-radius" />
+                {points.map((p) => (
+                  <circle
+                    key={p.id}
+                    cx={sx(p.x)}
+                    cy={sy(p.y)}
+                    r={treeQuery.found.includes(p) ? 7 : 4}
+                    className="geo-point"
+                    data-match={treeQuery.found.includes(p)}
+                  />
+                ))}
+              </g>
               <text x="32" y="495">
                 0
               </text>
@@ -238,6 +278,36 @@ export default function ProximityPlayground({ kind }: { kind: 'geo-cover' | 'geo
               <dd>{leaves.filter((l) => l.points.length > capacity).length}</dd>
             </div>
           </dl>
+          <div className="quad-query-feedback">
+            <dl className="worksheet-results" aria-live="polite">
+              <div>
+                <dt>Visited intersecting nodes / total</dt>
+                <dd data-quad-visited>
+                  {treeQuery.visited.length} / {treeQuery.totalNodes}
+                </dd>
+              </div>
+              <div>
+                <dt>Points exact-checked / brute force</dt>
+                <dd data-quad-checked>
+                  {treeQuery.checked} / {points.length}
+                </dd>
+              </div>
+              <div>
+                <dt>Exact radius matches</dt>
+                <dd data-quad-found>{treeQuery.found.length}</dd>
+              </div>
+            </dl>
+            <p>
+              Viền sáng đánh dấu leaf giao query circle; điểm lớn là exact match. Query bỏ nhánh
+              không giao circle rồi kiểm Euclidean distance tại leaf. Counts chỉ mô tả traversal
+              trong fixture; controls vẫn rebuild tree và inventory đầy đủ, không đo latency. Empty
+              leaf có thể được visit nhưng không phát sinh point check.
+            </p>
+            <p>
+              Result IDs:{' '}
+              <span translate="no">{treeQuery.found.map((p) => p.id).join(' · ') || '—'}</span>
+            </p>
+          </div>
           <details>
             <summary>Leaf inventory / coordinates and membership</summary>
             <figure className="handbook-table">
@@ -269,8 +339,8 @@ export default function ProximityPlayground({ kind }: { kind: 'geo-cover' | 'geo
           </details>
           <p>
             Leaf geometry và membership được tính lại theo controls. Đây là adaptive partition,
-            không là H3/geohash encoder. Search quadtree cần prune node không giao query rồi
-            exact-filter points; balancing, persistence và concurrent writes không được mô phỏng.
+            không là H3/geohash encoder. Circle query và exact checks được mô phỏng trên cùng mặt
+            phẳng; balancing, persistence và concurrent writes không được mô phỏng.
           </p>
         </>
       )}

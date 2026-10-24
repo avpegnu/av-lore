@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { gridSearch, geoPoints, clusteredPoints, quadPartition } from '../src/lib/proximity-models';
+import {
+  gridSearch,
+  geoPoints,
+  clusteredPoints,
+  quadPartition,
+  quadQuery,
+} from '../src/lib/proximity-models';
 test('bounding-box cell covers never lose true radius matches; center-only can lose boundary neighbors', () => {
   for (const size of [1, 2, 3, 4, 5])
     for (const x of [0, 2.9, 5, 9.9, 10])
@@ -48,4 +54,33 @@ test('adaptive leaves partition the region, keep every point exactly once and st
         );
       }
   assert.throws(() => quadPartition([{ id: 'bad', x: 10, y: 1 }], 2, 4));
+});
+
+test('quadtree circle pruning preserves exact matches and checks fewer points for selective queries', () => {
+  const points = [...geoPoints, ...clusteredPoints];
+  for (const capacity of [1, 2, 8])
+    for (const depth of [0, 2, 6])
+      for (const [x, y, radius] of [
+        [0, 0, 0],
+        [5, 5, 2],
+        [10, 10, 5],
+        [2, 8, 0.3],
+      ]) {
+        const q = quadQuery(points, capacity, depth, x, y, radius),
+          expected = points
+            .filter((p) => Math.hypot(p.x - x, p.y - y) <= radius)
+            .map((p) => p.id)
+            .sort();
+        assert.deepEqual(q.found.map((p) => p.id).sort(), expected);
+        assert.ok(q.checked <= points.length);
+        assert.ok(q.visited.length <= q.totalNodes);
+      }
+  const selective = quadQuery(points, 2, 6, 2, 8, 0.3);
+  assert.ok(selective.checked < points.length);
+  assert.ok(selective.visited.length < selective.totalNodes);
+  assert.deepEqual(
+    selective.found.map((p) => p.id),
+    ['P2'],
+  );
+  assert.throws(() => quadQuery(points, 2, 6, NaN, 5, 1), RangeError);
 });
