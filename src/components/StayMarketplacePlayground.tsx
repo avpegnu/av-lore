@@ -109,8 +109,9 @@ export default function StayMarketplacePlayground({
               </table>
             </div>
             <figcaption>
-              × = blocked; · = free trong bản index. Border đánh dấu requested nights; phần ngoài
-              horizon không có evidence. Một bitmap cho đêm bận không encode mọi eligibility rule.
+              × = blocked; · = free trong bản index. N1 tương ứng index 0; [4,7) highlight N5–N7.
+              Border đánh dấu requested nights; phần ngoài horizon không có evidence. Một bitmap cho
+              đêm bận không encode mọi eligibility rule.
             </figcaption>
           </figure>
           <dl className="worksheet-results" aria-live="polite">
