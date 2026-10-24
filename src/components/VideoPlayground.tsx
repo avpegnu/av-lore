@@ -1,6 +1,8 @@
 import { useId, useState } from 'react';
 import { useIslandReady } from '../lib/use-island-ready';
 import { abrReplay, videoProfiles, videoBandwidth, transcodeState } from '../lib/video-models';
+import EncodeSchedule from './EncodeSchedule';
+import AbrDecisions from './AbrDecisions';
 export default function VideoPlayground({
   kind,
 }: {
@@ -111,6 +113,7 @@ export default function VideoPlayground({
             time-to-playable, không tự giảm total encode work; khi high xong, xuất manifest version
             mới. Gate chưa duyệt thì artifact có thể đã encode nhưng chưa được phục vụ công khai.
           </p>
+          <EncodeSchedule />
         </>
       )}
       {kind === 'video-abr' && (
@@ -161,6 +164,7 @@ export default function VideoPlayground({
               </button>
             ))}
           </div>
+          <AbrDecisions runs={runs} />
           <div className="video-abr-results">
             {runs.map((run, i) => (
               <section key={i}>
@@ -234,6 +238,7 @@ export default function VideoPlayground({
                         {[
                           'Segment',
                           'Network Mbps',
+                          'Estimate before / Mbps',
                           'Chosen Mbps',
                           'Download s',
                           'Buffer s',
@@ -250,6 +255,7 @@ export default function VideoPlayground({
                         <tr key={r.index}>
                           <th scope="row">{r.index}</th>
                           <td>{r.available.toFixed(2)}</td>
+                          <td>{r.estimate.toFixed(2)}</td>
                           <td>{r.selected}</td>
                           <td>{r.download.toFixed(2)}</td>
                           <td>{r.buffer.toFixed(2)}</td>
