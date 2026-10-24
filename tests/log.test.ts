@@ -16,7 +16,7 @@ test('sparse index seeks by logical offset and byte position, retaining holes af
         if (n >= s.start) assert.equal(s.found?.offset, expected?.offset);
       }
 });
-test('replica timeline gates admission by minISR and all-current-ISR ACK; reply loss differs from data loss', () => {
+test('replica timeline gates all-ACK admission by minISR and all-current-ISR ACK; reply loss differs from data loss', () => {
   assert.equal(logReplication(2, 2, 'leader', false, false).sender, 'ACKNOWLEDGED');
   assert.equal(logReplication(2, 2, 'all', false, false).sender, 'UNKNOWN');
   assert.equal(logReplication(3, 2, 'all', true, false).sender, 'UNKNOWN');
@@ -44,4 +44,12 @@ test('transaction visibility is limited by replication, open transactions and ab
           .every((x) => x.offset < hw && x.offset < r.lso && x.kind !== 'marker'),
       );
     }
+});
+
+test('leader-only acceptance does not inherit all-ACK admission guarantees or strict HW visibility',()=>{
+ const low=logReplication(3,3,'leader',false,false),all=logReplication(3,3,'all',false,false);
+ assert.equal(low.admitted,true);assert.equal(low.sender,'ACKNOWLEDGED');assert.deepEqual(low.ends,{A:5,B:5,C:4});assert.equal(low.hw,4);
+ assert.equal(all.admitted,false);assert.equal(all.sender,'REJECTED');assert.deepEqual(all.ends,{A:4,B:4,C:4});assert.equal(all.hw,4);
+ assert.equal(logReplication(3,2,'all',false,false).hw,5);
+ const unsafe=logReplication(5,3,'leader',false,true);assert.equal(unsafe.lostAcknowledged,true);assert.equal(unsafe.currentCommittedLoss,false);
 });

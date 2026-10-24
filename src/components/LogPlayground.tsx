@@ -117,8 +117,7 @@ export default function LogPlayground({
           <p>
             ISR-only fixture bắt đầu với offsets 0–3 đã commit trên A/B/C, HW boundary 4. C rời ISR
             trước append offset 4; A vẫn là leader, B là follower trong ISR. C không nhận record
-            mới. Không mô phỏng ELR, fsync, timing hay mọi election rule của Kafka. Min ISR chỉ chặn
-            admission; all ACK vẫn chờ cả A và B.
+            mới. Không mô phỏng ELR, fsync, timing hay mọi election rule của Kafka. Min ISR chặn admission ở all ACK; leader ACK vẫn có thể nhận write dưới threshold. Fixture chọn strict HW: chỉ tiến visibility khi đủ Min ISR và mọi current ISR đã copy, nên ACK leader không chứng minh readable commit.
           </p>
           <div className="worksheet-inputs">
             <label>
@@ -171,8 +170,8 @@ export default function LogPlayground({
             {[
               'Baseline: A/B/C có committed prefix 0–3',
               'C rời ISR; membership được ghi bền',
-              'Append offset 4 trên A nếu đủ Min ISR',
-              'B copy record; A/B commit offset 4',
+              'Append offset 4 trên A; all ACK kiểm Min ISR',
+              'B copy record; HW chỉ tiến nếu đủ Min ISR',
               'A mất; promote B theo clean ISR election',
               'B cũng mất; chỉ còn stale C',
             ].map((s, i) => (

@@ -26,7 +26,7 @@ export default function EmailPlayground({kind}:{kind:'email-receipt'|'email-auth
   </>}
   {kind==='email-auth'&&<>
    <h3 id={id}>PASS chưa đủ nếu domain không align</h3>
-   <p>Visible From là example.com. SPF identity đại diện MAIL FROM domain đã xác định; DKIM identity là một signing domain. Các checkbox chỉ cung cấp kết quả giả định, không chạy DNS hoặc kiểm signature. Fixture coi example.com và mail.example.com cùng organizational domain; đây không phải Public Suffix List implementation. Off trong lab là definitive non-pass; DNS temporary errors và nhiều DKIM signatures không được mô phỏng.</p>
+   <p>Visible From là example.com. SPF identity đại diện MAIL FROM domain đã xác định; DKIM identity là một signing domain. Các checkbox chỉ cung cấp kết quả giả định, không chạy DNS hoặc kiểm signature. Fixture coi example.com và mail.example.com cùng organizational domain; lab không triển khai DNS/policy discovery cho Organizational Domain. Off trong lab là definitive non-pass; DNS temporary errors và nhiều DKIM signatures không được mô phỏng.</p>
    <label className="worksheet-toggle"><input type="checkbox" checked={spf} onChange={e=>setSpf(e.target.checked)}/>SPF result là PASS</label>
    {domainChoices('SPF',spfDomain,setSpfDomain)}
    <label className="worksheet-toggle"><input type="checkbox" checked={dkim} onChange={e=>setDkim(e.target.checked)}/>DKIM result là PASS</label>

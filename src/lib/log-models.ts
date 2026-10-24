@@ -113,9 +113,10 @@ export function logReplication(
   // Initial committed prefix is offsets 0..3 (HW boundary 4), all replicas eligible in ISR.
   // C is removed before the new append; membership is durable in this fixture.
   const isr = stage >= 1 ? ['A', 'B'] : ['A', 'B', 'C'],
-    admitted = stage >= 2 && isr.length >= minIsr;
+    admitted = stage >= 2 && (ack === 'leader' || isr.length >= minIsr);
   const ends = { A: admitted ? 5 : 4, B: admitted && stage >= 3 ? 5 : 4, C: 4 };
-  const committed = admitted && stage >= 3,
+  // Strict HW rule in this fixture: low-ISR leader ACKs do not advance visibility.
+  const committed = admitted && stage >= 3 && isr.length >= minIsr,
     hw = committed ? 5 : 4;
   const ackSent = admitted && (ack === 'leader' || committed);
   const newLeader = stage < 4 ? null : stage === 4 ? 'B' : unclean ? 'C' : null;
@@ -144,7 +145,7 @@ export function logReplication(
             ? 'UNCLEAN_WITH_DATA_LOSS'
             : 'CLEAN_ISR',
     recoveredEnd,
-    lostAcknowledged: stage === 5 && !!newLeader && ackSent && ack === 'all',
+    lostAcknowledged: stage === 5 && !!newLeader && ackSent && ends[newLeader] < ends.A,
     currentCommittedLoss: stage === 5 && !!newLeader && committed,
     leaderOnlyCrashLoss: admitted && stage === 2 && ack === 'leader',
   };
