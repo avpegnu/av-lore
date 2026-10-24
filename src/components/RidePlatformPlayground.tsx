@@ -302,10 +302,10 @@ export default function RidePlatformPlayground({
         <>
           <h3 id={id}>Ping mới tới có chắc là vị trí mới?</h3>
           <p>
-            Một driver có server-issued session epoch và sequence tăng trong session. Epoch 2 đã
-            được xác thực/kích hoạt; packets epoch 1 có thể tới muộn. TTL fixture là 10 giây theo
-            server receive time; duplicate không làm mới TTL khi sequence guard bật. A/B/C là cell
-            giả lập, không phải H3.
+            Một driver có server-issued session epoch và sequence tăng trong session. Khi packet thứ
+            tư tới, session mới epoch 2 đã được xác thực/kích hoạt; packet thứ năm từ epoch 1 là dữ
+            liệu tới muộn. TTL fixture là 10 giây theo server receive time; duplicate không làm mới
+            TTL khi sequence guard bật. A/B/C là cell giả lập, không phải H3.
           </p>
           <label className="worksheet-toggle">
             <input

@@ -5,7 +5,7 @@ Cập nhật 24/10/2026. Chủ sở hữu đã quay lại và yêu cầu tiếp 
 ## Trạng thái hiện tại
 
 - **73/73 bài có nội dung Việt–Anh**, gồm 4 Foundations, 8 Building Blocks, 26 Case Studies, 12 Build Stories,15 AI Systems và3Practice +5Interview. **73 bài đã build và kiểm tra browser local.**
-- **40/73 bài đã hoàn tất review độc lập; 33 bài còn `review`.** Đã chốt 4 Foundations, 8 Building Blocks, toàn bộ26 Case Studies, Netflix và Payment Platform. Ride-hailing là bài tiếp theo. Review kiểm độ phủ, kỹ thuật, diễn giải/English và mục đích hình/tương tác; tests/counts không thay review.
+- **41/73 bài đã hoàn tất review độc lập; 32 bài còn `review`.** Đã chốt 4 Foundations, 8 Building Blocks, toàn bộ26 Case Studies, Netflix, Payment Platform và Ride-hailing. Community Chat là bài tiếp theo. Review kiểm độ phủ, kỹ thuật, diễn giải/English và mục đích hình/tương tác; tests/counts không thay review.
 - **Không còn mục chưa biên soạn trong catalog73**; vẫn cần vòng review độc lập toàn bộ nội dung. Glossary68 đã có416original VIENentries/15groups (bao phủ332inventorytermnames/aliases +commonSQL/Frontend/OS/Git/K8s), canonical10sections/3traces/explorer/static fallback/term recall integration; đã validate và publish local; chuẩn bị checkpoint.
 - Main preview **http://127.0.0.1:4322/av-lore/** đã publish local73. Quiz: `/system-design/quiz/` và `/en/system-design/quiz/`. Question Bank: `/system-design/questions/` và `/en/system-design/questions/`. Mock Interview: `/system-design/mock/` và `/en/system-design/mock/`. Staff Signals: `/system-design/staff-signals/` và `/en/system-design/staff-signals/`. Visual Cheat Sheet: `/system-design/cheat-sheet/` và `/en/system-design/cheat-sheet/`. Glossary: `/system-design/glossary/` và `/en/system-design/glossary/`. Các bài mới `/ai-systems/ai-rag/`, `/ai-systems/ai-fine-tuning/`, `/ai-systems/ai-evals/`, `/ai-systems/ai-agents/`, `/ai-systems/ai-production/`, `/ai-systems/ai-safety/`, `/ai-systems/ai-case-rag/` và bản `/en/` tương ứng.
 - Giữ 198 chương/15 lộ trình, 31 Notes & Interview topics, stable IDs, localStorage keys và 9 themes. Không portfolio.
@@ -997,3 +997,13 @@ Mainpreview nếu đã tắt sau shutdown có thể restart tại rootAVLore:`np
 - Ride-hailing full15sections/eightanswers/twelve stage descriptions/panels read, own three models/UI/tests reviewed. Primary H3 geometry/traversal and public fulfillment design checked. Comparison main chapter read; remaining full comparison stages/demo/models and canonical graphs. Identified a wording clarification for when the new location-session epoch activates; no Ride-hailing source edits yet.
 
 - Ride-hailing remaining reads finished: full comparison12stages/node library/dispatch model/demo and all canonical13graphs/traces. Primary Schemaless2016, DeepETA2022 and DOMA2020 checked. Plan original matching worked table and atomic-accept sketch, geo-to-authority flow, compact13maps and VI prose/epoch-timeline clarification. No source edits yet.
+
+
+## Batch41 onward WIP
+
+- Batch40 pushed AVd2a9caa / IT786ac89; main4322 serves40reviewed. Ride-hailing complete full-scope review recorded above. Added original two-matrix matching worked table (total/worst/cardinality/collection separated), geo-cover-to-authority flow and supported serializable accept sketch preserving trip and driver invariants. Compacted12stage maps/main12node graph; translated remaining English-only VI diagram sentences and clarified epoch2activation occurs at packet4 in location fixture. Model/IDs unchanged, authored runtime English updated; browser now18theme/locale checks. Status remains review until validation. Community Chat not edited yet.
+
+
+## Batch41 validated / final metadata build
+
+- Source check405/no diagnostics267tests; isolated build/verify656pages305486links/assets0missingEnglish. Dedicated three-lab scenarios and all12stage controls pass VI/EN/mobile/keyboard/18theme-locale checks. Generic2routes/nine themes, static2pages/148HTML5526links pass. Main19routes and all stage routes bounded; all12stage/main label-kind bounds pass VI/EN with no clipping. Desktop request map and mobile matching worked table inspected. Completion metadata build/verify passed with the same totals; main4322 published41reviewed. Explicit owned-file commits/push follow. Community Chat canonical prose and own models/tests reviewed so far; comparison chapter and first six stages read, remaining stages/maps/UI pending. No Community Chat edits yet.
