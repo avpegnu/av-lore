@@ -346,15 +346,23 @@ export default function LlmSchedulingPlayground({
         <>
           <div className="llm-handoff-stages">
             {[
-              ['COLOCATED', handoff.monolithic],
-              ['SPLIT', handoff.split],
-            ].map(([label, parts]) => (
+              {
+                label: 'COLOCATED',
+                parts: handoff.monolithic,
+                names: ['Queue chung', 'Prefill', 'First decode'],
+              },
+              {
+                label: 'SPLIT',
+                parts: handoff.split,
+                names: ['Prefill queue', 'Prefill', 'KV transfer', 'Decode queue', 'First decode'],
+              },
+            ].map(({ label, parts, names }) => (
               <article key={String(label)}>
                 <strong>{String(label)}</strong>
                 <ol>
-                  {(parts as number[]).map((ms, i) => (
+                  {parts.map((ms, i) => (
                     <li key={i}>
-                      <span>{i + 1}</span>
+                      <span>{names[i]}</span>
                       <b>{ms.toFixed(1)} ms</b>
                     </li>
                   ))}
