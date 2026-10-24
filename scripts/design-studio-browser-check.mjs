@@ -119,6 +119,43 @@ try {
       mimeType: 'application/json',
       buffer: Buffer.from(JSON.stringify(exported)),
     });
+    // The edge cap limits additions, while editing an existing edge must remain possible.
+    const full = structuredClone(exported);
+    full.design.nodes = Array.from({ length: 11 }, (_, i) => ({
+      ...exported.design.nodes[0],
+      id: i ? 'service-' + i : 'client-1',
+      kind: i ? 'service' : 'client',
+      label: 'Bounded node ' + i,
+      x: (i % 4) * 250,
+      y: Math.floor(i / 4) * 200,
+    }));
+    const pairs = full.design.nodes.flatMap((a) =>
+      full.design.nodes
+        .filter((b) => b.kind !== 'client' && b.id !== a.id)
+        .map((b) => ({ from: a.id, to: b.id, reads: 1, writes: 0 })),
+    );
+    full.design.edges = pairs.slice(0, 80);
+    await file.setInputFiles({
+      name: 'full.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(full)),
+    });
+    const edgeForm = studio.locator('.studio-connect');
+    await edgeForm.locator('select').first().selectOption(full.design.edges[0].from);
+    await edgeForm.locator('select').last().selectOption(full.design.edges[0].to);
+    assert.equal(await edgeForm.locator('button').isEnabled(), true);
+    await edgeForm.locator('input').first().fill('0.5');
+    await edgeForm.locator('button').click();
+    assert.equal(await studio.locator('.studio-edge-list li').count(), 80);
+    await page.waitForFunction(() => document.querySelector('.studio-edge-list li:last-child')?.textContent.includes('r×0.5'));
+    await edgeForm.locator('select').first().selectOption(pairs[80].from);
+    await edgeForm.locator('select').last().selectOption(pairs[80].to);
+    assert.equal(await edgeForm.locator('button').isDisabled(), true);
+    await file.setInputFiles({
+      name: 'restore.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(exported)),
+    });
     // A harmless self-contained cycle must disable numerical inference rather than ignore a back edge.
     const cycle = structuredClone(exported);
     cycle.design.edges.push({ from: 'sql-5', to: 'service-3', reads: 1, writes: 0 });

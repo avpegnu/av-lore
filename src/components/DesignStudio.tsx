@@ -630,7 +630,8 @@ export default function DesignStudio() {
             selected === target ||
             !d.nodes.some((n) => n.id === selected) ||
             !d.nodes.some((n) => n.id === target && n.kind !== 'client') ||
-            d.edges.length >= studioLimits.edges
+            (d.edges.length >= studioLimits.edges &&
+              !d.edges.some((e) => e.from === selected && e.to === target))
           }
           onClick={() =>
             mutate((cur) =>
